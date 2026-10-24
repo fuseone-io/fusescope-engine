@@ -1,0 +1,27 @@
+[package]
+name = "fs-server"
+description = "FuseScope Engine binary: runs the ingester, querier and compactor roles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "fusescope-engine"
+path = "src/main.rs"
+
+[dependencies]
+fs-schema = { path = "../fs-schema" }
+fs-catalog = { path = "../fs-catalog" }
+fs-wal = { path = "../fs-wal" }
+fs-ingest = { path = "../fs-ingest" }
+fs-index = { path = "../fs-index" }
+fs-cache = { path = "../fs-cache" }
+fs-query = { path = "../fs-query" }
+fs-compactor = { path = "../fs-compactor" }
+fs-auth = { path = "../fs-auth" }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "fs-catalog"
+description = "File catalog in Postgres with in-memory cache, change notification and Iceberg export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

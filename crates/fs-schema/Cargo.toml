@@ -1,0 +1,14 @@
+[package]
+name = "fs-schema"
+description = "Versioned Arrow schemas for traces, logs and metrics, and OTLP to Arrow conversion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

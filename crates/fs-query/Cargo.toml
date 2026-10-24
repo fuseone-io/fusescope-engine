@@ -1,0 +1,14 @@
+[package]
+name = "fs-query"
+description = "DataFusion table providers, pruning, hot-window union, Flight SQL, typed actions and SQL sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
