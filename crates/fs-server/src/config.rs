@@ -671,6 +671,9 @@ impl Config {
         {
             return invalid("ingest.wal_batch_* and ingest.wal_queue_* must be positive");
         }
+        if self.ingest.wal_queue_records > tokio::sync::Semaphore::MAX_PERMITS {
+            return invalid("ingest.wal_queue_records is larger than the runtime can track");
+        }
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
             || self.query.memory_bytes < 64 * 1024 * 1024
@@ -860,6 +863,47 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("ingest.listen")
+        );
+    }
+
+    #[test]
+    fn wal_queue_fields_convert_and_validate() {
+        let config = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nwal_batch_records = 7\nwal_batch_bytes = 8\nwal_linger_ms = 9\nwal_queue_records = 10\nwal_queue_bytes = 11\nwal_queue_wait_ms = 12\n",
+        )
+        .unwrap();
+        let gc = config.ingest.to_ingest_config().unwrap().group_commit;
+        assert_eq!(gc.max_records, 7);
+        assert_eq!(gc.max_bytes, 8);
+        assert_eq!(gc.linger, std::time::Duration::from_millis(9));
+        assert_eq!(gc.max_inflight_records, 10);
+        assert_eq!(gc.max_inflight_bytes, 11);
+        assert_eq!(gc.queue_wait, std::time::Duration::from_millis(12));
+
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let huge = Config::parse(&format!(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nwal_queue_records = {}\n",
+            usize::MAX
+        ))
+        .unwrap();
+        assert!(
+            huge.validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("wal_queue_records")
+        );
+        let zero = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nwal_queue_bytes = 0\n",
+        )
+        .unwrap();
+        assert!(
+            zero.validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("wal_queue")
         );
     }
 

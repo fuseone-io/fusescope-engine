@@ -305,6 +305,18 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("fusescope_ingest_wal_bytes 42\n"), "{page}");
+        let writer = Arc::new(fs_ingest::walwriter::WriterStats::default());
+        writer.backpressure.fetch_add(5, Ordering::Relaxed);
+        metrics.register_writer(writer);
+        let page = metrics.render();
+        assert!(
+            page.contains("# TYPE fusescope_wal_backpressure_total counter\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_wal_backpressure_total 5\n"),
+            "{page}"
+        );
         assert!(page.lines().all(|l| {
             l.starts_with('#')
                 || l.split_once(' ')

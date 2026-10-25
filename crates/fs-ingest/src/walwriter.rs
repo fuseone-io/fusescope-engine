@@ -117,7 +117,9 @@ impl WalWriter {
             queue,
             stats,
             slots: Arc::new(tokio::sync::Semaphore::new(
-                config.max_inflight_records.max(1),
+                config
+                    .max_inflight_records
+                    .clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             )),
             inflight_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             config,
@@ -331,9 +333,17 @@ mod tests {
             let writer = writer.clone();
             tokio::spawn(async move { writer.append(vec![7u8; 100]).await })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let queued = async {
+            while writer.free_slots() != 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .expect("record queued");
         task.abort();
         let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             writer.inflight_bytes(),
             100,
@@ -341,13 +351,14 @@ mod tests {
         );
         assert_eq!(writer.free_slots(), 3, "the slot stays taken");
         drop(stall);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            writer.inflight_bytes(),
-            0,
-            "released once the writer synced the record"
-        );
-        assert_eq!(writer.free_slots(), 4);
+        let released = async {
+            while writer.free_slots() != 4 || writer.inflight_bytes() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), released)
+            .await
+            .expect("released once the writer synced the record");
         assert_eq!(
             writer.stats().records.load(Ordering::Relaxed),
             1,
