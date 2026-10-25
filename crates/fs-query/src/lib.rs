@@ -15,7 +15,7 @@ pub mod querier;
 pub mod session;
 pub mod spans_table;
 
-pub use querier::{Querier, QueryLimits, STORE_URL};
+pub use querier::{Querier, QueryLimits, QueryStats, STORE_URL};
 
 use thiserror::Error;
 

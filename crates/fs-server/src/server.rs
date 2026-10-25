@@ -62,6 +62,7 @@ pub async fn bootstrap(
         store,
         root,
         node_id,
+        metrics: Arc::new(crate::metrics::Metrics::default()),
     })
 }
 
@@ -178,6 +179,22 @@ pub async fn run(
     });
 
     let mut tasks: JoinSet<(&'static str, Result<(), ServerError>)> = JoinSet::new();
+    if !ctx.config.server.metrics_addr.is_empty() {
+        let listen: std::net::SocketAddr = ctx.config.server.metrics_addr.parse().map_err(|e| {
+            ServerError::InvalidConfig(format!(
+                "server.metrics_addr {:?}: {e}",
+                ctx.config.server.metrics_addr
+            ))
+        })?;
+        let metrics = Arc::clone(&ctx.metrics);
+        let rx = stop_rx.clone();
+        tasks.spawn(async move {
+            (
+                "metrics",
+                crate::metrics::serve(listen, metrics, rx, None).await,
+            )
+        });
+    }
     for r in role.expand() {
         let ctx = ctx.clone();
         let rx = stop_rx.clone();

@@ -117,7 +117,11 @@ pub fn l0_path(root: &Path, tenant: TenantId, start: DateTime<Utc>, id: FileId) 
     }
 }
 
-fn sort_spans(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
+/// Sorts a span batch by `(service_name, timestamp)`.
+///
+/// # Errors
+/// Arrow failures or a missing column.
+pub fn sort_spans(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
     let schema = batch.schema();
     let service = batch.column(schema.index_of("service_name")?);
     let timestamp = batch.column(schema.index_of(col::TIMESTAMP)?);
@@ -152,7 +156,11 @@ fn distinct_services(batch: &RecordBatch) -> Result<Vec<String>, IngestError> {
     Ok(seen.into_iter().collect())
 }
 
-fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
+/// Encodes a sorted span batch as a Parquet L0 file with the engine's writer settings.
+///
+/// # Errors
+/// Parquet failures.
+pub fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
     let props = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))

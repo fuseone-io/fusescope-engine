@@ -34,6 +34,7 @@ ClickHouse.
 | `fs-compactor` | Compaction levels, derived tables, promotions, retention |
 | `fs-auth` | mTLS, tenant JWT, per-role identity |
 | `fs-server` | Single binary, `--role ingester|querier|compactor|all` |
+| `fs-bench` | Benchmarks: ingest stages in process, OTLP load generator, Flight SQL query suite |
 
 ## Development
 
@@ -48,6 +49,11 @@ make tenant NAME=acme     # create a tenant; prints its id
 make token TENANT=<id> NAME=collector   # issue an ingest token; printed once
 make dev-down
 ```
+
+Benchmarks live in `fs-bench` and results in [docs/benchmarks/](docs/benchmarks/):
+`make bench-stages` decomposes the ingest path in process, `make bench-load`
+drives a running ingester over OTLP, `make bench-query` runs the DESIGN.md query
+suite over Flight SQL. The engine exposes Prometheus metrics on `:9464`.
 
 Point an OpenTelemetry collector's OTLP gRPC exporter at `localhost:4317` with
 `authorization: Bearer <token>` in its headers to send traces. Query with any

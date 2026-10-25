@@ -79,7 +79,7 @@ pub struct Shared {
     pub(crate) config: IngestConfig,
     pub(crate) auth: Authenticator,
     pub(crate) limiter: Option<StdMutex<RateLimiter>>,
-    pub(crate) stats: IngestStats,
+    pub(crate) stats: Arc<IngestStats>,
     wal: Arc<StdMutex<Wal>>,
     instance: Uuid,
     buffers: Mutex<Buffers>,
@@ -476,7 +476,7 @@ impl Ingester {
             config,
             auth,
             limiter,
-            stats: IngestStats::default(),
+            stats: Arc::new(IngestStats::default()),
             wal: Arc::new(StdMutex::new(wal)),
             instance,
             buffers: Mutex::new(buffers),
@@ -495,6 +495,16 @@ impl Ingester {
     /// Counters.
     pub fn stats(&self) -> &IngestStats {
         &self.shared.stats
+    }
+
+    /// Shared handle to the counters, for a metrics exporter.
+    pub fn shared_stats(&self) -> Arc<IngestStats> {
+        Arc::clone(&self.shared.stats)
+    }
+
+    /// Bytes the WAL currently holds on disk.
+    pub fn wal_bytes(&self) -> u64 {
+        self.shared.wal.lock().map_or(0, |w| w.bytes())
     }
 
     /// Retries or resumes every pending flush, then flushes every tenant.

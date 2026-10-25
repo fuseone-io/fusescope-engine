@@ -41,6 +41,21 @@ impl QueryWarnings {
     }
 }
 
+/// Counters exposed for metrics.
+#[derive(Debug, Default)]
+pub struct QueryStats {
+    /// Statements planned.
+    pub queries: std::sync::atomic::AtomicU64,
+    /// Statements that failed to plan or were refused.
+    pub errors: std::sync::atomic::AtomicU64,
+    /// Rows returned by `collect`.
+    pub rows: std::sync::atomic::AtomicU64,
+    /// Hot-window fan-outs performed.
+    pub hot_fanouts: std::sync::atomic::AtomicU64,
+    /// Ingesters that did not answer a fan-out.
+    pub hot_unavailable: std::sync::atomic::AtomicU64,
+}
+
 /// Resource limits applied to every query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLimits {
@@ -80,6 +95,7 @@ pub struct Querier {
     runtime: Arc<RuntimeEnv>,
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
+    stats: Arc<QueryStats>,
 }
 
 impl Querier {
@@ -102,10 +118,11 @@ impl Querier {
         let runtime = builder.build_arc()?;
         runtime.register_object_store(store_url.as_ref(), store);
         let cache = Arc::new(FileCache::new(catalog.clone()));
-        let hot = Arc::new(crate::hot::HotWindow::new(
-            catalog.clone(),
-            limits.hot_window,
-        ));
+        let stats = Arc::new(QueryStats::default());
+        let hot = Arc::new(
+            crate::hot::HotWindow::new(catalog.clone(), limits.hot_window)
+                .with_stats(Arc::clone(&stats)),
+        );
         info!(
             memory_bytes = limits.memory_bytes,
             timeout = ?limits.timeout,
@@ -119,6 +136,7 @@ impl Querier {
             runtime,
             store_url,
             limits,
+            stats,
         })
     }
 
@@ -130,6 +148,11 @@ impl Querier {
     /// Limits in force.
     pub fn limits(&self) -> QueryLimits {
         self.limits
+    }
+
+    /// Shared handle to the counters, for a metrics exporter.
+    pub fn stats(&self) -> Arc<QueryStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Plans `sql` for `tenant` without executing it. Returns the session, the
@@ -156,6 +179,9 @@ impl Querier {
             .ok_or(QueryError::UnknownTenant)?
             .bytes_budget;
         let budget = u64::try_from(budget).unwrap_or(u64::MAX);
+        self.stats
+            .queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let warnings = Arc::new(QueryWarnings::default());
         let ctx = tenant_session(
             tenant,
@@ -167,7 +193,15 @@ impl Querier {
             budget,
             self.limits.batch_size,
         )?;
-        let plan = plan_read_only(&ctx, sql).await?;
+        let plan = match plan_read_only(&ctx, sql).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.stats
+                    .errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+        };
         Ok((ctx, plan, warnings))
     }
 
@@ -226,6 +260,9 @@ impl Querier {
                 }
                 out.push(batch);
             }
+            self.stats
+                .rows
+                .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
             Ok((out, warnings.list()))
         };
         tokio::time::timeout(limits.timeout, run)

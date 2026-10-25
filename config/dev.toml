@@ -6,6 +6,7 @@
 role = "all"
 node_id = "dev-0"
 flight_addr = "0.0.0.0:8815"   # Arrow Flight SQL for the Go backend
+metrics_addr = "0.0.0.0:9464"  # Prometheus text exposition
 
 [catalog]
 max_connections = 8

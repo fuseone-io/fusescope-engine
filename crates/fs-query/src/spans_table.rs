@@ -186,8 +186,14 @@ impl TableProvider for SpansTable {
         let hot_exec: Option<Arc<dyn ExecutionPlan>> = if hot_batches.is_empty() {
             None
         } else {
+            // Flight hydrates dictionaries in transit; bring every column back
+            // to the declared type so the union sees one schema.
+            let coerced = hot_batches
+                .iter()
+                .map(|b| coerce_to_schema(b, &projected_schema))
+                .collect::<Result<Vec<_>, _>>()?;
             Some(MemorySourceConfig::try_new_exec(
-                &[hot_batches],
+                &[coerced],
                 Arc::clone(&projected_schema),
                 None,
             )?)
@@ -216,4 +222,31 @@ impl TableProvider for SpansTable {
             None => files_exec,
         })
     }
+}
+
+/// Casts every column whose type differs from `schema` to the declared type.
+fn coerce_to_schema(
+    batch: &arrow::record_batch::RecordBatch,
+    schema: &arrow::datatypes::SchemaRef,
+) -> DfResult<arrow::record_batch::RecordBatch> {
+    if batch.schema().fields() == schema.fields() {
+        return Ok(batch.clone());
+    }
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let index = batch.schema().index_of(field.name())?;
+            let column = batch.column(index);
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                Ok(arrow::compute::cast(column, field.data_type())?)
+            }
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    Ok(arrow::record_batch::RecordBatch::try_new(
+        Arc::clone(schema),
+        columns,
+    )?)
 }

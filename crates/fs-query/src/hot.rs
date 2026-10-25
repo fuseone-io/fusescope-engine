@@ -2,6 +2,7 @@
 //! they hold in memory, and learn which files to skip.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
@@ -70,12 +71,24 @@ pub struct HotResult {
 pub struct HotWindow {
     catalog: Catalog,
     config: HotWindowConfig,
+    stats: Option<Arc<crate::querier::QueryStats>>,
 }
 
 impl HotWindow {
     /// Fan-out over `catalog`'s live ingesters.
     pub fn new(catalog: Catalog, config: HotWindowConfig) -> Self {
-        Self { catalog, config }
+        Self {
+            catalog,
+            config,
+            stats: None,
+        }
+    }
+
+    /// Counts fan-outs and unavailable ingesters in `stats`.
+    #[must_use]
+    pub fn with_stats(mut self, stats: Arc<crate::querier::QueryStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// True when the pruned range may include rows not yet flushed.
@@ -118,6 +131,11 @@ impl HotWindow {
                 )
             }
         });
+        if let Some(stats) = &self.stats {
+            stats
+                .hot_fanouts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut result = HotResult::default();
         for (id, outcome) in futures_util::future::join_all(calls).await {
             match outcome {
@@ -127,6 +145,11 @@ impl HotWindow {
                 }
                 Err(e) => {
                     warn!(ingester = %id, error = %e, "hot window scan failed; result is partial");
+                    if let Some(stats) = &self.stats {
+                        stats
+                            .hot_unavailable
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     result.unavailable.push(id);
                 }
             }

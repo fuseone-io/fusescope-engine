@@ -28,6 +28,8 @@ pub struct Context {
     pub root: Path,
     /// This process's stable id.
     pub node_id: String,
+    /// Counters exposed on `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// Heartbeat period of the ingester. The querier treats 10 s of silence as down.
@@ -58,13 +60,18 @@ pub async fn ingester(
         "wal opened"
     );
     let ingest_config = ctx.config.ingest.to_ingest_config()?;
-    let ingester = fs_ingest::Ingester::new(
+    let ingester = Arc::new(fs_ingest::Ingester::new(
         ingest_config,
         ctx.catalog.clone(),
         ctx.store.clone(),
         ctx.root.clone(),
         wal,
-    )?;
+    )?);
+    let wal_probe = Arc::clone(&ingester);
+    ctx.metrics.register_ingest(
+        ingester.shared_stats(),
+        Arc::new(move || wal_probe.wal_bytes()),
+    );
 
     let heartbeat = {
         let ctx = ctx.clone();
@@ -108,6 +115,7 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
         ctx.config.query.spill_dir.clone(),
         ctx.config.query.to_limits(),
     )?;
+    ctx.metrics.register_query(querier.stats());
     let cache = querier.cache();
     let follower = cache.follow(shutdown.clone());
     let service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());

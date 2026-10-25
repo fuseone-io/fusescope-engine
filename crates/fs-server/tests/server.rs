@@ -63,6 +63,7 @@ fn config(dir: &std::path::Path) -> Config {
         r#"
         [server]
         node_id = "test-node"
+        metrics_addr = "127.0.0.1:0"
         [bucket]
         kind = "local"
         path = "{bucket}"

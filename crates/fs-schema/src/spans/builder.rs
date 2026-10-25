@@ -1,9 +1,11 @@
 //! Converts OTLP `ResourceSpans` into Arrow record batches with [`span_schema_v1`].
 
+use std::sync::Arc;
+
 use arrow::array::{
-    ArrayBuilder, ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int8Builder,
-    Int16Builder, ListBuilder, MapBuilder, StringBuilder, StringDictionaryBuilder, StructBuilder,
-    TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
+    ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder,
+    Int8Builder, Int16Builder, ListBuilder, MapBuilder, StringBuilder, StringDictionaryBuilder,
+    StructBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Int32Type};
 use arrow::record_batch::RecordBatch;
@@ -426,8 +428,42 @@ impl SpanBatchBuilder {
         ];
         columns.extend(self.promoted.iter_mut().map(ArrayBuilder::finish));
         self.rows = 0;
-        Ok(RecordBatch::try_new(span_schema_v1(), columns)?)
+        let batch = RecordBatch::try_new(span_schema_v1(), columns)?;
+        compact(&batch)
     }
+}
+
+/// Copies a batch into exactly sized buffers.
+///
+/// Builders over-allocate, and a batch that sits in a buffer for up to a flush
+/// interval would otherwise account for tens of kilobytes per span, tripping
+/// byte thresholds early. `concat` with a single input returns it unchanged, so
+/// an empty slice is added to force the copy. Dictionary columns are rebuilt
+/// through their value type, because concatenating dictionaries allocates a
+/// values buffer with builder-sized capacity.
+fn compact(batch: &RecordBatch) -> Result<RecordBatch, SchemaError> {
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| match column.data_type() {
+            DataType::Dictionary(_, _) => {
+                let dict = column.as_dictionary::<Int32Type>();
+                let keys = exact_copy(dict.keys())?;
+                let values = exact_copy(dict.values().as_ref())?;
+                let keys = keys.as_primitive::<Int32Type>().clone();
+                let rebuilt = arrow::array::DictionaryArray::<Int32Type>::try_new(keys, values)?;
+                Ok(Arc::new(rebuilt) as ArrayRef)
+            }
+            _ => exact_copy(column.as_ref()),
+        })
+        .collect::<Result<Vec<ArrayRef>, arrow::error::ArrowError>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+/// `concat` with a single input returns it unchanged; an empty slice forces a
+/// copy into buffers sized to the data.
+fn exact_copy(array: &dyn arrow::array::Array) -> Result<ArrayRef, arrow::error::ArrowError> {
+    arrow::compute::concat(&[&array.slice(0, 0), array])
 }
 
 fn append_string_map(
@@ -538,6 +574,42 @@ mod tests {
         );
         assert_eq!(promoted_from_typed(&typed, "ratio").as_deref(), Some("0.5"));
         assert_eq!(promoted_from_typed(&typed, "missing"), None);
+    }
+
+    #[test]
+    fn finished_batches_are_compact() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        let spans = (0..12u8)
+            .map(|i| Span {
+                trace_id: vec![1; 16],
+                span_id: vec![i + 1; 8],
+                name: "op".into(),
+                start_time_unix_nano: 1_000 + u64::from(i),
+                end_time_unix_nano: 2_000 + u64::from(i),
+                ..Span::default()
+            })
+            .collect();
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut b = SpanBatchBuilder::default();
+        b.append_request(&request).unwrap();
+        let batch = b.finish().unwrap();
+        assert_eq!(batch.num_rows(), 12);
+        let bytes = batch.get_array_memory_size();
+        assert!(
+            bytes < 16 * 1024,
+            "12 bare spans should not need {bytes} bytes"
+        );
     }
 
     #[test]

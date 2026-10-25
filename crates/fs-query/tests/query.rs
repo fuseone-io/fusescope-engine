@@ -578,6 +578,19 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
     assert_eq!(count(&rows), 12);
     assert!(warnings.is_empty(), "{warnings:?}");
 
+    // Dictionary columns travel hydrated over Flight; grouping and sorting on
+    // them must still work on hot rows alone and mixed with files.
+    let grouped = querier
+        .collect(tenant, "select service_name, count(*) as n, max(http_method) as m from spans where timestamp > now() - interval '1 hour' group by service_name order by service_name")
+        .await
+        .unwrap();
+    assert_eq!(grouped.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let listed = querier
+        .collect(tenant, "select timestamp, name, service_name, http_method from spans where timestamp > now() - interval '1 hour' order by timestamp limit 5")
+        .await
+        .unwrap();
+    assert_eq!(listed.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+
     // 2. Flushed and still retained in memory: the file is excluded, no duplicates.
     ingester.flush_all().await;
     querier
@@ -591,11 +604,28 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
         "file plus retained rows must not double count"
     );
 
-    // 3. Retention passed: rows come from the file only.
+    // Fresh hot rows so files and hot batches are unioned in one plan.
+    let mut again = tonic::Request::new(request("worker", 6, now_ns - 500_000_000, 3));
+    again.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from(format!("Bearer {ingest_token}")).unwrap(),
+    );
+    client.export(again).await.unwrap();
+    let grouped = querier
+        .collect(tenant, "select service_name, count(*) as n from spans where timestamp > now() - interval '1 hour' group by service_name order by service_name")
+        .await
+        .unwrap();
+    assert_eq!(
+        grouped.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        2,
+        "api from the file, worker from the hot window"
+    );
+
+    // 3. Retention passed: rows come from the files only.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     ingester.flush_all().await;
     let rows = querier.collect(tenant, sql).await.unwrap();
-    assert_eq!(count(&rows), 12);
+    assert_eq!(count(&rows), 15);
 
     // 4. A query outside the recent window never fans out.
     let old = querier
@@ -614,8 +644,13 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
         .unwrap()
         .unwrap()
         .unwrap();
+    // No notification follower runs in this test, so refresh the file list by hand.
+    querier
+        .cache()
+        .invalidate(tenant, fs_catalog::Signal::Traces)
+        .await;
     let (rows, warnings) = querier.collect_with_warnings(tenant, sql).await.unwrap();
-    assert_eq!(count(&rows), 12, "file rows survive the ingester");
+    assert_eq!(count(&rows), 15, "file rows survive the ingester");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("ingester-test"));
 

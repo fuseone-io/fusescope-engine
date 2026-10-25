@@ -1598,6 +1598,29 @@ name = "fs-auth"
 version = "0.0.1"
 
 [[package]]
+name = "fs-bench"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "bytes",
+ "chrono",
+ "fs-catalog",
+ "fs-ingest",
+ "fs-schema",
+ "fs-wal",
+ "futures-util",
+ "object_store",
+ "opentelemetry-proto",
+ "prost",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "fs-cache"
 version = "0.0.1"
 

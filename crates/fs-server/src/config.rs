@@ -53,6 +53,9 @@ pub struct ServerConfig {
     /// Address advertised to the catalog for hot-window scans.
     #[serde(default = "default_flight_addr")]
     pub flight_addr: String,
+    /// Prometheus `/metrics` listener. Empty string disables it.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
 }
 
 impl Default for ServerConfig {
@@ -61,8 +64,13 @@ impl Default for ServerConfig {
             role: default_role(),
             node_id: None,
             flight_addr: default_flight_addr(),
+            metrics_addr: default_metrics_addr(),
         }
     }
+}
+
+fn default_metrics_addr() -> String {
+    "0.0.0.0:9464".to_owned()
 }
 
 fn default_role() -> Role {
@@ -527,6 +535,9 @@ impl Config {
         }
         if let Some(v) = get("FS_FLIGHT_ADDR") {
             self.server.flight_addr = v;
+        }
+        if let Some(v) = get("FS_METRICS_ADDR") {
+            self.server.metrics_addr = v;
         }
         if let Some(v) = get("FS_BUCKET_ENDPOINT") {
             self.bucket.endpoint = Some(v);

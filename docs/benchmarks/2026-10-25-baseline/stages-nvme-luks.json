@@ -1,0 +1,65 @@
+{
+  "requests": 5000,
+  "spans": 60000,
+  "protobuf_bytes": 21091097,
+  "arrow_bytes": 96771964,
+  "parquet_bytes": 3900736,
+  "stages": [
+    {
+      "stage": "protobuf encode",
+      "total_ms": 54.790417,
+      "ns_per_span": 913.1736166666667,
+      "bytes": 21091097,
+      "mib_per_sec": 367.10867730269166
+    },
+    {
+      "stage": "wal append+sync (per request)",
+      "total_ms": 3435.149246,
+      "ns_per_span": 57252.487433333336,
+      "bytes": 21091097,
+      "mib_per_sec": 5.855360589399239
+    },
+    {
+      "stage": "otlp -> arrow",
+      "total_ms": 387.519833,
+      "ns_per_span": 6458.663883333334,
+      "bytes": 96771964,
+      "mib_per_sec": 238.15280859441907
+    },
+    {
+      "stage": "concat + sort",
+      "total_ms": 154.622791,
+      "ns_per_span": 2577.046516666667,
+      "bytes": 96771964,
+      "mib_per_sec": 596.8650288752725
+    },
+    {
+      "stage": "parquet encode",
+      "total_ms": 179.517554,
+      "ns_per_span": 2991.9592333333335,
+      "bytes": 3900736,
+      "mib_per_sec": 20.72238427603158
+    },
+    {
+      "stage": "upload",
+      "total_ms": 1.346919,
+      "ns_per_span": 22.44865,
+      "bytes": 3900736,
+      "mib_per_sec": 2761.8822945412826
+    },
+    {
+      "stage": "hot-window filter+project",
+      "total_ms": 104.707394,
+      "ns_per_span": 1745.1232333333332,
+      "bytes": 96771964,
+      "mib_per_sec": 881.3984675713564
+    },
+    {
+      "stage": "hot-window rows kept",
+      "total_ms": 0.0,
+      "ns_per_span": 0.0,
+      "bytes": 0,
+      "mib_per_sec": 0.0
+    }
+  ]
+}
