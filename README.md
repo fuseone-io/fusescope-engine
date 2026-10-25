@@ -34,6 +34,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check          # licenses, advisories, sources
 ```
 
+## Clean-room rule
+
+Parts of FuseScope's collector are AGPL-3.0. Nothing in this repository may be
+derived from that code. The OTLP mapping is specified from the OpenTelemetry
+protocol, the semantic conventions and observed data. See
+[ADR 0008](docs/adr/0008-clean-room-from-otlp.md).
+
 ## License
 
 Apache-2.0. Dependencies must be MIT, BSD, ISC or Apache-2.0; `cargo deny`

@@ -225,45 +225,76 @@ exported view, never the hot write path.
 Schemas are versioned in `fs-schema`. Old and new files coexist because
 DataFusion merges schemas and fills missing columns with null.
 
+**Compatibility rule (ADR 0007).** Logical field names and semantics follow
+the ones the Go backend already uses in `pkg/telemetryschema` and the
+`statementbuilder` packages, so the DataFusion dialect is a syntax
+translation, not a model translation. Physical encoding is chosen for Parquet
+and diverges from ClickHouse where that pays off. CamelCase aliases
+(`traceID`, `durationNano`, `serviceName`) and the v2 tables they served are
+not carried over.
+
+**Clean-room rule (ADR 0008).** The OTLP to schema mapping is specified from
+the OpenTelemetry protocol and semantic conventions and from observed data,
+never from the AGPL exporter code in the collector repository.
+
 ### Spans
 
 | Column | Type | Note |
 |---|---|---|
+| ts_bucket_start | UInt64 | virtual partition column, seconds, 30 min buckets; the query builder already emits this predicate |
 | timestamp | Timestamp(ns, UTC) | span start |
-| trace_id | FixedSizeBinary(16) | bloom key and trace_id index key |
+| trace_id | FixedSizeBinary(16) | binary, not hex; `hex()` UDF for the UI; literals converted by the dialect |
 | span_id | FixedSizeBinary(8) | |
 | parent_span_id | FixedSizeBinary(8) nullable | |
-| service_name | Dictionary(Utf8) | sort key |
+| trace_state | Utf8 | |
+| flags | UInt32 | |
 | name | Dictionary(Utf8) | |
-| kind | UInt8 | |
-| duration_ns | UInt64 | |
-| status_code | UInt8 | |
+| kind | Int8 | OTLP enum |
+| kind_string | Dictionary(Utf8) | |
+| duration_nano | UInt64 | |
+| status_code | Int16 | OTLP enum |
+| status_code_string | Dictionary(Utf8) | |
 | status_message | Utf8 | |
-| resource_fingerprint | UInt64 | hash of resource attributes |
-| resource | Map(Utf8, Utf8) | |
+| has_error | Boolean | status_code == ERROR |
+| is_remote | Dictionary(Utf8) | |
+| resource_fingerprint | UInt64 | xxh3 of the sorted resource attributes; internal, never compared across engines |
+| resources_string | Map(Utf8, Utf8) | |
 | attributes_string | Map(Utf8, Utf8) | |
 | attributes_number | Map(Utf8, Float64) | |
 | attributes_bool | Map(Utf8, Boolean) | |
-| events | List(Struct{ts, name, attributes}) | |
-| links | List(Struct{trace_id, span_id, attributes}) | |
-| promoted.* | native type | columns promoted by the compactor (e.g. http.status_code) |
+| scope_name, scope_version | Utf8 | |
+| scope_string | Map(Utf8, Utf8) | |
+| events | List(Struct{timestamp, name, attributes_string, attributes_number, attributes_bool}) | structured, no JSON strings |
+| links | List(Struct{trace_id, span_id, trace_state, attributes_string}) | |
+| promoted.* | native type | columns promoted by the compactor; the Go storage layer maps logical attribute to physical column, as it does today for `attribute_string_http$$route` |
+
+Promoted from day one because the Go backend and the UI depend on them:
+`service.name` (resource), `http.route`, `http.request.method` and legacy
+`http.method`, `http.response.status_code` and legacy `http.status_code`,
+`db.system`, `db.name`, `db.operation`, `rpc.system`, `rpc.service`,
+`rpc.method`, `messaging.system`, `messaging.operation`, `peer.service`,
+`deployment.environment.name` and legacy `deployment.environment`.
 
 ### Logs
 
-timestamp, observed_timestamp, trace_id, span_id, severity_number (UInt8),
-severity_text (Dictionary), service_name (Dictionary), body (Utf8),
-resource_fingerprint, resource, attributes_string, attributes_number,
-attributes_bool, scope, promoted.*.
+ts_bucket_start, timestamp, observed_timestamp, id (ULID, UInt128 as
+FixedSizeBinary(16)), trace_id, span_id, trace_flags (UInt32),
+severity_text (Dictionary), severity_number (UInt8), body (Utf8),
+resource_fingerprint, resources_string, attributes_string, attributes_number,
+attributes_bool, scope_name, scope_version, scope_string, promoted.*.
 
 ### Metrics
 
-`series`: fingerprint (UInt64), metric_name (Dictionary), labels (Map), unit,
-type (gauge, sum, histogram, exp_histogram, summary), temporality,
-is_monotonic, first_seen, last_seen.
+`series`: fingerprint (UInt64), metric_name (Dictionary), temporality
+(Dictionary), type (gauge, sum, histogram, exp_histogram, summary), unit,
+description, is_monotonic, labels (Map(Utf8, Utf8), not a JSON string),
+first_seen, last_seen.
 
-`samples`: fingerprint, timestamp (ms), value (Float64). Histograms are
-exploded into one series per bucket at ingest, as Prometheus does.
-Exponential histograms keep a dedicated Struct column.
+`samples`: fingerprint, metric_name (Dictionary, kept for file pruning),
+unix_milli (Int64), value (Float64). The `env` column of `samples_v4` is not
+carried over; it is a label. Histograms are exploded into one series per
+bucket at ingest, as Prometheus does. Exponential histograms keep a dedicated
+Struct column.
 
 ## 5. Indexes
 
@@ -567,3 +598,5 @@ decision, not inertia.
 | 004 | Single binary with roles | One binary per role: worse for development and small installs |
 | 005 | Legacy query-service v3/v4 is not ported | Porting: code upstream is retiring |
 | 006 | Collector exports standard OTLP to the ingester | Keeping an adapted ClickHouse exporter: schema stays in the AGPL repository |
+| 007 | Logical schema compatible with the Go backend, physical encoding free | Byte-compatible ClickHouse schema: carries hex ids, JSON strings and camelCase aliases into Parquet |
+| 008 | Clean-room mapping from OTLP; AGPL exporter code is never read | Porting the exporter's mapping: AGPL contamination of an Apache-2.0 engine |
