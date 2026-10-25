@@ -165,6 +165,13 @@ impl Shared {
             Ok(file) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(tenant = %tenant.0, path = %file.path, rows = file.row_count, bytes = file.size_bytes, services = file.services.len(), "flushed l0");
+                // Keep serving the rows until queriers have surely seen the file.
+                self.buffers.lock().await.remember_persisted(
+                    tenant,
+                    file.id,
+                    taken.batches,
+                    Instant::now(),
+                );
                 self.truncate_wal().await;
                 Ok(true)
             }
@@ -195,10 +202,16 @@ impl Shared {
         }
     }
 
+    /// Live and recently persisted rows of `tenant`, for the hot window.
+    pub(crate) async fn snapshot(&self, tenant: TenantId) -> crate::buffer::Snapshot {
+        self.buffers.lock().await.snapshot(tenant)
+    }
+
     async fn flush_due(&self, everything: bool) {
         let now = Instant::now();
         let tenants = {
-            let buffers = self.buffers.lock().await;
+            let mut buffers = self.buffers.lock().await;
+            buffers.sweep_persisted(self.config.persisted_retain, now);
             if everything {
                 buffers.all()
             } else {
@@ -339,10 +352,11 @@ impl Ingester {
         self.shared.flush_due(true).await;
     }
 
-    /// Serves OTLP until `shutdown` flips, then flushes everything.
+    /// Serves OTLP (and the hot window when configured) until `shutdown`
+    /// flips, then flushes everything.
     ///
-    /// The bound address is sent on `bound` once listening, so callers (and
-    /// tests binding port 0) learn the port.
+    /// Bound addresses are sent on `bound` and `hot_bound` once listening, so
+    /// callers (and tests binding port 0) learn the ports.
     ///
     /// # Errors
     /// Bind or transport failure.
@@ -350,6 +364,7 @@ impl Ingester {
         &self,
         mut shutdown: watch::Receiver<bool>,
         bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+        hot_bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
     ) -> Result<(), IngestError> {
         let listener = tokio::net::TcpListener::bind(self.shared.config.listen)
             .await
@@ -378,6 +393,13 @@ impl Ingester {
                 },
             );
 
+        let hot = crate::hot::serve(
+            self.shared.clone(),
+            self.shared.config.hot_listen,
+            shutdown.clone(),
+            hot_bound,
+        );
+
         let shared = self.shared.clone();
         let flusher = async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -390,8 +412,9 @@ impl Ingester {
             }
         };
 
-        let (transport, ()) = tokio::join!(server, flusher);
+        let (transport, hot_result, ()) = tokio::join!(server, hot, flusher);
         transport?;
+        hot_result?;
         info!("otlp server stopped, flushing buffers");
         self.flush_all().await;
         let wal = self.shared.wal.clone();

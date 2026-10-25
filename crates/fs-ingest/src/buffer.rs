@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
-use fs_catalog::TenantId;
+use fs_catalog::{FileId, TenantId};
 use fs_wal::Position;
 
 /// Pending rows of one tenant.
@@ -54,13 +54,68 @@ impl TenantBuffer {
     }
 }
 
+/// Rows already written to a registered file but still served from memory.
+#[derive(Debug, Clone)]
+pub struct Persisted {
+    /// Catalog id of the file holding these rows.
+    pub file: FileId,
+    /// The rows, as they were buffered.
+    pub batches: Vec<RecordBatch>,
+    /// When the file was registered.
+    pub at: Instant,
+}
+
+/// What a hot-window scan sees for one tenant.
+#[derive(Debug, Default)]
+pub struct Snapshot {
+    /// Rows not yet flushed.
+    pub live: Vec<RecordBatch>,
+    /// Rows flushed recently and still served; the querier skips these files.
+    pub persisted: Vec<Persisted>,
+}
+
 /// All tenant buffers.
 #[derive(Debug, Default)]
 pub struct Buffers {
     tenants: HashMap<TenantId, TenantBuffer>,
+    persisted: HashMap<TenantId, Vec<Persisted>>,
 }
 
 impl Buffers {
+    /// Keeps `batches` visible under `file` until swept.
+    pub fn remember_persisted(
+        &mut self,
+        tenant: TenantId,
+        file: FileId,
+        batches: Vec<RecordBatch>,
+        at: Instant,
+    ) {
+        self.persisted
+            .entry(tenant)
+            .or_default()
+            .push(Persisted { file, batches, at });
+    }
+
+    /// Drops persisted rows older than `retain`.
+    pub fn sweep_persisted(&mut self, retain: std::time::Duration, now: Instant) {
+        self.persisted.retain(|_, entries| {
+            entries.retain(|p| now.saturating_duration_since(p.at) < retain);
+            !entries.is_empty()
+        });
+    }
+
+    /// Live and recently persisted rows of `tenant`. Batches are shared, not copied.
+    pub fn snapshot(&self, tenant: TenantId) -> Snapshot {
+        Snapshot {
+            live: self
+                .tenants
+                .get(&tenant)
+                .map(|b| b.batches.clone())
+                .unwrap_or_default(),
+            persisted: self.persisted.get(&tenant).cloned().unwrap_or_default(),
+        }
+    }
+
     /// Buffer of `tenant`, created on first use.
     pub fn get_mut(&mut self, tenant: TenantId) -> &mut TenantBuffer {
         self.tenants.entry(tenant).or_default()

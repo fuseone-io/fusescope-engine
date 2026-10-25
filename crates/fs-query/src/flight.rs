@@ -26,6 +26,9 @@ use tracing::{info, warn};
 use crate::QueryError;
 use crate::querier::Querier;
 
+/// Response header set when the result may be incomplete, with the reasons.
+pub const PARTIAL_HEADER: &str = "x-fusescope-partial";
+
 /// Flight SQL service over a [`Querier`].
 #[derive(Clone)]
 pub struct FlightSql {
@@ -142,7 +145,7 @@ impl FlightSqlService for FlightSql {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let tenant = self.authenticate(request.metadata()).await?;
-        let (_, plan) = self
+        let (_, plan, _) = self
             .querier
             .plan(tenant, &query.query)
             .await
@@ -179,7 +182,7 @@ impl FlightSqlService for FlightSql {
             ));
         }
         let limits = self.querier.limits();
-        let stream = self
+        let (stream, warnings) = self
             .querier
             .execute(tenant, &sql)
             .await
@@ -209,14 +212,21 @@ impl FlightSqlService for FlightSql {
             .with_schema(schema)
             .build(limited)
             .map_err(|e| Status::internal(e.to_string()));
-        Ok(Response::new(Box::pin(encoded)
+        let mut response = Response::new(Box::pin(encoded)
             as Pin<
                 Box<
                     dyn futures_util::Stream<Item = Result<arrow_flight::FlightData, Status>>
                         + Send
                         + 'static,
                 >,
-            >))
+            >);
+        let warnings = warnings.list();
+        if !warnings.is_empty() {
+            if let Ok(value) = warnings.join("; ").parse() {
+                response.metadata_mut().insert(PARTIAL_HEADER, value);
+            }
+        }
+        Ok(response)
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}

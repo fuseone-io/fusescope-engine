@@ -484,3 +484,139 @@ async fn flight_sql_round_trip_with_query_token() {
         .unwrap();
     f.db.finish().await;
 }
+
+/// Live ingester plus querier in one process: rows are visible before any
+/// flush, never duplicated across a flush, and a dead ingester makes the
+/// result partial instead of failing it.
+#[tokio::test]
+async fn hot_window_merges_unflushed_rows_without_duplicates() {
+    use fs_ingest::{IngestConfig, Ingester};
+    use fs_wal::{Wal, WalConfig};
+    use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+    use tonic::metadata::MetadataValue;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (ingest_token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+
+    // Ingester with the hot window on a random port, long flush interval and a
+    // short persisted retention so the test can watch the hand-over.
+    let config = IngestConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        hot_listen: Some("127.0.0.1:0".parse().unwrap()),
+        flush_interval: Duration::from_secs(3600),
+        persisted_retain: Duration::from_secs(2),
+        ..IngestConfig::default()
+    };
+    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    let ingester = Arc::new(
+        Ingester::new(
+            config,
+            db.catalog.clone(),
+            store.clone(),
+            Path::from(""),
+            wal,
+        )
+        .unwrap(),
+    );
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let (otlp_tx, otlp_rx) = tokio::sync::oneshot::channel();
+    let (hot_tx, hot_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn({
+        let ingester = ingester.clone();
+        async move { ingester.run(rx, Some(otlp_tx), Some(hot_tx)).await }
+    });
+    let otlp_addr = tokio::time::timeout(Duration::from_secs(5), otlp_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let hot_addr = tokio::time::timeout(Duration::from_secs(5), hot_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    db.catalog
+        .heartbeat("ingester-test", &hot_addr.to_string())
+        .await
+        .unwrap();
+
+    // Spans timestamped now, so they fall inside the recent window.
+    let now_ns = u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap()).unwrap();
+    let mut client = TraceServiceClient::connect(format!("http://{otlp_addr}"))
+        .await
+        .unwrap();
+    let mut req = tonic::Request::new(request("api", 5, now_ns - 1_000_000_000, 12));
+    req.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from(format!("Bearer {ingest_token}")).unwrap(),
+    );
+    client.export(req).await.unwrap();
+
+    let limits = QueryLimits {
+        timeout: Duration::from_secs(30),
+        ..QueryLimits::default()
+    };
+    let querier = Querier::new(db.catalog.clone(), store.clone(), None, limits).unwrap();
+    let sql = "select count(*) from spans where timestamp > now() - interval '1 hour'";
+
+    // 1. Nothing flushed: rows come from the ingester only.
+    let (rows, warnings) = querier.collect_with_warnings(tenant, sql).await.unwrap();
+    assert_eq!(count(&rows), 12);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // 2. Flushed and still retained in memory: the file is excluded, no duplicates.
+    ingester.flush_all().await;
+    querier
+        .cache()
+        .invalidate(tenant, fs_catalog::Signal::Traces)
+        .await;
+    let rows = querier.collect(tenant, sql).await.unwrap();
+    assert_eq!(
+        count(&rows),
+        12,
+        "file plus retained rows must not double count"
+    );
+
+    // 3. Retention passed: rows come from the file only.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    ingester.flush_all().await;
+    let rows = querier.collect(tenant, sql).await.unwrap();
+    assert_eq!(count(&rows), 12);
+
+    // 4. A query outside the recent window never fans out.
+    let old = querier
+        .collect_with_warnings(
+            tenant,
+            "select count(*) from spans where timestamp < timestamp '2020-01-01T00:00:00Z'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&old.0), 0);
+
+    // 5. Ingester gone but heartbeat still fresh: partial result, not an error.
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let (rows, warnings) = querier.collect_with_warnings(tenant, sql).await.unwrap();
+    assert_eq!(count(&rows), 12, "file rows survive the ingester");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("ingester-test"));
+
+    db.finish().await;
+}

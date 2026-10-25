@@ -17,6 +17,7 @@ pub mod auth;
 pub mod buffer;
 pub mod config;
 pub mod flush;
+pub mod hot;
 pub mod ingester;
 pub mod ratelimit;
 pub mod record;
@@ -60,6 +61,14 @@ pub enum IngestError {
     /// gRPC transport failure.
     #[error("grpc: {0}")]
     Transport(#[from] tonic::transport::Error),
+    /// Hot-window scan against an ingester failed.
+    #[error("hot scan {ingester}: {reason}")]
+    HotScan {
+        /// Ingester address.
+        ingester: String,
+        /// Why.
+        reason: String,
+    },
     /// A blocking task panicked or was cancelled.
     #[error("task: {0}")]
     Join(#[from] tokio::task::JoinError),

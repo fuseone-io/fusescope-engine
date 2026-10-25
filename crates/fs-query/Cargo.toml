@@ -28,12 +28,13 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
+fs-ingest = { path = "../fs-ingest" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 sqlx = { workspace = true }
 opentelemetry-proto = { workspace = true }
-fs-ingest = { path = "../fs-ingest" }
+fs-wal = { path = "../fs-wal" }
 
 [lints]
 workspace = true

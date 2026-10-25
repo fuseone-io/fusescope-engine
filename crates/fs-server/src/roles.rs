@@ -74,7 +74,7 @@ pub async fn ingester(
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        if let Err(e) = ctx.catalog.heartbeat(&ctx.node_id, &ctx.config.server.flight_addr).await {
+                        if let Err(e) = ctx.catalog.heartbeat(&ctx.node_id, &ctx.config.ingest.hot_advertise).await {
                             warn!(role = "ingester", error = %e, "heartbeat failed");
                         }
                     }
@@ -83,7 +83,7 @@ pub async fn ingester(
             }
         }
     };
-    let (served, ()) = tokio::join!(ingester.run(shutdown.clone(), None), heartbeat);
+    let (served, ()) = tokio::join!(ingester.run(shutdown.clone(), None, None), heartbeat);
     served?;
     let _ = shutdown.borrow_and_update();
     info!(role = "ingester", "stopped");

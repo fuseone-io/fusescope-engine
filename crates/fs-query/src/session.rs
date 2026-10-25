@@ -29,9 +29,12 @@ pub const SCHEMA: &str = "public";
 ///
 /// # Errors
 /// DataFusion registration failure.
+#[allow(clippy::too_many_arguments)]
 pub fn tenant_session(
     tenant: TenantId,
     cache: Arc<FileCache>,
+    hot: Arc<crate::hot::HotWindow>,
+    warnings: Arc<crate::querier::QueryWarnings>,
     runtime: Arc<RuntimeEnv>,
     store_url: &ObjectStoreUrl,
     bytes_budget: u64,
@@ -58,12 +61,10 @@ pub fn tenant_session(
     let schema = Arc::new(MemorySchemaProvider::new());
     schema.register_table(
         "spans".into(),
-        Arc::new(SpansTable::new(
-            tenant,
-            cache,
-            store_url.clone(),
-            bytes_budget,
-        )),
+        Arc::new(
+            SpansTable::new(tenant, cache, store_url.clone(), bytes_budget)
+                .with_hot_window(hot, warnings),
+        ),
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());
     catalog.register_schema(SCHEMA, schema)?;

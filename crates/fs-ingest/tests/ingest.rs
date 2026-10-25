@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use arrow::record_batch::RecordBatch;
 use fs_catalog::{Catalog, NewTenant, Signal, TenantId, TimeRange, TokenScope};
 use fs_ingest::{IngestConfig, Ingester};
 use fs_wal::{Wal, WalConfig};
@@ -114,6 +115,7 @@ struct Harness {
     dir: tempfile::TempDir,
     ingester: Arc<Ingester>,
     addr: std::net::SocketAddr,
+    hot_addr: std::net::SocketAddr,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<(), fs_ingest::IngestError>>,
 }
@@ -126,11 +128,16 @@ async fn start(catalog: &Catalog, dir: tempfile::TempDir, config: IngestConfig) 
         Arc::new(Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap());
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let (hot_tx, hot_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn({
         let ingester = ingester.clone();
-        async move { ingester.run(rx, Some(bound_tx)).await }
+        async move { ingester.run(rx, Some(bound_tx), Some(hot_tx)).await }
     });
     let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let hot_addr = tokio::time::timeout(Duration::from_secs(5), hot_rx)
         .await
         .unwrap()
         .unwrap();
@@ -138,6 +145,7 @@ async fn start(catalog: &Catalog, dir: tempfile::TempDir, config: IngestConfig) 
         dir,
         ingester,
         addr,
+        hot_addr,
         shutdown,
         task,
     }
@@ -173,7 +181,9 @@ fn authed(req: ExportTraceServiceRequest, token: &str) -> Request<ExportTraceSer
 fn test_config() -> IngestConfig {
     IngestConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
+        hot_listen: Some("127.0.0.1:0".parse().unwrap()),
         flush_interval: Duration::from_secs(3600),
+        persisted_retain: Duration::from_secs(2),
         ..IngestConfig::default()
     }
 }
@@ -430,5 +440,129 @@ async fn shutdown_flushes_pending_rows() {
     let dir = h.stop().await;
     assert_eq!(parquet_files(&dir.path().join("bucket")).len(), 1);
     let _ = TenantId::new();
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn hot_window_serves_live_and_recently_persisted_rows() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let other = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("other"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 10), &token))
+        .await
+        .unwrap();
+    client
+        .export(authed(request("worker", 2, 4), &token))
+        .await
+        .unwrap();
+    let addr = h.hot_addr.to_string();
+
+    // Live rows, with filter and projection applied by the ingester.
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let got = scan(&addr, &all, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        14
+    );
+    assert_eq!(got.persisted_files.len(), 0);
+
+    let api_names = HotScanRequest {
+        tenant,
+        ts_min: Some(i64::try_from(T0 + 5_000_000).unwrap()),
+        ts_max: None,
+        services: Some(vec!["api".into()]),
+        columns: Some(vec!["timestamp".into(), "name".into()]),
+    };
+    let got = scan(&addr, &api_names, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        5,
+        "api spans 5..9"
+    );
+    assert_eq!(got.batches[0].num_columns(), 2);
+
+    // Another tenant sees nothing.
+    let empty = scan(
+        &addr,
+        &HotScanRequest {
+            tenant: other,
+            ..all.clone()
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        empty
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0
+    );
+
+    // After a flush the rows stay served and the file is reported, so a
+    // querier can skip it; after the retention they disappear from memory.
+    h.ingester.flush_all().await;
+    let got = scan(&addr, &all, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        14
+    );
+    assert_eq!(got.persisted_files.len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered[0].id, got.persisted_files[0]);
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    h.ingester.flush_all().await; // sweeps persisted rows past the retention
+    let got = scan(&addr, &all, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0
+    );
+    assert_eq!(got.persisted_files.len(), 0);
+
+    h.stop().await;
     db.finish().await;
 }

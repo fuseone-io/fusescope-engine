@@ -6,8 +6,21 @@ use uuid::Uuid;
 use crate::CatalogError;
 
 /// Tenant identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, sqlx::Type)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    sqlx::Type,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[sqlx(transparent)]
+#[serde(transparent)]
 pub struct TenantId(pub Uuid);
 
 impl TenantId {
@@ -24,8 +37,21 @@ impl Default for TenantId {
 }
 
 /// File identifier. Version 7 UUIDs sort by creation time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, sqlx::Type)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    sqlx::Type,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[sqlx(transparent)]
+#[serde(transparent)]
 pub struct FileId(pub Uuid);
 
 impl FileId {

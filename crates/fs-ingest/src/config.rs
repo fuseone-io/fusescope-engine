@@ -32,6 +32,13 @@ pub struct IngestConfig {
     pub limits: Limits,
     /// How long a resolved token stays cached before the catalog is asked again.
     pub token_cache_ttl: Duration,
+    /// Internal Arrow Flight address serving the hot window to queriers.
+    /// `None` disables it.
+    pub hot_listen: Option<SocketAddr>,
+    /// How long rows stay served from memory after their file is registered,
+    /// so queriers whose file list predates the file still see them. Must be
+    /// longer than the querier's file cache TTL.
+    pub persisted_retain: Duration,
 }
 
 impl Default for IngestConfig {
@@ -50,6 +57,8 @@ impl Default for IngestConfig {
             anonymous_tenant: None,
             limits: Limits::default(),
             token_cache_ttl: Duration::from_secs(60),
+            hot_listen: None,
+            persisted_retain: Duration::from_secs(15),
         }
     }
 }

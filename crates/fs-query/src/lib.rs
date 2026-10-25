@@ -9,6 +9,7 @@
 
 pub mod files;
 pub mod flight;
+pub mod hot;
 pub mod prune;
 pub mod querier;
 pub mod session;

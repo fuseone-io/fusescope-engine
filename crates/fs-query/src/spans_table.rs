@@ -5,12 +5,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, Result as DfResult};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, utils::conjunction};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::table_schema::TableSchema;
@@ -28,6 +30,10 @@ pub struct SpansTable {
     cache: Arc<FileCache>,
     store_url: ObjectStoreUrl,
     bytes_budget: u64,
+    hot: Option<(
+        Arc<crate::hot::HotWindow>,
+        Arc<crate::querier::QueryWarnings>,
+    )>,
 }
 
 impl SpansTable {
@@ -43,7 +49,19 @@ impl SpansTable {
             cache,
             store_url,
             bytes_budget,
+            hot: None,
         }
+    }
+
+    /// Adds the hot-window fan-out; ingesters that fail are noted in `warnings`.
+    #[must_use]
+    pub fn with_hot_window(
+        mut self,
+        hot: Arc<crate::hot::HotWindow>,
+        warnings: Arc<crate::querier::QueryWarnings>,
+    ) -> Self {
+        self.hot = Some((hot, warnings));
+        self
     }
 
     /// Files the scan would open after catalog-level pruning, with their total size.
@@ -54,19 +72,36 @@ impl SpansTable {
         &self,
         filters: &[Expr],
     ) -> Result<(Vec<PartitionedFile>, u64), QueryError> {
+        self.plan_files_excluding(filters, &std::collections::HashSet::new())
+            .await
+    }
+
+    async fn plan_files_excluding(
+        &self,
+        filters: &[Expr],
+        excluded: &std::collections::HashSet<fs_catalog::FileId>,
+    ) -> Result<(Vec<PartitionedFile>, u64), QueryError> {
         let pruning = Pruning::from_filters(filters);
         let all = self.cache.files(self.tenant, Signal::Traces).await?;
         let mut bytes = 0u64;
         let files: Vec<PartitionedFile> = all
             .iter()
-            .filter(|f| pruning.keeps(f))
+            .filter(|f| pruning.keeps(f) && !excluded.contains(&f.id))
             .map(|f| {
                 let size = u64::try_from(f.size_bytes).unwrap_or(0);
                 bytes = bytes.saturating_add(size);
                 PartitionedFile::new(f.path.clone(), size)
             })
             .collect();
-        debug!(tenant = %self.tenant.0, candidates = all.len(), kept = files.len(), bytes, ?pruning, "catalog pruning");
+        debug!(
+            tenant = %self.tenant.0,
+            candidates = all.len(),
+            kept = files.len(),
+            excluded = excluded.len(),
+            bytes,
+            ?pruning,
+            "catalog pruning"
+        );
         Ok((files, bytes))
     }
 }
@@ -105,24 +140,60 @@ impl TableProvider for SpansTable {
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let schema = span_schema_v1();
-        let (files, bytes) = self
-            .plan_files(filters)
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        if bytes > self.bytes_budget {
-            return Err(datafusion::error::DataFusionError::External(Box::new(
-                QueryError::OverBudget {
-                    bytes,
-                    budget: self.bytes_budget,
-                },
-            )));
+        let external = |e: QueryError| datafusion::error::DataFusionError::External(Box::new(e));
+
+        // Hot window first: ingesters report which recently flushed files they
+        // still serve, and those leave the file scan.
+        let pruning = Pruning::from_filters(filters);
+        let projected_names: Option<Vec<String>> = projection.map(|indices| {
+            indices
+                .iter()
+                .map(|i| schema.field(*i).name().clone())
+                .collect()
+        });
+        let mut hot_batches = Vec::new();
+        let mut excluded = std::collections::HashSet::new();
+        if let Some((hot, warnings)) = &self.hot {
+            if hot.touches_recent(&pruning) {
+                let result = hot
+                    .scan(self.tenant, &pruning, projected_names.clone())
+                    .await
+                    .map_err(|e| external(e.into()))?;
+                for ingester in &result.unavailable {
+                    warnings.push(format!(
+                        "ingester {ingester} did not answer; recent rows may be missing"
+                    ));
+                }
+                hot_batches = result.batches;
+                excluded = result.excluded_files;
+            }
         }
+
+        let (files, bytes) = self
+            .plan_files_excluding(filters, &excluded)
+            .await
+            .map_err(external)?;
+        if bytes > self.bytes_budget {
+            return Err(external(QueryError::OverBudget {
+                bytes,
+                budget: self.bytes_budget,
+            }));
+        }
+        let projected_schema = match projection {
+            Some(indices) => Arc::new(schema.project(indices)?),
+            None => Arc::clone(&schema),
+        };
+        let hot_exec: Option<Arc<dyn ExecutionPlan>> = if hot_batches.is_empty() {
+            None
+        } else {
+            Some(MemorySourceConfig::try_new_exec(
+                &[hot_batches],
+                Arc::clone(&projected_schema),
+                None,
+            )?)
+        };
         if files.is_empty() {
-            let projected = match projection {
-                Some(indices) => Arc::new(schema.project(indices)?),
-                None => schema,
-            };
-            return Ok(Arc::new(EmptyExec::new(projected)));
+            return Ok(hot_exec.unwrap_or_else(|| Arc::new(EmptyExec::new(projected_schema))));
         }
 
         let mut source = ParquetSource::new(TableSchema::from(Arc::clone(&schema)))
@@ -139,6 +210,10 @@ impl TableProvider for SpansTable {
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
             .build();
-        Ok(DataSourceExec::from_data_source(config))
+        let files_exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+        Ok(match hot_exec {
+            Some(hot) => UnionExec::try_new(vec![files_exec, hot])?,
+            None => files_exec,
+        })
     }
 }

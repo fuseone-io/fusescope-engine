@@ -227,6 +227,17 @@ pub struct IngestSection {
     pub tenant_bytes_per_sec: Option<u64>,
     /// Accept unauthenticated requests as this tenant id. Development only.
     pub anonymous_tenant: Option<uuid::Uuid>,
+    /// Internal Arrow Flight address serving the hot window to queriers.
+    #[serde(default = "default_hot_listen")]
+    pub hot_listen: String,
+    /// Address queriers use to reach this ingester's hot window. In
+    /// Kubernetes set it to the pod IP through `FS_INGEST_HOT_ADVERTISE`.
+    #[serde(default = "default_hot_advertise")]
+    pub hot_advertise: String,
+    /// Seconds flushed rows stay served from memory after their file is
+    /// registered. Must exceed the querier's file cache TTL.
+    #[serde(default = "default_persisted_retain")]
+    pub persisted_retain_secs: u64,
 }
 
 impl Default for IngestSection {
@@ -241,8 +252,23 @@ impl Default for IngestSection {
             wal_max_bytes: default_wal_max_bytes(),
             tenant_bytes_per_sec: None,
             anonymous_tenant: None,
+            hot_listen: default_hot_listen(),
+            hot_advertise: default_hot_advertise(),
+            persisted_retain_secs: default_persisted_retain(),
         }
     }
+}
+
+fn default_hot_listen() -> String {
+    "0.0.0.0:8816".to_owned()
+}
+
+fn default_hot_advertise() -> String {
+    "127.0.0.1:8816".to_owned()
+}
+
+fn default_persisted_retain() -> u64 {
+    15
 }
 
 impl IngestSection {
@@ -264,6 +290,10 @@ impl IngestSection {
             wal_max_bytes: self.wal_max_bytes,
             tenant_bytes_per_sec: self.tenant_bytes_per_sec,
             anonymous_tenant: self.anonymous_tenant.map(fs_catalog::TenantId),
+            hot_listen: Some(self.hot_listen.parse().map_err(|e| {
+                ServerError::InvalidConfig(format!("ingest.hot_listen {:?}: {e}", self.hot_listen))
+            })?),
+            persisted_retain: std::time::Duration::from_secs(self.persisted_retain_secs),
             ..fs_ingest::IngestConfig::default()
         })
     }
@@ -509,6 +539,9 @@ impl Config {
         }
         if let Some(v) = get("FS_INGEST_LISTEN") {
             self.ingest.listen = v;
+        }
+        if let Some(v) = get("FS_INGEST_HOT_ADVERTISE") {
+            self.ingest.hot_advertise = v;
         }
         if let Some(v) = get("FS_LOG_LEVEL") {
             self.log.level = v;
