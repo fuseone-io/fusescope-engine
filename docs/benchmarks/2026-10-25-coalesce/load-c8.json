@@ -1,0 +1,31 @@
+{
+  "requests_ok": 134183,
+  "requests_err": 0,
+  "spans_ok": 1610196,
+  "seconds": 30.040078866,
+  "rps": 4466.799191791442,
+  "spans_per_sec": 53601.59030149731,
+  "p50_ms": 1.035971,
+  "p95_ms": 3.025252,
+  "p99_ms": 40.518736,
+  "errors": [],
+  "flush": {
+    "flushes": 7,
+    "rows_per_flush": 207925.7142857143,
+    "parquet_mib_per_flush": 11.378839492797852,
+    "concat_ms": 44.910433285714284,
+    "sort_ms": 171.74635557142858,
+    "encode_ms": 532.9924211428571,
+    "upload_ms": 61.71852628571428,
+    "register_ms": 2.490322857142857,
+    "total_ms": 831.5555158571428,
+    "buffer_bytes": [
+      91831081,
+      0,
+      537145425
+    ],
+    "coalesces": 207,
+    "batches_per_coalesce": 632.7101449275362,
+    "coalesce_ms": 30.84510181642512
+  }
+}
