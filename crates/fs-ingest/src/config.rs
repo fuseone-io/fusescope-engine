@@ -46,6 +46,8 @@ pub struct IngestConfig {
     /// Make this many catalog registrations fail artificially. Zero in
     /// production; tests use it to exercise the retry path.
     pub inject_register_failures: u32,
+    /// WAL group commit limits.
+    pub group_commit: crate::walwriter::GroupCommitConfig,
 }
 
 impl Default for IngestConfig {
@@ -68,6 +70,7 @@ impl Default for IngestConfig {
             persisted_retain: Duration::from_secs(15),
             checkpoint_after_flush: true,
             inject_register_failures: 0,
+            group_commit: crate::walwriter::GroupCommitConfig::default(),
         }
     }
 }

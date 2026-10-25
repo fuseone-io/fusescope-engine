@@ -94,7 +94,7 @@ fn stage(name: &'static str, spans: usize, bytes: usize, d: Duration) -> StageRe
 ///
 /// # Errors
 /// Any stage failure.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub async fn run(
     params: StageParams,
 ) -> Result<StagesReport, Box<dyn std::error::Error + Send + Sync>> {
@@ -149,6 +149,69 @@ pub async fn run(
         "wal append+sync (per request)"
     };
     stages.push(stage(label, spans, protobuf_bytes, d));
+
+    // 2b. WAL through the group-commit writer, 64 concurrent appenders, same records
+    let gc_dir = params.wal_dir.join("group-commit");
+    let gc_config = WalConfig {
+        sync: params.sync,
+        ..WalConfig::new(&gc_dir)
+    };
+    let gc_wal = Arc::new(std::sync::Mutex::new(Wal::open(gc_config)?));
+    let writer = fs_ingest::walwriter::WalWriter::spawn(
+        Arc::clone(&gc_wal),
+        fs_ingest::walwriter::GroupCommitConfig::default(),
+    );
+    let records: Vec<Vec<u8>> = encoded
+        .iter()
+        .map(|payload| {
+            WalRecord {
+                tenant,
+                signal: RecordSignal::Traces,
+                payload: bytes::Bytes::copy_from_slice(payload),
+            }
+            .encode()
+        })
+        .collect();
+    let start = std::time::Instant::now();
+    let chunk = records.len().div_ceil(64).max(1);
+    let mut tasks = Vec::new();
+    for slice in records.chunks(chunk) {
+        let writer = writer.clone();
+        let slice = slice.to_vec();
+        tasks.push(tokio::spawn(async move {
+            for record in slice {
+                writer.append(record).await?;
+            }
+            Ok::<_, fs_ingest::IngestError>(())
+        }));
+    }
+    for t in tasks {
+        t.await??;
+    }
+    let d = start.elapsed();
+    let writer_stats = writer.stats();
+    let batches = writer_stats
+        .batches
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    stages.push(stage(
+        "wal group commit (64 senders)",
+        spans,
+        protobuf_bytes,
+        d,
+    ));
+    eprintln!(
+        "group commit: {} records in {} batches, {:.1} records per fsync",
+        writer_stats
+            .records
+            .load(std::sync::atomic::Ordering::Relaxed),
+        batches,
+        writer_stats
+            .records
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / batches as f64
+    );
+    drop(writer);
 
     // 3. OTLP → Arrow
     let (batches, d) = timed(|| {

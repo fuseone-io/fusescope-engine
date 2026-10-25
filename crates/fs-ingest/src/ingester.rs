@@ -81,6 +81,7 @@ pub struct Shared {
     pub(crate) limiter: Option<StdMutex<RateLimiter>>,
     pub(crate) stats: Arc<IngestStats>,
     wal: Arc<StdMutex<Wal>>,
+    writer: crate::walwriter::WalWriter,
     instance: Uuid,
     buffers: Mutex<Buffers>,
     /// Requests hold it shared across WAL append and buffer push; a flush
@@ -104,7 +105,8 @@ impl Shared {
                 "tenant buffer full, flush pending",
             ));
         }
-        let wal_bytes = self.wal.lock().map_or(0, |w| w.bytes());
+        // Never lock the WAL here: the writer holds it through every fsync.
+        let wal_bytes = self.writer.stats().wal_bytes.load(Ordering::Relaxed);
         if wal_bytes >= self.config.wal_max_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
@@ -113,17 +115,9 @@ impl Shared {
         Ok(())
     }
 
-    /// Appends and syncs on a blocking thread.
+    /// Appends through the group-commit writer; resolves once synced.
     async fn append_wal(&self, record: Vec<u8>) -> Result<Position, IngestError> {
-        let wal = self.wal.clone();
-        let position = tokio::task::spawn_blocking(move || {
-            let mut wal = wal.lock().map_err(|_| fs_wal::WalError::EmptyRecord)?;
-            let position = wal.append(&record)?;
-            wal.sync()?;
-            Ok::<_, fs_wal::WalError>(position)
-        })
-        .await??;
-        Ok(position)
+        self.writer.append(record).await
     }
 
     /// Logs a request, converts it and adds it to the tenant buffer, all while
@@ -472,12 +466,15 @@ impl Ingester {
         );
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
+        let wal = Arc::new(StdMutex::new(wal));
+        let writer = crate::walwriter::WalWriter::spawn(Arc::clone(&wal), config.group_commit);
         let shared = Shared {
             config,
             auth,
             limiter,
             stats: Arc::new(IngestStats::default()),
-            wal: Arc::new(StdMutex::new(wal)),
+            wal,
+            writer,
             instance,
             buffers: Mutex::new(buffers),
             gate: RwLock::new(()),
@@ -502,9 +499,14 @@ impl Ingester {
         Arc::clone(&self.shared.stats)
     }
 
-    /// Bytes the WAL currently holds on disk.
+    /// Group-commit counters of the WAL writer.
+    pub fn writer_stats(&self) -> Arc<crate::walwriter::WriterStats> {
+        self.shared.writer.stats()
+    }
+
+    /// Bytes the WAL held on disk after the last group commit.
     pub fn wal_bytes(&self) -> u64 {
-        self.shared.wal.lock().map_or(0, |w| w.bytes())
+        self.shared.writer.stats().wal_bytes.load(Ordering::Relaxed)
     }
 
     /// Retries or resumes every pending flush, then flushes every tenant.

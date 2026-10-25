@@ -1,0 +1,72 @@
+{
+  "requests": 5000,
+  "spans": 60000,
+  "protobuf_bytes": 21091097,
+  "arrow_bytes": 96771964,
+  "parquet_bytes": 3900929,
+  "stages": [
+    {
+      "stage": "protobuf encode",
+      "total_ms": 56.278088,
+      "ns_per_span": 937.9681333333333,
+      "bytes": 21091097,
+      "mib_per_sec": 357.40442201470864
+    },
+    {
+      "stage": "wal append+sync (per request)",
+      "total_ms": 2077.302365,
+      "ns_per_span": 34621.70608333333,
+      "bytes": 21091097,
+      "mib_per_sec": 9.68276831174402
+    },
+    {
+      "stage": "wal group commit (64 senders)",
+      "total_ms": 89.943056,
+      "ns_per_span": 1499.0509333333334,
+      "bytes": 21091097,
+      "mib_per_sec": 223.63079939971033
+    },
+    {
+      "stage": "otlp -> arrow",
+      "total_ms": 399.78230199999996,
+      "ns_per_span": 6663.038366666667,
+      "bytes": 96771964,
+      "mib_per_sec": 230.847979396022
+    },
+    {
+      "stage": "concat + sort",
+      "total_ms": 159.995644,
+      "ns_per_span": 2666.5940666666665,
+      "bytes": 96771964,
+      "mib_per_sec": 576.8215578106004
+    },
+    {
+      "stage": "parquet encode",
+      "total_ms": 185.648125,
+      "ns_per_span": 3094.1354166666665,
+      "bytes": 3900929,
+      "mib_per_sec": 20.039070135635985
+    },
+    {
+      "stage": "upload",
+      "total_ms": 1.255136,
+      "ns_per_span": 20.91893333333333,
+      "bytes": 3900929,
+      "mib_per_sec": 2963.994178658182
+    },
+    {
+      "stage": "hot-window filter+project",
+      "total_ms": 106.97863600000001,
+      "ns_per_span": 1782.9772666666668,
+      "bytes": 96771964,
+      "mib_per_sec": 862.6856731935733
+    },
+    {
+      "stage": "hot-window rows kept",
+      "total_ms": 0.0,
+      "ns_per_span": 0.0,
+      "bytes": 0,
+      "mib_per_sec": 0.0
+    }
+  ]
+}

@@ -62,9 +62,9 @@ pub struct LoadReport {
 pub async fn run(
     params: LoadParams,
 ) -> Result<LoadReport, Box<dyn std::error::Error + Send + Sync>> {
-    let channel = Channel::from_shared(format!("http://{}", params.endpoint))?
-        .connect()
-        .await?;
+    // One HTTP/2 connection per sender: a shared connection serialises frame
+    // handling on both sides and caps the generator, not the engine.
+    let endpoint = Channel::from_shared(format!("http://{}", params.endpoint))?;
     let ok = Arc::new(AtomicU64::new(0));
     let err = Arc::new(AtomicU64::new(0));
     let spans_ok = Arc::new(AtomicU64::new(0));
@@ -75,7 +75,7 @@ pub async fn run(
 
     let mut tasks = Vec::new();
     for worker in 0..params.concurrency {
-        let mut client = TraceServiceClient::new(channel.clone());
+        let mut client = TraceServiceClient::new(endpoint.connect().await?);
         let now_ns =
             u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).unwrap_or(0);
         let mut generator = Generator::new(

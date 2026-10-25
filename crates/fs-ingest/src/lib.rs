@@ -22,6 +22,7 @@ pub mod ingester;
 pub mod ratelimit;
 pub mod record;
 pub mod server;
+pub mod walwriter;
 
 pub use config::IngestConfig;
 pub use ingester::{IngestStats, Ingester};

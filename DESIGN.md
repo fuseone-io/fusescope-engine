@@ -93,8 +93,9 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
      ──► limits: message size, attributes per record, value size,
          new attribute keys per tenant per hour
      ──► normalization into the signal's Arrow schema (section 4)
-     ──► WAL: append-only segment, record = len + crc32c + Arrow IPC payload
-         fsync per batch (configurable), rotate every 64 MB
+     ──► WAL: append-only segment, record = len + crc32c + raw OTLP payload
+         group commit: one writer thread drains the queue, appends the batch,
+         fsyncs once and acknowledges every request in it; rotate every 64 MB
      ──► in-memory buffer: RecordBatches per (tenant, signal), sorted at flush
      ──► flush when: 128 MB, or 30 s, or end of hour
          1. sort by (service_name, timestamp)

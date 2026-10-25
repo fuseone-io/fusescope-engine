@@ -17,6 +17,7 @@ use crate::ServerError;
 pub struct Metrics {
     started: Instant,
     ingest: OnceLock<Arc<fs_ingest::IngestStats>>,
+    writer: OnceLock<Arc<fs_ingest::walwriter::WriterStats>>,
     wal_bytes: OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
     query: OnceLock<Arc<fs_query::QueryStats>>,
 }
@@ -26,6 +27,7 @@ impl Default for Metrics {
         Self {
             started: Instant::now(),
             ingest: OnceLock::new(),
+            writer: OnceLock::new(),
             wal_bytes: OnceLock::new(),
             query: OnceLock::new(),
         }
@@ -49,6 +51,11 @@ impl Metrics {
         let _ = self.wal_bytes.set(wal_bytes);
     }
 
+    /// Registers the WAL writer's group-commit counters.
+    pub fn register_writer(&self, stats: Arc<fs_ingest::walwriter::WriterStats>) {
+        let _ = self.writer.set(stats);
+    }
+
     /// Registers the querier's counters.
     pub fn register_query(&self, stats: Arc<fs_query::QueryStats>) {
         let _ = self.query.set(stats);
@@ -56,107 +63,153 @@ impl Metrics {
 
     /// Renders the exposition page.
     pub fn render(&self) -> String {
-        let mut out = String::with_capacity(2048);
-        let mut counter = |name: &str, help: &str, value: u64| {
-            let _ = writeln!(
-                out,
-                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
-            );
-        };
-        if let Some(i) = self.ingest.get() {
-            counter(
-                "fusescope_ingest_requests_total",
-                "OTLP export requests accepted",
-                i.requests.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_spans_total",
-                "Spans buffered",
-                i.spans.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_spans_rejected_total",
-                "Spans rejected for malformed ids",
-                i.spans_rejected.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_rate_limited_total",
-                "Requests refused by the throughput limiter",
-                i.rate_limited.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_over_capacity_total",
-                "Requests refused because buffers or WAL were full",
-                i.over_capacity.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_files_flushed_total",
-                "Parquet files written and registered",
-                i.files_flushed.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_flush_failures_total",
-                "Flush attempts that failed",
-                i.flush_failures.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_flush_retries_total",
-                "Flush retries after a failed attempt",
-                i.flush_retries.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_ingest_flushes_recovered_total",
-                "Flushes resumed from an intent after a restart",
-                i.flushes_recovered.load(Ordering::Relaxed),
-            );
-        }
-        if let Some(q) = self.query.get() {
-            counter(
-                "fusescope_query_statements_total",
-                "Statements planned",
-                q.queries.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_query_errors_total",
-                "Statements refused or failed to plan",
-                q.errors.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_query_rows_total",
-                "Rows returned by collected queries",
-                q.rows.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_query_hot_fanouts_total",
-                "Hot-window fan-outs",
-                q.hot_fanouts.load(Ordering::Relaxed),
-            );
-            counter(
-                "fusescope_query_hot_unavailable_total",
-                "Ingesters that did not answer a fan-out",
-                q.hot_unavailable.load(Ordering::Relaxed),
-            );
-        }
-        let mut gauge = |name: &str, help: &str, value: u64| {
-            let _ = writeln!(
-                out,
-                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
-            );
-        };
+        let mut out = String::with_capacity(4096);
+        self.render_ingest(&mut out);
+        self.render_query(&mut out);
         if let Some(f) = self.wal_bytes.get() {
             gauge(
+                &mut out,
                 "fusescope_ingest_wal_bytes",
                 "Bytes the write-ahead log holds on disk",
                 f(),
             );
         }
         gauge(
+            &mut out,
             "fusescope_uptime_seconds",
             "Seconds since the process started",
             self.started.elapsed().as_secs(),
         );
         out
     }
+
+    fn render_ingest(&self, out: &mut String) {
+        if let Some(i) = self.ingest.get() {
+            counter(
+                out,
+                "fusescope_ingest_requests_total",
+                "OTLP export requests accepted",
+                i.requests.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_spans_total",
+                "Spans buffered",
+                i.spans.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_spans_rejected_total",
+                "Spans rejected for malformed ids",
+                i.spans_rejected.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_rate_limited_total",
+                "Requests refused by the throughput limiter",
+                i.rate_limited.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_over_capacity_total",
+                "Requests refused because buffers or WAL were full",
+                i.over_capacity.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_files_flushed_total",
+                "Parquet files written and registered",
+                i.files_flushed.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_flush_failures_total",
+                "Flush attempts that failed",
+                i.flush_failures.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_flush_retries_total",
+                "Flush retries after a failed attempt",
+                i.flush_retries.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_ingest_flushes_recovered_total",
+                "Flushes resumed from an intent after a restart",
+                i.flushes_recovered.load(Ordering::Relaxed),
+            );
+        }
+        if let Some(w) = self.writer.get() {
+            counter(
+                out,
+                "fusescope_wal_records_total",
+                "Records appended to the WAL",
+                w.records.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_wal_batches_total",
+                "Group-commit batches synced",
+                w.batches.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_wal_sync_seconds_total",
+                "Seconds spent in fsync",
+                w.sync_nanos.load(Ordering::Relaxed) / 1_000_000_000,
+            );
+        }
+    }
+
+    fn render_query(&self, out: &mut String) {
+        if let Some(q) = self.query.get() {
+            counter(
+                out,
+                "fusescope_query_statements_total",
+                "Statements planned",
+                q.queries.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_errors_total",
+                "Statements refused or failed to plan",
+                q.errors.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_rows_total",
+                "Rows returned by collected queries",
+                q.rows.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_hot_fanouts_total",
+                "Hot-window fan-outs",
+                q.hot_fanouts.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_hot_unavailable_total",
+                "Ingesters that did not answer a fan-out",
+                q.hot_unavailable.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    let _ = writeln!(
+        out,
+        "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
+    );
+}
+
+fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+    let _ = writeln!(
+        out,
+        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
+    );
 }
 
 /// Serves `GET /metrics` on `listen` until `shutdown` flips. Any other path
