@@ -8,9 +8,10 @@ Read [DESIGN.md](DESIGN.md) first. Decisions are recorded in [docs/adr](docs/adr
 
 ## Status
 
-Phase 0, foundation. `fs-schema` (span schema v1, OTLP conversion) and `fs-wal`
-(segmented write-ahead log with recovery) are implemented; the other crates are
-placeholders.
+Phase 0, foundation. Implemented: `fs-schema` (span schema v1, OTLP
+conversion), `fs-wal` (segmented write-ahead log with recovery) and
+`fs-catalog` (Postgres file catalog with atomic compaction swaps and change
+notifications). The other crates are placeholders.
 
 ## Layout
 
@@ -30,11 +31,17 @@ placeholders.
 ## Development
 
 ```sh
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check          # licenses, advisories, sources
+make dev-up               # Postgres on :5433 and MinIO on :9000 via Docker
+make test                 # cargo test, with FS_TEST_DATABASE_URL pointing at that Postgres
+make lint                 # fmt and clippy
+make deny                 # licenses, advisories, sources
+make dev-down
 ```
+
+Database tests live in `crates/fs-catalog/tests` and run only when
+`FS_TEST_DATABASE_URL` is set; otherwise they print `skipped` and pass. Each
+test works in its own schema, so they run in parallel. CI provides a Postgres
+service and always runs them.
 
 ## Clean-room rule
 

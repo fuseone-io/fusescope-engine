@@ -1,0 +1,450 @@
+//! Integration tests against a real Postgres.
+//!
+//! They run when `FS_TEST_DATABASE_URL` points at a reachable server
+//! (`make dev-up` starts one) and are skipped with a message otherwise. Every
+//! test works in its own schema so tests run in parallel and leave nothing
+//! behind.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+
+use std::time::Duration as StdDuration;
+
+use chrono::{Duration, TimeZone, Utc};
+use fs_catalog::{
+    Catalog, CatalogError, FileId, FileState, Level, NewFile, NewTenant, Signal, TenantId,
+    TimeRange,
+};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Connection, Executor, PgConnection};
+
+struct TestDb {
+    admin_url: String,
+    schema: String,
+    catalog: Catalog,
+}
+
+impl TestDb {
+    /// `None` when no database is configured; the caller returns early.
+    async fn new() -> Option<Self> {
+        let Ok(admin_url) = std::env::var("FS_TEST_DATABASE_URL") else {
+            eprintln!("skipped: FS_TEST_DATABASE_URL is not set (run `make dev-up`)");
+            return None;
+        };
+        let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = PgConnection::connect(&admin_url)
+            .await
+            .expect("connect to test database");
+        admin
+            .execute(format!("create schema {schema}").as_str())
+            .await
+            .unwrap();
+        admin.close().await.unwrap();
+
+        let options: PgConnectOptions = admin_url.parse().unwrap();
+        let options = options.options([("search_path", schema.as_str())]);
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let catalog = Catalog::from_pool(pool);
+        catalog.migrate().await.unwrap();
+        Some(Self {
+            admin_url,
+            schema,
+            catalog,
+        })
+    }
+
+    async fn finish(self) {
+        self.catalog.pool().close().await;
+        let mut admin = PgConnection::connect(&self.admin_url).await.unwrap();
+        admin
+            .execute(format!("drop schema {} cascade", self.schema).as_str())
+            .await
+            .unwrap();
+        admin.close().await.unwrap();
+    }
+}
+
+fn hour(h: u32) -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 24, h, 0, 0).unwrap()
+}
+
+fn file(
+    tenant: TenantId,
+    signal: Signal,
+    start_hour: u32,
+    end_hour: u32,
+    services: &[&str],
+) -> NewFile {
+    let id = FileId::new();
+    NewFile {
+        id,
+        tenant_id: tenant,
+        signal,
+        level: Level::L0,
+        path: format!("t/{}/{}/l0/{}.parquet", tenant.0, signal.path_name(), id.0),
+        size_bytes: 128 << 20,
+        row_count: 1_000_000,
+        range: TimeRange {
+            start: hour(start_hour),
+            end: hour(end_hour),
+        },
+        services: services.iter().map(|s| (*s).to_owned()).collect(),
+        summary: Some(vec![1, 2, 3]),
+    }
+}
+
+#[tokio::test]
+async fn migrations_are_idempotent() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    db.catalog.migrate().await.unwrap();
+    db.catalog.migrate().await.unwrap();
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn tenants_round_trip_and_names_are_unique() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let created = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap();
+    assert_eq!(created.retention_days, 15);
+    let fetched = db.catalog.tenant(created.id).await.unwrap().unwrap();
+    assert_eq!(fetched, created);
+    assert!(db.catalog.tenant(TenantId::new()).await.unwrap().is_none());
+    let dup = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await;
+    assert!(matches!(dup, Err(CatalogError::Database(_))));
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn visible_files_filter_by_tenant_signal_and_overlap() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let a = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("a"))
+        .await
+        .unwrap()
+        .id;
+    let b = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("b"))
+        .await
+        .unwrap()
+        .id;
+
+    let f1 = db
+        .catalog
+        .register_file(&file(a, Signal::Traces, 0, 1, &["api"]))
+        .await
+        .unwrap();
+    let f2 = db
+        .catalog
+        .register_file(&file(a, Signal::Traces, 1, 2, &["api", "worker"]))
+        .await
+        .unwrap();
+    let _f3 = db
+        .catalog
+        .register_file(&file(a, Signal::Traces, 5, 6, &["api"]))
+        .await
+        .unwrap();
+    let _logs = db
+        .catalog
+        .register_file(&file(a, Signal::Logs, 0, 1, &["api"]))
+        .await
+        .unwrap();
+    let _other = db
+        .catalog
+        .register_file(&file(b, Signal::Traces, 0, 1, &["api"]))
+        .await
+        .unwrap();
+
+    assert_eq!(f1.state, FileState::Visible);
+    assert_eq!(f1.summary, Some(vec![1, 2, 3]));
+
+    let hits = db
+        .catalog
+        .visible_files(
+            a,
+            Signal::Traces,
+            TimeRange {
+                start: hour(1),
+                end: hour(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![f1.id, f2.id],
+        "inclusive overlap, oldest first"
+    );
+
+    let none = db
+        .catalog
+        .visible_files(
+            a,
+            Signal::Traces,
+            TimeRange {
+                start: hour(3),
+                end: hour(4),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(none.len(), 0);
+
+    let covered = db.catalog.covered_until(a, Signal::Traces).await.unwrap();
+    assert_eq!(covered, Some(hour(6)));
+    assert_eq!(
+        db.catalog.covered_until(b, Signal::Logs).await.unwrap(),
+        None
+    );
+
+    // Unknown tenant violates the foreign key; duplicate path violates the unique index.
+    let orphan = file(TenantId::new(), Signal::Traces, 0, 1, &[]);
+    assert!(db.catalog.register_file(&orphan).await.is_err());
+    let mut dup = file(a, Signal::Traces, 0, 1, &[]);
+    dup.path.clone_from(&f1.path);
+    assert!(db.catalog.register_file(&dup).await.is_err());
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn swap_is_atomic_and_detects_conflicts() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let in1 = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 0, 1, &["api"]))
+        .await
+        .unwrap();
+    let in2 = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 1, 2, &["api"]))
+        .await
+        .unwrap();
+    let mut out = file(t, Signal::Traces, 0, 2, &["api"]);
+    out.level = Level::L1;
+
+    let compaction = db
+        .catalog
+        .swap_files(
+            t,
+            Signal::Traces,
+            &[in1.id, in2.id],
+            std::slice::from_ref(&out),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compaction.inputs, vec![in1.id, in2.id]);
+    assert_eq!(compaction.outputs, vec![out.id]);
+
+    let visible = db
+        .catalog
+        .visible_files(
+            t,
+            Signal::Traces,
+            TimeRange {
+                start: hour(0),
+                end: hour(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        visible.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![out.id]
+    );
+    assert_eq!(visible[0].level, Level::L1);
+
+    // A second compactor racing on the same inputs loses, and its outputs never appear.
+    let loser = file(t, Signal::Traces, 0, 2, &["api"]);
+    let err = db
+        .catalog
+        .swap_files(
+            t,
+            Signal::Traces,
+            &[in1.id, in2.id],
+            std::slice::from_ref(&loser),
+        )
+        .await;
+    assert!(matches!(
+        err,
+        Err(CatalogError::CompactionConflict {
+            expected: 2,
+            found: 0
+        })
+    ));
+    let after = db
+        .catalog
+        .visible_files(
+            t,
+            Signal::Traces,
+            TimeRange {
+                start: hour(0),
+                end: hour(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(after.iter().all(|f| f.id != loser.id));
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn purge_returns_paths_of_old_quarantined_files_only() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let old = db
+        .catalog
+        .register_file(&file(t, Signal::Logs, 0, 1, &[]))
+        .await
+        .unwrap();
+    let keep = db
+        .catalog
+        .register_file(&file(t, Signal::Logs, 1, 2, &[]))
+        .await
+        .unwrap();
+    let replacement = file(t, Signal::Logs, 0, 1, &[]);
+    db.catalog
+        .swap_files(t, Signal::Logs, &[old.id], &[replacement])
+        .await
+        .unwrap();
+
+    let not_yet = db
+        .catalog
+        .purge_quarantined(Duration::hours(1), 100)
+        .await
+        .unwrap();
+    assert_eq!(not_yet.len(), 0, "quarantined just now, inside the TTL");
+
+    let purged = db
+        .catalog
+        .purge_quarantined(Duration::zero(), 100)
+        .await
+        .unwrap();
+    assert_eq!(purged.len(), 1);
+    assert_eq!(purged[0].id, old.id);
+    assert_eq!(purged[0].path, old.path);
+
+    let again = db
+        .catalog
+        .purge_quarantined(Duration::zero(), 100)
+        .await
+        .unwrap();
+    assert_eq!(again.len(), 0);
+    let visible = db
+        .catalog
+        .visible_files(
+            t,
+            Signal::Logs,
+            TimeRange {
+                start: hour(0),
+                end: hour(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(visible.iter().any(|f| f.id == keep.id));
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn ingester_heartbeats_expire() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    db.catalog
+        .heartbeat("ingester-0", "10.0.0.1:8815")
+        .await
+        .unwrap();
+    db.catalog
+        .heartbeat("ingester-0", "10.0.0.2:8815")
+        .await
+        .unwrap();
+    db.catalog
+        .heartbeat("ingester-1", "10.0.0.3:8815")
+        .await
+        .unwrap();
+    let live = db
+        .catalog
+        .live_ingesters(Duration::seconds(10))
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 2);
+    assert_eq!(live[0].address, "10.0.0.2:8815", "latest address wins");
+    let none = db
+        .catalog
+        .live_ingesters(Duration::seconds(-1))
+        .await
+        .unwrap();
+    assert_eq!(none.len(), 0);
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn watcher_sees_file_changes() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let mut watcher = db.catalog.watch().await.unwrap();
+    db.catalog
+        .register_file(&file(t, Signal::MetricSamples, 0, 1, &[]))
+        .await
+        .unwrap();
+
+    // The channel is shared by every schema on the server, so wait for our tenant.
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
+    loop {
+        let change = tokio::time::timeout_at(deadline, watcher.next())
+            .await
+            .expect("notification")
+            .unwrap();
+        if change.tenant_id == t {
+            assert_eq!(change.signal, Signal::MetricSamples);
+            break;
+        }
+    }
+    // The watcher holds a pooled connection; closing the pool would wait for it.
+    drop(watcher);
+    db.finish().await;
+}
