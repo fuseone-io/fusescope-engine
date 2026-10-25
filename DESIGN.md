@@ -264,16 +264,18 @@ never from the AGPL exporter code in the collector repository.
 | attributes_bool | Map(Utf8, Boolean) | |
 | scope_name, scope_version | Utf8 | |
 | scope_string | Map(Utf8, Utf8) | |
-| events | List(Struct{timestamp, name, attributes_string, attributes_number, attributes_bool}) | structured, no JSON strings |
-| links | List(Struct{trace_id, span_id, trace_state, attributes_string}) | |
-| promoted.* | native type | columns promoted by the compactor; the Go storage layer maps logical attribute to physical column, as it does today for `attribute_string_http$$route` |
+| events | List(Struct{timestamp, name, attributes}) | structured, no JSON strings; event attributes as a text map |
+| links | List(Struct{trace_id, span_id, trace_state, attributes}) | |
+| service_name, http_route, ... | Dictionary(Utf8), nullable | promoted columns with flat snake_case names, registry in `fs-schema` (`PROMOTED`); the Go storage layer maps logical attribute to physical column, as it does today for `attribute_string_http$$route` |
 
 Promoted from day one because the Go backend and the UI depend on them:
 `service.name` (resource), `http.route`, `http.request.method` and legacy
 `http.method`, `http.response.status_code` and legacy `http.status_code`,
 `db.system`, `db.name`, `db.operation`, `rpc.system`, `rpc.service`,
 `rpc.method`, `messaging.system`, `messaging.operation`, `peer.service`,
-`deployment.environment.name` and legacy `deployment.environment`.
+`deployment.environment.name` and legacy `deployment.environment`. Each
+column tries current and legacy semconv keys in order. The full rule set with
+sources is `crates/fs-schema/MAPPING.md`.
 
 ### Logs
 
@@ -559,7 +561,7 @@ Planned dependencies, all Apache-2.0 or MIT:
 | sqlx | Postgres |
 | roaring | postings |
 | xorf | xor filters |
-| xxhash-rust, crc32fast | checksums |
+| twox-hash (xxh3), crc32fast | checksums and fingerprints |
 | iceberg | L2 metadata export |
 | tokio, tracing | runtime and the engine's own observability |
 | tantivy | phase 2 |

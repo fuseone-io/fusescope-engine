@@ -32,27 +32,29 @@ doc_markdown = "allow"
 must_use_candidate = "allow"
 
 # Shared dependency versions. Crates opt in with `foo = { workspace = true }`.
-# Nothing here is pulled until a member references it, so the skeleton builds
-# offline. Versions are pinned when each crate is actually wired in.
+# Versions follow the pins of datafusion 55 (arrow/parquet 59, object_store 0.13)
+# and opentelemetry-proto 0.33 (prost/tonic 0.14).
 [workspace.dependencies]
 # format and engine
-arrow = "57"
-parquet = "57"
-datafusion = "52"
-arrow-flight = { version = "57", features = ["flight-sql"] }
-object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
+arrow = "59"
+parquet = "59"
+datafusion = "55"
+arrow-flight = { version = "59", features = ["flight-sql"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 # runtime
 tokio = { version = "1", features = ["full"] }
 tonic = "0.14"
 prost = "0.14"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # storage helpers
 foyer = "0.19"
+base64 = "0.22"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "chrono"] }
 roaring = "0.11"
 xorf = "0.11"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"] }
 crc32fast = "1"
 ulid = "1"
 # misc

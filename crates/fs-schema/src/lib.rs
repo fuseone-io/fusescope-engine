@@ -1,9 +1,30 @@
-//! Versioned Arrow schemas for traces, logs and metrics, and OTLP to Arrow conversion
+//! Versioned Arrow schemas for traces, logs and metrics, and OTLP to Arrow conversion.
 //!
-//! See DESIGN.md at the repository root for the role of this crate.
+//! Every mapping rule in this crate is specified from the OpenTelemetry protocol,
+//! the semantic conventions and observed data. See `MAPPING.md` next to this
+//! crate and ADR 0008.
+
+pub mod attrs;
+pub mod bucket;
+pub mod fingerprint;
+pub mod limits;
+pub mod spans;
+
+use thiserror::Error;
 
 /// Crate version, exposed for diagnostics and the `--version` flag.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Errors produced while building Arrow batches.
+#[derive(Debug, Error)]
+pub enum SchemaError {
+    /// An Arrow builder refused data, for example a dictionary key overflow.
+    #[error("arrow: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+    /// A nested builder did not have the layout the schema declares. Programming error.
+    #[error("builder layout mismatch at {0}")]
+    Layout(&'static str),
+}
 
 #[cfg(test)]
 mod tests {
