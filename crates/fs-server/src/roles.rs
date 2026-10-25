@@ -10,7 +10,7 @@ use fs_catalog::Catalog;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::ServerError;
 use crate::config::Config;
@@ -90,40 +90,30 @@ pub async fn ingester(
     Ok(())
 }
 
-/// Querier: follows catalog change notifications. The in-memory file cache
-/// that consumes them lands with `fs-query`.
+/// Querier: serves Arrow Flight SQL on the configured address and keeps the
+/// file cache fresh from catalog notifications.
 ///
 /// # Errors
-/// Never in phase 0; connection failures are logged and retried.
-pub async fn querier(ctx: Context, mut shutdown: watch::Receiver<bool>) -> Result<(), ServerError> {
-    info!(role = "querier", "ready");
-    loop {
-        let mut watcher = match ctx.catalog.watch().await {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(role = "querier", error = %e, "catalog watch failed, retrying");
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(2)) => continue,
-                    _ = shutdown.changed() => break,
-                }
-            }
-        };
-        loop {
-            tokio::select! {
-                change = watcher.next() => match change {
-                    Ok(change) => debug!(role = "querier", tenant = %change.tenant_id.0, signal = ?change.signal, "files changed"),
-                    Err(e) => {
-                        warn!(role = "querier", error = %e, "watch lost, reconnecting");
-                        break;
-                    }
-                },
-                _ = shutdown.changed() => {
-                    info!(role = "querier", "stopped");
-                    return Ok(());
-                }
-            }
-        }
-    }
+/// Engine construction, bind or transport failures.
+pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<(), ServerError> {
+    let listen: std::net::SocketAddr = ctx.config.server.flight_addr.parse().map_err(|e| {
+        ServerError::InvalidConfig(format!(
+            "server.flight_addr {:?}: {e}",
+            ctx.config.server.flight_addr
+        ))
+    })?;
+    let querier = fs_query::Querier::new(
+        ctx.catalog.clone(),
+        ctx.store.clone(),
+        ctx.config.query.spill_dir.clone(),
+        ctx.config.query.to_limits(),
+    )?;
+    let cache = querier.cache();
+    let follower = cache.follow(shutdown.clone());
+    let service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
+    info!(role = "querier", %listen, "ready");
+    let (served, ()) = tokio::join!(service.serve(listen, shutdown, None), follower);
+    served?;
     info!(role = "querier", "stopped");
     Ok(())
 }

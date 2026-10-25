@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use fs_catalog::{Catalog, TenantId, hash_token, looks_like_token};
+use fs_catalog::{Catalog, TenantId, TokenScope, hash_token, looks_like_token};
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 
@@ -71,7 +71,7 @@ impl Authenticator {
         }
         let resolved = self
             .catalog
-            .resolve_token(token)
+            .resolve_token(token, TokenScope::Ingest)
             .await
             .map_err(|e| Status::unavailable(format!("token lookup failed: {e}")))?
             .map_or(Lookup::Unknown, Lookup::Tenant);

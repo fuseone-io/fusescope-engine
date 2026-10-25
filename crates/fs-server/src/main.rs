@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]
        fusescope-engine --config <file> admin tenant create <name>
-       fusescope-engine --config <file> admin token create <tenant-id> <name>";
+       fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]";
 
 #[derive(Debug)]
 struct Args {
@@ -73,13 +73,19 @@ fn parse_admin(rest: &[String]) -> Result<AdminAction, String> {
         ["tenant", "create", name] => Ok(AdminAction::CreateTenant {
             name: (*name).to_owned(),
         }),
-        ["token", "create", tenant, name] => {
+        ["token", "create", tenant, name] | ["token", "create", tenant, name, _] => {
             let tenant = tenant
                 .parse()
                 .map_err(|e| format!("tenant id {tenant:?}: {e}\n{USAGE}"))?;
+            let scope = words
+                .get(4)
+                .map_or(Ok(fs_catalog::TokenScope::Ingest), |s| {
+                    s.parse().map_err(|e| format!("{e}\n{USAGE}"))
+                })?;
             Ok(AdminAction::CreateToken {
                 tenant,
                 name: (*name).to_owned(),
+                scope,
             })
         }
         _ => Err(format!("unknown admin command\n{USAGE}")),

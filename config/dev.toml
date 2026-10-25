@@ -5,6 +5,7 @@
 [server]
 role = "all"
 node_id = "dev-0"
+flight_addr = "0.0.0.0:8815"   # Arrow Flight SQL for the Go backend
 
 [catalog]
 max_connections = 8
@@ -24,6 +25,12 @@ dir = "./data/wal"
 listen = "0.0.0.0:4317"
 flush_interval_secs = 10       # short for development; production default is 30
 # anonymous_tenant = "<uuid>"   # development only: accept unauthenticated OTLP as this tenant
+
+[query]
+memory_bytes = 1073741824   # 1 GiB for development
+timeout_secs = 60
+max_rows = 1000000
+spill_dir = "./data/spill"
 
 [compactor]
 purge_interval_secs = 60

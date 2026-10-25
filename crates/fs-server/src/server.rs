@@ -95,12 +95,14 @@ pub enum AdminAction {
         /// Unique name.
         name: String,
     },
-    /// Issue an ingest token; the secret is printed once.
+    /// Issue a token; the secret is printed once.
     CreateToken {
         /// Tenant id.
         tenant: uuid::Uuid,
         /// Label for the token.
         name: String,
+        /// What the token may do.
+        scope: fs_catalog::TokenScope,
     },
 }
 
@@ -131,13 +133,18 @@ pub async fn admin(
                 format!("name={}", tenant.name),
             ])
         }
-        AdminAction::CreateToken { tenant, name } => {
+        AdminAction::CreateToken {
+            tenant,
+            name,
+            scope,
+        } => {
             let (secret, token) = catalog
-                .create_token(fs_catalog::TenantId(tenant), &name)
+                .create_token(fs_catalog::TenantId(tenant), &name, scope)
                 .await?;
             Ok(vec![
                 format!("tenant_id={}", token.tenant_id.0),
                 format!("name={}", token.name),
+                format!("scope={}", token.scope.name()),
                 format!("token={secret}"),
                 "store the token now; it is not kept in plaintext".to_owned(),
             ])

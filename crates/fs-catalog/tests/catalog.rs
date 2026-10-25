@@ -5,6 +5,7 @@
 //! test works in its own schema so tests run in parallel and leave nothing
 //! behind.
 #![allow(
+    clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
@@ -16,7 +17,7 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration, TimeZone, Utc};
 use fs_catalog::{
     Catalog, CatalogError, FileId, FileState, Level, NewFile, NewTenant, Signal, TenantId,
-    TimeRange, hash_token,
+    TimeRange, TokenScope, hash_token,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
@@ -460,16 +461,44 @@ async fn tokens_resolve_until_revoked() {
         .await
         .unwrap()
         .id;
-    let (secret, token) = db.catalog.create_token(t, "collector-a").await.unwrap();
+    let (secret, token) = db
+        .catalog
+        .create_token(t, "collector-a", TokenScope::Ingest)
+        .await
+        .unwrap();
+    assert_eq!(token.scope, TokenScope::Ingest);
     assert_eq!(token.tenant_id, t);
     assert!(token.revoked_at.is_none());
     assert!(secret.starts_with("fst_"));
 
-    assert_eq!(db.catalog.resolve_token(&secret).await.unwrap(), Some(t));
-    assert_eq!(db.catalog.resolve_token("fst_nope").await.unwrap(), None);
+    assert_eq!(
+        db.catalog
+            .resolve_token(&secret, TokenScope::Ingest)
+            .await
+            .unwrap(),
+        Some(t)
+    );
+    assert_eq!(
+        db.catalog
+            .resolve_token(&secret, TokenScope::Query)
+            .await
+            .unwrap(),
+        None,
+        "scope is enforced"
+    );
+    assert_eq!(
+        db.catalog
+            .resolve_token("fst_nope", TokenScope::Ingest)
+            .await
+            .unwrap(),
+        None
+    );
     let other = fs_catalog::generate_token().unwrap();
     assert_eq!(
-        db.catalog.resolve_token(&other).await.unwrap(),
+        db.catalog
+            .resolve_token(&other, TokenScope::Ingest)
+            .await
+            .unwrap(),
         None,
         "unknown but well formed"
     );
@@ -479,13 +508,19 @@ async fn tokens_resolve_until_revoked() {
         !db.catalog.revoke_token(&hash_token(&secret)).await.unwrap(),
         "second revoke is a no-op"
     );
-    assert_eq!(db.catalog.resolve_token(&secret).await.unwrap(), None);
+    assert_eq!(
+        db.catalog
+            .resolve_token(&secret, TokenScope::Ingest)
+            .await
+            .unwrap(),
+        None
+    );
     let listed = db.catalog.tokens(t).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert!(listed[0].revoked_at.is_some());
     assert!(
         db.catalog
-            .create_token(TenantId::new(), "orphan")
+            .create_token(TenantId::new(), "orphan", TokenScope::Query)
             .await
             .is_err(),
         "unknown tenant"

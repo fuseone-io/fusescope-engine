@@ -46,6 +46,9 @@ pub enum ServerError {
     /// Ingest failure.
     #[error("ingest: {0}")]
     Ingest(#[from] fs_ingest::IngestError),
+    /// Query engine failure.
+    #[error("query: {0}")]
+    Query(#[from] fs_query::QueryError),
     /// A role task panicked or was cancelled.
     #[error("role {role} stopped unexpectedly: {reason}")]
     RoleStopped {

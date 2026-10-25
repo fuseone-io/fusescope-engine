@@ -1,5 +1,6 @@
 //! Behaviour of the write-ahead log across appends, rotation, crashes and truncation.
 #![allow(
+    clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,

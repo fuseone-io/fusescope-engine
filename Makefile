@@ -39,6 +39,6 @@ tenant:        ## create a tenant: make tenant NAME=acme
 	FS_CATALOG_URL=$(FS_TEST_DATABASE_URL) FS_BUCKET_ACCESS_KEY=fusescope FS_BUCKET_SECRET_KEY=fusescope-dev \
 	cargo run -q -p fs-server -- --config config/dev.toml admin tenant create $(NAME)
 
-token:         ## issue an ingest token: make token TENANT=<uuid> NAME=collector
+token:         ## issue a token: make token TENANT=<uuid> NAME=collector [SCOPE=ingest|query]
 	FS_CATALOG_URL=$(FS_TEST_DATABASE_URL) FS_BUCKET_ACCESS_KEY=fusescope FS_BUCKET_SECRET_KEY=fusescope-dev \
-	cargo run -q -p fs-server -- --config config/dev.toml admin token create $(TENANT) $(NAME)
+	cargo run -q -p fs-server -- --config config/dev.toml admin token create $(TENANT) $(NAME) $(or $(SCOPE),ingest)

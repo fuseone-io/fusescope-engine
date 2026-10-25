@@ -13,8 +13,12 @@ Phase 1 in progress. Done: `fs-schema` (span schema v1, OTLP conversion),
 catalog, tenants and ingest tokens, atomic compaction swaps, change
 notifications), `fs-ingest` (OTLP gRPC with bearer-token authentication and
 per-tenant limits, WAL, buffers, sorted Parquet L0 flush with bloom filters,
-catalog registration) and `fs-server` (configuration, bootstrap, roles, admin
-commands, graceful shutdown). Next: `fs-query` with DataFusion and Flight SQL.
+catalog registration), `fs-query` (DataFusion over the catalog's files with
+tenant-scoped read-only sessions, catalog-level pruning, byte budgets and an
+Arrow Flight SQL front end) and `fs-server` (configuration, bootstrap, roles,
+admin commands, graceful shutdown). Next: hot-window scans from ingesters,
+the Go backend's Flight telemetrystore, and the first comparison against
+ClickHouse.
 
 ## Layout
 
@@ -46,7 +50,10 @@ make dev-down
 ```
 
 Point an OpenTelemetry collector's OTLP gRPC exporter at `localhost:4317` with
-`authorization: Bearer <token>` in its headers to send traces.
+`authorization: Bearer <token>` in its headers to send traces. Query with any
+Arrow Flight SQL client against `localhost:8815`, sending a `query`-scope token
+in the same header; the table is `spans`, the dialect is PostgreSQL-like, and
+only read statements are accepted.
 
 Configuration is a TOML file ([config/dev.toml](config/dev.toml) for the dev
 services) plus environment overrides. Secrets come only from the environment:

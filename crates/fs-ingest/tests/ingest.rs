@@ -3,6 +3,7 @@
 //! Needs `FS_TEST_DATABASE_URL` (`make dev-up`); skips otherwise. The bucket is
 //! a temporary directory.
 #![allow(
+    clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use fs_catalog::{Catalog, NewTenant, Signal, TenantId, TimeRange};
+use fs_catalog::{Catalog, NewTenant, Signal, TenantId, TimeRange, TokenScope};
 use fs_ingest::{IngestConfig, Ingester};
 use fs_wal::{Wal, WalConfig};
 use object_store::local::LocalFileSystem;
@@ -203,7 +204,11 @@ async fn authenticates_buffers_flushes_and_registers() {
         .await
         .unwrap()
         .id;
-    let (token, _) = db.catalog.create_token(tenant, "collector").await.unwrap();
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
     let mut client = h.client().await;
 
@@ -312,7 +317,11 @@ async fn replays_wal_after_crash_without_flush() {
         .await
         .unwrap()
         .id;
-    let (token, _) = db.catalog.create_token(tenant, "collector").await.unwrap();
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
 
     // First run: ingest, then drop the harness without a clean shutdown.
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
@@ -407,7 +416,11 @@ async fn shutdown_flushes_pending_rows() {
         .await
         .unwrap()
         .id;
-    let (token, _) = db.catalog.create_token(tenant, "collector").await.unwrap();
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
     h.client()
         .await

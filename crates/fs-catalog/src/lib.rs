@@ -14,7 +14,9 @@ mod types;
 mod watch;
 
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
-pub use token::{TOKEN_PREFIX, TenantToken, generate_token, hash_token, looks_like_token};
+pub use token::{
+    TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token, looks_like_token,
+};
 pub use types::{
     Compaction, FileId, FileRecord, FileState, Ingester, Level, NewFile, NewTenant, PurgedFile,
     Signal, Tenant, TenantId, TimeRange,

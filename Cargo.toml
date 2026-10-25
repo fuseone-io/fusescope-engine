@@ -38,7 +38,15 @@ must_use_candidate = "allow"
 # format and engine
 arrow = "59"
 parquet = "59"
-datafusion = "55"
+# No `compression` feature: it pulls bzip2/xz for CSV and JSON, which we never read,
+# and libbz2-rs-sys carries the bzip2-1.0.6 license that is outside the allow-list.
+datafusion = { version = "55", default-features = false, features = [
+  "sql", "parquet", "nested_expressions", "crypto_expressions", "datetime_expressions",
+  "encoding_expressions", "regex_expressions", "string_expressions", "unicode_expressions",
+  "recursive_protection",
+] }
+datafusion-datasource = { version = "55", default-features = false }
+async-trait = "0.1"
 arrow-flight = { version = "59", features = ["flight-sql"] }
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 # runtime

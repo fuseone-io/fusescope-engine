@@ -1,5 +1,6 @@
 //! End to end: OTLP request → Arrow batch → Parquet → Arrow batch.
 #![allow(
+    clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,

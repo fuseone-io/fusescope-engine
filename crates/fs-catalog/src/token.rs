@@ -13,6 +13,40 @@ pub const TOKEN_PREFIX: &str = "fst_";
 /// Bytes of entropy in a token.
 const TOKEN_BYTES: usize = 32;
 
+/// What a token may do. Stored as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum TokenScope {
+    /// Send telemetry to the ingester.
+    Ingest,
+    /// Run queries against the querier.
+    Query,
+}
+
+impl TokenScope {
+    /// Lowercase name, as stored.
+    pub fn name(self) -> &'static str {
+        match self {
+            TokenScope::Ingest => "ingest",
+            TokenScope::Query => "query",
+        }
+    }
+}
+
+impl std::str::FromStr for TokenScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ingest" => Ok(TokenScope::Ingest),
+            "query" => Ok(TokenScope::Query),
+            other => Err(format!(
+                "unknown token scope {other:?}, expected ingest or query"
+            )),
+        }
+    }
+}
+
 /// A token row, never carrying the secret.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct TenantToken {
@@ -20,6 +54,8 @@ pub struct TenantToken {
     pub tenant_id: TenantId,
     /// Human label, for example the collector it was issued to.
     pub name: String,
+    /// What it may do.
+    pub scope: TokenScope,
     /// Issue time.
     pub created_at: DateTime<Utc>,
     /// Revocation time, when revoked.

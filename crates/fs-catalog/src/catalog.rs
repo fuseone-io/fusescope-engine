@@ -6,7 +6,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::CatalogError;
-use crate::token::{TenantToken, generate_token, hash_token, looks_like_token};
+use crate::token::{TenantToken, TokenScope, generate_token, hash_token, looks_like_token};
 use crate::types::{
     Compaction, FileId, FileRecord, FileRow, FileState, Ingester, NewFile, NewTenant, PurgedFile,
     Signal, Tenant, TenantId, TimeRange,
@@ -126,6 +126,31 @@ impl Catalog {
         .bind(FileState::Visible.code())
         .bind(range.start)
         .bind(range.end)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(FileRecord::try_from).collect()
+    }
+
+    /// Every visible file of one tenant and signal, oldest first. Used to warm
+    /// querier caches; `visible_files` serves bounded lookups.
+    ///
+    /// # Errors
+    /// Database failure, or a row with values outside the domain.
+    pub async fn all_visible_files(
+        &self,
+        tenant: TenantId,
+        signal: Signal,
+    ) -> Result<Vec<FileRecord>, CatalogError> {
+        let rows = sqlx::query_as::<_, FileRow>(
+            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+                    services, summary, state, created_at, quarantined_at
+             from engine_file
+             where tenant_id = $1 and signal = $2 and state = $3
+             order by ts_min, id",
+        )
+        .bind(tenant)
+        .bind(signal.code())
+        .bind(FileState::Visible.code())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(FileRecord::try_from).collect()
@@ -283,27 +308,33 @@ impl Catalog {
         &self,
         tenant: TenantId,
         name: &str,
+        scope: TokenScope,
     ) -> Result<(String, TenantToken), CatalogError> {
         let token = generate_token()?;
         let hash = hash_token(&token);
         let row = sqlx::query_as::<_, TenantToken>(
-            "insert into engine_tenant_token (token_hash, tenant_id, name) values ($1, $2, $3)
-             returning tenant_id, name, created_at, revoked_at",
+            "insert into engine_tenant_token (token_hash, tenant_id, name, scope) values ($1, $2, $3, $4)
+             returning tenant_id, name, scope, created_at, revoked_at",
         )
         .bind(hash.as_slice())
         .bind(tenant)
         .bind(name)
+        .bind(scope)
         .fetch_one(&self.pool)
         .await?;
         Ok((token, row))
     }
 
-    /// The tenant an ingest token belongs to, if the token exists, is not
+    /// The tenant a token belongs to, if the token exists with `scope`, is not
     /// revoked and the tenant is not deleted.
     ///
     /// # Errors
     /// Database failure.
-    pub async fn resolve_token(&self, token: &str) -> Result<Option<TenantId>, CatalogError> {
+    pub async fn resolve_token(
+        &self,
+        token: &str,
+        scope: TokenScope,
+    ) -> Result<Option<TenantId>, CatalogError> {
         if !looks_like_token(token) {
             return Ok(None);
         }
@@ -311,9 +342,10 @@ impl Catalog {
         let row: Option<(TenantId,)> = sqlx::query_as(
             "select t.tenant_id from engine_tenant_token t
              join engine_tenant n on n.id = t.tenant_id
-             where t.token_hash = $1 and t.revoked_at is null and n.deleted_at is null",
+             where t.token_hash = $1 and t.scope = $2 and t.revoked_at is null and n.deleted_at is null",
         )
         .bind(hash.as_slice())
+        .bind(scope)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
@@ -339,7 +371,7 @@ impl Catalog {
     /// Database failure.
     pub async fn tokens(&self, tenant: TenantId) -> Result<Vec<TenantToken>, CatalogError> {
         let rows = sqlx::query_as::<_, TenantToken>(
-            "select tenant_id, name, created_at, revoked_at from engine_tenant_token
+            "select tenant_id, name, scope, created_at, revoked_at from engine_tenant_token
              where tenant_id = $1 order by created_at desc",
         )
         .bind(tenant)

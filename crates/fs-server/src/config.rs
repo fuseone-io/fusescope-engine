@@ -30,6 +30,9 @@ pub struct Config {
     /// OTLP ingest of the ingester role.
     #[serde(default)]
     pub ingest: IngestSection,
+    /// Query limits of the querier role.
+    #[serde(default)]
+    pub query: QuerySection,
     /// Compactor role.
     #[serde(default)]
     pub compactor: CompactorConfig,
@@ -294,6 +297,58 @@ fn default_wal_max_bytes() -> u64 {
     4 * 1024 * 1024 * 1024
 }
 
+/// Query limits.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuerySection {
+    /// Memory the querier may use for execution before spilling or failing.
+    #[serde(default = "default_query_memory")]
+    pub memory_bytes: usize,
+    /// Wall-clock limit per query.
+    #[serde(default = "default_query_timeout")]
+    pub timeout_secs: u64,
+    /// Maximum rows returned per query.
+    #[serde(default = "default_query_max_rows")]
+    pub max_rows: usize,
+    /// Directory for spill files. Unset disables spilling.
+    pub spill_dir: Option<PathBuf>,
+}
+
+impl Default for QuerySection {
+    fn default() -> Self {
+        Self {
+            memory_bytes: default_query_memory(),
+            timeout_secs: default_query_timeout(),
+            max_rows: default_query_max_rows(),
+            spill_dir: None,
+        }
+    }
+}
+
+impl QuerySection {
+    /// Converts to the query crate's limits.
+    pub fn to_limits(&self) -> fs_query::QueryLimits {
+        fs_query::QueryLimits {
+            memory_bytes: self.memory_bytes,
+            timeout: std::time::Duration::from_secs(self.timeout_secs),
+            max_rows: self.max_rows,
+            ..fs_query::QueryLimits::default()
+        }
+    }
+}
+
+fn default_query_memory() -> usize {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_query_timeout() -> u64 {
+    60
+}
+
+fn default_query_max_rows() -> usize {
+    1_000_000
+}
+
 /// Compactor role.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -509,6 +564,14 @@ impl Config {
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
+        }
+        if self.query.max_rows == 0
+            || self.query.timeout_secs == 0
+            || self.query.memory_bytes < 64 * 1024 * 1024
+        {
+            return invalid(
+                "query.max_rows and query.timeout_secs must be positive and query.memory_bytes at least 64 MiB",
+            );
         }
         Ok(())
     }

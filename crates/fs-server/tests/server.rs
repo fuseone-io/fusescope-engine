@@ -2,7 +2,12 @@
 //!
 //! Runs when `FS_TEST_DATABASE_URL` is set (`make dev-up`); the bucket is a
 //! temporary local directory so only Postgres is required. Skips otherwise.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use std::time::Duration;
 
