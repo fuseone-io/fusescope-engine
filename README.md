@@ -8,10 +8,12 @@ Read [DESIGN.md](DESIGN.md) first. Decisions are recorded in [docs/adr](docs/adr
 
 ## Status
 
-Phase 0, foundation. Implemented: `fs-schema` (span schema v1, OTLP
-conversion), `fs-wal` (segmented write-ahead log with recovery) and
-`fs-catalog` (Postgres file catalog with atomic compaction swaps and change
-notifications). The other crates are placeholders.
+Phase 0, foundation, complete: `fs-schema` (span schema v1, OTLP conversion),
+`fs-wal` (segmented write-ahead log with recovery), `fs-catalog` (Postgres file
+catalog with atomic compaction swaps and change notifications) and `fs-server`
+(configuration, bucket and catalog bootstrap, roles with heartbeat, change
+watch and quarantine purge, graceful shutdown). The binary starts against the
+local services. Ingest, query and compaction proper are phase 1 and later.
 
 ## Layout
 
@@ -31,12 +33,20 @@ notifications). The other crates are placeholders.
 ## Development
 
 ```sh
-make dev-up               # Postgres on :5433 and MinIO on :9000 via Docker
+make dev-up               # Postgres on :5433 and an S3 store (RustFS) on :9100 via Docker
 make test                 # cargo test, with FS_TEST_DATABASE_URL pointing at that Postgres
 make lint                 # fmt and clippy
 make deny                 # licenses, advisories, sources
+make check-env            # fusescope-engine --check: validates config and connectivity
+make run                  # fusescope-engine --role all against the dev services
 make dev-down
 ```
+
+Configuration is a TOML file ([config/dev.toml](config/dev.toml) for the dev
+services) plus environment overrides. Secrets come only from the environment:
+`FS_CATALOG_URL`, `FS_BUCKET_ACCESS_KEY`, `FS_BUCKET_SECRET_KEY`. Without
+bucket keys the S3 client uses the AWS environment and instance metadata, which
+is how Kubernetes workload identity is picked up.
 
 Database tests live in `crates/fs-catalog/tests` and run only when
 `FS_TEST_DATABASE_URL` is set; otherwise they print `skipped` and pass. Each

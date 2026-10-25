@@ -14,6 +14,15 @@ name = "fusescope-engine"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+object_store = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
 fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
 fs-wal = { path = "../fs-wal" }
@@ -23,6 +32,10 @@ fs-cache = { path = "../fs-cache" }
 fs-query = { path = "../fs-query" }
 fs-compactor = { path = "../fs-compactor" }
 fs-auth = { path = "../fs-auth" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

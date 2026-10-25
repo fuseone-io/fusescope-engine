@@ -12,6 +12,9 @@ use crate::types::{
 };
 use crate::watch::Watcher;
 
+/// How long to wait for a pooled connection before failing.
+pub const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Handle to the catalog database. Cheap to clone.
 #[derive(Clone)]
 pub struct Catalog {
@@ -26,6 +29,7 @@ impl Catalog {
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self, CatalogError> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
             .connect(url)
             .await?;
         Ok(Self { pool })

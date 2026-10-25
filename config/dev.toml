@@ -1,0 +1,29 @@
+# Development configuration for the services in compose.yaml.
+# Secrets never live in this file: FS_CATALOG_URL, FS_BUCKET_ACCESS_KEY and
+# FS_BUCKET_SECRET_KEY come from the environment (see the Makefile).
+
+[server]
+role = "all"
+node_id = "dev-0"
+
+[catalog]
+max_connections = 8
+migrate = true
+
+[bucket]
+kind = "s3"
+name = "fusescope"
+endpoint = "http://localhost:9100"
+region = "us-east-1"
+allow_http = true          # development only; production endpoints are https
+
+[wal]
+dir = "./data/wal"
+
+[compactor]
+purge_interval_secs = 60
+quarantine_ttl_secs = 3600
+
+[log]
+level = "info"
+format = "text"

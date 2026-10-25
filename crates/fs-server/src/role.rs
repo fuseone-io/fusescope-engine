@@ -1,11 +1,14 @@
-//! Process roles. One binary, selected at start with `--role`.
+//! Process roles. One binary, selected at start with `--role` or in the config file.
 
 use std::fmt;
 use std::str::FromStr;
 
+use serde::Deserialize;
+
 /// A role the process can run. `All` runs every role in one process for
 /// development and small installs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Receives OTLP, writes the WAL, flushes Parquet, serves the hot window.
     Ingester,
@@ -25,6 +28,16 @@ impl Role {
             Role::Querier => &[Role::Querier],
             Role::Compactor => &[Role::Compactor],
             Role::All => &[Role::Ingester, Role::Querier, Role::Compactor],
+        }
+    }
+
+    /// Lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Ingester => "ingester",
+            Role::Querier => "querier",
+            Role::Compactor => "compactor",
+            Role::All => "all",
         }
     }
 }
@@ -61,13 +74,7 @@ impl FromStr for Role {
 
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Role::Ingester => "ingester",
-            Role::Querier => "querier",
-            Role::Compactor => "compactor",
-            Role::All => "all",
-        };
-        f.write_str(name)
+        f.write_str(self.name())
     }
 }
 

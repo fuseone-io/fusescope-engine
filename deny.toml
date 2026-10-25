@@ -35,9 +35,20 @@ confidence-threshold = 0.9
 unused-allowed-license = "allow"
 
 [advisories]
-# RustSec advisories block the build.
+# RustSec advisories block the build. Every ignore below names the advisory,
+# why the exposure is acceptable, and what removes it.
 yanked = "deny"
 unmaintained = "workspace"
+ignore = [
+  # quick-xml 0.39 (via object_store 0.13, pinned by datafusion 55): quadratic
+  # time and unbounded allocation while parsing XML. The parser only reads
+  # responses from our own S3 endpoint, which is trusted infrastructure, so the
+  # denial of service needs a compromised bucket server. Removed by object_store
+  # 0.14 (quick-xml 0.41), which lands when datafusion moves to it. Revisit by
+  # 2026-12-31.
+  { id = "RUSTSEC-2026-0194", reason = "S3 response parsing only; fixed by object_store 0.14 with datafusion 56" },
+  { id = "RUSTSEC-2026-0195", reason = "S3 response parsing only; fixed by object_store 0.14 with datafusion 56" },
+]
 
 [bans]
 multiple-versions = "warn"
