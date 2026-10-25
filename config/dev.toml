@@ -27,6 +27,13 @@ listen = "0.0.0.0:4317"
 hot_listen = "0.0.0.0:8816"    # internal: queriers read unflushed rows here
 hot_advertise = "127.0.0.1:8816"
 flush_interval_secs = 10       # short for development; production default is 30
+# WAL group commit: batch limits, and the queue limits that turn into RESOURCE_EXHAUSTED
+# wal_batch_records = 1024
+# wal_batch_bytes = 16777216
+# wal_linger_ms = 0
+# wal_queue_records = 4096
+# wal_queue_bytes = 67108864
+# wal_queue_wait_ms = 2000
 # anonymous_tenant = "<uuid>"   # development only: accept unauthenticated OTLP as this tenant
 
 [query]

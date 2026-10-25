@@ -66,18 +66,23 @@ pub struct WriterStats {
     pub backpressure: AtomicU64,
 }
 
+/// A queued record. It owns its queue slot and byte lease, so a caller that
+/// cancels after queuing frees nothing: the limits stay taken until the writer
+/// has synced the record and dropped it.
 struct Pending {
     bytes: Vec<u8>,
     reply: oneshot::Sender<Result<Position, WalError>>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    _lease: ByteLease,
 }
 
-/// Gives the bytes of one record back to the in-flight budget on any exit path.
-struct ByteRelease<'a> {
-    counter: &'a std::sync::atomic::AtomicUsize,
+/// Bytes charged to the in-flight budget, returned when dropped.
+struct ByteLease {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
     size: usize,
 }
 
-impl Drop for ByteRelease<'_> {
+impl Drop for ByteLease {
     fn drop(&mut self) {
         self.counter.fetch_sub(self.size, Ordering::Relaxed);
     }
@@ -137,24 +142,42 @@ impl WalWriter {
             self.stats.backpressure.fetch_add(1, Ordering::Relaxed);
             return Err(IngestError::Backpressure("wal queue bytes"));
         }
-        let _release = ByteRelease {
-            counter: &self.inflight_bytes,
+        let lease = ByteLease {
+            counter: Arc::clone(&self.inflight_bytes),
             size,
         };
-        let Ok(Ok(_slot)) =
-            tokio::time::timeout(self.config.queue_wait, self.slots.acquire()).await
+        let Ok(Ok(slot)) = tokio::time::timeout(
+            self.config.queue_wait,
+            Arc::clone(&self.slots).acquire_owned(),
+        )
+        .await
         else {
             self.stats.backpressure.fetch_add(1, Ordering::Relaxed);
             return Err(IngestError::Backpressure("wal queue records"));
         };
         let (reply, answer) = oneshot::channel();
         self.queue
-            .send(Pending { bytes, reply })
+            .send(Pending {
+                bytes,
+                reply,
+                _slot: slot,
+                _lease: lease,
+            })
             .map_err(|_| IngestError::Record("wal writer stopped".into()))?;
         answer
             .await
             .map_err(|_| IngestError::Record("wal writer dropped a request".into()))?
             .map_err(IngestError::from)
+    }
+
+    /// Queue slots currently free. For tests and diagnostics.
+    pub fn free_slots(&self) -> usize {
+        self.slots.available_permits()
+    }
+
+    /// Bytes currently charged to the queue budget. For tests and diagnostics.
+    pub fn inflight_bytes(&self) -> usize {
+        self.inflight_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -200,11 +223,10 @@ fn commit(wal: &StdMutex<Wal>, batch: Vec<Pending>, stats: &WriterStats) {
         }
         return;
     };
-    let mut appended: Vec<(oneshot::Sender<Result<Position, WalError>>, Position)> =
-        Vec::with_capacity(batch.len());
+    let mut appended: Vec<(Pending, Position)> = Vec::with_capacity(batch.len());
     for p in batch {
         match wal.append(&p.bytes) {
-            Ok(position) => appended.push((p.reply, position)),
+            Ok(position) => appended.push((p, position)),
             Err(e) => {
                 let _ = p.reply.send(Err(e));
             }
@@ -222,7 +244,7 @@ fn commit(wal: &StdMutex<Wal>, batch: Vec<Pending>, stats: &WriterStats) {
         .fetch_add(appended.len() as u64, Ordering::Relaxed);
     stats.wal_bytes.store(wal.bytes(), Ordering::Relaxed);
     drop(wal);
-    for (reply, position) in appended {
+    for (pending, position) in appended {
         let outcome = match &synced {
             Ok(()) => Ok(position),
             Err(e) => Err(WalError::Io {
@@ -230,7 +252,8 @@ fn commit(wal: &StdMutex<Wal>, batch: Vec<Pending>, stats: &WriterStats) {
                 source: std::io::Error::other(e.to_string()),
             }),
         };
-        let _ = reply.send(outcome);
+        let _ = pending.reply.send(outcome);
+        // `pending` drops here: slot and bytes return only now.
     }
 }
 
@@ -262,7 +285,7 @@ mod tests {
             "budget returned"
         );
         writer.append(vec![0u8; 10]).await.unwrap();
-        assert_eq!(writer.inflight_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(writer.inflight_bytes(), 0);
     }
 
     #[tokio::test]
@@ -278,7 +301,7 @@ mod tests {
         };
         let writer = WalWriter::spawn(wal, config);
         // Hold the only slot without ever sending, as a stuck request would.
-        let held = writer.slots.clone().acquire_owned().await.unwrap();
+        let held = Arc::clone(&writer.slots).acquire_owned().await.unwrap();
         let err = writer.append(vec![1, 2, 3]).await.unwrap_err();
         assert!(
             matches!(err, IngestError::Backpressure("wal queue records")),
@@ -286,6 +309,50 @@ mod tests {
         );
         drop(held);
         writer.append(vec![1, 2, 3]).await.unwrap();
+    }
+
+    /// A caller that gives up after queuing must not free the limits: the
+    /// record is still going to be written, and the memory is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)] // holding the WAL lock across the sleep is the stall under test
+    async fn cancelled_append_keeps_limits_until_the_writer_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(StdMutex::new(
+            Wal::open(WalConfig::new(dir.path())).unwrap(),
+        ));
+        let config = GroupCommitConfig {
+            max_inflight_records: 4,
+            ..GroupCommitConfig::default()
+        };
+        let writer = WalWriter::spawn(Arc::clone(&wal), config);
+        // Stall the writer: it blocks on the WAL lock inside commit.
+        let stall = wal.lock().unwrap();
+        let task = {
+            let writer = writer.clone();
+            tokio::spawn(async move { writer.append(vec![7u8; 100]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            writer.inflight_bytes(),
+            100,
+            "bytes stay charged after the caller cancelled"
+        );
+        assert_eq!(writer.free_slots(), 3, "the slot stays taken");
+        drop(stall);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            writer.inflight_bytes(),
+            0,
+            "released once the writer synced the record"
+        );
+        assert_eq!(writer.free_slots(), 4);
+        assert_eq!(
+            writer.stats().records.load(Ordering::Relaxed),
+            1,
+            "the record was written anyway"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

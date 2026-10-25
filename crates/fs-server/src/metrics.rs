@@ -155,6 +155,12 @@ impl Metrics {
             );
             counter(
                 out,
+                "fusescope_wal_backpressure_total",
+                "Appends refused because the writer queue was full",
+                w.backpressure.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
                 "fusescope_wal_sync_seconds_total",
                 "Seconds spent in fsync",
                 w.sync_nanos.load(Ordering::Relaxed) / 1_000_000_000,

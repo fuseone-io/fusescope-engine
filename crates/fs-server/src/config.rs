@@ -246,6 +246,27 @@ pub struct IngestSection {
     /// registered. Must exceed the querier's file cache TTL.
     #[serde(default = "default_persisted_retain")]
     pub persisted_retain_secs: u64,
+    /// Most records in one WAL group-commit batch.
+    #[serde(default = "default_wal_batch_records")]
+    pub wal_batch_records: usize,
+    /// Most payload bytes in one WAL group-commit batch.
+    #[serde(default = "default_wal_batch_bytes")]
+    pub wal_batch_bytes: usize,
+    /// Milliseconds the first record of a batch waits for company. Zero
+    /// batches only what is already queued.
+    #[serde(default)]
+    pub wal_linger_ms: u64,
+    /// Most records waiting for the WAL writer; beyond it requests wait and
+    /// then get RESOURCE_EXHAUSTED.
+    #[serde(default = "default_wal_queue_records")]
+    pub wal_queue_records: usize,
+    /// Most payload bytes waiting for the WAL writer; beyond it requests get
+    /// RESOURCE_EXHAUSTED immediately.
+    #[serde(default = "default_wal_queue_bytes")]
+    pub wal_queue_bytes: usize,
+    /// Milliseconds a request waits for a WAL queue slot.
+    #[serde(default = "default_wal_queue_wait_ms")]
+    pub wal_queue_wait_ms: u64,
 }
 
 impl Default for IngestSection {
@@ -263,8 +284,34 @@ impl Default for IngestSection {
             hot_listen: default_hot_listen(),
             hot_advertise: default_hot_advertise(),
             persisted_retain_secs: default_persisted_retain(),
+            wal_batch_records: default_wal_batch_records(),
+            wal_batch_bytes: default_wal_batch_bytes(),
+            wal_linger_ms: 0,
+            wal_queue_records: default_wal_queue_records(),
+            wal_queue_bytes: default_wal_queue_bytes(),
+            wal_queue_wait_ms: default_wal_queue_wait_ms(),
         }
     }
+}
+
+fn default_wal_batch_records() -> usize {
+    1024
+}
+
+fn default_wal_batch_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_wal_queue_records() -> usize {
+    4096
+}
+
+fn default_wal_queue_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_wal_queue_wait_ms() -> u64 {
+    2000
 }
 
 fn default_hot_listen() -> String {
@@ -302,6 +349,14 @@ impl IngestSection {
                 ServerError::InvalidConfig(format!("ingest.hot_listen {:?}: {e}", self.hot_listen))
             })?),
             persisted_retain: std::time::Duration::from_secs(self.persisted_retain_secs),
+            group_commit: fs_ingest::walwriter::GroupCommitConfig {
+                max_records: self.wal_batch_records,
+                max_bytes: self.wal_batch_bytes,
+                linger: std::time::Duration::from_millis(self.wal_linger_ms),
+                max_inflight_records: self.wal_queue_records,
+                max_inflight_bytes: self.wal_queue_bytes,
+                queue_wait: std::time::Duration::from_millis(self.wal_queue_wait_ms),
+            },
             ..fs_ingest::IngestConfig::default()
         })
     }
@@ -608,6 +663,13 @@ impl Config {
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
+        }
+        if self.ingest.wal_batch_records == 0
+            || self.ingest.wal_batch_bytes == 0
+            || self.ingest.wal_queue_records == 0
+            || self.ingest.wal_queue_bytes == 0
+        {
+            return invalid("ingest.wal_batch_* and ingest.wal_queue_* must be positive");
         }
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
