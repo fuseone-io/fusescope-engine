@@ -55,6 +55,12 @@ pub struct FlushReport {
     pub total_ms: f64,
     /// Buffer bytes at the end of the run: live, flushing, persisted.
     pub buffer_bytes: (u64, u64, u64),
+    /// Chunks built by the coalescer during the run.
+    pub coalesces: u64,
+    /// Request batches per chunk.
+    pub batches_per_coalesce: f64,
+    /// Milliseconds per chunk.
+    pub coalesce_ms: f64,
 }
 
 /// Outcome of a load run.
@@ -224,6 +230,10 @@ pub fn print(report: &LoadReport) {
             f.buffer_bytes.1 >> 20,
             f.buffer_bytes.2 >> 20
         );
+        println!(
+            "coalesces={} batches/coalesce={:.0} {:.1}ms each",
+            f.coalesces, f.batches_per_coalesce, f.coalesce_ms
+        );
     }
 }
 
@@ -266,6 +276,14 @@ fn flush_report(
     };
     let ms = |k: &str| per(k) / 1e6;
     let gauge = |k: &str| after.get(k).copied().unwrap_or(0.0) as u64;
+    let coalesces = delta("fusescope_coalesce_total").max(0.0);
+    let per_coalesce = |k: &str| {
+        if coalesces > 0.0 {
+            delta(k) / coalesces
+        } else {
+            0.0
+        }
+    };
     FlushReport {
         flushes: flushes as u64,
         rows_per_flush: per("fusescope_flush_rows_total"),
@@ -281,5 +299,8 @@ fn flush_report(
             gauge("fusescope_buffer_flushing_bytes"),
             gauge("fusescope_buffer_persisted_bytes"),
         ),
+        coalesces: coalesces as u64,
+        batches_per_coalesce: per_coalesce("fusescope_coalesce_batches_total"),
+        coalesce_ms: per_coalesce("fusescope_coalesce_nanoseconds_total") / 1e6,
     }
 }

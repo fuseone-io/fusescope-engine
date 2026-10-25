@@ -225,6 +225,10 @@ pub struct IngestSection {
     /// Flush a tenant buffer once its oldest record is this old.
     #[serde(default = "default_flush_interval")]
     pub flush_interval_secs: u64,
+    /// Merge a tenant's complete request batches into one chunk once this
+    /// many are waiting. At least 2.
+    #[serde(default = "default_coalesce_batches")]
+    pub coalesce_batches: usize,
     /// Refuse a tenant's data when its live and flushing rows would exceed this.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
@@ -285,6 +289,7 @@ impl Default for IngestSection {
             flush_rows: default_flush_rows(),
             flush_bytes: default_flush_bytes(),
             flush_interval_secs: default_flush_interval(),
+            coalesce_batches: default_coalesce_batches(),
             max_buffer_bytes: default_max_buffer_bytes(),
             max_tenant_bytes: default_max_tenant_bytes(),
             wal_max_bytes: default_wal_max_bytes(),
@@ -351,6 +356,7 @@ impl IngestSection {
             flush_rows: self.flush_rows,
             flush_bytes: self.flush_bytes,
             flush_interval: std::time::Duration::from_secs(self.flush_interval_secs),
+            coalesce_batches: self.coalesce_batches,
             max_buffer_bytes: self.max_buffer_bytes,
             max_tenant_bytes: self.max_tenant_bytes,
             wal_max_bytes: self.wal_max_bytes,
@@ -392,6 +398,10 @@ fn default_flush_bytes() -> usize {
 
 fn default_flush_interval() -> u64 {
     30
+}
+
+fn default_coalesce_batches() -> usize {
+    512
 }
 
 fn default_max_buffer_bytes() -> usize {
@@ -683,6 +693,9 @@ impl Config {
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
+        }
+        if self.ingest.coalesce_batches < 2 {
+            return invalid("ingest.coalesce_batches must be at least 2");
         }
         if self.ingest.max_buffer_bytes > self.ingest.max_tenant_bytes
             || self.ingest.max_tenant_bytes > self.ingest.max_memory_bytes

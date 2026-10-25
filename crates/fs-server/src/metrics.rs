@@ -239,6 +239,24 @@ impl Metrics {
             "Nanoseconds from taking rows to checkpoint",
             ns(&f.total_nanos),
         );
+        counter(
+            out,
+            "fusescope_coalesce_total",
+            "Chunks built by merging request batches in log order.",
+            f.coalesces.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "fusescope_coalesce_batches_total",
+            "Request batches merged into chunks.",
+            f.coalesced_batches.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "fusescope_coalesce_nanoseconds_total",
+            "Time spent merging request batches.",
+            f.coalesce_nanos.load(Ordering::Relaxed),
+        );
         gauge(
             out,
             "fusescope_buffer_live_bytes",

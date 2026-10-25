@@ -19,6 +19,9 @@ pub struct IngestConfig {
     pub flush_bytes: usize,
     /// Flush a tenant buffer once its oldest record is this old.
     pub flush_interval: Duration,
+    /// Merge a tenant's complete request batches into one chunk once this
+    /// many are waiting, so a flush concatenates a few large batches.
+    pub coalesce_batches: usize,
     /// Refuse new data for a tenant whose live and flushing rows would exceed
     /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
@@ -73,6 +76,7 @@ impl Default for IngestConfig {
             flush_rows: 1_000_000,
             flush_bytes: 128 * 1024 * 1024,
             flush_interval: Duration::from_secs(30),
+            coalesce_batches: 512,
             max_buffer_bytes: 512 * 1024 * 1024,
             max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,

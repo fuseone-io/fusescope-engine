@@ -97,6 +97,12 @@ pub struct FlushStats {
     pub flushing_bytes: AtomicU64,
     /// Bytes kept for the hot window after registration, sampled every flusher tick.
     pub persisted_bytes: AtomicU64,
+    /// Chunks built by the coalescer.
+    pub coalesces: AtomicU64,
+    /// Request batches merged into chunks.
+    pub coalesced_batches: AtomicU64,
+    /// Nanoseconds spent merging.
+    pub coalesce_nanos: AtomicU64,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
@@ -134,6 +140,7 @@ pub struct Shared {
     /// holds it exclusively while it takes a buffer and reads the WAL position.
     gate: RwLock<()>,
     flush_now: Notify,
+    coalesce_now: Notify,
     inject_register_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
@@ -178,8 +185,9 @@ impl Shared {
         Ok(buffers.reserve(tenant, bytes))
     }
 
-    /// Appends through the group-commit writer; resolves once synced.
-    async fn append_wal(&self, record: Vec<u8>) -> Result<Position, IngestError> {
+    /// Appends through the group-commit writer; resolves once synced. The
+    /// position stays tracked as travelling until the handle is dropped.
+    async fn append_wal(&self, record: Vec<u8>) -> Result<crate::walwriter::Tracked, IngestError> {
         self.writer.append(record).await
     }
 
@@ -204,24 +212,32 @@ impl Shared {
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
 
         let reservation = self.admit(tenant, batch.get_array_memory_size()).await?;
-        let position = self.append_wal(record).await?;
+        let tracked = self.append_wal(record).await?;
         if let Some(delay) = self.config.inject_push_delay {
             if self.push_delay_pending.swap(false, Ordering::Relaxed) {
                 tokio::time::sleep(delay).await;
             }
         }
 
-        let due = {
+        let (due, coalesce) = {
             let mut buffers = self.buffers.lock().await;
-            buffers.get_mut(tenant).push(batch, position, now);
-            // Released under the same lock, so no admission runs between the
-            // push and the release and counts the bytes on neither side.
+            buffers.get_mut(tenant).push(batch, tracked.position, now);
+            // Both released under the lock: no admission runs between the push
+            // and the release, and no coalesce takes a run the position
+            // belongs in before the batch is there.
             drop(reservation);
+            drop(tracked);
             let live = buffers.get_mut(tenant);
-            live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes
+            (
+                live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes,
+                live.request_batches() >= self.config.coalesce_batches,
+            )
         };
         if due {
             self.flush_now.notify_one();
+        }
+        if coalesce {
+            self.coalesce_now.notify_one();
         }
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -417,6 +433,56 @@ impl Shared {
         }
     }
 
+    /// Merges each tenant's complete request batches into one chunk, one
+    /// tenant at a time, until no tenant has enough. Only batches below the
+    /// writer's stable bound are merged: nothing with a lower position is
+    /// still on its way to a buffer, so the chunk keeps the rows in log
+    /// order, the order replay produces. The concat runs outside the lock;
+    /// the batches stay served and counted meanwhile.
+    async fn coalesce_due(&self) {
+        let min = self.config.coalesce_batches;
+        loop {
+            let bound = self.writer.stable_bound();
+            let taken = {
+                let mut buffers = self.buffers.lock().await;
+                buffers.coalesce_candidate(bound, min).and_then(|tenant| {
+                    buffers
+                        .take_for_coalesce(tenant, bound, min)
+                        .map(|(id, batches)| (tenant, id, batches))
+                })
+            };
+            let Some((tenant, id, batches)) = taken else {
+                return;
+            };
+            let count = batches.len();
+            let started = Instant::now();
+            let merged = tokio::task::spawn_blocking(move || {
+                arrow::compute::concat_batches(&fs_schema::spans::span_schema_v1(), &batches)
+            })
+            .await;
+            match merged {
+                Ok(Ok(chunk)) => {
+                    if self.buffers.lock().await.finish_coalesce(tenant, id, chunk) {
+                        let fs = &self.flush_stats;
+                        fs.coalesces.fetch_add(1, Ordering::Relaxed);
+                        fs.coalesced_batches
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                        fs.coalesce_nanos
+                            .fetch_add(nanos(started.elapsed()), Ordering::Relaxed);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(tenant = %tenant.0, error = %e, "coalesce failed; batches stay as they are");
+                    self.buffers.lock().await.cancel_coalesce(tenant, id);
+                }
+                Err(e) => {
+                    warn!(tenant = %tenant.0, error = %e, "coalesce task failed; batches stay as they are");
+                    self.buffers.lock().await.cancel_coalesce(tenant, id);
+                }
+            }
+        }
+    }
+
     /// Rows of `tenant` in every state, plus the id the live rows will get.
     pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Option<FileId>) {
         let snapshot = self.buffers.lock().await.snapshot(tenant);
@@ -606,6 +672,7 @@ impl Ingester {
             buffers: Mutex::new(buffers),
             gate: RwLock::new(()),
             flush_now: Notify::new(),
+            coalesce_now: Notify::new(),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             catalog,
@@ -711,7 +778,11 @@ impl Ingester {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
-                    _ = tick.tick() => shared.flush_due(false).await,
+                    _ = tick.tick() => {
+                        shared.coalesce_due().await;
+                        shared.flush_due(false).await;
+                    }
+                    () = shared.coalesce_now.notified() => shared.coalesce_due().await,
                     () = shared.flush_now.notified() => shared.flush_due(false).await,
                     _ = shutdown.changed() => break,
                 }

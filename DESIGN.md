@@ -132,6 +132,17 @@ The checkpoint is a durable marker next to the segments: replay after a
 restart starts there, which is what prevents rows already in the bucket from
 being flushed twice.
 
+Buffers keep batches in WAL order, the order replay produces, so a file holds
+the same rows in the same order whether it was built from live batches or
+from replayed records, and a retry after a crash reproduces the object byte
+for byte. Request batches are small, a dozen spans, and a flush would
+concatenate thousands of them, so a coalescer merges complete runs of them
+into chunks in the background: a run is complete when every position in it
+is below the smallest position still travelling from the log to a buffer,
+which the WAL writer tracks. Chunks preserve the order, cost a few
+milliseconds each outside every lock, and pack live rows into a fraction of
+the memory of the batches they replace.
+
 ### 2.3 Read path
 
 ```

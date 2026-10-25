@@ -4,6 +4,13 @@
 //! them: `live` (not yet flushed), `flushing` (being written under a known file
 //! id) and `persisted` (registered, kept briefly so queriers whose file list
 //! predates the file still see the rows).
+//!
+//! Batches are kept in the order of their WAL positions, the order replay
+//! produces, so a file holds the same rows in the same order whether it was
+//! built from live batches or from replayed records. Request batches are
+//! small; the coalescer merges complete runs of them into chunks that keep
+//! that order, so a flush concatenates a few large batches and live rows
+//! take the memory of a packed batch.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,14 +21,38 @@ use arrow::record_batch::RecordBatch;
 use fs_catalog::{FileId, TenantId};
 use fs_wal::Position;
 
+/// Why an entry is in the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// One request's batch.
+    Request,
+    /// A request's batch taken by the coalesce with this id; still served
+    /// and counted until the chunk replaces it.
+    Coalescing(u64),
+    /// Several requests' batches merged, in log order.
+    Chunk,
+}
+
+/// One batch and the position of the request it came from; a chunk carries
+/// the position of its earliest request.
+#[derive(Debug, Clone)]
+struct Entry {
+    position: Position,
+    bytes: usize,
+    kind: Kind,
+    batch: RecordBatch,
+}
+
 /// Pending rows of one tenant.
 #[derive(Debug, Default)]
 pub struct TenantBuffer {
-    /// Batches in arrival order.
-    pub batches: Vec<RecordBatch>,
-    /// Rows across `batches`.
+    /// Sorted by position.
+    entries: Vec<Entry>,
+    /// Coalesce in progress over this buffer's entries.
+    coalesce: Option<u64>,
+    /// Rows across the entries.
     pub rows: usize,
-    /// Arrow memory across `batches`.
+    /// Arrow memory across the entries.
     pub bytes: usize,
     /// Smallest WAL position among the records in this buffer. Concurrent
     /// requests reach the buffer in any order, so this is a minimum, never
@@ -32,30 +63,69 @@ pub struct TenantBuffer {
 }
 
 impl TenantBuffer {
-    /// Adds a batch that was logged at `wal`.
+    /// Adds a batch that was logged at `wal`, keeping position order.
     pub fn push(&mut self, batch: RecordBatch, wal: Position, now: Instant) {
         if batch.num_rows() == 0 {
             return;
         }
         self.rows += batch.num_rows();
-        self.bytes += batch.get_array_memory_size();
+        let bytes = batch.get_array_memory_size();
+        self.bytes += bytes;
         self.first_wal = Some(self.first_wal.map_or(wal, |f| f.min(wal)));
         self.oldest.get_or_insert(now);
-        self.batches.push(batch);
+        let entry = Entry {
+            position: wal,
+            bytes,
+            kind: Kind::Request,
+            batch,
+        };
+        // Arrivals are almost always in order: search from the back.
+        let at = self
+            .entries
+            .iter()
+            .rposition(|e| e.position <= wal)
+            .map_or(0, |i| i + 1);
+        self.entries.insert(at, entry);
     }
 
     /// True when nothing is pending.
     pub fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+        self.entries.is_empty()
     }
 
-    /// Puts batches back in front after a failed flush.
+    /// The batches in position order. Shared, not copied.
+    pub fn batches(&self) -> Vec<RecordBatch> {
+        self.entries.iter().map(|e| e.batch.clone()).collect()
+    }
+
+    /// The batches in position order, consuming the buffer.
+    pub fn into_batches(self) -> Vec<RecordBatch> {
+        self.entries.into_iter().map(|e| e.batch).collect()
+    }
+
+    /// Request batches not yet merged into a chunk.
+    pub fn request_batches(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == Kind::Request)
+            .count()
+    }
+
+    /// Puts batches back in front after a failed flush. Every position in
+    /// `earlier` is below every position here.
     pub fn restore(&mut self, mut earlier: TenantBuffer) {
         if earlier.is_empty() {
             return;
         }
-        earlier.batches.append(&mut self.batches);
-        self.batches = earlier.batches;
+        // The coalesce over the earlier rows, if any, is discarded when it
+        // reports: its entries are plain requests again.
+        for entry in &mut earlier.entries {
+            if matches!(entry.kind, Kind::Coalescing(_)) {
+                entry.kind = Kind::Request;
+            }
+        }
+        earlier.entries.append(&mut self.entries);
+        self.entries = earlier.entries;
         self.rows += earlier.rows;
         self.bytes += earlier.bytes;
         self.first_wal = match (earlier.first_wal, self.first_wal) {
@@ -63,6 +133,88 @@ impl TenantBuffer {
             (a, b) => a.or(b),
         };
         self.oldest = earlier.oldest.or(self.oldest);
+    }
+
+    /// Request batches below `bound` (all of them when `None`), if at least
+    /// `min`: marked as taken by coalesce `id` and returned in position order.
+    /// `None` while another coalesce is in progress.
+    fn take_for_coalesce(
+        &mut self,
+        bound: Option<Position>,
+        min: usize,
+        id: u64,
+    ) -> Option<Vec<RecordBatch>> {
+        if self.coalesce.is_some() {
+            return None;
+        }
+        let complete = |e: &Entry| e.kind == Kind::Request && bound.is_none_or(|b| e.position < b);
+        if self.entries.iter().filter(|e| complete(e)).count() < min {
+            return None;
+        }
+        self.coalesce = Some(id);
+        let mut taken = Vec::new();
+        for entry in self.entries.iter_mut().filter(|e| complete(e)) {
+            entry.kind = Kind::Coalescing(id);
+            taken.push(entry.batch.clone());
+        }
+        Some(taken)
+    }
+
+    /// Replaces the entries taken by coalesce `id` with `chunk`, at the
+    /// position of the earliest. False, with the entries back as requests,
+    /// when `id` is not the coalesce in progress or the taken entries are no
+    /// longer contiguous, which no push can cause but is checked anyway: a
+    /// chunk out of order would change the file content.
+    fn finish_coalesce(&mut self, id: u64, chunk: RecordBatch) -> bool {
+        if self.coalesce != Some(id) {
+            self.cancel_coalesce(id);
+            return false;
+        }
+        let taken = |e: &Entry| e.kind == Kind::Coalescing(id);
+        let Some(first) = self.entries.iter().position(taken) else {
+            self.coalesce = None;
+            return false;
+        };
+        let last = self.entries.iter().rposition(taken).unwrap_or(first);
+        let Some(run) = self.entries.get(first..=last) else {
+            self.cancel_coalesce(id);
+            return false;
+        };
+        let (Some(position), true) = (
+            run.first().map(|e| e.position),
+            run.iter().all(taken)
+                && run.iter().map(|e| e.batch.num_rows()).sum::<usize>() == chunk.num_rows(),
+        ) else {
+            self.cancel_coalesce(id);
+            return false;
+        };
+        let removed: usize = run.iter().map(|e| e.bytes).sum();
+        let bytes = chunk.get_array_memory_size();
+        self.entries.drain(first..=last);
+        self.entries.insert(
+            first,
+            Entry {
+                position,
+                bytes,
+                kind: Kind::Chunk,
+                batch: chunk,
+            },
+        );
+        self.bytes = self.bytes - removed + bytes;
+        self.coalesce = None;
+        true
+    }
+
+    /// Returns the entries taken by coalesce `id` to plain requests.
+    fn cancel_coalesce(&mut self, id: u64) {
+        for entry in &mut self.entries {
+            if entry.kind == Kind::Coalescing(id) {
+                entry.kind = Kind::Request;
+            }
+        }
+        if self.coalesce == Some(id) {
+            self.coalesce = None;
+        }
     }
 }
 
@@ -149,6 +301,7 @@ pub struct Buffers {
     default_seed: Position,
     reserved: HashMap<TenantId, Arc<AtomicUsize>>,
     reserved_total: Arc<AtomicUsize>,
+    next_coalesce: u64,
 }
 
 impl Buffers {
@@ -163,6 +316,56 @@ impl Buffers {
             default_seed,
             reserved: HashMap::new(),
             reserved_total: Arc::new(AtomicUsize::new(0)),
+            next_coalesce: 0,
+        }
+    }
+
+    /// A tenant with at least `min` complete request batches below `bound`
+    /// and no coalesce in progress.
+    pub fn coalesce_candidate(&self, bound: Option<Position>, min: usize) -> Option<TenantId> {
+        self.tenants
+            .iter()
+            .find(|(_, b)| {
+                b.coalesce.is_none()
+                    && b.entries
+                        .iter()
+                        .filter(|e| e.kind == Kind::Request && bound.is_none_or(|x| e.position < x))
+                        .count()
+                        >= min
+            })
+            .map(|(t, _)| *t)
+    }
+
+    /// Takes the complete request batches of `tenant` for coalescing; see
+    /// [`TenantBuffer::take_for_coalesce`]. Returns the coalesce id with them.
+    pub fn take_for_coalesce(
+        &mut self,
+        tenant: TenantId,
+        bound: Option<Position>,
+        min: usize,
+    ) -> Option<(u64, Vec<RecordBatch>)> {
+        let id = self.next_coalesce;
+        let batches = self
+            .tenants
+            .get_mut(&tenant)?
+            .take_for_coalesce(bound, min, id)?;
+        self.next_coalesce += 1;
+        Some((id, batches))
+    }
+
+    /// Puts the chunk of coalesce `id` in place of the batches it merged.
+    /// False when the rows were cut for a flush meanwhile: the flush took
+    /// the original batches and the chunk is dropped.
+    pub fn finish_coalesce(&mut self, tenant: TenantId, id: u64, chunk: RecordBatch) -> bool {
+        self.tenants
+            .get_mut(&tenant)
+            .is_some_and(|b| b.finish_coalesce(id, chunk))
+    }
+
+    /// Gives up coalesce `id`: its batches stay as they are.
+    pub fn cancel_coalesce(&mut self, tenant: TenantId, id: u64) {
+        if let Some(b) = self.tenants.get_mut(&tenant) {
+            b.cancel_coalesce(id);
         }
     }
 
@@ -249,7 +452,7 @@ impl Buffers {
         end: Position,
     ) -> Option<Vec<RecordBatch>> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
-        let batches = buffer.batches.clone();
+        let batches = buffer.batches();
         let seed_before = self.seeds.insert(tenant, end);
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
@@ -292,7 +495,7 @@ impl Buffers {
                 .filter(|f| !f.in_progress && (force || f.next_attempt <= now))
             {
                 f.in_progress = true;
-                out.push((*tenant, f.file, f.buffer.batches.clone()));
+                out.push((*tenant, f.file, f.buffer.batches()));
             }
         }
         out
@@ -327,7 +530,7 @@ impl Buffers {
             self.persisted.entry(tenant).or_default().push(Persisted {
                 file,
                 bytes: entry.buffer.bytes,
-                batches: entry.buffer.batches,
+                batches: entry.buffer.into_batches(),
                 at: now,
             });
         }
@@ -369,18 +572,14 @@ impl Buffers {
     pub fn snapshot(&self, tenant: TenantId) -> Snapshot {
         let live = self.tenants.get(&tenant);
         Snapshot {
-            live: live.map(|b| b.batches.clone()).unwrap_or_default(),
+            live: live.map(TenantBuffer::batches).unwrap_or_default(),
             next_file_seed: live
                 .filter(|b| !b.is_empty())
                 .map(|_| self.file_seed(tenant)),
             flushing: self
                 .flushing
                 .get(&tenant)
-                .map(|list| {
-                    list.iter()
-                        .map(|f| (f.file, f.buffer.batches.clone()))
-                        .collect()
-                })
+                .map(|list| list.iter().map(|f| (f.file, f.buffer.batches())).collect())
                 .unwrap_or_default(),
             persisted: self.persisted.get(&tenant).cloned().unwrap_or_default(),
         }
@@ -456,7 +655,7 @@ impl Buffers {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::Int64Array;
+    use arrow::array::{AsArray, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
@@ -510,6 +709,96 @@ mod tests {
         buffers.note_intent_end(tenant, at(90));
         buffers.note_intent_end(tenant, at(60));
         assert_eq!(buffers.file_seed(tenant), at(90), "latest end wins");
+    }
+
+    fn values(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    fn tagged(rows: usize, tag: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let values =
+            Int64Array::from_iter_values((0..rows).map(|i| tag * 100 + i64::try_from(i).unwrap()));
+        RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap()
+    }
+
+    #[test]
+    fn coalesce_merges_complete_batches_in_log_order() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::new(at(0));
+        for (offset, tag) in [(30, 3), (10, 1), (40, 4), (20, 2)] {
+            buffers
+                .get_mut(tenant)
+                .push(tagged(2, tag), at(offset), now);
+        }
+        assert_eq!(
+            buffers.coalesce_candidate(Some(at(35)), 4),
+            None,
+            "only three are complete"
+        );
+        assert_eq!(buffers.coalesce_candidate(Some(at(35)), 3), Some(tenant));
+        let (id, taken) = buffers.take_for_coalesce(tenant, Some(at(35)), 3).unwrap();
+        assert_eq!(values(&taken), vec![100, 101, 200, 201, 300, 301]);
+        assert_eq!(
+            buffers.take_for_coalesce(tenant, None, 1),
+            None,
+            "one at a time"
+        );
+        // Rows arriving meanwhile sit above the bound and after the chunk.
+        buffers.get_mut(tenant).push(tagged(1, 5), at(50), now);
+        let before = buffers.get_mut(tenant).bytes;
+        let chunk =
+            arrow::compute::concat_batches(&taken.first().unwrap().schema(), &taken).unwrap();
+        assert!(buffers.finish_coalesce(tenant, id, chunk));
+        let live = buffers.get_mut(tenant);
+        assert_eq!(
+            values(&live.batches()),
+            vec![100, 101, 200, 201, 300, 301, 400, 401, 500]
+        );
+        assert_eq!(live.request_batches(), 2);
+        assert_eq!(live.rows, 9);
+        assert!(
+            live.bytes < before,
+            "a chunk is smaller than the batches it merged"
+        );
+        assert_eq!(live.first_wal, Some(at(10)));
+    }
+
+    #[test]
+    fn coalesce_result_after_a_cut_is_dropped() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let file = FileId(uuid::Uuid::from_u128(1));
+        let now = Instant::now();
+        let mut buffers = Buffers::new(at(0));
+        buffers.get_mut(tenant).push(tagged(1, 1), at(10), now);
+        buffers.get_mut(tenant).push(tagged(1, 2), at(20), now);
+        let (id, taken) = buffers.take_for_coalesce(tenant, None, 2).unwrap();
+        let flushed = buffers.begin_flush(tenant, file, at(30)).unwrap();
+        assert_eq!(
+            values(&flushed),
+            vec![100, 200],
+            "the flush took the originals"
+        );
+        let chunk =
+            arrow::compute::concat_batches(&taken.first().unwrap().schema(), &taken).unwrap();
+        assert!(!buffers.finish_coalesce(tenant, id, chunk));
+        buffers.get_mut(tenant).push(tagged(1, 3), at(40), now);
+        assert_eq!(
+            buffers
+                .take_for_coalesce(tenant, None, 1)
+                .map(|(_, b)| values(&b)),
+            Some(vec![300])
+        );
     }
 
     #[test]

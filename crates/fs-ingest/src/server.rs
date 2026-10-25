@@ -57,28 +57,39 @@ impl TraceService for TraceReceiver {
             signal: RecordSignal::Traces,
             payload,
         };
-        let outcome = shared
-            .ingest(tenant, &message, record.encode(), now)
-            .await
-            .map_err(|e| match e {
-                IngestError::Backpressure(what) => {
-                    shared
-                        .stats
-                        .over_capacity
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Status::resource_exhausted(format!("ingester busy: {what}"))
-                }
-                IngestError::Capacity(what) => Status::resource_exhausted(what),
-                IngestError::WalFull => Status::unavailable("write-ahead log full"),
-                IngestError::Wal(_) | IngestError::Join(_) => {
-                    warn!(error = %e, "wal append failed");
-                    Status::unavailable("write-ahead log unavailable")
-                }
-                other => {
-                    warn!(error = %other, "conversion failed");
-                    Status::internal("conversion failed")
-                }
-            })?;
+        // On its own task: a client that goes away after the record is logged
+        // must not drop the work before the rows reach the buffer, or memory
+        // and the log would disagree until a restart replayed it.
+        let task_shared = Arc::clone(shared);
+        let outcome = tokio::spawn(async move {
+            task_shared
+                .ingest(tenant, &message, record.encode(), now)
+                .await
+        })
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "ingest task failed");
+            Status::internal("ingest task failed")
+        })?
+        .map_err(|e| match e {
+            IngestError::Backpressure(what) => {
+                shared
+                    .stats
+                    .over_capacity
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Status::resource_exhausted(format!("ingester busy: {what}"))
+            }
+            IngestError::Capacity(what) => Status::resource_exhausted(what),
+            IngestError::WalFull => Status::unavailable("write-ahead log full"),
+            IngestError::Wal(_) | IngestError::Join(_) => {
+                warn!(error = %e, "wal append failed");
+                Status::unavailable("write-ahead log unavailable")
+            }
+            other => {
+                warn!(error = %other, "conversion failed");
+                Status::internal("conversion failed")
+            }
+        })?;
         debug!(tenant = %tenant.0, spans = outcome.accepted, rejected = outcome.rejected, "export");
 
         let partial_success = (outcome.rejected > 0).then(|| ExportTracePartialSuccess {

@@ -1376,3 +1376,95 @@ async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
     h.stop().await;
     db.finish().await;
 }
+
+/// Chunks built in the background hold the rows in log order, so the file
+/// written from chunks is the file replay rebuilds from the records: the
+/// retry after a crash registers the same bytes.
+#[tokio::test]
+async fn coalesced_flush_matches_replay_byte_for_byte() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        coalesce_batches: 3,
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for i in 1..=8u8 {
+        let service = ["api", "web", "db"][usize::from(i % 3)];
+        client
+            .export(authed(request(service, i, 5), &token))
+            .await
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.ingester.flush_stats().coalesces.load(Ordering::Relaxed) < 2 {
+        assert!(std::time::Instant::now() < deadline, "coalescer never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let served = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        served
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        40,
+        "rows stay served while chunks replace batches"
+    );
+
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(
+        h.ingester.stats().flush_failures.load(Ordering::Relaxed),
+        0,
+        "the file rebuilt from the log registers as the same content"
+    );
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].row_count, 40);
+    h.stop().await;
+    db.finish().await;
+}
