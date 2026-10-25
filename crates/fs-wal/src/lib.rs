@@ -39,6 +39,7 @@
 
 mod checkpoint;
 mod format;
+mod instance;
 mod replay;
 mod segment;
 mod wal;

@@ -45,7 +45,9 @@ impl WalConfig {
 }
 
 /// A location in the log: segment id and byte offset. Orders by write order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Position {
     /// Segment id.
     pub segment: u64,
@@ -81,6 +83,8 @@ pub struct Wal {
     checkpoint: Option<Position>,
     /// Bytes of every segment on disk, including the active one.
     bytes: u64,
+    /// Identity of this log directory.
+    instance: uuid::Uuid,
 }
 
 impl Wal {
@@ -96,15 +100,22 @@ impl Wal {
             Some(&(id, ref path)) => recover_last(&config, id, path)?,
         };
         let checkpoint = read_checkpoint(&config.dir)?;
+        let instance = crate::instance::load_or_create(&config.dir)?;
         let mut wal = Self {
             config,
             active,
             recovery,
             checkpoint,
             bytes: 0,
+            instance,
         };
         wal.bytes = wal.measure()?;
         Ok(wal)
+    }
+
+    /// Identity of this log directory, created with it and stable across restarts.
+    pub fn instance_id(&self) -> uuid::Uuid {
+        self.instance
     }
 
     /// Everything before this position is already materialised.

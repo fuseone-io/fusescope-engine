@@ -104,14 +104,26 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
          5. checkpoint the WAL at the first still-buffered record
 ```
 
-A file exists for the querier only after the catalog INSERT. The file id is
-derived from the tenant and the WAL position of the buffer's first record, so
-a flush replayed after a crash writes the same object and the INSERT is
-idempotent on id. The checkpoint is a durable marker next to the segments:
-replay after a restart starts there, which is what prevents rows already in
-the bucket from being flushed twice. If the ingester dies between steps 2 and
-4, the next run rebuilds and re-registers the same file; if it dies before
-step 2, the WAL is replayed from the checkpoint.
+A file exists for the querier only after the catalog INSERT. Three things
+make the flush idempotent under crashes at any step, with other requests
+arriving meanwhile:
+
+- The file id is derived from the WAL instance id (created with the WAL
+  directory, so two ingesters or a recreated volume never collide), the tenant
+  and the WAL position of the buffer's first record.
+- Before uploading, the ingester appends a flush intent to the WAL naming the
+  file id and the exact record range it covers. The range is exact because
+  requests append to the WAL and to the buffer under a shared gate that the
+  flush takes exclusively while it cuts the buffer. Replay groups records
+  under their intents, so a retry produces the same object and the same
+  catalog row even if later rows arrived during the original flush.
+- Uploads never overwrite (conditional create), and registering an existing
+  id verifies the immutable fields; a mismatch is an error, never a silent
+  accept.
+
+The checkpoint is a durable marker next to the segments: replay after a
+restart starts there, which is what prevents rows already in the bucket from
+being flushed twice.
 
 ### 2.3 Read path
 

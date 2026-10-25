@@ -17,14 +17,58 @@ const VERSION: u8 = 1;
 pub enum RecordSignal {
     /// `ExportTraceServiceRequest`.
     Traces = 1,
+    /// A [`FlushIntent`]: the exact set of earlier records one file is made of.
+    FlushIntent = 2,
 }
 
 impl RecordSignal {
     fn from_byte(b: u8) -> Option<Self> {
         match b {
             1 => Some(Self::Traces),
+            2 => Some(Self::FlushIntent),
             _ => None,
         }
+    }
+}
+
+/// Written to the WAL before a flush uploads anything. After a crash, replay
+/// groups the tenant's records in `[first, end)` under `file` again, so a
+/// retried flush produces the same object and the same catalog row even if
+/// later rows arrived meanwhile.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FlushIntent {
+    /// Tenant whose rows the file holds.
+    pub tenant: TenantId,
+    /// Id derived from `(wal instance, tenant, first)`.
+    pub file: fs_catalog::FileId,
+    /// Position of the first record in the file.
+    pub first: fs_wal::Position,
+    /// Position just past the last record in the file.
+    pub end: fs_wal::Position,
+}
+
+impl FlushIntent {
+    /// Serialises the intent as a WAL record payload.
+    pub fn to_record(&self) -> WalRecord {
+        WalRecord {
+            tenant: self.tenant,
+            signal: RecordSignal::FlushIntent,
+            payload: Bytes::from(serde_json::to_vec(self).unwrap_or_default()),
+        }
+    }
+
+    /// Parses an intent payload.
+    ///
+    /// # Errors
+    /// Malformed payload.
+    pub fn from_payload(payload: &[u8]) -> Result<Self, IngestError> {
+        serde_json::from_slice(payload)
+            .map_err(|e| IngestError::Record(format!("bad flush intent: {e}")))
+    }
+
+    /// True when a record of this tenant at `position` belongs to the file.
+    pub fn covers(&self, tenant: TenantId, position: fs_wal::Position) -> bool {
+        self.tenant == tenant && position >= self.first && position < self.end
     }
 }
 
@@ -95,6 +139,59 @@ mod tests {
         let bytes = record.encode();
         assert_eq!(bytes.len(), HEADER_LEN + 4);
         assert_eq!(WalRecord::decode(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn intent_round_trip_and_coverage() {
+        let tenant = TenantId::new();
+        let intent = FlushIntent {
+            tenant,
+            file: fs_catalog::FileId::new(),
+            first: fs_wal::Position {
+                segment: 1,
+                offset: 16,
+            },
+            end: fs_wal::Position {
+                segment: 1,
+                offset: 4096,
+            },
+        };
+        let record = intent.to_record();
+        assert_eq!(record.signal, RecordSignal::FlushIntent);
+        let decoded = WalRecord::decode(&record.encode()).unwrap();
+        assert_eq!(FlushIntent::from_payload(&decoded.payload).unwrap(), intent);
+        assert!(intent.covers(
+            tenant,
+            fs_wal::Position {
+                segment: 1,
+                offset: 16
+            }
+        ));
+        assert!(intent.covers(
+            tenant,
+            fs_wal::Position {
+                segment: 1,
+                offset: 4095
+            }
+        ));
+        assert!(
+            !intent.covers(
+                tenant,
+                fs_wal::Position {
+                    segment: 1,
+                    offset: 4096
+                }
+            ),
+            "end is exclusive"
+        );
+        assert!(!intent.covers(
+            TenantId::new(),
+            fs_wal::Position {
+                segment: 1,
+                offset: 100
+            }
+        ));
+        assert!(FlushIntent::from_payload(b"nope").is_err());
     }
 
     #[test]

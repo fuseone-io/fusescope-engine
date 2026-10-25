@@ -419,17 +419,54 @@ async fn insert_file(
     .bind(FileState::Visible.code())
     .fetch_optional(&mut **tx)
     .await?;
-    let row =
-        match inserted {
-            Some(row) => row,
-            None => sqlx::query_as::<_, FileRow>(
-                "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+    let row = if let Some(row) = inserted {
+        row
+    } else {
+        let existing = sqlx::query_as::<_, FileRow>(
+            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                     services, summary, state, created_at, quarantined_at
              from engine_file where id = $1",
-            )
-            .bind(file.id)
-            .fetch_one(&mut **tx)
-            .await?,
-        };
+        )
+        .bind(file.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        verify_same_content(file, &existing)?;
+        existing
+    };
     FileRecord::try_from(row)
+}
+
+/// A second registration under one id must describe the same bytes.
+fn verify_same_content(file: &NewFile, existing: &FileRow) -> Result<(), CatalogError> {
+    let mismatch = |field| {
+        Err(CatalogError::FileMismatch {
+            id: file.id.0,
+            field,
+        })
+    };
+    if existing.tenant_id != file.tenant_id {
+        return mismatch("tenant");
+    }
+    if existing.signal != file.signal.code() {
+        return mismatch("signal");
+    }
+    if existing.level != file.level.code() {
+        return mismatch("level");
+    }
+    if existing.path != file.path {
+        return mismatch("path");
+    }
+    if existing.size_bytes != file.size_bytes {
+        return mismatch("size_bytes");
+    }
+    if existing.row_count != file.row_count {
+        return mismatch("row_count");
+    }
+    if existing.ts_min != file.range.start || existing.ts_max != file.range.end {
+        return mismatch("time range");
+    }
+    if existing.services != file.services {
+        return mismatch("services");
+    }
+    Ok(())
 }

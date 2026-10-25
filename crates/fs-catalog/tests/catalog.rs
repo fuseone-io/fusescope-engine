@@ -540,11 +540,24 @@ async fn register_is_idempotent_on_id() {
         .unwrap()
         .id;
     let mut f = file(t, Signal::Traces, 0, 1, &["api"]);
-    f.id = FileId::derived(t, 7, 4096);
+    f.id = FileId::derived(uuid::Uuid::new_v4(), t, 7, 4096);
     f.path = format!("t/{}/traces/l0/{}.parquet", t.0, f.id.0);
     let first = db.catalog.register_file(&f).await.unwrap();
     let again = db.catalog.register_file(&f).await.unwrap();
     assert_eq!(first, again, "same id returns the existing row");
+    let mut changed = f.clone();
+    changed.row_count += 1;
+    let err = db.catalog.register_file(&changed).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CatalogError::FileMismatch {
+                field: "row_count",
+                ..
+            }
+        ),
+        "{err}"
+    );
     let visible = db
         .catalog
         .visible_files(

@@ -62,10 +62,12 @@ impl FileId {
 
     /// An id derived from what a flush contains, so a retried or replayed
     /// flush of the same rows produces the same id and path, and registering
-    /// it twice is idempotent. `segment` and `offset` locate the first record
-    /// of the flushed buffer in the ingester's write-ahead log.
-    pub fn derived(tenant: TenantId, segment: u64, offset: u64) -> Self {
-        let mut name = Vec::with_capacity(32);
+    /// it twice is idempotent. `instance` identifies the write-ahead log
+    /// directory (two ingesters start at the same positions), and `segment`
+    /// and `offset` locate the first record of the flushed buffer in it.
+    pub fn derived(instance: Uuid, tenant: TenantId, segment: u64, offset: u64) -> Self {
+        let mut name = Vec::with_capacity(48);
+        name.extend_from_slice(instance.as_bytes());
         name.extend_from_slice(tenant.0.as_bytes());
         name.extend_from_slice(&segment.to_le_bytes());
         name.extend_from_slice(&offset.to_le_bytes());
@@ -486,11 +488,17 @@ mod tests {
     #[test]
     fn derived_ids_are_stable_and_distinct() {
         let tenant = TenantId::new();
-        let a = FileId::derived(tenant, 3, 4096);
-        assert_eq!(a, FileId::derived(tenant, 3, 4096));
-        assert_ne!(a, FileId::derived(tenant, 3, 4097));
-        assert_ne!(a, FileId::derived(tenant, 4, 4096));
-        assert_ne!(a, FileId::derived(TenantId::new(), 3, 4096));
+        let wal = Uuid::new_v4();
+        let a = FileId::derived(wal, tenant, 3, 4096);
+        assert_eq!(a, FileId::derived(wal, tenant, 3, 4096));
+        assert_ne!(a, FileId::derived(wal, tenant, 3, 4097));
+        assert_ne!(a, FileId::derived(wal, tenant, 4, 4096));
+        assert_ne!(a, FileId::derived(wal, TenantId::new(), 3, 4096));
+        assert_ne!(
+            a,
+            FileId::derived(Uuid::new_v4(), tenant, 3, 4096),
+            "another ingester, another id"
+        );
     }
 
     #[test]

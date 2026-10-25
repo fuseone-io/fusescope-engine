@@ -493,7 +493,11 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
         14
     );
-    assert_eq!(got.persisted_files.len(), 0);
+    assert_eq!(
+        got.persisted_files.len(),
+        1,
+        "live rows announce the id their file will get"
+    );
 
     let api_names = HotScanRequest {
         tenant,
@@ -642,6 +646,205 @@ async fn restart_after_flush_does_not_duplicate_rows() {
         .unwrap();
     assert_eq!(registered.len(), 2);
     assert_eq!(registered.iter().map(|f| f.row_count).sum::<i64>(), 23);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Crash after the file is registered but before the checkpoint, with more
+/// rows arriving while the flush ran. Replay must keep the original grouping:
+/// the first file is reproduced byte for byte and the later rows become a
+/// second file, instead of one file silently growing under the same id.
+#[tokio::test]
+async fn crash_after_register_keeps_flush_boundaries() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+
+    let no_checkpoint = IngestConfig {
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), no_checkpoint).await;
+    h.client()
+        .await
+        .export(authed(request("api", 7, 10), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await; // intent + upload + register, no checkpoint
+    h.client()
+        .await
+        .export(authed(request("api", 8, 3), &token))
+        .await
+        .unwrap(); // arrives after the flush
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+    let first_files = parquet_files(&dir.path().join("bucket"));
+    assert_eq!(first_files.len(), 1);
+    let first_len = std::fs::metadata(&first_files[0]).unwrap().len();
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    assert!(
+        h.ingester.stats().flushes_recovered.load(Ordering::Relaxed) >= 1,
+        "the intent was resumed"
+    );
+    h.ingester.flush_all().await;
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(files.len(), 2, "the 3 late rows become their own file");
+    assert_eq!(
+        std::fs::metadata(&first_files[0]).unwrap().len(),
+        first_len,
+        "the first object is untouched"
+    );
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut rows: Vec<i64> = registered.iter().map(|f| f.row_count).collect();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![3, 10]);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Crash after the intent but before the upload succeeded: the retry after
+/// restart writes exactly the intended file, once.
+#[tokio::test]
+async fn crash_after_intent_before_upload_is_resumed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.client()
+        .await
+        .export(authed(request("api", 7, 10), &token))
+        .await
+        .unwrap();
+    // Make the bucket unwritable so the upload fails after the intent is logged.
+    let bucket = h.dir.path().join("bucket");
+    std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o555)).unwrap();
+    h.ingester.flush_all().await;
+    assert!(h.ingester.stats().flush_failures.load(Ordering::Relaxed) >= 1);
+    std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o755)).unwrap();
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+    assert_eq!(parquet_files(&dir.path().join("bucket")).len(), 0);
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].row_count, 10);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Live rows already announce the id their file will get, so a querier that
+/// sees the file appear while planning still excludes it.
+#[tokio::test]
+async fn hot_window_announces_prospective_file_id() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.client()
+        .await
+        .export(authed(request("api", 1, 4), &token))
+        .await
+        .unwrap();
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let before = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        before.persisted_files.len(),
+        1,
+        "live rows carry their future file id"
+    );
+
+    h.ingester.flush_all().await;
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(
+        registered[0].id, before.persisted_files[0],
+        "the announced id is the registered one"
+    );
     h.stop().await;
     db.finish().await;
 }

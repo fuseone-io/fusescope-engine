@@ -312,3 +312,12 @@ fn checkpoint_skips_materialised_records_across_restarts() {
     let (payloads, _) = records(&mut wal);
     assert_eq!(payloads.len(), 0);
 }
+
+#[test]
+fn instance_id_survives_restart_and_differs_per_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = Wal::open(config(dir.path())).unwrap().instance_id();
+    assert_eq!(Wal::open(config(dir.path())).unwrap().instance_id(), id);
+    let other = tempfile::tempdir().unwrap();
+    assert_ne!(Wal::open(config(other.path())).unwrap().instance_id(), id);
+}

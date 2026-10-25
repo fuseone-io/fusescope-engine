@@ -1727,8 +1727,10 @@ name = "fs-wal"
 version = "0.0.1"
 dependencies = [
  "crc32c",
+ "serde",
  "tempfile",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

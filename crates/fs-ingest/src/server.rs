@@ -12,6 +12,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
+use crate::IngestError;
 use crate::ingester::Shared;
 use crate::record::{RecordSignal, WalRecord};
 
@@ -58,17 +59,18 @@ impl TraceService for TraceReceiver {
             signal: RecordSignal::Traces,
             payload,
         };
-        let position = shared.append_wal(record.encode()).await.map_err(|e| {
-            warn!(error = %e, "wal append failed");
-            Status::unavailable("write-ahead log unavailable")
-        })?;
-
         let outcome = shared
-            .convert_and_buffer(tenant, &message, position, now)
+            .ingest(tenant, &message, record.encode(), now)
             .await
-            .map_err(|e| {
-                warn!(error = %e, "conversion failed after wal append");
-                Status::internal("conversion failed")
+            .map_err(|e| match e {
+                IngestError::Wal(_) | IngestError::Join(_) => {
+                    warn!(error = %e, "wal append failed");
+                    Status::unavailable("write-ahead log unavailable")
+                }
+                other => {
+                    warn!(error = %other, "conversion failed after wal append");
+                    Status::internal("conversion failed")
+                }
             })?;
         debug!(tenant = %tenant.0, spans = outcome.accepted, rejected = outcome.rejected, "export");
 

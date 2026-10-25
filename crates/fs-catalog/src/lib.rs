@@ -46,6 +46,16 @@ pub enum CatalogError {
         /// Inputs still visible at swap time.
         found: usize,
     },
+    /// A file was registered again under the same id with different content.
+    /// The id is derived from what a flush contains, so this means a retry
+    /// grouped rows differently from the original; the caller must not proceed.
+    #[error("file {id} already registered with a different {field}")]
+    FileMismatch {
+        /// File id.
+        id: uuid::Uuid,
+        /// First differing field.
+        field: &'static str,
+    },
     /// The operating system could not provide randomness for a token.
     #[error("randomness unavailable: {0}")]
     Randomness(#[from] getrandom::Error),

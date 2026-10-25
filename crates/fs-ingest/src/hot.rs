@@ -3,10 +3,11 @@
 //!
 //! The querier sends a [`HotScanRequest`] as the ticket. The ingester filters
 //! its buffers by time and service, projects the requested columns and streams
-//! the result. The response header [`PERSISTED_FILES_HEADER`] lists the files
-//! whose rows are included although already registered in the catalog, so the
-//! querier drops those files from its own scan and reads neither twice nor
-//! never.
+//! the result. The response header [`PERSISTED_FILES_HEADER`] lists the ids of
+//! every file whose rows are included: already registered, being written, or
+//! the id the live rows will get. The querier drops those files from its own
+//! scan and reads neither twice nor never, whatever the catalog shows at the
+//! moment it plans.
 //!
 //! This endpoint is internal: it trusts the caller's tenant id. It must only
 //! be reachable by queriers (cluster network now, mTLS later).
@@ -252,22 +253,28 @@ impl FlightService for HotService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let scan = HotScanRequest::from_ticket(request.get_ref())?;
-        let snapshot = self.shared.snapshot(scan.tenant).await;
-        let mut batches = Vec::with_capacity(snapshot.live.len());
-        let mut persisted = Vec::with_capacity(snapshot.persisted.len());
-        for batch in snapshot
+        let (snapshot, live_file) = self.shared.snapshot(scan.tenant).await;
+        let sources = snapshot
             .live
             .iter()
-            .chain(snapshot.persisted.iter().flat_map(|p| p.batches.iter()))
-        {
+            .chain(snapshot.flushing.iter().flat_map(|(_, b)| b.iter()))
+            .chain(snapshot.persisted.iter().flat_map(|p| p.batches.iter()));
+        let mut batches = Vec::new();
+        for batch in sources {
             let kept = apply(batch, &scan).map_err(|e| Status::invalid_argument(e.to_string()))?;
             if kept.num_rows() > 0 {
                 batches.push(kept);
             }
         }
-        for p in &snapshot.persisted {
-            persisted.push(p.file.0.to_string());
-        }
+        // Every file id whose rows are (or will be) in this answer. Excluding
+        // an id that is not in the catalog yet is harmless and closes the race
+        // where it appears while the querier plans.
+        let persisted: Vec<String> = live_file
+            .into_iter()
+            .chain(snapshot.flushing.iter().map(|(id, _)| *id))
+            .chain(snapshot.persisted.iter().map(|p| p.file))
+            .map(|id| id.0.to_string())
+            .collect();
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         debug!(tenant = %scan.tenant.0, rows, persisted = persisted.len(), "hot scan");
 

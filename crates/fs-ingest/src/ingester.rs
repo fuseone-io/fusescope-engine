@@ -1,10 +1,28 @@
 //! Ingester lifecycle: WAL replay, gRPC server, flusher, shutdown.
+//!
+//! # Flush protocol
+//!
+//! A flush must produce the same file whether it runs once or is retried after
+//! a crash at any point, with other requests arriving meanwhile:
+//!
+//! 1. Under the flush gate (a write lock no request holds while it appends to
+//!    the WAL and buffers), take the tenant's live rows and read the WAL
+//!    position: every record before it is in the buffers, so the rows taken
+//!    are exactly the tenant's records in `[first, end)`.
+//! 2. Append a [`FlushIntent`] naming the file id and that range, and sync.
+//! 3. Encode, upload without overwriting, register idempotently.
+//! 4. Move the rows to the persisted state and checkpoint the WAL.
+//!
+//! Replay groups records under the intents found in the log, so a crash
+//! anywhere after step 2 reproduces the same file and the same catalog row;
+//! a crash before step 2 simply flushes the rows again under a new intent.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use fs_catalog::{Catalog, TenantId};
+use arrow::record_batch::RecordBatch;
+use fs_catalog::{Catalog, FileId, TenantId};
 use fs_schema::spans::SpanBatchBuilder;
 use fs_wal::{Event, Position, Wal};
 use object_store::ObjectStore;
@@ -12,15 +30,16 @@ use object_store::path::Path;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use prost::Message;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tonic::Status;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::buffer::Buffers;
+use crate::buffer::{Buffers, Snapshot, TenantBuffer};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
-use crate::record::{RecordSignal, WalRecord};
+use crate::record::{FlushIntent, RecordSignal, WalRecord};
 use crate::server::TraceReceiver;
 use crate::{IngestError, flush};
 
@@ -41,6 +60,8 @@ pub struct IngestStats {
     pub files_flushed: AtomicU64,
     /// Flush attempts that failed.
     pub flush_failures: AtomicU64,
+    /// Flushes resumed from an intent after a restart.
+    pub flushes_recovered: AtomicU64,
 }
 
 /// Result of converting one request.
@@ -56,7 +77,11 @@ pub struct Shared {
     pub(crate) limiter: Option<StdMutex<RateLimiter>>,
     pub(crate) stats: IngestStats,
     wal: Arc<StdMutex<Wal>>,
+    instance: Uuid,
     buffers: Mutex<Buffers>,
+    /// Requests hold it shared across WAL append and buffer push; a flush
+    /// holds it exclusively while it takes a buffer and reads the WAL position.
+    gate: RwLock<()>,
     flush_now: Notify,
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
@@ -84,7 +109,7 @@ impl Shared {
     }
 
     /// Appends and syncs on a blocking thread.
-    pub(crate) async fn append_wal(&self, record: Vec<u8>) -> Result<Position, IngestError> {
+    async fn append_wal(&self, record: Vec<u8>) -> Result<Position, IngestError> {
         let wal = self.wal.clone();
         let position = tokio::task::spawn_blocking(move || {
             let mut wal = wal.lock().map_err(|_| fs_wal::WalError::EmptyRecord)?;
@@ -96,14 +121,19 @@ impl Shared {
         Ok(position)
     }
 
-    /// Converts a request and adds it to the tenant buffer.
-    pub(crate) async fn convert_and_buffer(
+    /// Logs a request, converts it and adds it to the tenant buffer, all while
+    /// holding the flush gate so a concurrent flush sees either both effects or
+    /// neither.
+    pub(crate) async fn ingest(
         &self,
         tenant: TenantId,
         message: &ExportTraceServiceRequest,
-        position: Position,
+        record: Vec<u8>,
         now: Instant,
     ) -> Result<Converted, IngestError> {
+        let _shared = self.gate.read().await;
+        let position = self.append_wal(record).await?;
+
         let mut builder = SpanBatchBuilder::new(self.config.limits);
         builder.append_request(message)?;
         let stats = builder.stats();
@@ -111,11 +141,12 @@ impl Shared {
         let accepted = batch.num_rows();
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
 
-        let mut buffers = self.buffers.lock().await;
-        buffers.push_batch(tenant, batch, position, now);
-        let due = buffers.get_mut(tenant).rows >= self.config.flush_rows
-            || buffers.get_mut(tenant).bytes >= self.config.flush_bytes;
-        drop(buffers);
+        let due = {
+            let mut buffers = self.buffers.lock().await;
+            buffers.get_mut(tenant).push(batch, position, now);
+            let live = buffers.get_mut(tenant);
+            live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes
+        };
         if due {
             self.flush_now.notify_one();
         }
@@ -129,31 +160,66 @@ impl Shared {
         Ok(Converted { accepted, rejected })
     }
 
-    /// Flushes one tenant. On failure the rows go back to the buffer.
+    /// Steps 1 and 2 of the flush protocol, then materialisation.
     async fn flush_tenant(&self, tenant: TenantId) -> Result<bool, IngestError> {
-        let Some(taken) = self.buffers.lock().await.take(tenant) else {
-            return Ok(false);
+        let (file_id, intent, batches) = {
+            let _exclusive = self.gate.write().await;
+            let end = self
+                .wal
+                .lock()
+                .map(|w| w.position())
+                .map_err(|_| fs_wal::WalError::EmptyRecord)?;
+            let mut buffers = self.buffers.lock().await;
+            let Some(first) = buffers.live_first_wal(tenant) else {
+                return Ok(false);
+            };
+            let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
+            let Some(batches) = buffers.begin_flush(tenant, file_id) else {
+                return Ok(false);
+            };
+            (
+                file_id,
+                FlushIntent {
+                    tenant,
+                    file: file_id,
+                    first,
+                    end,
+                },
+                batches,
+            )
         };
+        if let Err(e) = self.append_wal(intent.to_record().encode()).await {
+            self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
+            warn!(tenant = %tenant.0, error = %e, "flush intent could not be logged; keeping rows buffered");
+            self.buffers.lock().await.abort_flush(tenant, file_id);
+            return Err(e);
+        }
+        self.materialize(tenant, file_id, batches)
+            .await
+            .map(|()| true)
+    }
+
+    /// Steps 3 and 4: encode, upload, register, persist, checkpoint. On failure
+    /// the rows return to the live buffer; the intent in the WAL still binds
+    /// them to `file_id` if the process dies before the retry.
+    async fn materialize(
+        &self,
+        tenant: TenantId,
+        file_id: FileId,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), IngestError> {
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let root = self.root.clone();
-        let batches = taken.batches.clone();
-        // The id follows from the first WAL record in the buffer: a flush
-        // replayed after a crash rebuilds the same file and registration stays
-        // idempotent.
-        let first = taken.first_wal.unwrap_or(Position {
-            segment: 0,
-            offset: 0,
-        });
-        let file_id = fs_catalog::FileId::derived(tenant, first.segment, first.offset);
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
                 .await;
         let result = match prepared {
             Ok(Ok(prepared)) => match flush::upload(self.store.as_ref(), &prepared).await {
-                Ok(()) => self
+                Ok(created) => self
                     .catalog
                     .register_file(&prepared.file)
                     .await
-                    .map(|_| prepared.file)
+                    .map(|_| (prepared.file, created))
                     .map_err(IngestError::from),
                 Err(e) => Err(e),
             },
@@ -161,24 +227,43 @@ impl Shared {
             Err(e) => Err(IngestError::from(e)),
         };
         match result {
-            Ok(file) => {
+            Ok((file, created)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
-                info!(tenant = %tenant.0, path = %file.path, rows = file.row_count, bytes = file.size_bytes, services = file.services.len(), "flushed l0");
-                // Keep serving the rows until queriers have surely seen the file.
-                self.buffers.lock().await.remember_persisted(
-                    tenant,
-                    file.id,
-                    taken.batches,
-                    Instant::now(),
+                info!(
+                    tenant = %tenant.0,
+                    path = %file.path,
+                    rows = file.row_count,
+                    bytes = file.size_bytes,
+                    services = file.services.len(),
+                    created,
+                    "flushed l0"
                 );
-                self.checkpoint_wal().await;
-                Ok(true)
+                self.buffers
+                    .lock()
+                    .await
+                    .finish_flush(tenant, file_id, Instant::now());
+                if self.config.checkpoint_after_flush {
+                    self.checkpoint_wal().await;
+                }
+                Ok(())
             }
             Err(e) => {
                 self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
-                warn!(tenant = %tenant.0, error = %e, rows = taken.rows, "flush failed, keeping rows buffered");
-                self.buffers.lock().await.get_mut(tenant).restore(taken);
+                warn!(tenant = %tenant.0, error = %e, rows, "flush failed, keeping rows buffered");
+                self.buffers.lock().await.abort_flush(tenant, file_id);
                 Err(e)
+            }
+        }
+    }
+
+    /// Finishes flushes that an intent in the WAL had started before a restart.
+    async fn recover_flushing(&self) {
+        let pending = self.buffers.lock().await.flushing();
+        for (tenant, file, batches) in pending {
+            self.stats.flushes_recovered.fetch_add(1, Ordering::Relaxed);
+            info!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "resuming flush from intent");
+            if let Err(e) = self.materialize(tenant, file, batches).await {
+                error!(tenant = %tenant.0, file = %file.0, error = %e, "recovered flush failed; rows stay buffered under the same intent");
             }
         }
     }
@@ -202,9 +287,13 @@ impl Shared {
         }
     }
 
-    /// Live and recently persisted rows of `tenant`, for the hot window.
-    pub(crate) async fn snapshot(&self, tenant: TenantId) -> crate::buffer::Snapshot {
-        self.buffers.lock().await.snapshot(tenant)
+    /// Rows of `tenant` in every state, plus the id the live rows will get.
+    pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Option<FileId>) {
+        let snapshot = self.buffers.lock().await.snapshot(tenant);
+        let live_file = snapshot
+            .live_first_wal
+            .map(|p| FileId::derived(self.instance, tenant, p.segment, p.offset));
+        (snapshot, live_file)
     }
 
     async fn flush_due(&self, everything: bool) {
@@ -231,24 +320,30 @@ impl Shared {
     }
 }
 
-/// Rebuilds buffers from the WAL. Returns `(records, damaged)`; damaged
-/// records are counted and skipped.
-fn replay(
-    limits: fs_schema::limits::Limits,
-    wal: &mut Wal,
-    buffers: &mut Buffers,
-) -> Result<(usize, usize), IngestError> {
-    let mut records = 0usize;
-    let mut damaged = 0usize;
-    let now = Instant::now();
+/// Everything replay found: rows with their positions, and flush intents.
+struct Replayed {
+    rows: Vec<(TenantId, Position, RecordBatch)>,
+    intents: Vec<FlushIntent>,
+    records: usize,
+    damaged: usize,
+}
+
+/// Reads the WAL from the checkpoint. Damaged records are counted and skipped.
+fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, IngestError> {
+    let mut out = Replayed {
+        rows: Vec::new(),
+        intents: Vec::new(),
+        records: 0,
+        damaged: 0,
+    };
     for event in wal.replay()? {
         match event {
             Event::Record(entry) => {
-                records += 1;
+                out.records += 1;
                 let record = match WalRecord::decode(&entry.payload) {
                     Ok(r) => r,
                     Err(e) => {
-                        damaged += 1;
+                        out.damaged += 1;
                         warn!(position = ?entry.position, error = %e, "skipping undecodable wal record");
                         continue;
                     }
@@ -256,35 +351,55 @@ fn replay(
                 match record.signal {
                     RecordSignal::Traces => {
                         let Ok(message) = ExportTraceServiceRequest::decode(record.payload) else {
-                            damaged += 1;
+                            out.damaged += 1;
                             continue;
                         };
                         let mut builder = SpanBatchBuilder::new(limits);
                         builder.append_request(&message)?;
-                        let batch = builder.finish()?;
-                        buffers.push_batch(record.tenant, batch, entry.position, now);
+                        out.rows
+                            .push((record.tenant, entry.position, builder.finish()?));
                     }
+                    RecordSignal::FlushIntent => match FlushIntent::from_payload(&record.payload) {
+                        Ok(intent) => out.intents.push(intent),
+                        Err(e) => {
+                            out.damaged += 1;
+                            warn!(position = ?entry.position, error = %e, "skipping undecodable flush intent");
+                        }
+                    },
                 }
             }
             Event::Damaged { position, damage } => {
-                damaged += 1;
+                out.damaged += 1;
                 warn!(?position, ?damage, "wal damage during replay");
             }
         }
     }
-    Ok((records, damaged))
+    Ok(out)
 }
 
-impl Buffers {
-    fn push_batch(
-        &mut self,
-        tenant: TenantId,
-        batch: arrow::record_batch::RecordBatch,
-        position: Position,
-        now: Instant,
-    ) {
-        self.get_mut(tenant).push(batch, position, now);
+/// Rebuilds buffers: rows covered by an intent go back to the flushing state
+/// under that file id, everything else is live.
+fn rebuild(replayed: Replayed) -> Buffers {
+    let now = Instant::now();
+    let mut buffers = Buffers::default();
+    let mut groups: Vec<(FlushIntent, TenantBuffer)> = replayed
+        .intents
+        .into_iter()
+        .map(|i| (i, TenantBuffer::default()))
+        .collect();
+    for (tenant, position, batch) in replayed.rows {
+        match groups
+            .iter_mut()
+            .find(|(intent, _)| intent.covers(tenant, position))
+        {
+            Some((_, buffer)) => buffer.push(batch, position, now),
+            None => buffers.get_mut(tenant).push(batch, position, now),
+        }
     }
+    for (intent, buffer) in groups {
+        buffers.insert_flushing(intent.tenant, intent.file, buffer);
+    }
+    buffers
 }
 
 /// The ingester role.
@@ -317,21 +432,27 @@ impl Ingester {
         let limiter = config
             .tenant_bytes_per_sec
             .map(|r| StdMutex::new(RateLimiter::new(r)));
-        let mut buffers = Buffers::default();
-        let (records, damaged) = replay(config.limits, &mut wal, &mut buffers)?;
+        let replayed = replay(config.limits, &mut wal)?;
+        let (records, damaged, intents) =
+            (replayed.records, replayed.damaged, replayed.intents.len());
+        let buffers = rebuild(replayed);
         info!(
             records,
             damaged,
+            intents,
             rows = buffers.total_rows(),
             "wal replayed"
         );
+        let instance = wal.instance_id();
         let shared = Shared {
             config,
             auth,
             limiter,
             stats: IngestStats::default(),
             wal: Arc::new(StdMutex::new(wal)),
+            instance,
             buffers: Mutex::new(buffers),
+            gate: RwLock::new(()),
             flush_now: Notify::new(),
             catalog,
             store,
@@ -347,8 +468,10 @@ impl Ingester {
         &self.shared.stats
     }
 
-    /// Flushes every tenant now. Used by tests and at shutdown.
+    /// Finishes flushes left by a previous run, then flushes every tenant.
+    /// Used by tests and at shutdown.
     pub async fn flush_all(&self) {
+        self.shared.recover_flushing().await;
         self.shared.flush_due(true).await;
     }
 
@@ -366,6 +489,8 @@ impl Ingester {
         bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
         hot_bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
     ) -> Result<(), IngestError> {
+        self.shared.recover_flushing().await;
+
         let listener = tokio::net::TcpListener::bind(self.shared.config.listen)
             .await
             .map_err(|source| IngestError::Bind {

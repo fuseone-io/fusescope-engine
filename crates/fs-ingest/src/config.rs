@@ -39,6 +39,10 @@ pub struct IngestConfig {
     /// so queriers whose file list predates the file still see them. Must be
     /// longer than the querier's file cache TTL.
     pub persisted_retain: Duration,
+    /// Advance the WAL checkpoint after a successful flush. Always true in
+    /// production; tests set it to false to simulate a crash between
+    /// registration and checkpoint.
+    pub checkpoint_after_flush: bool,
 }
 
 impl Default for IngestConfig {
@@ -59,6 +63,7 @@ impl Default for IngestConfig {
             token_cache_ttl: Duration::from_secs(60),
             hot_listen: None,
             persisted_retain: Duration::from_secs(15),
+            checkpoint_after_flush: true,
         }
     }
 }
