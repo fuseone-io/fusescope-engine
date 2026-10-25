@@ -16,6 +16,8 @@
 //! Replay groups records under the intents found in the log, so a crash
 //! anywhere after step 2 reproduces the same file and the same catalog row;
 //! a crash before step 2 simply flushes the rows again under a new intent.
+//! After step 2 a failure of any later step keeps the rows bound to the same
+//! id and retries them unchanged: an id has exactly one possible content.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -62,6 +64,8 @@ pub struct IngestStats {
     pub flush_failures: AtomicU64,
     /// Flushes resumed from an intent after a restart.
     pub flushes_recovered: AtomicU64,
+    /// Retries of a flush whose earlier attempt failed after the intent.
+    pub flush_retries: AtomicU64,
 }
 
 /// Result of converting one request.
@@ -83,6 +87,7 @@ pub struct Shared {
     /// holds it exclusively while it takes a buffer and reads the WAL position.
     gate: RwLock<()>,
     flush_now: Notify,
+    inject_register_failures: std::sync::atomic::AtomicU32,
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
     root: Path,
@@ -216,11 +221,9 @@ impl Shared {
         let result = match prepared {
             Ok(Ok(prepared)) => match flush::upload(self.store.as_ref(), &prepared).await {
                 Ok(created) => self
-                    .catalog
-                    .register_file(&prepared.file)
+                    .register(&prepared.file)
                     .await
-                    .map(|_| (prepared.file, created))
-                    .map_err(IngestError::from),
+                    .map(|()| (prepared.file, created)),
                 Err(e) => Err(e),
             },
             Ok(Err(e)) => Err(e),
@@ -248,22 +251,45 @@ impl Shared {
                 Ok(())
             }
             Err(e) => {
+                // The intent is durable: the rows stay bound to this id and are
+                // retried as they are. Returning them to the live buffer would let
+                // later rows join a file whose object may already exist.
                 self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
-                warn!(tenant = %tenant.0, error = %e, rows, "flush failed, keeping rows buffered");
-                self.buffers.lock().await.abort_flush(tenant, file_id);
+                warn!(tenant = %tenant.0, file = %file_id.0, error = %e, rows, "flush failed; will retry with the same id");
+                self.buffers
+                    .lock()
+                    .await
+                    .flush_failed(tenant, file_id, Instant::now());
                 Err(e)
             }
         }
     }
 
-    /// Finishes flushes that an intent in the WAL had started before a restart.
-    async fn recover_flushing(&self) {
-        let pending = self.buffers.lock().await.flushing();
+    /// Catalog registration, with the test-only failure injection in front.
+    async fn register(&self, file: &fs_catalog::NewFile) -> Result<(), IngestError> {
+        let remaining = self.inject_register_failures.load(Ordering::Relaxed);
+        if remaining > 0 {
+            self.inject_register_failures
+                .store(remaining - 1, Ordering::Relaxed);
+            return Err(IngestError::Injected("catalog registration"));
+        }
+        self.catalog.register_file(file).await?;
+        Ok(())
+    }
+
+    /// Retries flushes whose earlier attempt failed after the intent, or
+    /// resumes those an earlier run left behind. `force` ignores the backoff.
+    async fn retry_flushing(&self, force: bool) {
+        let pending = self
+            .buffers
+            .lock()
+            .await
+            .flushing_due(Instant::now(), force);
         for (tenant, file, batches) in pending {
-            self.stats.flushes_recovered.fetch_add(1, Ordering::Relaxed);
-            info!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "resuming flush from intent");
+            self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
+            debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
             if let Err(e) = self.materialize(tenant, file, batches).await {
-                error!(tenant = %tenant.0, file = %file.0, error = %e, "recovered flush failed; rows stay buffered under the same intent");
+                warn!(tenant = %tenant.0, file = %file.0, error = %e, "flush retry failed");
             }
         }
     }
@@ -312,6 +338,7 @@ impl Shared {
                 )
             }
         };
+        self.retry_flushing(everything).await;
         for tenant in tenants {
             if let Err(e) = self.flush_tenant(tenant).await {
                 error!(tenant = %tenant.0, error = %e, "flush error");
@@ -444,6 +471,7 @@ impl Ingester {
             "wal replayed"
         );
         let instance = wal.instance_id();
+        let config_injected = config.inject_register_failures;
         let shared = Shared {
             config,
             auth,
@@ -454,6 +482,7 @@ impl Ingester {
             buffers: Mutex::new(buffers),
             gate: RwLock::new(()),
             flush_now: Notify::new(),
+            inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             catalog,
             store,
             root,
@@ -468,10 +497,9 @@ impl Ingester {
         &self.shared.stats
     }
 
-    /// Finishes flushes left by a previous run, then flushes every tenant.
+    /// Retries or resumes every pending flush, then flushes every tenant.
     /// Used by tests and at shutdown.
     pub async fn flush_all(&self) {
-        self.shared.recover_flushing().await;
         self.shared.flush_due(true).await;
     }
 
@@ -489,7 +517,21 @@ impl Ingester {
         bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
         hot_bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
     ) -> Result<(), IngestError> {
-        self.shared.recover_flushing().await;
+        let recovered = self
+            .shared
+            .buffers
+            .lock()
+            .await
+            .flushing_due(Instant::now(), true)
+            .len();
+        if recovered > 0 {
+            self.shared
+                .stats
+                .flushes_recovered
+                .fetch_add(recovered as u64, Ordering::Relaxed);
+            info!(flushes = recovered, "resuming flushes from intents");
+            self.shared.retry_flushing(true).await;
+        }
 
         let listener = tokio::net::TcpListener::bind(self.shared.config.listen)
             .await

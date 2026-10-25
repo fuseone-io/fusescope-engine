@@ -468,5 +468,8 @@ fn verify_same_content(file: &NewFile, existing: &FileRow) -> Result<(), Catalog
     if existing.services != file.services {
         return mismatch("services");
     }
+    if existing.summary != file.summary {
+        return mismatch("summary");
+    }
     Ok(())
 }

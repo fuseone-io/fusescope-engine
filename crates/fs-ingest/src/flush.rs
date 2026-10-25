@@ -11,7 +11,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_schema::spans::{col, span_schema_v1};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
@@ -81,10 +81,12 @@ pub fn prepare(
 
 /// Uploads a prepared file to its path without overwriting: a retried flush
 /// finds the object already there and leaves it. Returns whether this call
-/// created it. Stores without conditional writes fall back to a plain put.
+/// created it. A store without conditional writes is an error, not a plain
+/// put: overwriting is never allowed.
 ///
 /// # Errors
-/// Bucket failure other than "already exists".
+/// Bucket failure other than "already exists", including missing support for
+/// conditional writes.
 pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<bool, IngestError> {
     let path = Path::from(prepared.file.path.as_str());
     let payload = PutPayload::from_bytes(prepared.bytes.clone());
@@ -92,13 +94,9 @@ pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<bool
         mode: PutMode::Create,
         ..PutOptions::default()
     };
-    match store.put_opts(&path, payload.clone(), create).await {
+    match store.put_opts(&path, payload, create).await {
         Ok(_) => Ok(true),
         Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
-        Err(object_store::Error::NotImplemented { .. }) => {
-            store.put(&path, payload).await?;
-            Ok(true)
-        }
         Err(e) => Err(e.into()),
     }
 }

@@ -848,3 +848,89 @@ async fn hot_window_announces_prospective_file_id() {
     h.stop().await;
     db.finish().await;
 }
+
+/// Registration fails after the object exists, more rows arrive, and the
+/// retry runs without a restart. The rows bound by the intent must stay
+/// bound: the retry registers exactly the uploaded content and the late rows
+/// become a second file.
+#[tokio::test]
+async fn register_failure_keeps_rows_bound_to_their_file() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_register_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+
+    h.client()
+        .await
+        .export(authed(request("api", 7, 10), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await; // upload succeeds, registration is injected to fail
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(files.len(), 1, "the object exists although unregistered");
+    let first_len = std::fs::metadata(&files[0]).unwrap().len();
+    assert_eq!(
+        db.catalog
+            .visible_files(
+                tenant,
+                Signal::Traces,
+                TimeRange {
+                    start: chrono::DateTime::UNIX_EPOCH,
+                    end: chrono::Utc::now()
+                }
+            )
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+
+    h.client()
+        .await
+        .export(authed(request("api", 8, 3), &token))
+        .await
+        .unwrap(); // arrives before the retry
+    h.ingester.flush_all().await; // retry registers F(P); R becomes its own file
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(files.len(), 2);
+    assert!(
+        files
+            .iter()
+            .any(|f| std::fs::metadata(f).unwrap().len() == first_len),
+        "the first object is untouched"
+    );
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut rows: Vec<i64> = registered.iter().map(|f| f.row_count).collect();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![3, 10], "catalog describes each object exactly");
+    assert!(h.ingester.stats().flush_retries.load(Ordering::Relaxed) >= 1);
+    h.stop().await;
+    db.finish().await;
+}

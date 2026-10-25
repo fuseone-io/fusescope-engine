@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -32,7 +32,11 @@ pub fn open(config: &BucketConfig, secrets: &Secrets) -> Result<Arc<dyn ObjectSt
             Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?))
         }
         BucketKind::S3 => {
-            let mut builder = AmazonS3Builder::from_env().with_allow_http(config.allow_http);
+            // Conditional writes are required: the ingester never overwrites an
+            // object and fails closed on a store that cannot promise that.
+            let mut builder = AmazonS3Builder::from_env()
+                .with_allow_http(config.allow_http)
+                .with_conditional_put(S3ConditionalPut::ETagMatch);
             if let Some(name) = &config.name {
                 builder = builder.with_bucket_name(name);
             }

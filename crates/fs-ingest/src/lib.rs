@@ -61,6 +61,9 @@ pub enum IngestError {
     /// gRPC transport failure.
     #[error("grpc: {0}")]
     Transport(#[from] tonic::transport::Error),
+    /// A failure injected by test configuration.
+    #[error("injected failure: {0}")]
+    Injected(&'static str),
     /// Hot-window scan against an ingester failed.
     #[error("hot scan {ingester}: {reason}")]
     HotScan {

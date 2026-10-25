@@ -59,14 +59,23 @@ impl TenantBuffer {
     }
 }
 
-/// Rows being written to a file.
+/// Rows bound to a file by a durable intent. They never return to the live
+/// buffer: every failure is retried with the same id and the same rows, so the
+/// object and the catalog row can only ever have one content.
 #[derive(Debug)]
 pub struct Flushing {
     /// Id the file will have.
     pub file: FileId,
     /// The rows.
     pub buffer: TenantBuffer,
+    /// Failed attempts so far.
+    pub attempts: u32,
+    /// Earliest time of the next attempt.
+    pub next_attempt: Instant,
 }
+
+/// Longest wait between retries of a failed flush.
+pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Rows already written to a registered file but still served from memory.
 #[derive(Debug, Clone)]
@@ -128,10 +137,12 @@ impl Buffers {
     pub fn begin_flush(&mut self, tenant: TenantId, file: FileId) -> Option<Vec<RecordBatch>> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches.clone();
-        self.flushing
-            .entry(tenant)
-            .or_default()
-            .push(Flushing { file, buffer });
+        self.flushing.entry(tenant).or_default().push(Flushing {
+            file,
+            buffer,
+            attempts: 0,
+            next_attempt: Instant::now(),
+        });
         Some(batches)
     }
 
@@ -139,22 +150,42 @@ impl Buffers {
     /// assigned to `file`.
     pub fn insert_flushing(&mut self, tenant: TenantId, file: FileId, buffer: TenantBuffer) {
         if !buffer.is_empty() {
-            self.flushing
-                .entry(tenant)
-                .or_default()
-                .push(Flushing { file, buffer });
+            self.flushing.entry(tenant).or_default().push(Flushing {
+                file,
+                buffer,
+                attempts: 0,
+                next_attempt: Instant::now(),
+            });
         }
     }
 
-    /// Every flush in progress, for recovery.
-    pub fn flushing(&self) -> Vec<(TenantId, FileId, Vec<RecordBatch>)> {
+    /// Flushes whose next attempt is due at `now`, or every flush when `force`.
+    pub fn flushing_due(
+        &self,
+        now: Instant,
+        force: bool,
+    ) -> Vec<(TenantId, FileId, Vec<RecordBatch>)> {
         self.flushing
             .iter()
             .flat_map(|(t, list)| {
                 list.iter()
+                    .filter(move |f| force || f.next_attempt <= now)
                     .map(move |f| (*t, f.file, f.buffer.batches.clone()))
             })
             .collect()
+    }
+
+    /// Records a failed attempt and schedules the next one with exponential backoff.
+    pub fn flush_failed(&mut self, tenant: TenantId, file: FileId, now: Instant) {
+        if let Some(entry) = self
+            .flushing
+            .get_mut(&tenant)
+            .and_then(|l| l.iter_mut().find(|f| f.file == file))
+        {
+            entry.attempts = entry.attempts.saturating_add(1);
+            let backoff = Duration::from_secs(1u64 << entry.attempts.min(6)).min(MAX_RETRY_BACKOFF);
+            entry.next_attempt = now + backoff;
+        }
     }
 
     /// The file is registered: its rows become persisted until swept.
@@ -168,7 +199,9 @@ impl Buffers {
         }
     }
 
-    /// The flush failed: its rows go back in front of the live buffer.
+    /// The intent could not be logged, so the rows are not bound to the file
+    /// yet: they go back in front of the live buffer. Never called once the
+    /// intent is durable.
     pub fn abort_flush(&mut self, tenant: TenantId, file: FileId) {
         if let Some(entry) = self.remove_flushing(tenant, file) {
             self.get_mut(tenant).restore(entry.buffer);

@@ -43,6 +43,9 @@ pub struct IngestConfig {
     /// production; tests set it to false to simulate a crash between
     /// registration and checkpoint.
     pub checkpoint_after_flush: bool,
+    /// Make this many catalog registrations fail artificially. Zero in
+    /// production; tests use it to exercise the retry path.
+    pub inject_register_failures: u32,
 }
 
 impl Default for IngestConfig {
@@ -64,6 +67,7 @@ impl Default for IngestConfig {
             hot_listen: None,
             persisted_retain: Duration::from_secs(15),
             checkpoint_after_flush: true,
+            inject_register_failures: 0,
         }
     }
 }
