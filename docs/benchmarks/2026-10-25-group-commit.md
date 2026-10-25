@@ -41,12 +41,17 @@ below the conversion cost.
 |---:|---:|---:|---:|---:|---:|---:|
 | 8, baseline | 2 196 | 26 354 | 3.20 ms | 5.23 ms | 6.95 ms | 0 |
 | 32, baseline | 2 216 | 26 589 | 13.40 ms | 24.73 ms | 49.62 ms | 0 |
-| 8 | 5 520 | 66 237 | 0.85 ms | 1.20 ms | 40.45 ms | 0 |
-| 32 | 9 524 | 114 290 | 1.59 ms | 2.51 ms | 40.82 ms | 10 660 (3.6%) |
-| 128 | 7 796 | 93 551 | 7.03 ms | 11.61 ms | 47.52 ms | 67 873 (22%) |
+| 8 | 5 490 | 65 875 | 0.85 ms | 1.24 ms | 40.43 ms | 0 |
+| 32 | 9 918 | 119 015 | 1.56 ms | 2.50 ms | 40.79 ms | 10 699 (3.5%) |
+| 128 | 8 608 | 103 291 | 6.80 ms | 10.29 ms | 42.00 ms | 65 485 (20%) |
 
-Across the three runs: 686 619 records in 109 428 batches, 6.3 records per
-fsync, 51 s of fsync time over 90 s of load. 8.2 million spans ingested, 61
+The generator starts every sender behind a barrier after all connections are
+open and starts the clock when the barrier opens; an earlier run without the
+barrier counted requests sent before the clock started and read 9 524 at 32
+senders, within 5% of the honest number.
+
+Across the three runs: 720 970 records in 114 054 batches, 6.3 records per
+fsync, 53 s of fsync time over 90 s of load. 8.65 million spans ingested, 65
 files flushed, no flush failure.
 
 **Reading.** Throughput now scales with concurrency: 4.3× at 32 senders, with
@@ -59,6 +64,18 @@ and it names the next bottleneck: the flush path, which is sequential per
 tenant and encodes a whole file in memory. The p99 of about 40 ms in every
 run is the same thing seen from the other side, a flush competing for CPU.
 
-Against the DESIGN.md target of 150 MB/s of OTLP per ingester: 9 500
-requests × 4 KiB is about 39 MB/s, from 9 MB/s at the baseline. The WAL is no
+Against the DESIGN.md target of 150 MB/s of OTLP per ingester: 9 900
+requests × 4 KiB is about 40 MB/s, from 9 MB/s at the baseline. The WAL is no
 longer the limit; the flusher is.
+
+## Review fixes in the same change set
+
+- The WAL size the capacity check reads was published only after a commit, so
+  a WAL that reached its cap stayed "full" after the checkpoint freed segments
+  and the ingester refused writes until a restart. The checkpoint now publishes
+  the size under the lock; a test fills a small WAL, flushes and writes again.
+- The writer queue was unbounded: a slow disk would have let every in-flight
+  request hold its decoded message and record outside the buffer and WAL
+  limits. The queue now has a record limit with a bounded wait and a byte
+  budget that refuses immediately, both answered as `RESOURCE_EXHAUSTED` and
+  counted in `fusescope_wal_backpressure_total`.

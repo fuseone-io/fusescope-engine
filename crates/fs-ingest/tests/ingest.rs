@@ -121,9 +121,19 @@ struct Harness {
 }
 
 async fn start(catalog: &Catalog, dir: tempfile::TempDir, config: IngestConfig) -> Harness {
+    let wal_config = WalConfig::new(dir.path().join("wal"));
+    start_with_wal(catalog, dir, config, wal_config).await
+}
+
+async fn start_with_wal(
+    catalog: &Catalog,
+    dir: tempfile::TempDir,
+    config: IngestConfig,
+    wal_config: WalConfig,
+) -> Harness {
     std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
-    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    let wal = Wal::open(wal_config).unwrap();
     let ingester =
         Arc::new(Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap());
     let (shutdown, rx) = tokio::sync::watch::channel(false);
@@ -931,6 +941,64 @@ async fn register_failure_keeps_rows_bound_to_their_file() {
     rows.sort_unstable();
     assert_eq!(rows, vec![3, 10], "catalog describes each object exactly");
     assert!(h.ingester.stats().flush_retries.load(Ordering::Relaxed) >= 1);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A WAL that hits its size cap refuses writes, and a flush that checkpoints
+/// away old segments must reopen it without a restart.
+#[tokio::test]
+async fn wal_full_recovers_after_checkpoint() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        wal_max_bytes: 256 * 1024,
+        ..test_config()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let wal_config = WalConfig {
+        segment_max_bytes: 64 * 1024,
+        ..WalConfig::new(dir.path().join("wal"))
+    };
+    let h = start_with_wal(&db.catalog, dir, config, wal_config).await;
+    let mut client = h.client().await;
+
+    let mut refused = false;
+    for i in 0..400u16 {
+        let trace = u8::try_from(i % 250 + 1).unwrap();
+        if let Err(status) = client
+            .export(authed(request("api", trace, 40), &token))
+            .await
+        {
+            assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+            assert!(
+                status.message().contains("write-ahead log full"),
+                "{status:?}"
+            );
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the cap must be reached");
+
+    h.ingester.flush_all().await; // registers files, checkpoints, removes segments
+    client
+        .export(authed(request("api", 1, 1), &token))
+        .await
+        .expect("writes resume after the checkpoint");
+    assert!(h.ingester.wal_bytes() < 256 * 1024);
     h.stop().await;
     db.finish().await;
 }

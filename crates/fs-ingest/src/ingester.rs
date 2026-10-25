@@ -294,10 +294,15 @@ impl Shared {
     async fn checkpoint_wal(&self) {
         let earliest = self.buffers.lock().await.earliest_wal();
         let wal = self.wal.clone();
+        let writer_stats = self.writer.stats();
         let result = tokio::task::spawn_blocking(move || {
             let mut wal = wal.lock().map_err(|_| fs_wal::WalError::EmptyRecord)?;
             let cut = earliest.unwrap_or_else(|| wal.position());
-            wal.checkpoint(cut).map(|()| cut)
+            let outcome = wal.checkpoint(cut).map(|()| cut);
+            // Segments were removed: publish the new size while still holding
+            // the lock, or a full WAL stays "full" until the next append.
+            writer_stats.wal_bytes.store(wal.bytes(), Ordering::Relaxed);
+            outcome
         })
         .await;
         match result {

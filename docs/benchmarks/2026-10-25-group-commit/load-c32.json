@@ -1,13 +1,13 @@
 {
-  "requests_ok": 286076,
-  "requests_err": 10660,
-  "spans_ok": 3432912,
-  "seconds": 30.036927817,
-  "rps": 9524.14313950209,
-  "spans_per_sec": 114289.71767402507,
-  "p50_ms": 1.589739,
-  "p95_ms": 2.506177,
-  "p99_ms": 40.817722,
+  "requests_ok": 297745,
+  "requests_err": 10699,
+  "spans_ok": 3572940,
+  "seconds": 30.020795962,
+  "rps": 9917.958217259875,
+  "spans_per_sec": 119015.49860711851,
+  "p50_ms": 1.5567140000000002,
+  "p95_ms": 2.50009,
+  "p99_ms": 40.785038,
   "errors": [
     "ResourceExhausted: tenant buffer full, flush pending"
   ]

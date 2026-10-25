@@ -70,12 +70,16 @@ pub async fn run(
     let spans_ok = Arc::new(AtomicU64::new(0));
     let samples = Arc::new(Mutex::new(Samples::default()));
     let errors = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
-    let deadline = Instant::now() + params.duration;
+    // Every sender connects first, then all start together behind a barrier;
+    // the clock starts when the barrier opens.
+    let barrier = Arc::new(tokio::sync::Barrier::new(params.concurrency + 1));
+    let duration = params.duration;
     let header: MetadataValue<_> = format!("Bearer {}", params.token).parse()?;
 
     let mut tasks = Vec::new();
     for worker in 0..params.concurrency {
         let mut client = TraceServiceClient::new(endpoint.connect().await?);
+        let barrier = Arc::clone(&barrier);
         let now_ns =
             u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).unwrap_or(0);
         let mut generator = Generator::new(
@@ -93,6 +97,8 @@ pub async fn run(
         );
         tasks.push(tokio::spawn(async move {
             let mut local = Samples::default();
+            barrier.wait().await;
+            let deadline = Instant::now() + duration;
             while Instant::now() < deadline {
                 let request = generator.request();
                 let spans: usize = request
@@ -128,6 +134,7 @@ pub async fn run(
                 .extend(local.into_values());
         }));
     }
+    barrier.wait().await;
     let start = Instant::now();
     for t in tasks {
         let _ = t.await;

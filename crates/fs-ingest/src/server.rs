@@ -63,6 +63,13 @@ impl TraceService for TraceReceiver {
             .ingest(tenant, &message, record.encode(), now)
             .await
             .map_err(|e| match e {
+                IngestError::Backpressure(what) => {
+                    shared
+                        .stats
+                        .over_capacity
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Status::resource_exhausted(format!("ingester busy: {what}"))
+                }
                 IngestError::Wal(_) | IngestError::Join(_) => {
                     warn!(error = %e, "wal append failed");
                     Status::unavailable("write-ahead log unavailable")

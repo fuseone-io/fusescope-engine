@@ -62,6 +62,9 @@ pub enum IngestError {
     /// gRPC transport failure.
     #[error("grpc: {0}")]
     Transport(#[from] tonic::transport::Error),
+    /// The WAL queue is over its in-flight limit; the caller answers RESOURCE_EXHAUSTED.
+    #[error("backpressure: {0}")]
+    Backpressure(&'static str),
     /// A failure injected by test configuration.
     #[error("injected failure: {0}")]
     Injected(&'static str),

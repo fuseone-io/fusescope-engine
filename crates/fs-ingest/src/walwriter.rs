@@ -27,6 +27,14 @@ pub struct GroupCommitConfig {
     /// How long the first record of a batch waits for more. Zero batches only
     /// what is already queued.
     pub linger: Duration,
+    /// Most records waiting for the writer at once. Beyond it, appends wait up
+    /// to `queue_wait` for a slot and then fail with backpressure.
+    pub max_inflight_records: usize,
+    /// Most payload bytes waiting for the writer at once. Beyond it, appends
+    /// fail with backpressure immediately: memory is the point of the limit.
+    pub max_inflight_bytes: usize,
+    /// How long an append waits for a queue slot.
+    pub queue_wait: Duration,
 }
 
 impl Default for GroupCommitConfig {
@@ -35,6 +43,9 @@ impl Default for GroupCommitConfig {
             max_records: 1024,
             max_bytes: 16 * 1024 * 1024,
             linger: Duration::ZERO,
+            max_inflight_records: 4096,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            queue_wait: Duration::from_secs(2),
         }
     }
 }
@@ -51,11 +62,25 @@ pub struct WriterStats {
     /// Bytes the WAL held on disk after the last batch. Read this instead of
     /// locking the WAL: the writer holds the lock for the whole fsync.
     pub wal_bytes: AtomicU64,
+    /// Appends refused or timed out because the queue was full.
+    pub backpressure: AtomicU64,
 }
 
 struct Pending {
     bytes: Vec<u8>,
     reply: oneshot::Sender<Result<Position, WalError>>,
+}
+
+/// Gives the bytes of one record back to the in-flight budget on any exit path.
+struct ByteRelease<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+    size: usize,
+}
+
+impl Drop for ByteRelease<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.size, Ordering::Relaxed);
+    }
 }
 
 /// Handle to the writer thread. Cheap to clone; dropping the last handle stops
@@ -64,6 +89,9 @@ struct Pending {
 pub struct WalWriter {
     queue: mpsc::Sender<Pending>,
     stats: Arc<WriterStats>,
+    slots: Arc<tokio::sync::Semaphore>,
+    inflight_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    config: GroupCommitConfig,
 }
 
 impl WalWriter {
@@ -80,7 +108,15 @@ impl WalWriter {
             .spawn(move || run(&wal, &inbox, config, &thread_stats))
             .map_err(|e| warn!(error = %e, "wal writer thread could not start"))
             .ok();
-        Self { queue, stats }
+        Self {
+            queue,
+            stats,
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                config.max_inflight_records.max(1),
+            )),
+            inflight_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            config,
+        }
     }
 
     /// Counters.
@@ -91,8 +127,26 @@ impl WalWriter {
     /// Appends one record and resolves once it is synced.
     ///
     /// # Errors
-    /// WAL failure, or the writer thread is gone.
+    /// Backpressure when the queue is over its record or byte limit, WAL
+    /// failure, or the writer thread is gone.
     pub async fn append(&self, bytes: Vec<u8>) -> Result<Position, IngestError> {
+        let size = bytes.len();
+        let held = self.inflight_bytes.fetch_add(size, Ordering::Relaxed) + size;
+        if held > self.config.max_inflight_bytes {
+            self.inflight_bytes.fetch_sub(size, Ordering::Relaxed);
+            self.stats.backpressure.fetch_add(1, Ordering::Relaxed);
+            return Err(IngestError::Backpressure("wal queue bytes"));
+        }
+        let _release = ByteRelease {
+            counter: &self.inflight_bytes,
+            size,
+        };
+        let Ok(Ok(_slot)) =
+            tokio::time::timeout(self.config.queue_wait, self.slots.acquire()).await
+        else {
+            self.stats.backpressure.fetch_add(1, Ordering::Relaxed);
+            return Err(IngestError::Backpressure("wal queue records"));
+        };
         let (reply, answer) = oneshot::channel();
         self.queue
             .send(Pending { bytes, reply })
@@ -184,6 +238,55 @@ fn commit(wal: &StdMutex<Wal>, batch: Vec<Pending>, stats: &WriterStats) {
 mod tests {
     use super::*;
     use fs_wal::{Event, WalConfig};
+
+    #[tokio::test]
+    async fn byte_budget_refuses_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(StdMutex::new(
+            Wal::open(WalConfig::new(dir.path())).unwrap(),
+        ));
+        let config = GroupCommitConfig {
+            max_inflight_bytes: 10,
+            ..GroupCommitConfig::default()
+        };
+        let writer = WalWriter::spawn(wal, config);
+        let err = writer.append(vec![0u8; 11]).await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Backpressure("wal queue bytes")),
+            "{err}"
+        );
+        assert_eq!(writer.stats().backpressure.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            writer.inflight_bytes.load(Ordering::Relaxed),
+            0,
+            "budget returned"
+        );
+        writer.append(vec![0u8; 10]).await.unwrap();
+        assert_eq!(writer.inflight_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn record_slots_time_out_under_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(StdMutex::new(
+            Wal::open(WalConfig::new(dir.path())).unwrap(),
+        ));
+        let config = GroupCommitConfig {
+            max_inflight_records: 1,
+            queue_wait: Duration::from_millis(50),
+            ..GroupCommitConfig::default()
+        };
+        let writer = WalWriter::spawn(wal, config);
+        // Hold the only slot without ever sending, as a stuck request would.
+        let held = writer.slots.clone().acquire_owned().await.unwrap();
+        let err = writer.append(vec![1, 2, 3]).await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Backpressure("wal queue records")),
+            "{err}"
+        );
+        drop(held);
+        writer.append(vec![1, 2, 3]).await.unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_appends_get_ordered_positions_and_fewer_syncs() {
