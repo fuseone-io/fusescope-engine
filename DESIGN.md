@@ -111,11 +111,17 @@ arriving meanwhile:
 
 - The file id is derived from the WAL instance id (created with the WAL
   directory, so two ingesters or a recreated volume never collide), the tenant
-  and the WAL position of the buffer's first record.
+  and a seed: the WAL position that ended the tenant's previous intent, or the
+  position at startup before any intent. The seed is fixed before the rows
+  arrive, so it does not depend on the order in which concurrent requests
+  reach the buffer, and the id the hot window announces for live rows is the
+  id their file gets.
 - Before uploading, the ingester appends a flush intent to the WAL naming the
   file id and the exact record range it covers. The range is exact because
   requests append to the WAL and to the buffer under a shared gate that the
-  flush takes exclusively while it cuts the buffer. Replay groups records
+  flush takes exclusively while it cuts the buffer, and its start is the
+  smallest position in the buffer, not the position of the record that got
+  there first. Replay groups records
   under their intents, so a retry produces the same object and the same
   catalog row even if later rows arrived during the original flush.
 - Uploads never overwrite (conditional create), and registering an existing

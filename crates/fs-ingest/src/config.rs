@@ -19,8 +19,13 @@ pub struct IngestConfig {
     pub flush_bytes: usize,
     /// Flush a tenant buffer once its oldest record is this old.
     pub flush_interval: Duration,
-    /// Refuse new data for a tenant whose buffer exceeds this while flushes fail.
+    /// Refuse new data for a tenant whose live and flushing rows would exceed
+    /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
+    /// Refuse new data for a tenant whose rows in every state, persisted for
+    /// the hot window included, would exceed this. One tenant can never hold
+    /// the whole `max_memory_bytes` and starve the others.
+    pub max_tenant_bytes: usize,
     /// Refuse new data when everything held in memory, live, flushing and
     /// persisted for the hot window, exceeds this. Persisted rows are never
     /// evicted early to make room: queriers may still need them.
@@ -50,6 +55,10 @@ pub struct IngestConfig {
     /// Make this many catalog registrations fail artificially. Zero in
     /// production; tests use it to exercise the retry path.
     pub inject_register_failures: u32,
+    /// Hold the first request this long between its WAL append and its
+    /// buffer push, so a later request overtakes it. `None` in production;
+    /// tests use it to reorder concurrent requests deterministically.
+    pub inject_push_delay: Option<Duration>,
     /// WAL group commit limits.
     pub group_commit: crate::walwriter::GroupCommitConfig,
 }
@@ -65,6 +74,7 @@ impl Default for IngestConfig {
             flush_bytes: 128 * 1024 * 1024,
             flush_interval: Duration::from_secs(30),
             max_buffer_bytes: 512 * 1024 * 1024,
+            max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,
             wal_max_bytes: 4 * 1024 * 1024 * 1024,
             tenant_bytes_per_sec: None,
@@ -75,6 +85,7 @@ impl Default for IngestConfig {
             persisted_retain: Duration::from_secs(15),
             checkpoint_after_flush: true,
             inject_register_failures: 0,
+            inject_push_delay: None,
             group_commit: crate::walwriter::GroupCommitConfig::default(),
         }
     }

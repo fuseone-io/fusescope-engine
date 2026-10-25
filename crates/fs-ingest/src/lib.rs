@@ -65,6 +65,13 @@ pub enum IngestError {
     /// The WAL queue is over its in-flight limit; the caller answers RESOURCE_EXHAUSTED.
     #[error("backpressure: {0}")]
     Backpressure(&'static str),
+    /// Admitting the request would cross a memory cap; the caller answers
+    /// RESOURCE_EXHAUSTED.
+    #[error("over capacity: {0}")]
+    Capacity(&'static str),
+    /// The WAL on disk is over its cap; the caller answers UNAVAILABLE.
+    #[error("write-ahead log full")]
+    WalFull,
     /// A failure injected by test configuration.
     #[error("injected failure: {0}")]
     Injected(&'static str),

@@ -1045,8 +1045,9 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
         .create_token(tenant, "collector", TokenScope::Ingest)
         .await
         .unwrap();
+    // Four 30-span batches fit under 80 KiB, a fifth would cross it.
     let config = IngestConfig {
-        max_memory_bytes: 64 * 1024,
+        max_memory_bytes: 80 * 1024,
         persisted_retain: Duration::from_secs(2),
         ..test_config()
     };
@@ -1139,6 +1140,239 @@ async fn concurrent_flushes_do_not_duplicate_work() {
     );
     assert_eq!(fs.flushes.load(Ordering::Relaxed), 1);
     assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Request A takes the lower WAL position but reaches the buffer after
+/// request B. The intent must still start at A's position, and the id the
+/// hot window announced while only B was live must be the id registered,
+/// across the upload, a crash before the checkpoint and the replay.
+#[tokio::test]
+async fn out_of_order_pushes_keep_intent_and_file_id() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_push_delay: Some(Duration::from_secs(2)),
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+
+    let mut client_a = h.client().await;
+    let token_a = token.clone();
+    let a = tokio::spawn(async move {
+        client_a
+            .export(authed(request("api", 1, 10), &token_a))
+            .await
+    });
+    // Once A's record is synced, A sleeps before its push and B overtakes it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.ingester.writer_stats().records.load(Ordering::Relaxed) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first request never reached the wal"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    h.client()
+        .await
+        .export(authed(request("api", 2, 20), &token))
+        .await
+        .unwrap();
+    assert!(
+        !a.is_finished(),
+        "the delayed request must still be pending"
+    );
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .persisted_files;
+    assert_eq!(announced.len(), 1);
+    a.await.unwrap().unwrap();
+
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(
+        h.ingester.stats().flush_failures.load(Ordering::Relaxed),
+        0,
+        "the replayed intent covers the same rows as the uploaded object"
+    );
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].row_count, 30);
+    assert_eq!(announced, vec![registered[0].id]);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// One tenant holding its hot-window rows is refused at its own cap while
+/// another tenant is still admitted.
+#[tokio::test]
+async fn tenant_memory_cap_isolates_tenants() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let mut tokens = Vec::new();
+    for name in ["acme", "globex"] {
+        let tenant = db
+            .catalog
+            .create_tenant(&NewTenant::with_defaults(name))
+            .await
+            .unwrap()
+            .id;
+        let (token, _) = db
+            .catalog
+            .create_token(tenant, "collector", TokenScope::Ingest)
+            .await
+            .unwrap();
+        tokens.push(token);
+    }
+    // Four 30-span batches fit under 80 KiB, a fifth would cross it.
+    let config = IngestConfig {
+        max_tenant_bytes: 80 * 1024,
+        persisted_retain: Duration::from_secs(2),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for i in 1..=4u8 {
+        client
+            .export(authed(request("api", i, 30), &tokens[0]))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await;
+    let refused = client
+        .export(authed(request("api", 9, 30), &tokens[0]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+    assert!(
+        refused.message().contains("tenant memory full"),
+        "{refused:?}"
+    );
+    client
+        .export(authed(request("web", 1, 30), &tokens[1]))
+        .await
+        .expect("another tenant is not held by the first one's retention");
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    h.ingester.flush_all().await; // sweeps the retention
+    client
+        .export(authed(request("api", 9, 30), &tokens[0]))
+        .await
+        .expect("admitted once the retention passed");
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Requests admitted together cannot overshoot the cap: admission reserves
+/// the batch under the buffer lock, so exactly as many fit as the cap allows.
+#[tokio::test]
+async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    // Three 30-span batches fit under 64 KiB, a fourth would cross it.
+    let config = IngestConfig {
+        max_memory_bytes: 64 * 1024,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut tasks = Vec::new();
+    for i in 1..=12u8 {
+        let mut client = h.client().await;
+        let token = token.clone();
+        tasks.push(tokio::spawn(async move {
+            client
+                .export(authed(request("api", i, 30), &token))
+                .await
+                .map(|_| ())
+        }));
+    }
+    let mut admitted = 0;
+    let mut refused = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(()) => admitted += 1,
+            Err(status) => {
+                assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+                assert!(
+                    status.message().contains("ingester memory full"),
+                    "{status:?}"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!((admitted, refused), (3, 9));
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        90
+    );
     h.stop().await;
     db.finish().await;
 }

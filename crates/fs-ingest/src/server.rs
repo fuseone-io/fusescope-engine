@@ -52,8 +52,6 @@ impl TraceService for TraceReceiver {
                 return Err(Status::resource_exhausted("tenant throughput limit"));
             }
         }
-        shared.check_capacity(tenant).await?;
-
         let record = WalRecord {
             tenant,
             signal: RecordSignal::Traces,
@@ -70,12 +68,14 @@ impl TraceService for TraceReceiver {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Status::resource_exhausted(format!("ingester busy: {what}"))
                 }
+                IngestError::Capacity(what) => Status::resource_exhausted(what),
+                IngestError::WalFull => Status::unavailable("write-ahead log full"),
                 IngestError::Wal(_) | IngestError::Join(_) => {
                     warn!(error = %e, "wal append failed");
                     Status::unavailable("write-ahead log unavailable")
                 }
                 other => {
-                    warn!(error = %other, "conversion failed after wal append");
+                    warn!(error = %other, "conversion failed");
                     Status::internal("conversion failed")
                 }
             })?;

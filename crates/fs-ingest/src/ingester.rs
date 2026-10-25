@@ -33,12 +33,11 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use prost::Message;
 use tokio::sync::{Mutex, Notify, RwLock, watch};
-use tonic::Status;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::buffer::{Buffers, Snapshot, TenantBuffer};
+use crate::buffer::{Buffers, Reservation, Snapshot, TenantBuffer};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
 use crate::record::{FlushIntent, RecordSignal, WalRecord};
@@ -136,30 +135,36 @@ pub struct Shared {
     gate: RwLock<()>,
     flush_now: Notify,
     inject_register_failures: std::sync::atomic::AtomicU32,
+    push_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
     root: Path,
 }
 
 impl Shared {
-    /// Refuses when the tenant's buffer or the WAL on disk is over its cap.
-    pub(crate) async fn check_capacity(&self, tenant: TenantId) -> Result<(), Status> {
-        let (buffered, total) = {
-            let buffers = self.buffers.lock().await;
-            (buffers.bytes_of(tenant), buffers.total_bytes())
-        };
-        if buffered >= self.config.max_buffer_bytes {
+    /// Admits `bytes` of converted rows against the caps, atomically with
+    /// every other admission and push, and reserves them until the rows are
+    /// in a buffer. A request that would cross a cap is refused: the caps are
+    /// ceilings, not watermarks.
+    async fn admit(&self, tenant: TenantId, bytes: usize) -> Result<Reservation, IngestError> {
+        let mut buffers = self.buffers.lock().await;
+        let reserved = buffers.reserved_of(tenant);
+        if buffers.bytes_of(tenant) + reserved + bytes > self.config.max_buffer_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
-            return Err(Status::resource_exhausted(
-                "tenant buffer full, flush pending",
+            return Err(IngestError::Capacity("tenant buffer full, flush pending"));
+        }
+        if buffers.tenant_total(tenant) + reserved + bytes > self.config.max_tenant_bytes {
+            // Persisted rows count and are not evicted: queriers with a stale
+            // file list still need them. Admission waits instead.
+            self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
+            return Err(IngestError::Capacity(
+                "tenant memory full, hot-window retention pending",
             ));
         }
-        if total >= self.config.max_memory_bytes {
-            // Persisted rows count here and are not evicted: queriers with a
-            // stale file list still need them. Admission waits instead.
+        if buffers.total_bytes() + buffers.reserved_total() + bytes > self.config.max_memory_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
-            return Err(Status::resource_exhausted(
+            return Err(IngestError::Capacity(
                 "ingester memory full, hot-window retention pending",
             ));
         }
@@ -168,9 +173,9 @@ impl Shared {
         if wal_bytes >= self.config.wal_max_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
-            return Err(Status::unavailable("write-ahead log full"));
+            return Err(IngestError::WalFull);
         }
-        Ok(())
+        Ok(buffers.reserve(tenant, bytes))
     }
 
     /// Appends through the group-commit writer; resolves once synced.
@@ -178,9 +183,11 @@ impl Shared {
         self.writer.append(record).await
     }
 
-    /// Logs a request, converts it and adds it to the tenant buffer, all while
-    /// holding the flush gate so a concurrent flush sees either both effects or
-    /// neither.
+    /// Converts a request, admits it against the caps, logs it and adds it to
+    /// the tenant buffer, all while holding the flush gate so a concurrent
+    /// flush sees either both the log record and the rows or neither.
+    /// Conversion comes first: a request the engine cannot convert or hold is
+    /// refused before it reaches the WAL.
     pub(crate) async fn ingest(
         &self,
         tenant: TenantId,
@@ -189,8 +196,6 @@ impl Shared {
         now: Instant,
     ) -> Result<Converted, IngestError> {
         let _shared = self.gate.read().await;
-        let position = self.append_wal(record).await?;
-
         let mut builder = SpanBatchBuilder::new(self.config.limits);
         builder.append_request(message)?;
         let stats = builder.stats();
@@ -198,9 +203,20 @@ impl Shared {
         let accepted = batch.num_rows();
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
 
+        let reservation = self.admit(tenant, batch.get_array_memory_size()).await?;
+        let position = self.append_wal(record).await?;
+        if let Some(delay) = self.config.inject_push_delay {
+            if self.push_delay_pending.swap(false, Ordering::Relaxed) {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
         let due = {
             let mut buffers = self.buffers.lock().await;
             buffers.get_mut(tenant).push(batch, position, now);
+            // Released under the same lock, so no admission runs between the
+            // push and the release and counts the bytes on neither side.
+            drop(reservation);
             let live = buffers.get_mut(tenant);
             live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes
         };
@@ -230,8 +246,9 @@ impl Shared {
             let Some(first) = buffers.live_first_wal(tenant) else {
                 return Ok(false);
             };
-            let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
-            let Some(batches) = buffers.begin_flush(tenant, file_id) else {
+            let seed = buffers.file_seed(tenant);
+            let file_id = FileId::derived(self.instance, tenant, seed.segment, seed.offset);
+            let Some(batches) = buffers.begin_flush(tenant, file_id, end) else {
                 return Ok(false);
             };
             (
@@ -404,7 +421,7 @@ impl Shared {
     pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Option<FileId>) {
         let snapshot = self.buffers.lock().await.snapshot(tenant);
         let live_file = snapshot
-            .live_first_wal
+            .next_file_seed
             .map(|p| FileId::derived(self.instance, tenant, p.segment, p.offset));
         (snapshot, live_file)
     }
@@ -502,10 +519,15 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
 }
 
 /// Rebuilds buffers: rows covered by an intent go back to the flushing state
-/// under that file id, everything else is live.
-fn rebuild(replayed: Replayed) -> Buffers {
+/// under that file id, everything else is live. Tenants seed their next file
+/// from the end of their latest intent, or from `startup`, the WAL position
+/// after replay, when they have none.
+fn rebuild(replayed: Replayed, startup: Position) -> Buffers {
     let now = Instant::now();
-    let mut buffers = Buffers::default();
+    let mut buffers = Buffers::new(startup);
+    for intent in &replayed.intents {
+        buffers.note_intent_end(intent.tenant, intent.end);
+    }
     let mut groups: Vec<(FlushIntent, TenantBuffer)> = replayed
         .intents
         .into_iter()
@@ -559,7 +581,7 @@ impl Ingester {
         let replayed = replay(config.limits, &mut wal)?;
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
-        let buffers = rebuild(replayed);
+        let buffers = rebuild(replayed, wal.position());
         info!(
             records,
             damaged,
@@ -569,6 +591,7 @@ impl Ingester {
         );
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
+        let push_delay_pending = config.inject_push_delay.is_some();
         let wal = Arc::new(StdMutex::new(wal));
         let writer = crate::walwriter::WalWriter::spawn(Arc::clone(&wal), config.group_commit);
         let shared = Shared {
@@ -584,6 +607,7 @@ impl Ingester {
             gate: RwLock::new(()),
             flush_now: Notify::new(),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
+            push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             catalog,
             store,
             root,

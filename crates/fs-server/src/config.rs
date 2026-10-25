@@ -225,9 +225,14 @@ pub struct IngestSection {
     /// Flush a tenant buffer once its oldest record is this old.
     #[serde(default = "default_flush_interval")]
     pub flush_interval_secs: u64,
-    /// Refuse a tenant's data when its buffer exceeds this while flushes fail.
+    /// Refuse a tenant's data when its live and flushing rows would exceed this.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
+    /// Refuse a tenant's data when its rows in every state, hot-window rows
+    /// included, would exceed this. Keeps one tenant from holding the whole
+    /// `max_memory_bytes`.
+    #[serde(default = "default_max_tenant_bytes")]
+    pub max_tenant_bytes: usize,
     /// Refuse data when the WAL on disk exceeds this.
     #[serde(default = "default_wal_max_bytes")]
     pub wal_max_bytes: u64,
@@ -281,6 +286,7 @@ impl Default for IngestSection {
             flush_bytes: default_flush_bytes(),
             flush_interval_secs: default_flush_interval(),
             max_buffer_bytes: default_max_buffer_bytes(),
+            max_tenant_bytes: default_max_tenant_bytes(),
             wal_max_bytes: default_wal_max_bytes(),
             max_memory_bytes: default_max_memory_bytes(),
             tenant_bytes_per_sec: None,
@@ -346,6 +352,7 @@ impl IngestSection {
             flush_bytes: self.flush_bytes,
             flush_interval: std::time::Duration::from_secs(self.flush_interval_secs),
             max_buffer_bytes: self.max_buffer_bytes,
+            max_tenant_bytes: self.max_tenant_bytes,
             wal_max_bytes: self.wal_max_bytes,
             max_memory_bytes: self.max_memory_bytes,
             tenant_bytes_per_sec: self.tenant_bytes_per_sec,
@@ -389,6 +396,10 @@ fn default_flush_interval() -> u64 {
 
 fn default_max_buffer_bytes() -> usize {
     512 * 1024 * 1024
+}
+
+fn default_max_tenant_bytes() -> usize {
+    1024 * 1024 * 1024
 }
 
 fn default_max_memory_bytes() -> usize {
@@ -673,6 +684,13 @@ impl Config {
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
         }
+        if self.ingest.max_buffer_bytes > self.ingest.max_tenant_bytes
+            || self.ingest.max_tenant_bytes > self.ingest.max_memory_bytes
+        {
+            return invalid(
+                "ingest.max_buffer_bytes <= ingest.max_tenant_bytes <= ingest.max_memory_bytes must hold",
+            );
+        }
         if self.ingest.wal_batch_records == 0
             || self.ingest.wal_batch_bytes == 0
             || self.ingest.wal_queue_records == 0
@@ -872,6 +890,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("ingest.listen")
+        );
+
+        let inverted = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nmax_tenant_bytes = 4096\nmax_memory_bytes = 1024\n",
+        )
+        .unwrap();
+        assert!(
+            inverted
+                .validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("max_tenant_bytes")
         );
     }
 
