@@ -5,7 +5,15 @@
 all-features = true
 
 [licenses]
-# Only permissive licenses compatible with Apache-2.0 distribution.
+# Only permissive licenses compatible with Apache-2.0 distribution. The list
+# matches the FuseScope backend policy (MIT, BSD, ISC, Apache-2.0) plus the
+# licenses of the Rust standard ecosystem (Unicode, Zlib, CC0).
+#
+# BSL-1.0 (Boost Software License) is permissive and would be acceptable, but
+# it is not listed until a dependency needs it with no MIT/Apache alternative.
+# When that day comes, add it here with a comment and update the FuseScope
+# CLAUDE.md in the same change. Never confuse it with BUSL-1.1 (Business
+# Source License), which is not open source and stays forbidden.
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",

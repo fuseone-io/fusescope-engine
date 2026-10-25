@@ -44,4 +44,6 @@ protocol, the semantic conventions and observed data. See
 ## License
 
 Apache-2.0. Dependencies must be MIT, BSD, ISC or Apache-2.0; `cargo deny`
-enforces it.
+enforces it. Other permissive licenses (for example Boost, BSL-1.0) are added
+to [deny.toml](deny.toml) only when a dependency needs them and no MIT or
+Apache alternative exists, and the FuseScope backend policy changes with them.
