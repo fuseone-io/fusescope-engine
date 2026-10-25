@@ -368,6 +368,7 @@ async fn replays_wal_after_crash_without_flush() {
         .read_dir()
         .unwrap()
         .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "wal"))
         .collect();
     assert_eq!(
         segments.len(),
@@ -563,6 +564,84 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
     );
     assert_eq!(got.persisted_files.len(), 0);
 
+    h.stop().await;
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn restart_after_flush_does_not_duplicate_rows() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+
+    // Ingest, flush, then die without a clean shutdown.
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.client()
+        .await
+        .export(authed(request("api", 7, 20), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    h.client()
+        .await
+        .export(authed(request("api", 8, 3), &token))
+        .await
+        .unwrap(); // unflushed
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+    assert_eq!(parquet_files(&dir.path().join("bucket")).len(), 1);
+
+    // Restart: only the 3 unflushed spans come back from the WAL.
+    let h = start(&db.catalog, dir, test_config()).await;
+    assert_eq!(
+        h.ingester.stats().spans.load(Ordering::Relaxed),
+        0,
+        "stats count live traffic only"
+    );
+    h.ingester.flush_all().await;
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(
+        files.len(),
+        2,
+        "one file per flush, no replayed duplicate of the first"
+    );
+    let total: i64 = files
+        .iter()
+        .map(|f| {
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(f).unwrap())
+                .unwrap()
+                .metadata()
+                .file_metadata()
+                .num_rows()
+        })
+        .sum();
+    assert_eq!(total, 23);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 2);
+    assert_eq!(registered.iter().map(|f| f.row_count).sum::<i64>(), 23);
     h.stop().await;
     db.finish().await;
 }

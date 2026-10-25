@@ -101,12 +101,17 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
          2. write Parquet L0 to the bucket under a temporary path
          3. write index sidecars (section 5)
          4. INSERT into the catalog with state "visible"
-         5. truncate the WAL up to the covered offset
+         5. checkpoint the WAL at the first still-buffered record
 ```
 
-A file exists for the querier only after the catalog INSERT. If the ingester
-dies between steps 2 and 4, the orphan file is collected by the compactor from
-the temporary prefix. If it dies before step 2, the WAL is replayed on start.
+A file exists for the querier only after the catalog INSERT. The file id is
+derived from the tenant and the WAL position of the buffer's first record, so
+a flush replayed after a crash writes the same object and the INSERT is
+idempotent on id. The checkpoint is a durable marker next to the segments:
+replay after a restart starts there, which is what prevents rows already in
+the bucket from being flushed twice. If the ingester dies between steps 2 and
+4, the next run rebuilds and re-registers the same file; if it dies before
+step 2, the WAL is replayed from the checkpoint.
 
 ### 2.3 Read path
 

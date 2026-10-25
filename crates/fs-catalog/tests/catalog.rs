@@ -527,3 +527,36 @@ async fn tokens_resolve_until_revoked() {
     );
     db.finish().await;
 }
+
+#[tokio::test]
+async fn register_is_idempotent_on_id() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let mut f = file(t, Signal::Traces, 0, 1, &["api"]);
+    f.id = FileId::derived(t, 7, 4096);
+    f.path = format!("t/{}/traces/l0/{}.parquet", t.0, f.id.0);
+    let first = db.catalog.register_file(&f).await.unwrap();
+    let again = db.catalog.register_file(&f).await.unwrap();
+    assert_eq!(first, again, "same id returns the existing row");
+    let visible = db
+        .catalog
+        .visible_files(
+            t,
+            Signal::Traces,
+            TimeRange {
+                start: hour(0),
+                end: hour(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    db.finish().await;
+}

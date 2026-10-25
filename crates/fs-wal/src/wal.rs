@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::WalError;
+use crate::checkpoint::{read_checkpoint, write_checkpoint};
 use crate::format::{parse_segment_file_name, segment_file_name};
 use crate::replay::{Damage, Replay, SegmentReader};
 use crate::segment::{SegmentWriter, sync_dir};
@@ -75,6 +76,11 @@ pub struct Wal {
     config: WalConfig,
     active: SegmentWriter,
     recovery: Recovery,
+    /// Everything before this position has been materialised and is skipped
+    /// on replay. `None` until the first checkpoint.
+    checkpoint: Option<Position>,
+    /// Bytes of every segment on disk, including the active one.
+    bytes: u64,
 }
 
 impl Wal {
@@ -89,11 +95,40 @@ impl Wal {
             None => (SegmentWriter::create(&config.dir, 0)?, Recovery::default()),
             Some(&(id, ref path)) => recover_last(&config, id, path)?,
         };
-        Ok(Self {
+        let checkpoint = read_checkpoint(&config.dir)?;
+        let mut wal = Self {
             config,
             active,
             recovery,
-        })
+            checkpoint,
+            bytes: 0,
+        };
+        wal.bytes = wal.measure()?;
+        Ok(wal)
+    }
+
+    /// Everything before this position is already materialised.
+    pub fn checkpoint_position(&self) -> Option<Position> {
+        self.checkpoint
+    }
+
+    /// Bytes on disk across every segment. Maintained incrementally; no I/O.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn measure(&self) -> Result<u64, WalError> {
+        let mut total = 0u64;
+        for (id, path) in list_segments(&self.config.dir)? {
+            total += if id == self.active.id() {
+                self.active.len()
+            } else {
+                fs::metadata(&path)
+                    .map_err(|e| WalError::io(&path, e))?
+                    .len()
+            };
+        }
+        Ok(total)
     }
 
     /// What recovery did on open.
@@ -126,7 +161,9 @@ impl Wal {
         if self.active.len() >= self.config.segment_max_bytes {
             self.rotate()?;
         }
+        let before = self.active.len();
         let offset = self.active.append(payload)?;
+        self.bytes += self.active.len() - before;
         if self.config.sync == SyncPolicy::Always {
             self.active.sync()?;
         }
@@ -153,11 +190,12 @@ impl Wal {
             .checked_add(1)
             .ok_or(WalError::SegmentIdOverflow)?;
         self.active = SegmentWriter::create(&self.config.dir, next)?;
+        self.bytes += self.active.len();
         Ok(())
     }
 
-    /// Iterates every record on disk, oldest first. Call before appending; the
-    /// active segment is read up to the last [`Wal::sync`].
+    /// Iterates every record at or after the checkpoint, oldest first. Call
+    /// before appending; the active segment is read up to the last [`Wal::sync`].
     ///
     /// # Errors
     /// Filesystem errors while listing segments.
@@ -166,7 +204,25 @@ impl Wal {
         Ok(Replay::new(
             list_segments(&self.config.dir)?,
             self.config.max_record_bytes,
-        ))
+        )
+        .skipping_before(self.checkpoint))
+    }
+
+    /// Records durably that every record before `position` has been
+    /// materialised, then drops the segments that end before it. Replay after
+    /// a restart starts at `position`. Moving a checkpoint backwards is a no-op.
+    ///
+    /// # Errors
+    /// Filesystem errors.
+    pub fn checkpoint(&mut self, position: Position) -> Result<(), WalError> {
+        if self.checkpoint.is_some_and(|current| position <= current) {
+            return Ok(());
+        }
+        self.active.sync()?;
+        write_checkpoint(&self.config.dir, position)?;
+        self.checkpoint = Some(position);
+        self.truncate_before(position)?;
+        Ok(())
     }
 
     /// Deletes every segment that ends before `position`, keeping the one that
@@ -179,7 +235,11 @@ impl Wal {
         let mut removed = 0;
         for (id, path) in list_segments(&self.config.dir)? {
             if id < position.segment && id != self.active.id() {
+                let size = fs::metadata(&path)
+                    .map_err(|e| WalError::io(&path, e))?
+                    .len();
                 fs::remove_file(&path).map_err(|e| WalError::io(&path, e))?;
+                self.bytes = self.bytes.saturating_sub(size);
                 removed += 1;
             }
         }

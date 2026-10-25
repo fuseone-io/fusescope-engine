@@ -59,7 +59,24 @@ impl FileId {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
+
+    /// An id derived from what a flush contains, so a retried or replayed
+    /// flush of the same rows produces the same id and path, and registering
+    /// it twice is idempotent. `segment` and `offset` locate the first record
+    /// of the flushed buffer in the ingester's write-ahead log.
+    pub fn derived(tenant: TenantId, segment: u64, offset: u64) -> Self {
+        let mut name = Vec::with_capacity(32);
+        name.extend_from_slice(tenant.0.as_bytes());
+        name.extend_from_slice(&segment.to_le_bytes());
+        name.extend_from_slice(&offset.to_le_bytes());
+        Self(Uuid::new_v5(&FILE_NAMESPACE, &name))
+    }
 }
+
+/// Namespace for derived file ids. Fixed forever; changing it changes every id.
+const FILE_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x5f, 0x73, 0x65, 0x6e, 0x67, 0x69, 0x6e, 0x65, 0x66, 0x69, 0x6c, 0x65, 0x69, 0x64, 0x30, 0x31,
+]);
 
 impl Default for FileId {
     fn default() -> Self {
@@ -464,6 +481,16 @@ mod tests {
         }
         assert!(Level::from_code(3).is_err());
         assert!(FileState::from_code(-1).is_err());
+    }
+
+    #[test]
+    fn derived_ids_are_stable_and_distinct() {
+        let tenant = TenantId::new();
+        let a = FileId::derived(tenant, 3, 4096);
+        assert_eq!(a, FileId::derived(tenant, 3, 4096));
+        assert_ne!(a, FileId::derived(tenant, 3, 4097));
+        assert_ne!(a, FileId::derived(tenant, 4, 4096));
+        assert_ne!(a, FileId::derived(TenantId::new(), 3, 4096));
     }
 
     #[test]

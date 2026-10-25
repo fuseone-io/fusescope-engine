@@ -62,7 +62,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 foyer = "0.19"
 base64 = "0.22"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "uuid", "chrono", "migrate", "macros"] }
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = "0.3"
 roaring = "0.11"

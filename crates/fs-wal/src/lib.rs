@@ -28,7 +28,16 @@
 //! record (a torn write from a crash) is cut off so appends continue from a
 //! consistent point. Earlier segments are never modified; damage in them is
 //! reported during replay and the scan continues with the next segment.
+//!
+//! # Checkpoints
+//!
+//! Once the records before a position are materialised, the owner calls
+//! [`Wal::checkpoint`]. The position is stored durably next to the segments,
+//! replay starts there after a restart, and whole segments before it are
+//! deleted. Without the checkpoint a restart after a flush would replay rows
+//! that already live in the bucket.
 
+mod checkpoint;
 mod format;
 mod replay;
 mod segment;

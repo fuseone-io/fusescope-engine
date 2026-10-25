@@ -14,7 +14,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Trac
 use prost::Message;
 use tokio::sync::{Mutex, Notify, watch};
 use tonic::Status;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::Authenticator;
 use crate::buffer::Buffers;
@@ -74,17 +74,7 @@ impl Shared {
                 "tenant buffer full, flush pending",
             ));
         }
-        let wal_bytes = {
-            let wal = self.wal.clone();
-            tokio::task::spawn_blocking(move || {
-                wal.lock().map_or(0, |w| {
-                    w.segments()
-                        .map_or(0, |s| s.iter().map(|x| x.bytes).sum::<u64>())
-                })
-            })
-            .await
-            .unwrap_or(0)
-        };
+        let wal_bytes = self.wal.lock().map_or(0, |w| w.bytes());
         if wal_bytes >= self.config.wal_max_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
@@ -146,8 +136,17 @@ impl Shared {
         };
         let root = self.root.clone();
         let batches = taken.batches.clone();
+        // The id follows from the first WAL record in the buffer: a flush
+        // replayed after a crash rebuilds the same file and registration stays
+        // idempotent.
+        let first = taken.first_wal.unwrap_or(Position {
+            segment: 0,
+            offset: 0,
+        });
+        let file_id = fs_catalog::FileId::derived(tenant, first.segment, first.offset);
         let prepared =
-            tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, &batches)).await;
+            tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
+                .await;
         let result = match prepared {
             Ok(Ok(prepared)) => match flush::upload(self.store.as_ref(), &prepared).await {
                 Ok(()) => self
@@ -172,7 +171,7 @@ impl Shared {
                     taken.batches,
                     Instant::now(),
                 );
-                self.truncate_wal().await;
+                self.checkpoint_wal().await;
                 Ok(true)
             }
             Err(e) => {
@@ -184,21 +183,22 @@ impl Shared {
         }
     }
 
-    /// Drops WAL segments every tenant has flushed past.
-    async fn truncate_wal(&self) {
+    /// Records that everything before the earliest still-buffered record is
+    /// materialised: replay after a restart starts there, and segments before
+    /// it are deleted.
+    async fn checkpoint_wal(&self) {
         let earliest = self.buffers.lock().await.earliest_wal();
         let wal = self.wal.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut wal = wal.lock().map_err(|_| fs_wal::WalError::EmptyRecord)?;
             let cut = earliest.unwrap_or_else(|| wal.position());
-            wal.truncate_before(cut)
+            wal.checkpoint(cut).map(|()| cut)
         })
         .await;
         match result {
-            Ok(Ok(removed)) if removed > 0 => info!(segments = removed, "wal truncated"),
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => warn!(error = %e, "wal truncate failed"),
-            Err(e) => warn!(error = %e, "wal truncate task failed"),
+            Ok(Ok(cut)) => debug!(?cut, "wal checkpoint"),
+            Ok(Err(e)) => warn!(error = %e, "wal checkpoint failed; replay may duplicate rows"),
+            Err(e) => warn!(error = %e, "wal checkpoint task failed"),
         }
     }
 

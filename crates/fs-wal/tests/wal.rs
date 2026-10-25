@@ -264,3 +264,51 @@ fn sync_always_is_durable_without_explicit_sync() {
     let (payloads, _) = records(&mut wal);
     assert_eq!(payloads, vec![payload(1)]);
 }
+
+#[test]
+fn checkpoint_skips_materialised_records_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wal = Wal::open(config(dir.path())).unwrap();
+    let positions: Vec<Position> = (0..100).map(|i| wal.append(&payload(i)).unwrap()).collect();
+    wal.sync().unwrap();
+    let on_disk: u64 = wal.segments().unwrap().iter().map(|s| s.bytes).sum();
+    assert_eq!(wal.bytes(), on_disk, "size counter matches the files");
+
+    // Everything before record 60 is materialised.
+    wal.checkpoint(positions[60]).unwrap();
+    assert_eq!(wal.checkpoint_position(), Some(positions[60]));
+    let (payloads, damaged) = records(&mut wal);
+    assert_eq!(damaged, vec![]);
+    assert_eq!(payloads.len(), 40);
+    assert_eq!(payloads[0], payload(60));
+    assert!(
+        wal.segments()
+            .unwrap()
+            .iter()
+            .all(|s| s.id >= positions[60].segment),
+        "older segments are gone"
+    );
+    assert_eq!(
+        wal.bytes(),
+        wal.segments().unwrap().iter().map(|s| s.bytes).sum::<u64>()
+    );
+
+    // Moving backwards is ignored.
+    wal.checkpoint(positions[10]).unwrap();
+    assert_eq!(wal.checkpoint_position(), Some(positions[60]));
+
+    // The checkpoint survives a restart and new records land after it.
+    drop(wal);
+    let mut wal = Wal::open(config(dir.path())).unwrap();
+    assert_eq!(wal.checkpoint_position(), Some(positions[60]));
+    wal.append(&payload(100)).unwrap();
+    wal.sync().unwrap();
+    let (payloads, _) = records(&mut wal);
+    assert_eq!(payloads.len(), 41);
+    assert_eq!(payloads.last().unwrap(), &payload(100));
+
+    // Checkpointing at the live position leaves nothing to replay.
+    wal.checkpoint(wal.position()).unwrap();
+    let (payloads, _) = records(&mut wal);
+    assert_eq!(payloads.len(), 0);
+}

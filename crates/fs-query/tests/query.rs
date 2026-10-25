@@ -134,7 +134,8 @@ async fn write_file(
     let mut builder = SpanBatchBuilder::new(Limits::default());
     builder.append_request(request).unwrap();
     let batch = builder.finish().unwrap();
-    let prepared = flush::prepare(tenant, &Path::from(""), &[batch]).unwrap();
+    let prepared =
+        flush::prepare(tenant, &Path::from(""), fs_catalog::FileId::new(), &[batch]).unwrap();
     flush::upload(store, &prepared).await.unwrap();
     catalog.register_file(&prepared.file).await.unwrap();
     prepared.file.size_bytes

@@ -50,6 +50,7 @@ pub struct Replay {
     segments: std::vec::IntoIter<(u64, PathBuf)>,
     current: Option<SegmentReader>,
     max_record_bytes: usize,
+    skip_before: Option<Position>,
 }
 
 impl Replay {
@@ -58,7 +59,15 @@ impl Replay {
             segments: segments.into_iter(),
             current: None,
             max_record_bytes,
+            skip_before: None,
         }
+    }
+
+    /// Yields only records at or after `position`. Segments entirely before it
+    /// are not even opened.
+    pub(crate) fn skipping_before(mut self, position: Option<Position>) -> Self {
+        self.skip_before = position;
+        self
     }
 }
 
@@ -69,6 +78,8 @@ impl Iterator for Replay {
         loop {
             if let Some(reader) = self.current.as_mut() {
                 match reader.next_record(self.max_record_bytes) {
+                    Step::Record(entry)
+                        if self.skip_before.is_some_and(|cut| entry.position < cut) => {}
                     Step::Record(entry) => return Some(Event::Record(entry)),
                     Step::End => self.current = None,
                     Step::Damaged(position, damage) => {
@@ -79,6 +90,9 @@ impl Iterator for Replay {
                 continue;
             }
             let (id, path) = self.segments.next()?;
+            if self.skip_before.is_some_and(|cut| id < cut.segment) {
+                continue;
+            }
             match SegmentReader::open(id, &path) {
                 Ok(reader) => self.current = Some(reader),
                 Err(damage) => {

@@ -43,6 +43,7 @@ pub struct Prepared {
 pub fn prepare(
     tenant: TenantId,
     root: &Path,
+    id: FileId,
     batches: &[RecordBatch],
 ) -> Result<Prepared, IngestError> {
     let schema = span_schema_v1();
@@ -56,7 +57,6 @@ pub fn prepare(
     let ts_max = arrow::compute::max(ts).unwrap_or(0);
     let services = distinct_services(&sorted)?;
 
-    let id = FileId::new();
     let start = Utc.timestamp_nanos(ts_min);
     let path = l0_path(root, tenant, start, id);
     let bytes = encode_parquet(&sorted)?;

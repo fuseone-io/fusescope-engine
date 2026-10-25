@@ -94,8 +94,12 @@ impl Catalog {
     /// Registers a file as visible. Called by the ingester after the object is
     /// fully written to the bucket.
     ///
+    /// Idempotent on `file.id`: registering the same id again returns the
+    /// existing row untouched, so a flush retried after a crash between upload
+    /// and registration does not create a second file.
+    ///
     /// # Errors
-    /// Duplicate path, unknown tenant, or database failure.
+    /// Duplicate path under a different id, unknown tenant, or database failure.
     pub async fn register_file(&self, file: &NewFile) -> Result<FileRecord, CatalogError> {
         let mut tx = self.pool.begin().await?;
         let record = insert_file(&mut tx, file).await?;
@@ -393,10 +397,11 @@ async fn insert_file(
     tx: &mut Transaction<'_, Postgres>,
     file: &NewFile,
 ) -> Result<FileRecord, CatalogError> {
-    let row = sqlx::query_as::<_, FileRow>(
+    let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
              (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         on conflict (id) do nothing
          returning id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                    services, summary, state, created_at, quarantined_at",
     )
@@ -412,7 +417,19 @@ async fn insert_file(
     .bind(&file.services)
     .bind(&file.summary)
     .bind(FileState::Visible.code())
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    let row =
+        match inserted {
+            Some(row) => row,
+            None => sqlx::query_as::<_, FileRow>(
+                "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+                    services, summary, state, created_at, quarantined_at
+             from engine_file where id = $1",
+            )
+            .bind(file.id)
+            .fetch_one(&mut **tx)
+            .await?,
+        };
     FileRecord::try_from(row)
 }
