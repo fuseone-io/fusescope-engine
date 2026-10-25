@@ -84,6 +84,9 @@ pub struct Persisted {
     pub file: FileId,
     /// The rows, as they were buffered.
     pub batches: Vec<RecordBatch>,
+    /// Arrow memory of `batches`, carried over from the buffer so accounting
+    /// never walks the batches again.
+    pub bytes: usize,
     /// When the file was registered.
     pub at: Instant,
 }
@@ -193,6 +196,7 @@ impl Buffers {
         if let Some(entry) = self.remove_flushing(tenant, file) {
             self.persisted.entry(tenant).or_default().push(Persisted {
                 file,
+                bytes: entry.buffer.bytes,
                 batches: entry.buffer.batches,
                 at: now,
             });
@@ -283,6 +287,7 @@ impl Buffers {
     }
 
     /// Bytes held in each state across tenants: `(live, flushing, persisted)`.
+    /// Sums per-entry counters; it never walks batches.
     pub fn memory(&self) -> (usize, usize, usize) {
         let live = self.tenants.values().map(|b| b.bytes).sum();
         let flushing = self
@@ -291,14 +296,14 @@ impl Buffers {
             .flatten()
             .map(|f| f.buffer.bytes)
             .sum();
-        let persisted = self
-            .persisted
-            .values()
-            .flatten()
-            .flat_map(|p| p.batches.iter())
-            .map(RecordBatch::get_array_memory_size)
-            .sum();
+        let persisted = self.persisted.values().flatten().map(|p| p.bytes).sum();
         (live, flushing, persisted)
+    }
+
+    /// Everything the buffers hold, in every state.
+    pub fn total_bytes(&self) -> usize {
+        let (live, flushing, persisted) = self.memory();
+        live + flushing + persisted
     }
 
     /// Rows pending across tenants, live and flushing.

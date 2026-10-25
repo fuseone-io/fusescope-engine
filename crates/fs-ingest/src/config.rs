@@ -21,6 +21,10 @@ pub struct IngestConfig {
     pub flush_interval: Duration,
     /// Refuse new data for a tenant whose buffer exceeds this while flushes fail.
     pub max_buffer_bytes: usize,
+    /// Refuse new data when everything held in memory, live, flushing and
+    /// persisted for the hot window, exceeds this. Persisted rows are never
+    /// evicted early to make room: queriers may still need them.
+    pub max_memory_bytes: usize,
     /// Refuse new data when the WAL on disk exceeds this.
     pub wal_max_bytes: u64,
     /// Per-tenant throughput limit in bytes per second of request payload.
@@ -61,6 +65,7 @@ impl Default for IngestConfig {
             flush_bytes: 128 * 1024 * 1024,
             flush_interval: Duration::from_secs(30),
             max_buffer_bytes: 512 * 1024 * 1024,
+            max_memory_bytes: 2 * 1024 * 1024 * 1024,
             wal_max_bytes: 4 * 1024 * 1024 * 1024,
             tenant_bytes_per_sec: None,
             anonymous_tenant: None,

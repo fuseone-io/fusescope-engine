@@ -41,6 +41,8 @@ pub struct FlushReport {
     pub rows_per_flush: f64,
     /// Parquet MiB per flush.
     pub parquet_mib_per_flush: f64,
+    /// Milliseconds per flush concatenating request batches.
+    pub concat_ms: f64,
     /// Milliseconds per flush in sort.
     pub sort_ms: f64,
     /// Milliseconds per flush encoding Parquet.
@@ -208,10 +210,11 @@ pub fn print(report: &LoadReport) {
     }
     if let Some(f) = &report.flush {
         println!(
-            "flushes={} rows/flush={:.0} parquet/flush={:.1} MiB | per flush: sort={:.0}ms encode={:.0}ms upload={:.0}ms register={:.0}ms total={:.0}ms | buffers at end: live={} MiB flushing={} MiB persisted={} MiB",
+            "flushes={} rows/flush={:.0} parquet/flush={:.1} MiB | per flush: concat={:.0}ms sort={:.0}ms encode={:.0}ms upload={:.0}ms register={:.0}ms total={:.0}ms | buffers at end: live={} MiB flushing={} MiB persisted={} MiB",
             f.flushes,
             f.rows_per_flush,
             f.parquet_mib_per_flush,
+            f.concat_ms,
             f.sort_ms,
             f.encode_ms,
             f.upload_ms,
@@ -267,6 +270,7 @@ fn flush_report(
         flushes: flushes as u64,
         rows_per_flush: per("fusescope_flush_rows_total"),
         parquet_mib_per_flush: per("fusescope_flush_parquet_bytes_total") / (1024.0 * 1024.0),
+        concat_ms: ms("fusescope_flush_concat_nanoseconds_total"),
         sort_ms: ms("fusescope_flush_sort_nanoseconds_total"),
         encode_ms: ms("fusescope_flush_encode_nanoseconds_total"),
         upload_ms: ms("fusescope_flush_upload_nanoseconds_total"),

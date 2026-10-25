@@ -32,7 +32,9 @@ pub struct Prepared {
     pub file: NewFile,
     /// File bytes.
     pub bytes: Bytes,
-    /// Time spent in concat and sort.
+    /// Time spent concatenating the request batches.
+    pub concat: std::time::Duration,
+    /// Time spent sorting.
     pub sort: std::time::Duration,
     /// Time spent encoding Parquet.
     pub encode: std::time::Duration,
@@ -50,11 +52,13 @@ pub fn prepare(
     id: FileId,
     batches: &[RecordBatch],
 ) -> Result<Prepared, IngestError> {
-    let started = std::time::Instant::now();
+    let concat_started = std::time::Instant::now();
     let schema = span_schema_v1();
     let merged = concat_batches(&schema, batches)?;
+    let concat = concat_started.elapsed();
+    let sort_started = std::time::Instant::now();
     let sorted = sort_spans(&merged)?;
-    let sort = started.elapsed();
+    let sort = sort_started.elapsed();
 
     let ts = sorted
         .column(schema.index_of(col::TIMESTAMP)?)
@@ -87,6 +91,7 @@ pub fn prepare(
     Ok(Prepared {
         file,
         bytes,
+        concat,
         sort,
         encode,
     })

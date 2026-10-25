@@ -71,13 +71,18 @@ pub struct IngestStats {
 /// Per-stage flush timings and buffer memory, for sizing the flush path.
 #[derive(Debug, Default)]
 pub struct FlushStats {
-    /// Flushes completed.
+    /// Flush attempts started, successful or not.
+    pub attempts: AtomicU64,
+    /// Flushes completed. Stage times below are added only on completion, so
+    /// `stage / flushes` is the cost of a successful flush.
     pub flushes: AtomicU64,
     /// Rows written.
     pub rows: AtomicU64,
     /// Parquet bytes written.
     pub parquet_bytes: AtomicU64,
-    /// Nanoseconds in concat and sort.
+    /// Nanoseconds concatenating request batches.
+    pub concat_nanos: AtomicU64,
+    /// Nanoseconds sorting.
     pub sort_nanos: AtomicU64,
     /// Nanoseconds encoding Parquet.
     pub encode_nanos: AtomicU64,
@@ -93,6 +98,16 @@ pub struct FlushStats {
     pub flushing_bytes: AtomicU64,
     /// Bytes kept for the hot window after registration, sampled every flusher tick.
     pub persisted_bytes: AtomicU64,
+}
+
+/// Stage durations of one flush attempt, in nanoseconds.
+#[derive(Debug, Default)]
+struct StageTiming {
+    concat: u64,
+    sort: u64,
+    encode: u64,
+    upload: u64,
+    register: u64,
 }
 
 fn nanos(d: std::time::Duration) -> u64 {
@@ -129,12 +144,23 @@ pub struct Shared {
 impl Shared {
     /// Refuses when the tenant's buffer or the WAL on disk is over its cap.
     pub(crate) async fn check_capacity(&self, tenant: TenantId) -> Result<(), Status> {
-        let buffered = self.buffers.lock().await.bytes_of(tenant);
+        let (buffered, total) = {
+            let buffers = self.buffers.lock().await;
+            (buffers.bytes_of(tenant), buffers.total_bytes())
+        };
         if buffered >= self.config.max_buffer_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
             return Err(Status::resource_exhausted(
                 "tenant buffer full, flush pending",
+            ));
+        }
+        if total >= self.config.max_memory_bytes {
+            // Persisted rows count here and are not evicted: queriers with a
+            // stale file list still need them. Admission waits instead.
+            self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted(
+                "ingester memory full, hot-window retention pending",
             ));
         }
         // Never lock the WAL here: the writer holds it through every fsync.
@@ -231,8 +257,7 @@ impl Shared {
     }
 
     /// Steps 3 and 4: encode, upload, register, persist, checkpoint. On failure
-    /// the rows return to the live buffer; the intent in the WAL still binds
-    /// them to `file_id` if the process dies before the retry.
+    /// the rows stay bound to `file_id` and are retried as they are.
     async fn materialize(
         &self,
         tenant: TenantId,
@@ -240,35 +265,13 @@ impl Shared {
         batches: Vec<RecordBatch>,
     ) -> Result<(), IngestError> {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let root = self.root.clone();
-        let started = Instant::now();
-        let prepared =
-            tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
-                .await;
         let fs = &self.flush_stats;
-        let result = match prepared {
-            Ok(Ok(prepared)) => {
-                fs.sort_nanos
-                    .fetch_add(nanos(prepared.sort), Ordering::Relaxed);
-                fs.encode_nanos
-                    .fetch_add(nanos(prepared.encode), Ordering::Relaxed);
-                let upload_started = Instant::now();
-                match flush::upload(self.store.as_ref(), &prepared).await {
-                    Ok(created) => {
-                        fs.upload_nanos
-                            .fetch_add(nanos(upload_started.elapsed()), Ordering::Relaxed);
-                        let register_started = Instant::now();
-                        let registered = self.register(&prepared.file).await;
-                        fs.register_nanos
-                            .fetch_add(nanos(register_started.elapsed()), Ordering::Relaxed);
-                        registered.map(|()| (prepared.file, created))
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(IngestError::from(e)),
-        };
+        fs.attempts.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let mut timing = StageTiming::default();
+        let result = self
+            .write_and_register(tenant, file_id, batches, &mut timing)
+            .await;
         match result {
             Ok((file, created)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
@@ -288,6 +291,14 @@ impl Shared {
                 if self.config.checkpoint_after_flush {
                     self.checkpoint_wal().await;
                 }
+                // Stage times are published only for completed flushes, so the
+                // per-flush averages are not inflated by retries.
+                fs.concat_nanos.fetch_add(timing.concat, Ordering::Relaxed);
+                fs.sort_nanos.fetch_add(timing.sort, Ordering::Relaxed);
+                fs.encode_nanos.fetch_add(timing.encode, Ordering::Relaxed);
+                fs.upload_nanos.fetch_add(timing.upload, Ordering::Relaxed);
+                fs.register_nanos
+                    .fetch_add(timing.register, Ordering::Relaxed);
                 fs.flushes.fetch_add(1, Ordering::Relaxed);
                 fs.rows.fetch_add(
                     u64::try_from(file.row_count).unwrap_or(0),
@@ -314,6 +325,30 @@ impl Shared {
                 Err(e)
             }
         }
+    }
+
+    /// Encode, upload and register, filling `timing` as it goes.
+    async fn write_and_register(
+        &self,
+        tenant: TenantId,
+        file_id: FileId,
+        batches: Vec<RecordBatch>,
+        timing: &mut StageTiming,
+    ) -> Result<(fs_catalog::NewFile, bool), IngestError> {
+        let root = self.root.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
+                .await??;
+        timing.concat = nanos(prepared.concat);
+        timing.sort = nanos(prepared.sort);
+        timing.encode = nanos(prepared.encode);
+        let upload_started = Instant::now();
+        let created = flush::upload(self.store.as_ref(), &prepared).await?;
+        timing.upload = nanos(upload_started.elapsed());
+        let register_started = Instant::now();
+        self.register(&prepared.file).await?;
+        timing.register = nanos(register_started.elapsed());
+        Ok((prepared.file, created))
     }
 
     /// Catalog registration, with the test-only failure injection in front.

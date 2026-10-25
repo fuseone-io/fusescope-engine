@@ -276,8 +276,10 @@ async fn authenticates_buffers_flushes_and_registers() {
     assert_eq!(fs.rows.load(Ordering::Relaxed), 14);
     assert!(fs.parquet_bytes.load(Ordering::Relaxed) > 0);
     assert!(
-        fs.sort_nanos.load(Ordering::Relaxed) > 0 && fs.encode_nanos.load(Ordering::Relaxed) > 0
+        fs.concat_nanos.load(Ordering::Relaxed) > 0 && fs.sort_nanos.load(Ordering::Relaxed) > 0
     );
+    assert!(fs.encode_nanos.load(Ordering::Relaxed) > 0);
+    assert_eq!(fs.attempts.load(Ordering::Relaxed), 1);
     assert!(
         fs.upload_nanos.load(Ordering::Relaxed) > 0
             && fs.register_nanos.load(Ordering::Relaxed) > 0
@@ -904,6 +906,14 @@ async fn register_failure_keeps_rows_bound_to_their_file() {
         .unwrap();
     h.ingester.flush_all().await; // upload succeeds, registration is injected to fail
     assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let fs = h.ingester.flush_stats();
+    assert_eq!(fs.attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(fs.flushes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        fs.encode_nanos.load(Ordering::Relaxed),
+        0,
+        "stage times wait for a completed flush"
+    );
     let files = parquet_files(&h.dir.path().join("bucket"));
     assert_eq!(files.len(), 1, "the object exists although unregistered");
     let first_len = std::fs::metadata(&files[0]).unwrap().len();
@@ -1011,6 +1021,77 @@ async fn wal_full_recovers_after_checkpoint() {
         .await
         .expect("writes resume after the checkpoint");
     assert!(h.ingester.wal_bytes() < 256 * 1024);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Rows retained for the hot window count toward the memory cap and are not
+/// evicted to make room; admission waits for the retention to pass.
+#[tokio::test]
+async fn memory_cap_counts_persisted_rows_without_evicting_them() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_memory_bytes: 64 * 1024,
+        persisted_retain: Duration::from_secs(2),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+
+    for i in 1..=4u8 {
+        client
+            .export(authed(request("api", i, 30), &token))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await; // rows move to persisted, still in memory
+    let refused = client
+        .export(authed(request("api", 9, 30), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+    assert!(
+        refused.message().contains("ingester memory full"),
+        "{refused:?}"
+    );
+
+    // The persisted rows are still served meanwhile.
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        120
+    );
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    h.ingester.flush_all().await; // sweeps the retention
+    client
+        .export(authed(request("api", 9, 30), &token))
+        .await
+        .expect("admitted once the retention passed");
     h.stop().await;
     db.finish().await;
 }

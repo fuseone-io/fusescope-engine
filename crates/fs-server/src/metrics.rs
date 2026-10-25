@@ -181,6 +181,12 @@ impl Metrics {
         let ns = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         counter(
             out,
+            "fusescope_flush_attempts_total",
+            "Flush attempts, successful or not",
+            ns(&f.attempts),
+        );
+        counter(
+            out,
             "fusescope_flush_total",
             "Flushes completed",
             ns(&f.flushes),
@@ -199,8 +205,14 @@ impl Metrics {
         );
         counter(
             out,
+            "fusescope_flush_concat_nanoseconds_total",
+            "Nanoseconds concatenating request batches, completed flushes",
+            ns(&f.concat_nanos),
+        );
+        counter(
+            out,
             "fusescope_flush_sort_nanoseconds_total",
-            "Nanoseconds in concat and sort",
+            "Nanoseconds sorting, completed flushes",
             ns(&f.sort_nanos),
         );
         counter(

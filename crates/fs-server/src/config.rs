@@ -231,6 +231,9 @@ pub struct IngestSection {
     /// Refuse data when the WAL on disk exceeds this.
     #[serde(default = "default_wal_max_bytes")]
     pub wal_max_bytes: u64,
+    /// Refuse data when live, flushing and hot-window rows together exceed this.
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: usize,
     /// Per-tenant throughput limit in bytes per second. Unset disables it.
     pub tenant_bytes_per_sec: Option<u64>,
     /// Accept unauthenticated requests as this tenant id. Development only.
@@ -279,6 +282,7 @@ impl Default for IngestSection {
             flush_interval_secs: default_flush_interval(),
             max_buffer_bytes: default_max_buffer_bytes(),
             wal_max_bytes: default_wal_max_bytes(),
+            max_memory_bytes: default_max_memory_bytes(),
             tenant_bytes_per_sec: None,
             anonymous_tenant: None,
             hot_listen: default_hot_listen(),
@@ -343,6 +347,7 @@ impl IngestSection {
             flush_interval: std::time::Duration::from_secs(self.flush_interval_secs),
             max_buffer_bytes: self.max_buffer_bytes,
             wal_max_bytes: self.wal_max_bytes,
+            max_memory_bytes: self.max_memory_bytes,
             tenant_bytes_per_sec: self.tenant_bytes_per_sec,
             anonymous_tenant: self.anonymous_tenant.map(fs_catalog::TenantId),
             hot_listen: Some(self.hot_listen.parse().map_err(|e| {
@@ -384,6 +389,10 @@ fn default_flush_interval() -> u64 {
 
 fn default_max_buffer_bytes() -> usize {
     512 * 1024 * 1024
+}
+
+fn default_max_memory_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_wal_max_bytes() -> u64 {
