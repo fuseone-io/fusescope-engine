@@ -87,6 +87,64 @@ pub async fn check(
     })
 }
 
+/// Administrative actions that need the catalog but no roles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAction {
+    /// Create a tenant with default limits.
+    CreateTenant {
+        /// Unique name.
+        name: String,
+    },
+    /// Issue an ingest token; the secret is printed once.
+    CreateToken {
+        /// Tenant id.
+        tenant: uuid::Uuid,
+        /// Label for the token.
+        name: String,
+    },
+}
+
+/// Runs an administrative action and returns the lines to print.
+///
+/// # Errors
+/// Invalid configuration or catalog failure.
+pub async fn admin(
+    config: Config,
+    secrets: Secrets,
+    action: AdminAction,
+) -> Result<Vec<String>, ServerError> {
+    config.validate(&secrets)?;
+    let url = config
+        .catalog_url(&secrets)
+        .ok_or_else(|| ServerError::InvalidConfig("catalog url missing".into()))?;
+    let catalog = Catalog::connect(url, 2).await?;
+    if config.catalog.migrate {
+        catalog.migrate().await?;
+    }
+    match action {
+        AdminAction::CreateTenant { name } => {
+            let tenant = catalog
+                .create_tenant(&fs_catalog::NewTenant::with_defaults(name))
+                .await?;
+            Ok(vec![
+                format!("tenant_id={}", tenant.id.0),
+                format!("name={}", tenant.name),
+            ])
+        }
+        AdminAction::CreateToken { tenant, name } => {
+            let (secret, token) = catalog
+                .create_token(fs_catalog::TenantId(tenant), &name)
+                .await?;
+            Ok(vec![
+                format!("tenant_id={}", token.tenant_id.0),
+                format!("name={}", token.name),
+                format!("token={secret}"),
+                "store the token now; it is not kept in plaintext".to_owned(),
+            ])
+        }
+    }
+}
+
 /// Runs `role` until `shutdown` flips to `true`, then waits for every role to stop.
 ///
 /// The first role that fails stops the others and its error is returned.

@@ -9,17 +9,21 @@ use std::process::ExitCode;
 
 use fs_server::config::{Config, LogFormat, Secrets};
 use fs_server::role::Role;
+use fs_server::server::AdminAction;
 use fs_server::{ServerError, server};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]";
+const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]
+       fusescope-engine --config <file> admin tenant create <name>
+       fusescope-engine --config <file> admin token create <tenant-id> <name>";
 
 #[derive(Debug)]
 struct Args {
     config: Option<PathBuf>,
     role: Option<Role>,
     check: bool,
+    admin: Option<AdminAction>,
 }
 
 #[derive(Debug)]
@@ -33,10 +37,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Result<Args, Early>,
         config: None,
         role: None,
         check: false,
+        admin: None,
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "admin" => {
+                let rest: Vec<String> = args.by_ref().collect();
+                out.admin = Some(parse_admin(&rest)?);
+            }
             "--version" => return Ok(Err(Early::Version)),
             "-h" | "--help" => return Ok(Err(Early::Help)),
             "--check" => out.check = true,
@@ -56,6 +65,25 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Result<Args, Early>,
         }
     }
     Ok(Ok(out))
+}
+
+fn parse_admin(rest: &[String]) -> Result<AdminAction, String> {
+    let words: Vec<&str> = rest.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["tenant", "create", name] => Ok(AdminAction::CreateTenant {
+            name: (*name).to_owned(),
+        }),
+        ["token", "create", tenant, name] => {
+            let tenant = tenant
+                .parse()
+                .map_err(|e| format!("tenant id {tenant:?}: {e}\n{USAGE}"))?;
+            Ok(AdminAction::CreateToken {
+                tenant,
+                name: (*name).to_owned(),
+            })
+        }
+        _ => Err(format!("unknown admin command\n{USAGE}")),
+    }
 }
 
 fn init_tracing(level: &str, format: LogFormat) {
@@ -110,6 +138,12 @@ async fn real_main(args: Args) -> Result<(), ServerError> {
     let node_id = config.node_id(&env);
     let role = args.role.unwrap_or(config.server.role);
 
+    if let Some(action) = args.admin {
+        for line in server::admin(config, secrets, action).await? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     if args.check {
         let report = server::check(config, secrets, node_id).await?;
         println!(
@@ -196,6 +230,48 @@ mod tests {
             parse_args(args(&["--config"]))
                 .unwrap_err()
                 .contains("needs a path")
+        );
+    }
+
+    #[test]
+    fn parses_admin_commands() {
+        let parsed = parse_args(args(&[
+            "--config", "x.toml", "admin", "tenant", "create", "acme",
+        ]))
+        .unwrap()
+        .ok()
+        .unwrap();
+        assert_eq!(
+            parsed.admin,
+            Some(AdminAction::CreateTenant {
+                name: "acme".into()
+            })
+        );
+        let id = "00000000-0000-0000-0000-000000000001";
+        let parsed = parse_args(args(&[
+            "--config",
+            "x.toml",
+            "admin",
+            "token",
+            "create",
+            id,
+            "collector",
+        ]))
+        .unwrap()
+        .ok()
+        .unwrap();
+        assert!(
+            matches!(parsed.admin, Some(AdminAction::CreateToken { name, .. }) if name == "collector")
+        );
+        assert!(
+            parse_args(args(&["admin", "token", "create", "not-a-uuid", "x"]))
+                .unwrap_err()
+                .contains("tenant id")
+        );
+        assert!(
+            parse_args(args(&["admin", "frobnicate"]))
+                .unwrap_err()
+                .contains("unknown admin command")
         );
     }
 

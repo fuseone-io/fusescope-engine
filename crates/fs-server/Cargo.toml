@@ -23,6 +23,7 @@ object_store = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
+uuid = { workspace = true }
 fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
 fs-wal = { path = "../fs-wal" }
@@ -35,7 +36,6 @@ fs-auth = { path = "../fs-auth" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-uuid = { workspace = true }
 
 [lints]
 workspace = true

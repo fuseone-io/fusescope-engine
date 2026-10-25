@@ -16,7 +16,7 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration, TimeZone, Utc};
 use fs_catalog::{
     Catalog, CatalogError, FileId, FileState, Level, NewFile, NewTenant, Signal, TenantId,
-    TimeRange,
+    TimeRange, hash_token,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
@@ -446,5 +446,49 @@ async fn watcher_sees_file_changes() {
     }
     // The watcher holds a pooled connection; closing the pool would wait for it.
     drop(watcher);
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn tokens_resolve_until_revoked() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let (secret, token) = db.catalog.create_token(t, "collector-a").await.unwrap();
+    assert_eq!(token.tenant_id, t);
+    assert!(token.revoked_at.is_none());
+    assert!(secret.starts_with("fst_"));
+
+    assert_eq!(db.catalog.resolve_token(&secret).await.unwrap(), Some(t));
+    assert_eq!(db.catalog.resolve_token("fst_nope").await.unwrap(), None);
+    let other = fs_catalog::generate_token().unwrap();
+    assert_eq!(
+        db.catalog.resolve_token(&other).await.unwrap(),
+        None,
+        "unknown but well formed"
+    );
+
+    assert!(db.catalog.revoke_token(&hash_token(&secret)).await.unwrap());
+    assert!(
+        !db.catalog.revoke_token(&hash_token(&secret)).await.unwrap(),
+        "second revoke is a no-op"
+    );
+    assert_eq!(db.catalog.resolve_token(&secret).await.unwrap(), None);
+    let listed = db.catalog.tokens(t).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].revoked_at.is_some());
+    assert!(
+        db.catalog
+            .create_token(TenantId::new(), "orphan")
+            .await
+            .is_err(),
+        "unknown tenant"
+    );
     db.finish().await;
 }

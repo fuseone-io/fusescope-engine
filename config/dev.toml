@@ -20,6 +20,11 @@ allow_http = true          # development only; production endpoints are https
 [wal]
 dir = "./data/wal"
 
+[ingest]
+listen = "0.0.0.0:4317"
+flush_interval_secs = 10       # short for development; production default is 30
+# anonymous_tenant = "<uuid>"   # development only: accept unauthenticated OTLP as this tenant
+
 [compactor]
 purge_interval_secs = 60
 quarantine_ttl_secs = 3600

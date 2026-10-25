@@ -1,0 +1,55 @@
+//! Ingest configuration.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use fs_catalog::TenantId;
+use fs_schema::limits::Limits;
+
+/// Tunables of the ingest path. Defaults follow DESIGN.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestConfig {
+    /// OTLP gRPC listen address.
+    pub listen: SocketAddr,
+    /// Largest accepted gRPC message. Larger requests fail with RESOURCE_EXHAUSTED.
+    pub max_message_bytes: usize,
+    /// Flush a tenant buffer at this many rows.
+    pub flush_rows: usize,
+    /// Flush a tenant buffer at this many bytes of Arrow memory.
+    pub flush_bytes: usize,
+    /// Flush a tenant buffer once its oldest record is this old.
+    pub flush_interval: Duration,
+    /// Refuse new data for a tenant whose buffer exceeds this while flushes fail.
+    pub max_buffer_bytes: usize,
+    /// Refuse new data when the WAL on disk exceeds this.
+    pub wal_max_bytes: u64,
+    /// Per-tenant throughput limit in bytes per second of request payload.
+    /// `None` disables it.
+    pub tenant_bytes_per_sec: Option<u64>,
+    /// Accept unauthenticated requests as this tenant. Development only.
+    pub anonymous_tenant: Option<TenantId>,
+    /// Attribute limits applied during conversion.
+    pub limits: Limits,
+    /// How long a resolved token stays cached before the catalog is asked again.
+    pub token_cache_ttl: Duration,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:4317"
+                .parse()
+                .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 4317))),
+            max_message_bytes: 16 * 1024 * 1024,
+            flush_rows: 1_000_000,
+            flush_bytes: 128 * 1024 * 1024,
+            flush_interval: Duration::from_secs(30),
+            max_buffer_bytes: 512 * 1024 * 1024,
+            wal_max_bytes: 4 * 1024 * 1024 * 1024,
+            tenant_bytes_per_sec: None,
+            anonymous_tenant: None,
+            limits: Limits::default(),
+            token_cache_ttl: Duration::from_secs(60),
+        }
+    }
+}

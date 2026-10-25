@@ -3,7 +3,7 @@
 export FS_TEST_DATABASE_URL ?= postgres://fusescope:fusescope@localhost:5433/fusescope
 export FS_TEST_S3_ENDPOINT  ?= http://localhost:9100
 
-.PHONY: dev-up dev-down check test lint deny ci run check-env
+.PHONY: dev-up dev-down check test lint deny ci run check-env tenant token
 
 dev-up:        ## start Postgres and an S3-compatible store, create the dev bucket
 	docker compose up -d --wait postgres s3
@@ -34,3 +34,11 @@ run:           ## run every role against the dev services
 check-env:     ## validate configuration and connectivity, then exit
 	FS_CATALOG_URL=$(FS_TEST_DATABASE_URL) FS_BUCKET_ACCESS_KEY=fusescope FS_BUCKET_SECRET_KEY=fusescope-dev \
 	cargo run -p fs-server -- --config config/dev.toml --check
+
+tenant:        ## create a tenant: make tenant NAME=acme
+	FS_CATALOG_URL=$(FS_TEST_DATABASE_URL) FS_BUCKET_ACCESS_KEY=fusescope FS_BUCKET_SECRET_KEY=fusescope-dev \
+	cargo run -q -p fs-server -- --config config/dev.toml admin tenant create $(NAME)
+
+token:         ## issue an ingest token: make token TENANT=<uuid> NAME=collector
+	FS_CATALOG_URL=$(FS_TEST_DATABASE_URL) FS_BUCKET_ACCESS_KEY=fusescope FS_BUCKET_SECRET_KEY=fusescope-dev \
+	cargo run -q -p fs-server -- --config config/dev.toml admin token create $(TENANT) $(NAME)

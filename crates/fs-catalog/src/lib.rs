@@ -9,10 +9,12 @@
 //! stream ([`Catalog::watch`]) that keeps such a cache fresh.
 
 mod catalog;
+mod token;
 mod types;
 mod watch;
 
-pub use catalog::Catalog;
+pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
+pub use token::{TOKEN_PREFIX, TenantToken, generate_token, hash_token, looks_like_token};
 pub use types::{
     Compaction, FileId, FileRecord, FileState, Ingester, Level, NewFile, NewTenant, PurgedFile,
     Signal, Tenant, TenantId, TimeRange,
@@ -42,6 +44,9 @@ pub enum CatalogError {
         /// Inputs still visible at swap time.
         found: usize,
     },
+    /// The operating system could not provide randomness for a token.
+    #[error("randomness unavailable: {0}")]
+    Randomness(#[from] getrandom::Error),
     /// A value read from the database is outside the domain, for example an
     /// unknown signal code.
     #[error("invalid value in column {column}: {value}")]

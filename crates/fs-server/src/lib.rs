@@ -43,6 +43,9 @@ pub enum ServerError {
     /// Write-ahead log failure.
     #[error("wal: {0}")]
     Wal(#[from] fs_wal::WalError),
+    /// Ingest failure.
+    #[error("ingest: {0}")]
+    Ingest(#[from] fs_ingest::IngestError),
     /// A role task panicked or was cancelled.
     #[error("role {role} stopped unexpectedly: {reason}")]
     RoleStopped {

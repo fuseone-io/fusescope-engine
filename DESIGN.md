@@ -558,6 +558,7 @@ Planned dependencies, all Apache-2.0 or MIT:
 | object_store | S3, GCS, Azure, local |
 | foyer | hybrid memory and SSD cache |
 | opentelemetry-proto, tonic, prost | OTLP gRPC |
+| sha2, getrandom | ingest token hashing and generation |
 | sqlx | Postgres |
 | roaring | postings |
 | xorf | xor filters |

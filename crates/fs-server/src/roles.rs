@@ -33,10 +33,11 @@ pub struct Context {
 /// Heartbeat period of the ingester. The querier treats 10 s of silence as down.
 pub const HEARTBEAT: Duration = Duration::from_secs(2);
 
-/// Ingester: opens the WAL, replays it, and heartbeats to the catalog.
+/// Ingester: opens and replays the WAL, serves OTLP, flushes Parquet L0 files
+/// and heartbeats to the catalog so queriers find it for hot-window scans.
 ///
 /// # Errors
-/// WAL or catalog failures.
+/// WAL, bind, transport or catalog failures.
 pub async fn ingester(
     ctx: Context,
     mut shutdown: watch::Receiver<bool>,
@@ -47,29 +48,44 @@ pub async fn ingester(
         max_record_bytes: ctx.config.wal.max_record_bytes,
         sync: ctx.config.wal.sync.into(),
     };
-    let mut wal = fs_wal::Wal::open(wal_config)?;
+    let wal = fs_wal::Wal::open(wal_config)?;
     let recovery = wal.recovery().clone();
-    let replayed = wal.replay()?.count();
     info!(
         role = "ingester",
         dir = %ctx.config.wal.dir.display(),
-        replayed_records = replayed,
         truncated_bytes = recovery.truncated_bytes,
         damage = ?recovery.damage,
-        "wal ready"
+        "wal opened"
     );
-    let mut tick = tokio::time::interval(HEARTBEAT);
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                if let Err(e) = ctx.catalog.heartbeat(&ctx.node_id, &ctx.config.server.flight_addr).await {
-                    warn!(role = "ingester", error = %e, "heartbeat failed");
+    let ingest_config = ctx.config.ingest.to_ingest_config()?;
+    let ingester = fs_ingest::Ingester::new(
+        ingest_config,
+        ctx.catalog.clone(),
+        ctx.store.clone(),
+        ctx.root.clone(),
+        wal,
+    )?;
+
+    let heartbeat = {
+        let ctx = ctx.clone();
+        let mut shutdown = shutdown.clone();
+        async move {
+            let mut tick = tokio::time::interval(HEARTBEAT);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if let Err(e) = ctx.catalog.heartbeat(&ctx.node_id, &ctx.config.server.flight_addr).await {
+                            warn!(role = "ingester", error = %e, "heartbeat failed");
+                        }
+                    }
+                    _ = shutdown.changed() => break,
                 }
             }
-            _ = shutdown.changed() => break,
         }
-    }
-    wal.sync()?;
+    };
+    let (served, ()) = tokio::join!(ingester.run(shutdown.clone(), None), heartbeat);
+    served?;
+    let _ = shutdown.borrow_and_update();
     info!(role = "ingester", "stopped");
     Ok(())
 }

@@ -27,6 +27,9 @@ pub struct Config {
     /// Write-ahead log of the ingester role.
     #[serde(default)]
     pub wal: WalConfig,
+    /// OTLP ingest of the ingester role.
+    #[serde(default)]
+    pub ingest: IngestSection,
     /// Compactor role.
     #[serde(default)]
     pub compactor: CompactorConfig,
@@ -192,6 +195,105 @@ impl From<SyncPolicy> for fs_wal::SyncPolicy {
     }
 }
 
+/// OTLP ingest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestSection {
+    /// gRPC listen address.
+    #[serde(default = "default_ingest_listen")]
+    pub listen: String,
+    /// Largest accepted gRPC message.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Flush a tenant buffer at this many rows.
+    #[serde(default = "default_flush_rows")]
+    pub flush_rows: usize,
+    /// Flush a tenant buffer at this many bytes.
+    #[serde(default = "default_flush_bytes")]
+    pub flush_bytes: usize,
+    /// Flush a tenant buffer once its oldest record is this old.
+    #[serde(default = "default_flush_interval")]
+    pub flush_interval_secs: u64,
+    /// Refuse a tenant's data when its buffer exceeds this while flushes fail.
+    #[serde(default = "default_max_buffer_bytes")]
+    pub max_buffer_bytes: usize,
+    /// Refuse data when the WAL on disk exceeds this.
+    #[serde(default = "default_wal_max_bytes")]
+    pub wal_max_bytes: u64,
+    /// Per-tenant throughput limit in bytes per second. Unset disables it.
+    pub tenant_bytes_per_sec: Option<u64>,
+    /// Accept unauthenticated requests as this tenant id. Development only.
+    pub anonymous_tenant: Option<uuid::Uuid>,
+}
+
+impl Default for IngestSection {
+    fn default() -> Self {
+        Self {
+            listen: default_ingest_listen(),
+            max_message_bytes: default_max_message_bytes(),
+            flush_rows: default_flush_rows(),
+            flush_bytes: default_flush_bytes(),
+            flush_interval_secs: default_flush_interval(),
+            max_buffer_bytes: default_max_buffer_bytes(),
+            wal_max_bytes: default_wal_max_bytes(),
+            tenant_bytes_per_sec: None,
+            anonymous_tenant: None,
+        }
+    }
+}
+
+impl IngestSection {
+    /// Converts to the ingest crate's configuration.
+    ///
+    /// # Errors
+    /// Unparsable listen address.
+    pub fn to_ingest_config(&self) -> Result<fs_ingest::IngestConfig, ServerError> {
+        let listen = self.listen.parse().map_err(|e| {
+            ServerError::InvalidConfig(format!("ingest.listen {:?}: {e}", self.listen))
+        })?;
+        Ok(fs_ingest::IngestConfig {
+            listen,
+            max_message_bytes: self.max_message_bytes,
+            flush_rows: self.flush_rows,
+            flush_bytes: self.flush_bytes,
+            flush_interval: std::time::Duration::from_secs(self.flush_interval_secs),
+            max_buffer_bytes: self.max_buffer_bytes,
+            wal_max_bytes: self.wal_max_bytes,
+            tenant_bytes_per_sec: self.tenant_bytes_per_sec,
+            anonymous_tenant: self.anonymous_tenant.map(fs_catalog::TenantId),
+            ..fs_ingest::IngestConfig::default()
+        })
+    }
+}
+
+fn default_ingest_listen() -> String {
+    "0.0.0.0:4317".to_owned()
+}
+
+fn default_max_message_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_flush_rows() -> usize {
+    1_000_000
+}
+
+fn default_flush_bytes() -> usize {
+    128 * 1024 * 1024
+}
+
+fn default_flush_interval() -> u64 {
+    30
+}
+
+fn default_max_buffer_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+fn default_wal_max_bytes() -> u64 {
+    4 * 1024 * 1024 * 1024
+}
+
 /// Compactor role.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -350,6 +452,9 @@ impl Config {
         if let Some(v) = get("FS_WAL_DIR") {
             self.wal.dir = PathBuf::from(v);
         }
+        if let Some(v) = get("FS_INGEST_LISTEN") {
+            self.ingest.listen = v;
+        }
         if let Some(v) = get("FS_LOG_LEVEL") {
             self.log.level = v;
         }
@@ -400,6 +505,10 @@ impl Config {
         }
         if self.compactor.purge_batch <= 0 {
             return invalid("compactor.purge_batch must be positive");
+        }
+        self.ingest.to_ingest_config()?;
+        if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
+            return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
         }
         Ok(())
     }
@@ -554,6 +663,34 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("catalog url")
+        );
+    }
+
+    #[test]
+    fn ingest_section_converts_and_validates() {
+        let config = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nlisten = \"127.0.0.1:4317\"\nflush_rows = 10\nanonymous_tenant = \"00000000-0000-0000-0000-000000000001\"\n",
+        )
+        .unwrap();
+        let ingest = config.ingest.to_ingest_config().unwrap();
+        assert_eq!(ingest.listen.port(), 4317);
+        assert_eq!(ingest.flush_rows, 10);
+        assert!(ingest.anonymous_tenant.is_some());
+        assert_eq!(ingest.flush_interval, std::time::Duration::from_secs(30));
+
+        let bad = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nlisten = \"nope\"\n",
+        )
+        .unwrap();
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        assert!(
+            bad.validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("ingest.listen")
         );
     }
 

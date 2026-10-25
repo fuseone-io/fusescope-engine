@@ -6,6 +6,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::CatalogError;
+use crate::token::{TenantToken, generate_token, hash_token, looks_like_token};
 use crate::types::{
     Compaction, FileId, FileRecord, FileRow, FileState, Ingester, NewFile, NewTenant, PurgedFile,
     Signal, Tenant, TenantId, TimeRange,
@@ -268,6 +269,80 @@ impl Catalog {
             "select id, address, last_heartbeat from engine_ingester where last_heartbeat > $1 order by id",
         )
         .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Issues an ingest token for `tenant`. The plaintext is returned once and
+    /// never stored.
+    ///
+    /// # Errors
+    /// Unknown tenant, no randomness, or database failure.
+    pub async fn create_token(
+        &self,
+        tenant: TenantId,
+        name: &str,
+    ) -> Result<(String, TenantToken), CatalogError> {
+        let token = generate_token()?;
+        let hash = hash_token(&token);
+        let row = sqlx::query_as::<_, TenantToken>(
+            "insert into engine_tenant_token (token_hash, tenant_id, name) values ($1, $2, $3)
+             returning tenant_id, name, created_at, revoked_at",
+        )
+        .bind(hash.as_slice())
+        .bind(tenant)
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((token, row))
+    }
+
+    /// The tenant an ingest token belongs to, if the token exists, is not
+    /// revoked and the tenant is not deleted.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn resolve_token(&self, token: &str) -> Result<Option<TenantId>, CatalogError> {
+        if !looks_like_token(token) {
+            return Ok(None);
+        }
+        let hash = hash_token(token);
+        let row: Option<(TenantId,)> = sqlx::query_as(
+            "select t.tenant_id from engine_tenant_token t
+             join engine_tenant n on n.id = t.tenant_id
+             where t.token_hash = $1 and t.revoked_at is null and n.deleted_at is null",
+        )
+        .bind(hash.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Revokes a token by its hash. Returns whether a live token was revoked.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn revoke_token(&self, hash: &[u8; 32]) -> Result<bool, CatalogError> {
+        let result = sqlx::query(
+            "update engine_tenant_token set revoked_at = now() where token_hash = $1 and revoked_at is null",
+        )
+        .bind(hash.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Tokens of a tenant, newest first, without secrets.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn tokens(&self, tenant: TenantId) -> Result<Vec<TenantToken>, CatalogError> {
+        let rows = sqlx::query_as::<_, TenantToken>(
+            "select tenant_id, name, created_at, revoked_at from engine_tenant_token
+             where tenant_id = $1 order by created_at desc",
+        )
+        .bind(tenant)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

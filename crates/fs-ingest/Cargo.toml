@@ -10,6 +10,26 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+opentelemetry-proto = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+fs-schema = { path = "../fs-schema" }
+fs-wal = { path = "../fs-wal" }
+fs-catalog = { path = "../fs-catalog" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

@@ -8,12 +8,13 @@ Read [DESIGN.md](DESIGN.md) first. Decisions are recorded in [docs/adr](docs/adr
 
 ## Status
 
-Phase 0, foundation, complete: `fs-schema` (span schema v1, OTLP conversion),
+Phase 1 in progress. Done: `fs-schema` (span schema v1, OTLP conversion),
 `fs-wal` (segmented write-ahead log with recovery), `fs-catalog` (Postgres file
-catalog with atomic compaction swaps and change notifications) and `fs-server`
-(configuration, bucket and catalog bootstrap, roles with heartbeat, change
-watch and quarantine purge, graceful shutdown). The binary starts against the
-local services. Ingest, query and compaction proper are phase 1 and later.
+catalog, tenants and ingest tokens, atomic compaction swaps, change
+notifications), `fs-ingest` (OTLP gRPC with bearer-token authentication and
+per-tenant limits, WAL, buffers, sorted Parquet L0 flush with bloom filters,
+catalog registration) and `fs-server` (configuration, bootstrap, roles, admin
+commands, graceful shutdown). Next: `fs-query` with DataFusion and Flight SQL.
 
 ## Layout
 
@@ -39,8 +40,13 @@ make lint                 # fmt and clippy
 make deny                 # licenses, advisories, sources
 make check-env            # fusescope-engine --check: validates config and connectivity
 make run                  # fusescope-engine --role all against the dev services
+make tenant NAME=acme     # create a tenant; prints its id
+make token TENANT=<id> NAME=collector   # issue an ingest token; printed once
 make dev-down
 ```
+
+Point an OpenTelemetry collector's OTLP gRPC exporter at `localhost:4317` with
+`authorization: Bearer <token>` in its headers to send traces.
 
 Configuration is a TOML file ([config/dev.toml](config/dev.toml) for the dev
 services) plus environment overrides. Secrets come only from the environment:
