@@ -72,6 +72,8 @@ pub struct Flushing {
     pub attempts: u32,
     /// Earliest time of the next attempt.
     pub next_attempt: Instant,
+    /// An attempt is running right now; the flusher tick must not start another.
+    pub in_progress: bool,
 }
 
 /// Longest wait between retries of a failed flush.
@@ -145,6 +147,7 @@ impl Buffers {
             buffer,
             attempts: 0,
             next_attempt: Instant::now(),
+            in_progress: true,
         });
         Some(batches)
     }
@@ -158,24 +161,39 @@ impl Buffers {
                 buffer,
                 attempts: 0,
                 next_attempt: Instant::now(),
+                in_progress: false,
             });
         }
     }
 
-    /// Flushes whose next attempt is due at `now`, or every flush when `force`.
-    pub fn flushing_due(
-        &self,
+    /// Takes the flushes whose next attempt is due at `now`, or every idle
+    /// flush when `force`, marking each as in progress so a concurrent caller
+    /// cannot take it again until it fails or finishes.
+    pub fn take_due(
+        &mut self,
         now: Instant,
         force: bool,
     ) -> Vec<(TenantId, FileId, Vec<RecordBatch>)> {
+        let mut out = Vec::new();
+        for (tenant, list) in &mut self.flushing {
+            for f in list
+                .iter_mut()
+                .filter(|f| !f.in_progress && (force || f.next_attempt <= now))
+            {
+                f.in_progress = true;
+                out.push((*tenant, f.file, f.buffer.batches.clone()));
+            }
+        }
+        out
+    }
+
+    /// Flushes bound by an intent and not being worked on right now.
+    pub fn idle_flushing(&self) -> usize {
         self.flushing
-            .iter()
-            .flat_map(|(t, list)| {
-                list.iter()
-                    .filter(move |f| force || f.next_attempt <= now)
-                    .map(move |f| (*t, f.file, f.buffer.batches.clone()))
-            })
-            .collect()
+            .values()
+            .flatten()
+            .filter(|f| !f.in_progress)
+            .count()
     }
 
     /// Records a failed attempt and schedules the next one with exponential backoff.
@@ -188,6 +206,7 @@ impl Buffers {
             entry.attempts = entry.attempts.saturating_add(1);
             let backoff = Duration::from_secs(1u64 << entry.attempts.min(6)).min(MAX_RETRY_BACKOFF);
             entry.next_attempt = now + backoff;
+            entry.in_progress = false;
         }
     }
 

@@ -366,11 +366,7 @@ impl Shared {
     /// Retries flushes whose earlier attempt failed after the intent, or
     /// resumes those an earlier run left behind. `force` ignores the backoff.
     async fn retry_flushing(&self, force: bool) {
-        let pending = self
-            .buffers
-            .lock()
-            .await
-            .flushing_due(Instant::now(), force);
+        let pending = self.buffers.lock().await.take_due(Instant::now(), force);
         for (tenant, file, batches) in pending {
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
@@ -642,13 +638,7 @@ impl Ingester {
         bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
         hot_bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
     ) -> Result<(), IngestError> {
-        let recovered = self
-            .shared
-            .buffers
-            .lock()
-            .await
-            .flushing_due(Instant::now(), true)
-            .len();
+        let recovered = self.shared.buffers.lock().await.idle_flushing();
         if recovered > 0 {
             self.shared
                 .stats

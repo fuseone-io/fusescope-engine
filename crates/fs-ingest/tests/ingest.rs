@@ -1095,3 +1095,50 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
     h.stop().await;
     db.finish().await;
 }
+
+/// Two flushers racing, as the flusher tick and a shutdown flush do, must
+/// not materialise the same bound rows twice.
+#[tokio::test]
+async fn concurrent_flushes_do_not_duplicate_work() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.client()
+        .await
+        .export(authed(request("api", 7, 50), &token))
+        .await
+        .unwrap();
+    let a = {
+        let ingester = h.ingester.clone();
+        tokio::spawn(async move { ingester.flush_all().await })
+    };
+    let b = {
+        let ingester = h.ingester.clone();
+        tokio::spawn(async move { ingester.flush_all().await })
+    };
+    a.await.unwrap();
+    b.await.unwrap();
+    h.ingester.flush_all().await;
+    let fs = h.ingester.flush_stats();
+    assert_eq!(
+        fs.attempts.load(Ordering::Relaxed),
+        1,
+        "one attempt for one bound buffer"
+    );
+    assert_eq!(fs.flushes.load(Ordering::Relaxed), 1);
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    h.stop().await;
+    db.finish().await;
+}
