@@ -29,7 +29,7 @@ use crate::traffic::Shape;
 
 const USAGE: &str = "usage:
   fs-bench stages [--requests N] [--spans-per-trace K] [--services S] [--sync batch|always] [--store local|s3] [--wal-dir DIR] [--json out.json]
-  fs-bench load   --endpoint host:4317 --token fst_... [--concurrency C] [--duration-secs D] [--spans-per-trace K] [--services S] [--json out.json]
+  fs-bench load   --endpoint host:4317 --token fst_... [--concurrency C] [--duration-secs D] [--spans-per-trace K] [--services S] [--metrics host:9464] [--json out.json]
   fs-bench query  --endpoint host:8815 --token fst_... [--iterations N] [--json out.json]";
 
 type Flags = HashMap<String, String>;
@@ -165,6 +165,7 @@ async fn real_main(
                 duration: Duration::from_secs(get(flags, "duration-secs", 30)?),
                 shape: shape(flags)?,
                 seed: get(flags, "seed", 42)?,
+                metrics: flags.get("metrics").cloned(),
             })
             .await?;
             load::print(&report);

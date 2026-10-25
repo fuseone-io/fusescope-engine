@@ -73,6 +73,7 @@ pub async fn ingester(
         Arc::new(move || wal_probe.wal_bytes()),
     );
     ctx.metrics.register_writer(ingester.writer_stats());
+    ctx.metrics.register_flush(ingester.flush_stats());
 
     let heartbeat = {
         let ctx = ctx.clone();

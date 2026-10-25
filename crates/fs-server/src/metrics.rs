@@ -18,6 +18,7 @@ pub struct Metrics {
     started: Instant,
     ingest: OnceLock<Arc<fs_ingest::IngestStats>>,
     writer: OnceLock<Arc<fs_ingest::walwriter::WriterStats>>,
+    flush: OnceLock<Arc<fs_ingest::FlushStats>>,
     wal_bytes: OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
     query: OnceLock<Arc<fs_query::QueryStats>>,
 }
@@ -28,6 +29,7 @@ impl Default for Metrics {
             started: Instant::now(),
             ingest: OnceLock::new(),
             writer: OnceLock::new(),
+            flush: OnceLock::new(),
             wal_bytes: OnceLock::new(),
             query: OnceLock::new(),
         }
@@ -56,6 +58,11 @@ impl Metrics {
         let _ = self.writer.set(stats);
     }
 
+    /// Registers the flush timings and buffer gauges.
+    pub fn register_flush(&self, stats: Arc<fs_ingest::FlushStats>) {
+        let _ = self.flush.set(stats);
+    }
+
     /// Registers the querier's counters.
     pub fn register_query(&self, stats: Arc<fs_query::QueryStats>) {
         let _ = self.query.set(stats);
@@ -65,6 +72,7 @@ impl Metrics {
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(4096);
         self.render_ingest(&mut out);
+        self.render_flush(&mut out);
         self.render_query(&mut out);
         if let Some(f) = self.wal_bytes.get() {
             gauge(
@@ -166,6 +174,77 @@ impl Metrics {
                 w.sync_nanos.load(Ordering::Relaxed) / 1_000_000_000,
             );
         }
+    }
+
+    fn render_flush(&self, out: &mut String) {
+        let Some(f) = self.flush.get() else { return };
+        let ns = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        counter(
+            out,
+            "fusescope_flush_total",
+            "Flushes completed",
+            ns(&f.flushes),
+        );
+        counter(
+            out,
+            "fusescope_flush_rows_total",
+            "Rows written by flushes",
+            ns(&f.rows),
+        );
+        counter(
+            out,
+            "fusescope_flush_parquet_bytes_total",
+            "Parquet bytes written by flushes",
+            ns(&f.parquet_bytes),
+        );
+        counter(
+            out,
+            "fusescope_flush_sort_nanoseconds_total",
+            "Nanoseconds in concat and sort",
+            ns(&f.sort_nanos),
+        );
+        counter(
+            out,
+            "fusescope_flush_encode_nanoseconds_total",
+            "Nanoseconds encoding Parquet",
+            ns(&f.encode_nanos),
+        );
+        counter(
+            out,
+            "fusescope_flush_upload_nanoseconds_total",
+            "Nanoseconds uploading",
+            ns(&f.upload_nanos),
+        );
+        counter(
+            out,
+            "fusescope_flush_register_nanoseconds_total",
+            "Nanoseconds registering in the catalog",
+            ns(&f.register_nanos),
+        );
+        counter(
+            out,
+            "fusescope_flush_nanoseconds_total",
+            "Nanoseconds from taking rows to checkpoint",
+            ns(&f.total_nanos),
+        );
+        gauge(
+            out,
+            "fusescope_buffer_live_bytes",
+            "Bytes in live buffers",
+            ns(&f.live_bytes),
+        );
+        gauge(
+            out,
+            "fusescope_buffer_flushing_bytes",
+            "Bytes bound to flushes in progress",
+            ns(&f.flushing_bytes),
+        );
+        gauge(
+            out,
+            "fusescope_buffer_persisted_bytes",
+            "Bytes kept for the hot window after registration",
+            ns(&f.persisted_bytes),
+        );
     }
 
     fn render_query(&self, out: &mut String) {
@@ -317,6 +396,17 @@ mod tests {
             page.contains("fusescope_wal_backpressure_total 5\n"),
             "{page}"
         );
+        let flush = Arc::new(fs_ingest::FlushStats::default());
+        flush.flushes.fetch_add(2, Ordering::Relaxed);
+        flush.live_bytes.store(77, Ordering::Relaxed);
+        metrics.register_flush(flush);
+        let page = metrics.render();
+        assert!(page.contains("fusescope_flush_total 2\n"), "{page}");
+        assert!(
+            page.contains("# TYPE fusescope_buffer_live_bytes gauge\n"),
+            "{page}"
+        );
+        assert!(page.contains("fusescope_buffer_live_bytes 77\n"), "{page}");
         assert!(page.lines().all(|l| {
             l.starts_with('#')
                 || l.split_once(' ')

@@ -32,6 +32,10 @@ pub struct Prepared {
     pub file: NewFile,
     /// File bytes.
     pub bytes: Bytes,
+    /// Time spent in concat and sort.
+    pub sort: std::time::Duration,
+    /// Time spent encoding Parquet.
+    pub encode: std::time::Duration,
 }
 
 /// Concatenates, sorts by `(service_name, timestamp)` and encodes `batches`.
@@ -46,9 +50,11 @@ pub fn prepare(
     id: FileId,
     batches: &[RecordBatch],
 ) -> Result<Prepared, IngestError> {
+    let started = std::time::Instant::now();
     let schema = span_schema_v1();
     let merged = concat_batches(&schema, batches)?;
     let sorted = sort_spans(&merged)?;
+    let sort = started.elapsed();
 
     let ts = sorted
         .column(schema.index_of(col::TIMESTAMP)?)
@@ -59,7 +65,9 @@ pub fn prepare(
 
     let start = Utc.timestamp_nanos(ts_min);
     let path = l0_path(root, tenant, start, id);
+    let encode_started = std::time::Instant::now();
     let bytes = encode_parquet(&sorted)?;
+    let encode = encode_started.elapsed();
 
     let file = NewFile {
         id,
@@ -76,7 +84,12 @@ pub fn prepare(
         services,
         summary: None,
     };
-    Ok(Prepared { file, bytes })
+    Ok(Prepared {
+        file,
+        bytes,
+        sort,
+        encode,
+    })
 }
 
 /// Uploads a prepared file to its path without overwriting: a retried flush

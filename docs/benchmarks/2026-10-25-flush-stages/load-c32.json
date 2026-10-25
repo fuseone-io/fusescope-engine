@@ -1,0 +1,29 @@
+{
+  "requests_ok": 237779,
+  "requests_err": 10149,
+  "spans_ok": 2853348,
+  "seconds": 30.029902685,
+  "rps": 7918.07427730264,
+  "spans_per_sec": 95016.89132763169,
+  "p50_ms": 1.5878960000000002,
+  "p95_ms": 2.6225609999999997,
+  "p99_ms": 40.854427,
+  "errors": [
+    "ResourceExhausted: tenant buffer full, flush pending"
+  ],
+  "flush": {
+    "flushes": 17,
+    "rows_per_flush": 159336.0,
+    "parquet_mib_per_flush": 9.177863064934225,
+    "sort_ms": 850.9752647647059,
+    "encode_ms": 399.9764323529412,
+    "upload_ms": 47.13072411764706,
+    "register_ms": 1.7120175882352942,
+    "total_ms": 1318.0267825882354,
+    "buffer_bytes": [
+      253251518,
+      0,
+      2151486618
+    ]
+  }
+}

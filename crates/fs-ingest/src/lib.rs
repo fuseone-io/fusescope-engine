@@ -25,7 +25,7 @@ pub mod server;
 pub mod walwriter;
 
 pub use config::IngestConfig;
-pub use ingester::{IngestStats, Ingester};
+pub use ingester::{FlushStats, IngestStats, Ingester};
 
 use thiserror::Error;
 

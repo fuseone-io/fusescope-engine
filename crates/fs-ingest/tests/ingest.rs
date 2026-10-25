@@ -271,6 +271,18 @@ async fn authenticates_buffers_flushes_and_registers() {
     assert!(h.dir.path().join("wal").read_dir().unwrap().count() >= 1);
 
     h.ingester.flush_all().await;
+    let fs = h.ingester.flush_stats();
+    assert_eq!(fs.flushes.load(Ordering::Relaxed), 1);
+    assert_eq!(fs.rows.load(Ordering::Relaxed), 14);
+    assert!(fs.parquet_bytes.load(Ordering::Relaxed) > 0);
+    assert!(
+        fs.sort_nanos.load(Ordering::Relaxed) > 0 && fs.encode_nanos.load(Ordering::Relaxed) > 0
+    );
+    assert!(
+        fs.upload_nanos.load(Ordering::Relaxed) > 0
+            && fs.register_nanos.load(Ordering::Relaxed) > 0
+    );
+    assert!(fs.total_nanos.load(Ordering::Relaxed) >= fs.encode_nanos.load(Ordering::Relaxed));
     let files = parquet_files(&h.dir.path().join("bucket"));
     assert_eq!(files.len(), 1, "one tenant, one L0 file");
     assert!(

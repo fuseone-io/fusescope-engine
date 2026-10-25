@@ -282,6 +282,25 @@ impl Buffers {
         live.chain(flushing).min()
     }
 
+    /// Bytes held in each state across tenants: `(live, flushing, persisted)`.
+    pub fn memory(&self) -> (usize, usize, usize) {
+        let live = self.tenants.values().map(|b| b.bytes).sum();
+        let flushing = self
+            .flushing
+            .values()
+            .flatten()
+            .map(|f| f.buffer.bytes)
+            .sum();
+        let persisted = self
+            .persisted
+            .values()
+            .flatten()
+            .flat_map(|p| p.batches.iter())
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        (live, flushing, persisted)
+    }
+
     /// Rows pending across tenants, live and flushing.
     pub fn total_rows(&self) -> usize {
         self.tenants.values().map(|b| b.rows).sum::<usize>()

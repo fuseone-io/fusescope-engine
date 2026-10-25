@@ -68,6 +68,37 @@ pub struct IngestStats {
     pub flush_retries: AtomicU64,
 }
 
+/// Per-stage flush timings and buffer memory, for sizing the flush path.
+#[derive(Debug, Default)]
+pub struct FlushStats {
+    /// Flushes completed.
+    pub flushes: AtomicU64,
+    /// Rows written.
+    pub rows: AtomicU64,
+    /// Parquet bytes written.
+    pub parquet_bytes: AtomicU64,
+    /// Nanoseconds in concat and sort.
+    pub sort_nanos: AtomicU64,
+    /// Nanoseconds encoding Parquet.
+    pub encode_nanos: AtomicU64,
+    /// Nanoseconds uploading.
+    pub upload_nanos: AtomicU64,
+    /// Nanoseconds registering in the catalog.
+    pub register_nanos: AtomicU64,
+    /// Nanoseconds from taking the rows to the checkpoint.
+    pub total_nanos: AtomicU64,
+    /// Bytes in live buffers, sampled every flusher tick.
+    pub live_bytes: AtomicU64,
+    /// Bytes bound to flushes in progress, sampled every flusher tick.
+    pub flushing_bytes: AtomicU64,
+    /// Bytes kept for the hot window after registration, sampled every flusher tick.
+    pub persisted_bytes: AtomicU64,
+}
+
+fn nanos(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Result of converting one request.
 pub(crate) struct Converted {
     pub(crate) accepted: usize,
@@ -80,6 +111,7 @@ pub struct Shared {
     pub(crate) auth: Authenticator,
     pub(crate) limiter: Option<StdMutex<RateLimiter>>,
     pub(crate) stats: Arc<IngestStats>,
+    flush_stats: Arc<FlushStats>,
     wal: Arc<StdMutex<Wal>>,
     writer: crate::walwriter::WalWriter,
     instance: Uuid,
@@ -209,17 +241,31 @@ impl Shared {
     ) -> Result<(), IngestError> {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let root = self.root.clone();
+        let started = Instant::now();
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
                 .await;
+        let fs = &self.flush_stats;
         let result = match prepared {
-            Ok(Ok(prepared)) => match flush::upload(self.store.as_ref(), &prepared).await {
-                Ok(created) => self
-                    .register(&prepared.file)
-                    .await
-                    .map(|()| (prepared.file, created)),
-                Err(e) => Err(e),
-            },
+            Ok(Ok(prepared)) => {
+                fs.sort_nanos
+                    .fetch_add(nanos(prepared.sort), Ordering::Relaxed);
+                fs.encode_nanos
+                    .fetch_add(nanos(prepared.encode), Ordering::Relaxed);
+                let upload_started = Instant::now();
+                match flush::upload(self.store.as_ref(), &prepared).await {
+                    Ok(created) => {
+                        fs.upload_nanos
+                            .fetch_add(nanos(upload_started.elapsed()), Ordering::Relaxed);
+                        let register_started = Instant::now();
+                        let registered = self.register(&prepared.file).await;
+                        fs.register_nanos
+                            .fetch_add(nanos(register_started.elapsed()), Ordering::Relaxed);
+                        registered.map(|()| (prepared.file, created))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             Ok(Err(e)) => Err(e),
             Err(e) => Err(IngestError::from(e)),
         };
@@ -242,6 +288,17 @@ impl Shared {
                 if self.config.checkpoint_after_flush {
                     self.checkpoint_wal().await;
                 }
+                fs.flushes.fetch_add(1, Ordering::Relaxed);
+                fs.rows.fetch_add(
+                    u64::try_from(file.row_count).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                fs.parquet_bytes.fetch_add(
+                    u64::try_from(file.size_bytes).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                fs.total_nanos
+                    .fetch_add(nanos(started.elapsed()), Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
@@ -326,6 +383,16 @@ impl Shared {
         let tenants = {
             let mut buffers = self.buffers.lock().await;
             buffers.sweep_persisted(self.config.persisted_retain, now);
+            let (live, flushing, persisted) = buffers.memory();
+            self.flush_stats
+                .live_bytes
+                .store(live as u64, Ordering::Relaxed);
+            self.flush_stats
+                .flushing_bytes
+                .store(flushing as u64, Ordering::Relaxed);
+            self.flush_stats
+                .persisted_bytes
+                .store(persisted as u64, Ordering::Relaxed);
             if everything {
                 buffers.all()
             } else {
@@ -478,6 +545,7 @@ impl Ingester {
             auth,
             limiter,
             stats: Arc::new(IngestStats::default()),
+            flush_stats: Arc::new(FlushStats::default()),
             wal,
             writer,
             instance,
@@ -502,6 +570,11 @@ impl Ingester {
     /// Shared handle to the counters, for a metrics exporter.
     pub fn shared_stats(&self) -> Arc<IngestStats> {
         Arc::clone(&self.shared.stats)
+    }
+
+    /// Flush timings and buffer memory.
+    pub fn flush_stats(&self) -> Arc<FlushStats> {
+        Arc::clone(&self.shared.flush_stats)
     }
 
     /// Group-commit counters of the WAL writer.

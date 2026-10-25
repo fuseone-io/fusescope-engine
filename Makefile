@@ -47,7 +47,7 @@ bench-stages:  ## ingest decomposed by stage, in process, WAL on the project dis
 	cargo run --release -q -p fs-bench -- stages --requests $(or $(REQUESTS),5000) $(BENCH_ARGS)
 
 bench-load:    ## OTLP load against a running ingester: make bench-load TOKEN=fst_... [DURATION=30] [CONCURRENCY=8]
-	cargo run --release -q -p fs-bench -- load --endpoint 127.0.0.1:4317 --token $(TOKEN) --duration-secs $(or $(DURATION),30) --concurrency $(or $(CONCURRENCY),8) $(BENCH_ARGS)
+	cargo run --release -q -p fs-bench -- load --endpoint 127.0.0.1:4317 --token $(TOKEN) --duration-secs $(or $(DURATION),30) --concurrency $(or $(CONCURRENCY),8) --metrics 127.0.0.1:9464 $(BENCH_ARGS)
 
 bench-query:   ## DESIGN.md query suite over Flight SQL: make bench-query TOKEN=fst_... [ITERATIONS=10]
 	cargo run --release -q -p fs-bench -- query --endpoint 127.0.0.1:8815 --token $(TOKEN) --iterations $(or $(ITERATIONS),10) $(BENCH_ARGS)
