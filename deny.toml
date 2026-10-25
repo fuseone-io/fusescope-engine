@@ -14,6 +14,11 @@ all-features = true
 # When that day comes, add it here with a comment and update the FuseScope
 # CLAUDE.md in the same change. Never confuse it with BUSL-1.1 (Business
 # Source License), which is not open source and stays forbidden.
+#
+# TLS roots: every TLS client uses the operating system trust store
+# (rustls-native-certs) rather than the bundled webpki-roots crate, whose
+# Mozilla CA data is CDLA-Permissive-2.0. Container images therefore ship the
+# distribution's ca-certificates package.
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
