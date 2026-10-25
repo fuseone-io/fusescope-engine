@@ -8,7 +8,9 @@ Read [DESIGN.md](DESIGN.md) first. Decisions are recorded in [docs/adr](docs/adr
 
 ## Status
 
-Phase 0, foundation. The workspace compiles; no crate does real work yet.
+Phase 0, foundation. `fs-schema` (span schema v1, OTLP conversion) and `fs-wal`
+(segmented write-ahead log with recovery) are implemented; the other crates are
+placeholders.
 
 ## Layout
 

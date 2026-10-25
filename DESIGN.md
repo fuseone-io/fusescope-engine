@@ -561,7 +561,7 @@ Planned dependencies, all Apache-2.0 or MIT:
 | sqlx | Postgres |
 | roaring | postings |
 | xorf | xor filters |
-| twox-hash (xxh3), crc32fast | checksums and fingerprints |
+| twox-hash (xxh3), crc32c | fingerprints and WAL checksums |
 | iceberg | L2 metadata export |
 | tokio, tracing | runtime and the engine's own observability |
 | tantivy | phase 2 |
