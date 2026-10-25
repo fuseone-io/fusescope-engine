@@ -9,6 +9,8 @@ rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/fuseone-io/fusescope-engine"
 authors = ["FuseOne <oss@fuseone.io>"]
+# crates are internal to this workspace; cargo-deny only allows path deps for unpublished crates
+publish = false
 
 # Every crate inherits these. fs-cache and fs-index downgrade `unsafe_code`
 # to `deny` locally because mmap paths may need audited unsafe blocks.

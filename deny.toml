@@ -18,6 +18,8 @@ allow = [
   "CC0-1.0",
 ]
 confidence-threshold = 0.9
+# allow-list entries not yet used by any dependency are fine
+unused-allowed-license = "allow"
 
 [advisories]
 # RustSec advisories block the build.
@@ -27,6 +29,8 @@ unmaintained = "workspace"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# workspace crates reference each other by path without a version
+allow-wildcard-paths = true
 # OpenSSL is replaced by rustls everywhere.
 deny = [
   { crate = "openssl", reason = "use rustls" },
