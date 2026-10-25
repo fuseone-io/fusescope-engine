@@ -22,6 +22,12 @@ pub struct IngestConfig {
     /// Merge a tenant's complete request batches into one chunk once this
     /// many are waiting, so a flush concatenates a few large batches.
     pub coalesce_batches: usize,
+    /// Most Arrow bytes merged into one chunk at a time; bounds the working
+    /// memory of a merge, which counts against `max_memory_bytes`.
+    pub coalesce_bytes: usize,
+    /// Requests converted to Arrow at the same time; bounds the memory of
+    /// batches built but not yet admitted, and the CPU the request path uses.
+    pub max_conversions: usize,
     /// Refuse new data for a tenant whose live and flushing rows would exceed
     /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
@@ -77,6 +83,8 @@ impl Default for IngestConfig {
             flush_bytes: 128 * 1024 * 1024,
             flush_interval: Duration::from_secs(30),
             coalesce_batches: 512,
+            coalesce_bytes: 64 * 1024 * 1024,
+            max_conversions: default_parallelism(),
             max_buffer_bytes: 512 * 1024 * 1024,
             max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -93,4 +101,9 @@ impl Default for IngestConfig {
             group_commit: crate::walwriter::GroupCommitConfig::default(),
         }
     }
+}
+
+/// Available cores, or 4 when the runtime cannot tell.
+pub fn default_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
 }

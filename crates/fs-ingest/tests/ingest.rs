@@ -27,6 +27,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, Executor, PgConnection};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -196,6 +197,10 @@ fn test_config() -> IngestConfig {
         persisted_retain: Duration::from_secs(2),
         ..IngestConfig::default()
     }
+}
+
+fn sha256_of(path: &std::path::Path) -> [u8; 32] {
+    Sha256::digest(std::fs::read(path).unwrap()).into()
 }
 
 fn parquet_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -1378,8 +1383,9 @@ async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
 }
 
 /// Chunks built in the background hold the rows in log order, so the file
-/// written from chunks is the file replay rebuilds from the records: the
-/// retry after a crash registers the same bytes.
+/// written from chunks is, byte for byte, the file replay rebuilds from the
+/// records. The object is removed after the crash so the retry has to write
+/// it again, and the two digests are compared.
 #[tokio::test]
 async fn coalesced_flush_matches_replay_byte_for_byte() {
     use fs_ingest::hot::{HotScanRequest, scan};
@@ -1438,10 +1444,13 @@ async fn coalesced_flush_matches_replay_byte_for_byte() {
     );
 
     h.ingester.flush_all().await;
-    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    let written = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(written.len(), 1);
+    let from_chunks = sha256_of(&written[0]);
     h.task.abort();
     let _ = h.task.await;
     let dir = h.dir;
+    std::fs::remove_file(&written[0]).unwrap();
 
     let h = start(&db.catalog, dir, test_config()).await;
     h.ingester.flush_all().await;
@@ -1450,7 +1459,13 @@ async fn coalesced_flush_matches_replay_byte_for_byte() {
         0,
         "the file rebuilt from the log registers as the same content"
     );
-    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    let rewritten = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(rewritten, written);
+    assert_eq!(
+        sha256_of(&rewritten[0]),
+        from_chunks,
+        "replayed records produce the same parquet bytes as the chunks did"
+    );
     let registered = db
         .catalog
         .visible_files(
@@ -1465,6 +1480,130 @@ async fn coalesced_flush_matches_replay_byte_for_byte() {
         .unwrap();
     assert_eq!(registered.len(), 1);
     assert_eq!(registered[0].row_count, 40);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A record accepted while the checkpoint is being chosen must stay above
+/// the cut. The request is held between its append and its push while the
+/// checkpoint runs; after a crash the row must be replayed exactly once.
+#[tokio::test]
+async fn checkpoint_never_skips_an_accepted_record() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_push_delay: Some(Duration::from_secs(2)),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    let delayed =
+        tokio::spawn(async move { client.export(authed(request("api", 1, 20), &token)).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.ingester.writer_stats().records.load(Ordering::Relaxed) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "request never reached the wal"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!delayed.is_finished());
+    h.ingester.checkpoint().await;
+    delayed.await.unwrap().unwrap();
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(files.len(), 1, "the replayed rows are flushed once");
+    let rows: usize =
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&files[0]).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+    assert_eq!(rows, 20);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The id announced for live rows must be the id their file gets even when
+/// the ingester restarts in between with no intent logged: a querier that
+/// scanned the hot window before the restart excludes exactly that file.
+#[tokio::test]
+async fn announced_file_id_survives_a_restart_without_intent() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    let mut client = h.client().await;
+    for i in 1..=2u8 {
+        client
+            .export(authed(request("api", i, 6), &token))
+            .await
+            .unwrap();
+    }
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+    };
+    let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .persisted_files;
+    assert_eq!(announced.len(), 1);
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].row_count, 12);
+    assert_eq!(announced, vec![registered[0].id]);
     h.stop().await;
     db.finish().await;
 }

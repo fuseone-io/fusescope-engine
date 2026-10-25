@@ -34,6 +34,7 @@ fs-catalog = { path = "../fs-catalog" }
 [dev-dependencies]
 tempfile = { workspace = true }
 sqlx = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

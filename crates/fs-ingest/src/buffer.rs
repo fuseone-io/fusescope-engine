@@ -136,14 +136,17 @@ impl TenantBuffer {
     }
 
     /// Request batches below `bound` (all of them when `None`), if at least
-    /// `min`: marked as taken by coalesce `id` and returned in position order.
-    /// `None` while another coalesce is in progress.
+    /// `min`: marked as taken by coalesce `id` and returned in position order
+    /// with their bytes. The run stops before the batch that would take it
+    /// past `max_bytes`, so it stays a prefix. `None` while another coalesce
+    /// is in progress.
     fn take_for_coalesce(
         &mut self,
         bound: Option<Position>,
         min: usize,
+        max_bytes: usize,
         id: u64,
-    ) -> Option<Vec<RecordBatch>> {
+    ) -> Option<(Vec<RecordBatch>, usize)> {
         if self.coalesce.is_some() {
             return None;
         }
@@ -153,11 +156,16 @@ impl TenantBuffer {
         }
         self.coalesce = Some(id);
         let mut taken = Vec::new();
+        let mut bytes = 0;
         for entry in self.entries.iter_mut().filter(|e| complete(e)) {
+            if !taken.is_empty() && bytes + entry.bytes > max_bytes {
+                break;
+            }
             entry.kind = Kind::Coalescing(id);
+            bytes += entry.bytes;
             taken.push(entry.batch.clone());
         }
-        Some(taken)
+        Some((taken, bytes))
     }
 
     /// Replaces the entries taken by coalesce `id` with `chunk`, at the
@@ -233,9 +241,6 @@ pub struct Flushing {
     pub next_attempt: Instant,
     /// An attempt is running right now; the flusher tick must not start another.
     pub in_progress: bool,
-    /// The tenant's file seed before this cut, put back if the intent cannot
-    /// be logged.
-    seed_before: Option<Position>,
 }
 
 /// Longest wait between retries of a failed flush.
@@ -258,6 +263,31 @@ impl Drop for Reservation {
     }
 }
 
+/// Bytes of working memory counted against the global cap while a chunk is
+/// being built: the inputs of the merge, an upper bound of its output.
+#[derive(Debug)]
+pub struct Scratch {
+    bytes: usize,
+    total: Arc<AtomicUsize>,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Batches taken for one coalesce.
+#[derive(Debug)]
+pub struct Taken {
+    /// Coalesce id, to report the chunk under.
+    pub id: u64,
+    /// The batches, in position order.
+    pub batches: Vec<RecordBatch>,
+    /// Working memory held while the chunk is built.
+    pub scratch: Scratch,
+}
+
 /// Rows already written to a registered file but still served from memory.
 #[derive(Debug, Clone)]
 pub struct Persisted {
@@ -277,8 +307,10 @@ pub struct Persisted {
 pub struct Snapshot {
     /// Rows not yet flushed.
     pub live: Vec<RecordBatch>,
-    /// Seed of the id the live rows' file will get, when any are live.
-    pub next_file_seed: Option<Position>,
+    /// Smallest WAL position of the live rows, which the next flush derives
+    /// its file id from; final when the snapshot was taken with no request
+    /// between its append and its push.
+    pub live_first_wal: Option<Position>,
     /// Rows being flushed, with the id their file will have.
     pub flushing: Vec<(FileId, Vec<RecordBatch>)>,
     /// Rows flushed recently and still served; the querier skips these files.
@@ -286,46 +318,29 @@ pub struct Snapshot {
 }
 
 /// All tenant buffers.
-///
-/// File ids derive from a per-tenant seed: the WAL position that ended the
-/// tenant's previous intent, or the position at startup before any intent.
-/// The seed is fixed before the rows arrive, so the id the hot window
-/// announces for live rows is the id their file gets, whatever order
-/// concurrent requests reached the buffer in.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Buffers {
     tenants: HashMap<TenantId, TenantBuffer>,
     flushing: HashMap<TenantId, Vec<Flushing>>,
     persisted: HashMap<TenantId, Vec<Persisted>>,
-    seeds: HashMap<TenantId, Position>,
-    default_seed: Position,
     reserved: HashMap<TenantId, Arc<AtomicUsize>>,
     reserved_total: Arc<AtomicUsize>,
+    scratch_total: Arc<AtomicUsize>,
     next_coalesce: u64,
 }
 
 impl Buffers {
-    /// Empty buffers; tenants without an intent yet seed their first file
-    /// from `default_seed`.
-    pub fn new(default_seed: Position) -> Self {
-        Self {
-            tenants: HashMap::new(),
-            flushing: HashMap::new(),
-            persisted: HashMap::new(),
-            seeds: HashMap::new(),
-            default_seed,
-            reserved: HashMap::new(),
-            reserved_total: Arc::new(AtomicUsize::new(0)),
-            next_coalesce: 0,
-        }
-    }
-
-    /// A tenant with at least `min` complete request batches below `bound`
-    /// and no coalesce in progress.
-    pub fn coalesce_candidate(&self, bound: Option<Position>, min: usize) -> Option<TenantId> {
+    /// A tenant with at least `min` complete request batches below its bound
+    /// and no coalesce in progress. `bound_of` gives each tenant's bound.
+    pub fn coalesce_candidate(
+        &self,
+        min: usize,
+        bound_of: impl Fn(TenantId) -> Option<Position>,
+    ) -> Option<TenantId> {
         self.tenants
             .iter()
-            .find(|(_, b)| {
+            .find(|(tenant, b)| {
+                let bound = bound_of(**tenant);
                 b.coalesce.is_none()
                     && b.entries
                         .iter()
@@ -336,21 +351,42 @@ impl Buffers {
             .map(|(t, _)| *t)
     }
 
-    /// Takes the complete request batches of `tenant` for coalescing; see
-    /// [`TenantBuffer::take_for_coalesce`]. Returns the coalesce id with them.
+    /// Takes complete request batches of `tenant` for coalescing, at least
+    /// `min` of them and at most `max_bytes` of Arrow memory; see
+    /// [`TenantBuffer::take_for_coalesce`]. Their bytes are held as scratch
+    /// against the global cap until the result is dropped.
     pub fn take_for_coalesce(
         &mut self,
         tenant: TenantId,
         bound: Option<Position>,
         min: usize,
-    ) -> Option<(u64, Vec<RecordBatch>)> {
+        max_bytes: usize,
+    ) -> Option<Taken> {
         let id = self.next_coalesce;
-        let batches = self
+        let (batches, bytes) = self
             .tenants
             .get_mut(&tenant)?
-            .take_for_coalesce(bound, min, id)?;
+            .take_for_coalesce(bound, min, max_bytes, id)?;
         self.next_coalesce += 1;
-        Some((id, batches))
+        Some(Taken {
+            id,
+            batches,
+            scratch: self.hold_scratch(bytes),
+        })
+    }
+
+    /// Counts `bytes` of working memory against the global cap until dropped.
+    pub fn hold_scratch(&self, bytes: usize) -> Scratch {
+        self.scratch_total.fetch_add(bytes, Ordering::Relaxed);
+        Scratch {
+            bytes,
+            total: Arc::clone(&self.scratch_total),
+        }
+    }
+
+    /// Working memory currently held by chunks being built.
+    pub fn scratch_total(&self) -> usize {
+        self.scratch_total.load(Ordering::Relaxed)
     }
 
     /// Puts the chunk of coalesce `id` in place of the batches it merged.
@@ -419,22 +455,7 @@ impl Buffers {
         }
     }
 
-    /// Seed of the next file id of `tenant`.
-    pub fn file_seed(&self, tenant: TenantId) -> Position {
-        self.seeds
-            .get(&tenant)
-            .copied()
-            .unwrap_or(self.default_seed)
-    }
-
-    /// Records that an intent of `tenant` ended at `end`, so the next file
-    /// seeds from the latest end seen. Replay calls it for every intent.
-    pub fn note_intent_end(&mut self, tenant: TenantId, end: Position) {
-        let seed = self.seeds.entry(tenant).or_insert(end);
-        *seed = (*seed).max(end);
-    }
-
-    /// WAL position of the first live record of `tenant`, if any rows are live.
+    /// Smallest WAL position among the live rows of `tenant`, if any.
     pub fn live_first_wal(&self, tenant: TenantId) -> Option<Position> {
         self.tenants
             .get(&tenant)
@@ -442,25 +463,17 @@ impl Buffers {
             .and_then(|b| b.first_wal)
     }
 
-    /// Moves the live rows of `tenant` into the flushing state under `file`,
-    /// whose intent ends at `end`, and returns them for writing. The next
-    /// file of the tenant seeds from `end`. `None` when nothing is live.
-    pub fn begin_flush(
-        &mut self,
-        tenant: TenantId,
-        file: FileId,
-        end: Position,
-    ) -> Option<Vec<RecordBatch>> {
+    /// Moves the live rows of `tenant` into the flushing state under `file`
+    /// and returns them for writing. `None` when nothing is live.
+    pub fn begin_flush(&mut self, tenant: TenantId, file: FileId) -> Option<Vec<RecordBatch>> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
-        let seed_before = self.seeds.insert(tenant, end);
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
             buffer,
             attempts: 0,
             next_attempt: Instant::now(),
             in_progress: true,
-            seed_before,
         });
         Some(batches)
     }
@@ -475,7 +488,6 @@ impl Buffers {
                 attempts: 0,
                 next_attempt: Instant::now(),
                 in_progress: false,
-                seed_before: None,
             });
         }
     }
@@ -541,10 +553,6 @@ impl Buffers {
     /// intent is durable.
     pub fn abort_flush(&mut self, tenant: TenantId, file: FileId) {
         if let Some(entry) = self.remove_flushing(tenant, file) {
-            match entry.seed_before {
-                Some(seed) => self.seeds.insert(tenant, seed),
-                None => self.seeds.remove(&tenant),
-            };
             self.get_mut(tenant).restore(entry.buffer);
         }
     }
@@ -573,9 +581,7 @@ impl Buffers {
         let live = self.tenants.get(&tenant);
         Snapshot {
             live: live.map(TenantBuffer::batches).unwrap_or_default(),
-            next_file_seed: live
-                .filter(|b| !b.is_empty())
-                .map(|_| self.file_seed(tenant)),
+            live_first_wal: live.filter(|b| !b.is_empty()).and_then(|b| b.first_wal),
             flushing: self
                 .flushing
                 .get(&tenant)
@@ -687,28 +693,31 @@ mod tests {
     }
 
     #[test]
-    fn file_seed_follows_intent_ends_and_survives_aborts() {
+    fn live_first_wal_survives_an_aborted_flush() {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
         let file = FileId(uuid::Uuid::from_u128(1));
-        let mut buffers = Buffers::new(at(10));
-        assert_eq!(buffers.file_seed(tenant), at(10));
+        let mut buffers = Buffers::default();
         buffers
             .get_mut(tenant)
             .push(batch(1), at(20), Instant::now());
-
-        assert!(buffers.begin_flush(tenant, file, at(40)).is_some());
-        assert_eq!(buffers.file_seed(tenant), at(40));
+        buffers
+            .get_mut(tenant)
+            .push(batch(1), at(15), Instant::now());
+        assert_eq!(buffers.live_first_wal(tenant), Some(at(15)));
+        assert!(buffers.begin_flush(tenant, file).is_some());
+        assert_eq!(buffers.live_first_wal(tenant), None);
         buffers.abort_flush(tenant, file);
-        assert_eq!(
-            buffers.file_seed(tenant),
-            at(10),
-            "no intent, seed unchanged"
-        );
-        assert_eq!(buffers.live_first_wal(tenant), Some(at(20)));
+        assert_eq!(buffers.live_first_wal(tenant), Some(at(15)));
+        assert_eq!(buffers.earliest_wal(), Some(at(15)));
+    }
 
-        buffers.note_intent_end(tenant, at(90));
-        buffers.note_intent_end(tenant, at(60));
-        assert_eq!(buffers.file_seed(tenant), at(90), "latest end wins");
+    #[test]
+    fn scratch_counts_until_dropped() {
+        let buffers = Buffers::default();
+        let held = buffers.hold_scratch(40);
+        assert_eq!(buffers.scratch_total(), 40);
+        drop(held);
+        assert_eq!(buffers.scratch_total(), 0);
     }
 
     fn values(batches: &[RecordBatch]) -> Vec<i64> {
@@ -735,25 +744,38 @@ mod tests {
     fn coalesce_merges_complete_batches_in_log_order() {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
         let now = Instant::now();
-        let mut buffers = Buffers::new(at(0));
+        let mut buffers = Buffers::default();
         for (offset, tag) in [(30, 3), (10, 1), (40, 4), (20, 2)] {
             buffers
                 .get_mut(tenant)
                 .push(tagged(2, tag), at(offset), now);
         }
         assert_eq!(
-            buffers.coalesce_candidate(Some(at(35)), 4),
+            buffers.coalesce_candidate(4, |_| Some(at(35))),
             None,
             "only three are complete"
         );
-        assert_eq!(buffers.coalesce_candidate(Some(at(35)), 3), Some(tenant));
-        let (id, taken) = buffers.take_for_coalesce(tenant, Some(at(35)), 3).unwrap();
-        assert_eq!(values(&taken), vec![100, 101, 200, 201, 300, 301]);
         assert_eq!(
-            buffers.take_for_coalesce(tenant, None, 1),
-            None,
+            buffers.coalesce_candidate(3, |_| Some(at(35))),
+            Some(tenant)
+        );
+        let Taken {
+            id,
+            batches: taken,
+            scratch,
+        } = buffers
+            .take_for_coalesce(tenant, Some(at(35)), 3, usize::MAX)
+            .unwrap();
+        assert_eq!(values(&taken), vec![100, 101, 200, 201, 300, 301]);
+        assert!(buffers.scratch_total() > 0, "inputs are held as scratch");
+        assert!(
+            buffers
+                .take_for_coalesce(tenant, None, 1, usize::MAX)
+                .is_none(),
             "one at a time"
         );
+        drop(scratch);
+        assert_eq!(buffers.scratch_total(), 0);
         // Rows arriving meanwhile sit above the bound and after the chunk.
         buffers.get_mut(tenant).push(tagged(1, 5), at(50), now);
         let before = buffers.get_mut(tenant).bytes;
@@ -779,11 +801,15 @@ mod tests {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
         let file = FileId(uuid::Uuid::from_u128(1));
         let now = Instant::now();
-        let mut buffers = Buffers::new(at(0));
+        let mut buffers = Buffers::default();
         buffers.get_mut(tenant).push(tagged(1, 1), at(10), now);
         buffers.get_mut(tenant).push(tagged(1, 2), at(20), now);
-        let (id, taken) = buffers.take_for_coalesce(tenant, None, 2).unwrap();
-        let flushed = buffers.begin_flush(tenant, file, at(30)).unwrap();
+        let Taken {
+            id, batches: taken, ..
+        } = buffers
+            .take_for_coalesce(tenant, None, 2, usize::MAX)
+            .unwrap();
+        let flushed = buffers.begin_flush(tenant, file).unwrap();
         assert_eq!(
             values(&flushed),
             vec![100, 200],
@@ -795,16 +821,52 @@ mod tests {
         buffers.get_mut(tenant).push(tagged(1, 3), at(40), now);
         assert_eq!(
             buffers
-                .take_for_coalesce(tenant, None, 1)
-                .map(|(_, b)| values(&b)),
+                .take_for_coalesce(tenant, None, 1, usize::MAX)
+                .map(|t| values(&t.batches)),
             Some(vec![300])
+        );
+    }
+
+    #[test]
+    fn coalesce_groups_stop_at_the_byte_limit() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4)] {
+            buffers
+                .get_mut(tenant)
+                .push(tagged(2, tag), at(offset), now);
+        }
+        let one = buffers.get_mut(tenant).entries.first().unwrap().bytes;
+        let taken = buffers.take_for_coalesce(tenant, None, 2, one * 2).unwrap();
+        assert_eq!(
+            values(&taken.batches),
+            vec![100, 101, 200, 201],
+            "a prefix within the limit"
+        );
+        let chunk = arrow::compute::concat_batches(
+            &taken.batches.first().unwrap().schema(),
+            &taken.batches,
+        )
+        .unwrap();
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert_eq!(
+            values(&buffers.get_mut(tenant).batches()),
+            vec![100, 101, 200, 201, 300, 301, 400, 401]
+        );
+        assert_eq!(buffers.get_mut(tenant).request_batches(), 2);
+        let tiny = buffers.take_for_coalesce(tenant, None, 1, 1).unwrap();
+        assert_eq!(
+            values(&tiny.batches),
+            vec![300, 301],
+            "at least one batch is always taken"
         );
     }
 
     #[test]
     fn reservations_count_until_dropped() {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
-        let mut buffers = Buffers::new(at(0));
+        let mut buffers = Buffers::default();
         let first = buffers.reserve(tenant, 100);
         let second = buffers.reserve(tenant, 50);
         assert_eq!(buffers.reserved_of(tenant), 150);

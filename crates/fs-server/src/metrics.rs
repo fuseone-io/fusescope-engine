@@ -257,6 +257,12 @@ impl Metrics {
             "Time spent merging request batches.",
             f.coalesce_nanos.load(Ordering::Relaxed),
         );
+        self.render_buffers(out);
+    }
+
+    fn render_buffers(&self, out: &mut String) {
+        let Some(f) = self.flush.get() else { return };
+        let ns = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         gauge(
             out,
             "fusescope_buffer_live_bytes",
@@ -274,6 +280,12 @@ impl Metrics {
             "fusescope_buffer_persisted_bytes",
             "Bytes kept for the hot window after registration",
             ns(&f.persisted_bytes),
+        );
+        gauge(
+            out,
+            "fusescope_buffer_scratch_bytes",
+            "Working memory held by chunks being built",
+            ns(&f.scratch_bytes),
         );
     }
 

@@ -103,6 +103,8 @@ pub struct FlushStats {
     pub coalesced_batches: AtomicU64,
     /// Nanoseconds spent merging.
     pub coalesce_nanos: AtomicU64,
+    /// Working memory held by chunks being built, sampled every flusher tick.
+    pub scratch_bytes: AtomicU64,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
@@ -141,6 +143,7 @@ pub struct Shared {
     gate: RwLock<()>,
     flush_now: Notify,
     coalesce_now: Notify,
+    conversions: tokio::sync::Semaphore,
     inject_register_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
@@ -169,7 +172,9 @@ impl Shared {
                 "tenant memory full, hot-window retention pending",
             ));
         }
-        if buffers.total_bytes() + buffers.reserved_total() + bytes > self.config.max_memory_bytes {
+        if buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total() + bytes
+            > self.config.max_memory_bytes
+        {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             return Err(IngestError::Capacity(
                 "ingester memory full, hot-window retention pending",
@@ -187,15 +192,21 @@ impl Shared {
 
     /// Appends through the group-commit writer; resolves once synced. The
     /// position stays tracked as travelling until the handle is dropped.
-    async fn append_wal(&self, record: Vec<u8>) -> Result<crate::walwriter::Tracked, IngestError> {
-        self.writer.append(record).await
+    async fn append_wal(
+        &self,
+        tenant: TenantId,
+        record: Vec<u8>,
+    ) -> Result<crate::walwriter::Tracked, IngestError> {
+        self.writer.append(tenant, record).await
     }
 
     /// Converts a request, admits it against the caps, logs it and adds it to
     /// the tenant buffer, all while holding the flush gate so a concurrent
     /// flush sees either both the log record and the rows or neither.
     /// Conversion comes first: a request the engine cannot convert or hold is
-    /// refused before it reaches the WAL.
+    /// refused before it reaches the WAL. Conversions run at most
+    /// `max_conversions` at a time, which bounds the memory of batches built
+    /// but not yet admitted.
     pub(crate) async fn ingest(
         &self,
         tenant: TenantId,
@@ -204,6 +215,11 @@ impl Shared {
         now: Instant,
     ) -> Result<Converted, IngestError> {
         let _shared = self.gate.read().await;
+        let slot = self
+            .conversions
+            .acquire()
+            .await
+            .map_err(|_| IngestError::Backpressure("conversions closed"))?;
         let mut builder = SpanBatchBuilder::new(self.config.limits);
         builder.append_request(message)?;
         let stats = builder.stats();
@@ -212,7 +228,8 @@ impl Shared {
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
 
         let reservation = self.admit(tenant, batch.get_array_memory_size()).await?;
-        let tracked = self.append_wal(record).await?;
+        drop(slot);
+        let tracked = self.append_wal(tenant, record).await?;
         if let Some(delay) = self.config.inject_push_delay {
             if self.push_delay_pending.swap(false, Ordering::Relaxed) {
                 tokio::time::sleep(delay).await;
@@ -262,9 +279,8 @@ impl Shared {
             let Some(first) = buffers.live_first_wal(tenant) else {
                 return Ok(false);
             };
-            let seed = buffers.file_seed(tenant);
-            let file_id = FileId::derived(self.instance, tenant, seed.segment, seed.offset);
-            let Some(batches) = buffers.begin_flush(tenant, file_id, end) else {
+            let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
+            let Some(batches) = buffers.begin_flush(tenant, file_id) else {
                 return Ok(false);
             };
             (
@@ -278,7 +294,7 @@ impl Shared {
                 batches,
             )
         };
-        if let Err(e) = self.append_wal(intent.to_record().encode()).await {
+        if let Err(e) = self.append_wal(tenant, intent.to_record().encode()).await {
             self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
             warn!(tenant = %tenant.0, error = %e, "flush intent could not be logged; keeping rows buffered");
             self.buffers.lock().await.abort_flush(tenant, file_id);
@@ -412,13 +428,25 @@ impl Shared {
     /// Records that everything before the earliest still-buffered record is
     /// materialised: replay after a restart starts there, and segments before
     /// it are deleted.
+    /// Advances the checkpoint to the earliest row still in memory, or to the
+    /// end of the log when nothing is. The cut is chosen under the exclusive
+    /// gate, so no request is between its append and its push: every record
+    /// accepted after the cut is above it and replay still finds it.
     async fn checkpoint_wal(&self) {
-        let earliest = self.buffers.lock().await.earliest_wal();
+        let cut = {
+            let _exclusive = self.gate.write().await;
+            let earliest = self.buffers.lock().await.earliest_wal();
+            let Some(position) = earliest.or_else(|| self.wal.lock().ok().map(|w| w.position()))
+            else {
+                warn!("wal lock poisoned; skipping checkpoint");
+                return;
+            };
+            position
+        };
         let wal = self.wal.clone();
         let writer_stats = self.writer.stats();
         let result = tokio::task::spawn_blocking(move || {
             let mut wal = wal.lock().map_err(|_| fs_wal::WalError::EmptyRecord)?;
-            let cut = earliest.unwrap_or_else(|| wal.position());
             let outcome = wal.checkpoint(cut).map(|()| cut);
             // Segments were removed: publish the new size while still holding
             // the lock, or a full WAL stays "full" until the next append.
@@ -441,19 +469,27 @@ impl Shared {
     /// the batches stay served and counted meanwhile.
     async fn coalesce_due(&self) {
         let min = self.config.coalesce_batches;
+        let max_bytes = self.config.coalesce_bytes;
         loop {
-            let bound = self.writer.stable_bound();
             let taken = {
                 let mut buffers = self.buffers.lock().await;
-                buffers.coalesce_candidate(bound, min).and_then(|tenant| {
-                    buffers
-                        .take_for_coalesce(tenant, bound, min)
-                        .map(|(id, batches)| (tenant, id, batches))
-                })
+                buffers
+                    .coalesce_candidate(min, |tenant| self.writer.stable_bound(tenant))
+                    .and_then(|tenant| {
+                        let bound = self.writer.stable_bound(tenant);
+                        buffers
+                            .take_for_coalesce(tenant, bound, min, max_bytes)
+                            .map(|taken| (tenant, taken))
+                    })
             };
-            let Some((tenant, id, batches)) = taken else {
+            let Some((tenant, taken)) = taken else {
                 return;
             };
+            let crate::buffer::Taken {
+                id,
+                batches,
+                scratch,
+            } = taken;
             let count = batches.len();
             let started = Instant::now();
             let merged = tokio::task::spawn_blocking(move || {
@@ -480,14 +516,21 @@ impl Shared {
                     self.buffers.lock().await.cancel_coalesce(tenant, id);
                 }
             }
+            drop(scratch);
         }
     }
 
     /// Rows of `tenant` in every state, plus the id the live rows will get.
+    /// Taken under the exclusive gate: no request is between its append and
+    /// its push, so the smallest live position, and with it the announced id,
+    /// is the one the next flush derives from.
     pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Option<FileId>) {
-        let snapshot = self.buffers.lock().await.snapshot(tenant);
+        let snapshot = {
+            let _exclusive = self.gate.write().await;
+            self.buffers.lock().await.snapshot(tenant)
+        };
         let live_file = snapshot
-            .next_file_seed
+            .live_first_wal
             .map(|p| FileId::derived(self.instance, tenant, p.segment, p.offset));
         (snapshot, live_file)
     }
@@ -507,6 +550,9 @@ impl Shared {
             self.flush_stats
                 .persisted_bytes
                 .store(persisted as u64, Ordering::Relaxed);
+            self.flush_stats
+                .scratch_bytes
+                .store(buffers.scratch_total() as u64, Ordering::Relaxed);
             if everything {
                 buffers.all()
             } else {
@@ -585,15 +631,10 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
 }
 
 /// Rebuilds buffers: rows covered by an intent go back to the flushing state
-/// under that file id, everything else is live. Tenants seed their next file
-/// from the end of their latest intent, or from `startup`, the WAL position
-/// after replay, when they have none.
-fn rebuild(replayed: Replayed, startup: Position) -> Buffers {
+/// under that file id, everything else is live.
+fn rebuild(replayed: Replayed) -> Buffers {
     let now = Instant::now();
-    let mut buffers = Buffers::new(startup);
-    for intent in &replayed.intents {
-        buffers.note_intent_end(intent.tenant, intent.end);
-    }
+    let mut buffers = Buffers::default();
     let mut groups: Vec<(FlushIntent, TenantBuffer)> = replayed
         .intents
         .into_iter()
@@ -647,7 +688,7 @@ impl Ingester {
         let replayed = replay(config.limits, &mut wal)?;
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
-        let buffers = rebuild(replayed, wal.position());
+        let buffers = rebuild(replayed);
         info!(
             records,
             damaged,
@@ -657,6 +698,7 @@ impl Ingester {
         );
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
+        let config_conversions = config.max_conversions;
         let push_delay_pending = config.inject_push_delay.is_some();
         let wal = Arc::new(StdMutex::new(wal));
         let writer = crate::walwriter::WalWriter::spawn(Arc::clone(&wal), config.group_commit);
@@ -673,6 +715,9 @@ impl Ingester {
             gate: RwLock::new(()),
             flush_now: Notify::new(),
             coalesce_now: Notify::new(),
+            conversions: tokio::sync::Semaphore::new(
+                config_conversions.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+            ),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             catalog,
@@ -713,6 +758,12 @@ impl Ingester {
     /// Used by tests and at shutdown.
     pub async fn flush_all(&self) {
         self.shared.flush_due(true).await;
+    }
+
+    /// Advances the WAL checkpoint to the earliest row still in memory. Runs
+    /// after every flush; exposed for tests and operators.
+    pub async fn checkpoint(&self) {
+        self.shared.checkpoint_wal().await;
     }
 
     /// Serves OTLP (and the hot window when configured) until `shutdown`

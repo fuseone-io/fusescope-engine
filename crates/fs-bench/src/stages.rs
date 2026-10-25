@@ -180,7 +180,7 @@ pub async fn run(
         let slice = slice.to_vec();
         tasks.push(tokio::spawn(async move {
             for record in slice {
-                writer.append(record).await?;
+                writer.append(tenant, record).await?;
             }
             Ok::<_, fs_ingest::IngestError>(())
         }));

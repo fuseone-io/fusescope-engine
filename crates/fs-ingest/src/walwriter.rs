@@ -7,11 +7,12 @@
 //! idle a record waits for nothing but its own fsync. An optional linger lets
 //! the first record of a batch wait a little for company.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use std::time::{Duration, Instant};
 
+use fs_catalog::TenantId;
 use fs_wal::{Position, Wal, WalError};
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
@@ -67,22 +68,31 @@ pub struct WriterStats {
     pub backpressure: AtomicU64,
 }
 
+/// Positions of records travelling from the log to a buffer, per tenant.
+type Inflight = Arc<StdMutex<HashMap<TenantId, BTreeSet<Position>>>>;
+
 /// A synced record's position, held by the caller until the rows it carries
 /// are in a buffer. While it is held the position counts as travelling, and
-/// everything below the smallest travelling position is complete: no lower
-/// record is still on its way to a buffer. The coalescer merges only below
-/// that bound, so merged rows keep the order of the log.
+/// everything of the tenant below its smallest travelling position is
+/// complete: no lower record is still on its way to a buffer. The coalescer
+/// merges only below that bound, so merged rows keep the order of the log.
 #[derive(Debug)]
 pub struct Tracked {
     /// Position of the record.
     pub position: Position,
-    inflight: Arc<StdMutex<BTreeSet<Position>>>,
+    tenant: TenantId,
+    inflight: Inflight,
 }
 
 impl Drop for Tracked {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.inflight.lock() {
-            set.remove(&self.position);
+        if let Ok(mut map) = self.inflight.lock() {
+            if let Some(set) = map.get_mut(&self.tenant) {
+                set.remove(&self.position);
+                if set.is_empty() {
+                    map.remove(&self.tenant);
+                }
+            }
         }
     }
 }
@@ -92,6 +102,7 @@ impl Drop for Tracked {
 /// has synced the record and dropped it.
 struct Pending {
     bytes: Vec<u8>,
+    tenant: TenantId,
     reply: oneshot::Sender<Result<Tracked, WalError>>,
     _slot: tokio::sync::OwnedSemaphorePermit,
     _lease: ByteLease,
@@ -117,7 +128,7 @@ pub struct WalWriter {
     stats: Arc<WriterStats>,
     slots: Arc<tokio::sync::Semaphore>,
     inflight_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    inflight: Arc<StdMutex<BTreeSet<Position>>>,
+    inflight: Inflight,
     config: GroupCommitConfig,
 }
 
@@ -130,7 +141,7 @@ impl WalWriter {
             .wal_bytes
             .store(wal.lock().map_or(0, |w| w.bytes()), Ordering::Relaxed);
         let thread_stats = Arc::clone(&stats);
-        let inflight = Arc::new(StdMutex::new(BTreeSet::new()));
+        let inflight: Inflight = Arc::new(StdMutex::new(HashMap::new()));
         let thread_inflight = Arc::clone(&inflight);
         std::thread::Builder::new()
             .name("fs-wal-writer".into())
@@ -151,13 +162,13 @@ impl WalWriter {
         }
     }
 
-    /// Smallest position still travelling to a buffer, if any. Records below
-    /// it are complete in memory.
-    pub fn stable_bound(&self) -> Option<Position> {
+    /// Smallest position of `tenant` still travelling to a buffer, if any.
+    /// Records of the tenant below it are complete in memory.
+    pub fn stable_bound(&self, tenant: TenantId) -> Option<Position> {
         self.inflight
             .lock()
             .ok()
-            .and_then(|set| set.first().copied())
+            .and_then(|map| map.get(&tenant).and_then(|set| set.first().copied()))
     }
 
     /// Counters.
@@ -171,7 +182,7 @@ impl WalWriter {
     /// # Errors
     /// Backpressure when the queue is over its record or byte limit, WAL
     /// failure, or the writer thread is gone.
-    pub async fn append(&self, bytes: Vec<u8>) -> Result<Tracked, IngestError> {
+    pub async fn append(&self, tenant: TenantId, bytes: Vec<u8>) -> Result<Tracked, IngestError> {
         let size = bytes.len();
         let held = self.inflight_bytes.fetch_add(size, Ordering::Relaxed) + size;
         if held > self.config.max_inflight_bytes {
@@ -196,6 +207,7 @@ impl WalWriter {
         self.queue
             .send(Pending {
                 bytes,
+                tenant,
                 reply,
                 _slot: slot,
                 _lease: lease,
@@ -223,7 +235,7 @@ fn run(
     inbox: &mpsc::Receiver<Pending>,
     config: GroupCommitConfig,
     stats: &WriterStats,
-    inflight: &Arc<StdMutex<BTreeSet<Position>>>,
+    inflight: &Inflight,
 ) {
     while let Ok(first) = inbox.recv() {
         let mut batch = vec![first];
@@ -254,12 +266,7 @@ fn run(
     debug!("wal writer stopped");
 }
 
-fn commit(
-    wal: &StdMutex<Wal>,
-    batch: Vec<Pending>,
-    stats: &WriterStats,
-    inflight: &Arc<StdMutex<BTreeSet<Position>>>,
-) {
+fn commit(wal: &StdMutex<Wal>, batch: Vec<Pending>, stats: &WriterStats, inflight: &Inflight) {
     let Ok(mut wal) = wal.lock() else {
         for p in batch {
             let _ = p.reply.send(Err(WalError::EmptyRecord));
@@ -277,8 +284,10 @@ fn commit(
     }
     // Positions become travelling before anyone can learn them: a caller only
     // sees its position through the reply, after this insert.
-    if let Ok(mut set) = inflight.lock() {
-        set.extend(appended.iter().map(|(_, position)| *position));
+    if let Ok(mut map) = inflight.lock() {
+        for (pending, position) in &appended {
+            map.entry(pending.tenant).or_default().insert(*position);
+        }
     }
     let started = Instant::now();
     let synced = wal.sync();
@@ -295,6 +304,7 @@ fn commit(
     for (pending, position) in appended {
         let tracked = Tracked {
             position,
+            tenant: pending.tenant,
             inflight: Arc::clone(inflight),
         };
         let outcome = match &synced {
@@ -316,6 +326,10 @@ mod tests {
     use super::*;
     use fs_wal::{Event, WalConfig};
 
+    fn tenant(n: u128) -> TenantId {
+        TenantId(uuid::Uuid::from_u128(n))
+    }
+
     #[tokio::test]
     async fn byte_budget_refuses_immediately() {
         let dir = tempfile::tempdir().unwrap();
@@ -327,7 +341,7 @@ mod tests {
             ..GroupCommitConfig::default()
         };
         let writer = WalWriter::spawn(wal, config);
-        let err = writer.append(vec![0u8; 11]).await.unwrap_err();
+        let err = writer.append(tenant(1), vec![0u8; 11]).await.unwrap_err();
         assert!(
             matches!(err, IngestError::Backpressure("wal queue bytes")),
             "{err}"
@@ -338,7 +352,7 @@ mod tests {
             0,
             "budget returned"
         );
-        writer.append(vec![0u8; 10]).await.unwrap();
+        writer.append(tenant(1), vec![0u8; 10]).await.unwrap();
         assert_eq!(writer.inflight_bytes(), 0);
     }
 
@@ -356,13 +370,13 @@ mod tests {
         let writer = WalWriter::spawn(wal, config);
         // Hold the only slot without ever sending, as a stuck request would.
         let held = Arc::clone(&writer.slots).acquire_owned().await.unwrap();
-        let err = writer.append(vec![1, 2, 3]).await.unwrap_err();
+        let err = writer.append(tenant(1), vec![1, 2, 3]).await.unwrap_err();
         assert!(
             matches!(err, IngestError::Backpressure("wal queue records")),
             "{err}"
         );
         drop(held);
-        writer.append(vec![1, 2, 3]).await.unwrap();
+        writer.append(tenant(1), vec![1, 2, 3]).await.unwrap();
     }
 
     /// A caller that gives up after queuing must not free the limits: the
@@ -383,7 +397,7 @@ mod tests {
         let stall = wal.lock().unwrap();
         let task = {
             let writer = writer.clone();
-            tokio::spawn(async move { writer.append(vec![7u8; 100]).await })
+            tokio::spawn(async move { writer.append(tenant(1), vec![7u8; 100]).await })
         };
         let queued = async {
             while writer.free_slots() != 3 {
@@ -425,15 +439,23 @@ mod tests {
             Wal::open(WalConfig::new(dir.path())).unwrap(),
         ));
         let writer = WalWriter::spawn(wal, GroupCommitConfig::default());
-        assert_eq!(writer.stable_bound(), None);
-        let first = writer.append(vec![1]).await.unwrap();
-        let second = writer.append(vec![2]).await.unwrap();
-        assert!(first.position < second.position);
-        assert_eq!(writer.stable_bound(), Some(first.position));
+        assert_eq!(writer.stable_bound(tenant(1)), None);
+        let first = writer.append(tenant(1), vec![1]).await.unwrap();
+        let other = writer.append(tenant(2), vec![9]).await.unwrap();
+        let second = writer.append(tenant(1), vec![2]).await.unwrap();
+        assert!(first.position < other.position && other.position < second.position);
+        assert_eq!(writer.stable_bound(tenant(1)), Some(first.position));
+        assert_eq!(writer.stable_bound(tenant(2)), Some(other.position));
         drop(first);
-        assert_eq!(writer.stable_bound(), Some(second.position));
+        assert_eq!(
+            writer.stable_bound(tenant(1)),
+            Some(second.position),
+            "another tenant's record does not hold this one back"
+        );
+        drop(other);
         drop(second);
-        assert_eq!(writer.stable_bound(), None);
+        assert_eq!(writer.stable_bound(tenant(1)), None);
+        assert_eq!(writer.stable_bound(tenant(2)), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -448,7 +470,7 @@ mod tests {
             let writer = writer.clone();
             tasks.push(tokio::spawn(async move {
                 writer
-                    .append(i.to_le_bytes().to_vec())
+                    .append(tenant(1), i.to_le_bytes().to_vec())
                     .await
                     .unwrap()
                     .position

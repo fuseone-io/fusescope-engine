@@ -111,11 +111,11 @@ arriving meanwhile:
 
 - The file id is derived from the WAL instance id (created with the WAL
   directory, so two ingesters or a recreated volume never collide), the tenant
-  and a seed: the WAL position that ended the tenant's previous intent, or the
-  position at startup before any intent. The seed is fixed before the rows
-  arrive, so it does not depend on the order in which concurrent requests
-  reach the buffer, and the id the hot window announces for live rows is the
-  id their file gets.
+  and the smallest WAL position in the buffer. Replay rebuilds the same
+  minimum from the records, so the id survives a restart with no state beyond
+  the log. The hot window takes its snapshot under the exclusive gate, with no
+  request between its append and its push, so the id it announces for live
+  rows is the id their file gets.
 - Before uploading, the ingester appends a flush intent to the WAL naming the
   file id and the exact record range it covers. The range is exact because
   requests append to the WAL and to the buffer under a shared gate that the
@@ -130,7 +130,14 @@ arriving meanwhile:
 
 The checkpoint is a durable marker next to the segments: replay after a
 restart starts there, which is what prevents rows already in the bucket from
-being flushed twice.
+being flushed twice. Its cut is chosen under the same exclusive gate, so a
+record accepted while the checkpoint is chosen is above the cut and replay
+still finds it.
+
+Memory the caps do not see is bounded separately: at most `max_conversions`
+requests are converted to Arrow before admission at a time, and a merge holds
+its inputs as scratch against `max_memory_bytes` and takes at most
+`coalesce_bytes` of them.
 
 Buffers keep batches in WAL order, the order replay produces, so a file holds
 the same rows in the same order whether it was built from live batches or
