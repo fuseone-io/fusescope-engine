@@ -950,6 +950,18 @@ mod tests {
                 .contains("ingest.listen")
         );
 
+        for (secs, accepted) in [(7u64, false), (8, true)] {
+            let config = Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\npersisted_retain_secs = {secs}\n"
+            ))
+            .unwrap();
+            let outcome = config.validate(&secrets);
+            assert_eq!(outcome.is_ok(), accepted, "retention {secs}s: {outcome:?}");
+            if let Err(e) = outcome {
+                assert!(e.to_string().contains("persisted_retain_secs"), "{e}");
+            }
+        }
+
         let inverted = Config::parse(
             "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nmax_tenant_bytes = 4096\nmax_memory_bytes = 1024\n",
         )

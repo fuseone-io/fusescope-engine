@@ -322,6 +322,19 @@ pub struct Scratch {
     total: Arc<AtomicU64>,
 }
 
+impl Scratch {
+    /// Changes the held amount to `bytes`, once the real size is known.
+    pub fn resize(&mut self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if bytes >= self.bytes {
+            self.total.fetch_add(bytes - self.bytes, Ordering::Relaxed);
+        } else {
+            self.total.fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+    }
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         self.total.fetch_sub(self.bytes, Ordering::Relaxed);
@@ -424,6 +437,14 @@ impl Buffers {
             batches,
             scratch: self.hold_scratch(bytes),
         })
+    }
+
+    /// Counts `bytes` of working memory against the global cap until dropped,
+    /// only if they fit under `cap` next to everything held and reserved;
+    /// `None` otherwise, with nothing changed.
+    pub fn try_hold_scratch(&self, bytes: usize, cap: usize) -> Option<Scratch> {
+        let held = self.total_bytes() + self.reserved_total() + self.scratch_total();
+        (held.saturating_add(bytes) <= cap).then(|| self.hold_scratch(bytes))
     }
 
     /// Counts `bytes` of working memory against the global cap until dropped.
@@ -825,6 +846,31 @@ mod tests {
         let buffers = Buffers::default();
         let held = buffers.hold_scratch(40);
         assert_eq!(buffers.scratch_total(), 40);
+        drop(held);
+        assert_eq!(buffers.scratch_total(), 0);
+    }
+
+    #[test]
+    fn scratch_is_reserved_under_the_cap_and_resized_to_the_real_size() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let mut buffers = Buffers::default();
+        buffers
+            .get_mut(tenant)
+            .push(tagged(4, 1), at(10), Instant::now());
+        let resident = buffers.total_bytes();
+        assert!(
+            buffers
+                .try_hold_scratch(resident, resident * 2 - 1)
+                .is_none(),
+            "no room"
+        );
+        assert_eq!(buffers.scratch_total(), 0, "a refusal changes nothing");
+        let mut held = buffers.try_hold_scratch(resident, resident * 2).unwrap();
+        assert_eq!(buffers.scratch_total(), resident);
+        held.resize(10);
+        assert_eq!(buffers.scratch_total(), 10);
+        held.resize(25);
+        assert_eq!(buffers.scratch_total(), 25);
         drop(held);
         assert_eq!(buffers.scratch_total(), 0);
     }

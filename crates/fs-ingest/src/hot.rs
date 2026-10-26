@@ -404,5 +404,15 @@ mod tests {
             request
         );
         assert!(HotScanRequest::from_ticket(&Ticket::new(b"nope".to_vec())).is_err());
+
+        // A ticket from a querier that predates the id predicates.
+        let old = format!(
+            r#"{{"tenant":"{}","ts_min":1,"ts_max":null,"services":null,"columns":null}}"#,
+            request.tenant.0
+        );
+        let decoded = HotScanRequest::from_ticket(&Ticket::new(old.into_bytes())).unwrap();
+        assert_eq!(decoded.tenant, request.tenant);
+        assert_eq!(decoded.trace_ids, None);
+        assert_eq!(decoded.span_ids, None);
     }
 }
