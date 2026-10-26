@@ -188,8 +188,10 @@ impl Shared {
                 "tenant memory full, hot-window retention pending",
             ));
         }
-        if buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total() + bytes
-            > self.config.max_memory_bytes
+        // Admitted rows must always be writable: besides the batch itself,
+        // room for the scratch its flush will reserve stays free.
+        if bytes.saturating_mul(1 + crate::buffer::FLUSH_SCRATCH_FACTOR)
+            > buffers.headroom(self.config.max_memory_bytes)
         {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             return Err(IngestError::Capacity(
@@ -425,33 +427,41 @@ impl Shared {
         ),
         IngestError,
     > {
-        // Preparing holds the merged rows and the sorted rows at once, each at
-        // most the size of the inputs: reserved under the cap before the work
-        // starts, refused with a backoff when the cap has no room, and sized
-        // to what is really held once known.
+        // Preparing holds the merged rows, the sorted rows and the encoder's
+        // output at once, each at most the size of the inputs: reserved under
+        // the cap before the work starts, which admission kept room for, and
+        // lowered to what is really held once known.
         let inputs: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         let mut held = self
             .buffers
             .lock()
             .await
-            .try_hold_scratch(inputs.saturating_mul(2), self.config.max_memory_bytes)
+            .try_hold_scratch(
+                inputs.saturating_mul(crate::buffer::FLUSH_SCRATCH_FACTOR),
+                self.config.max_memory_bytes,
+            )
             .ok_or(IngestError::Backpressure("flush scratch"))?;
         let root = self.root.clone();
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
                 .await??;
-        held.resize(prepared.rows.get_array_memory_size() + prepared.bytes.len());
+        held.shrink(prepared.rows.get_array_memory_size() + prepared.bytes.len());
         timing.concat = nanos(prepared.concat);
         timing.sort = nanos(prepared.sort);
         timing.encode = nanos(prepared.encode);
         let upload_started = Instant::now();
         let created = flush::upload(self.store.as_ref(), &prepared).await?;
         timing.upload = nanos(upload_started.elapsed());
-        held.resize(prepared.rows.get_array_memory_size());
+        let flush::Prepared {
+            file, bytes, rows, ..
+        } = prepared;
+        // The object is in the bucket: its bytes go before the lease shrinks.
+        drop(bytes);
+        held.shrink(rows.get_array_memory_size());
         let register_started = Instant::now();
-        self.register(&prepared.file).await?;
+        self.register(&file).await?;
         timing.register = nanos(register_started.elapsed());
-        Ok((prepared.file, created, prepared.rows, held))
+        Ok((file, created, rows, held))
     }
 
     /// Catalog registration, with the test-only failure injection in front.
@@ -585,9 +595,7 @@ impl Shared {
                 let mut buffers = self.buffers.lock().await;
                 // The merge's inputs are reserved inside the cap, never on top
                 // of it: with no headroom nothing is merged until a flush.
-                let headroom = self.config.max_memory_bytes.saturating_sub(
-                    buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total(),
-                );
+                let headroom = buffers.headroom(self.config.max_memory_bytes);
                 let candidates = buffers.coalesce_candidates(min);
                 candidates.into_iter().find_map(|tenant| {
                     let bound = self.writer.stable_bound(tenant);

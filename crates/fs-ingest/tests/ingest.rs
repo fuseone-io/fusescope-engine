@@ -1056,12 +1056,12 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
         .create_token(tenant, "collector", TokenScope::Ingest)
         .await
         .unwrap();
-    // Four raw 30-span batches and the two copies their flush reserves fit
-    // under 256 KiB. After the flush the rows stay as one compact batch, so
-    // more requests fit before the retention plus the live rows cross the
-    // cap.
+    // Four raw 30-span batches, each with the three copies its flush keeps
+    // room for, fit under 512 KiB. After the flush the rows stay as one
+    // compact batch, so more requests fit before the retention plus the
+    // live rows and their margin cross the cap.
     let config = IngestConfig {
-        max_memory_bytes: 256 * 1024,
+        max_memory_bytes: 512 * 1024,
         persisted_retain: Duration::from_secs(2),
         ..test_config()
     };
@@ -1360,9 +1360,10 @@ async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
         .create_token(tenant, "collector", TokenScope::Ingest)
         .await
         .unwrap();
-    // Three 30-span batches fit under 64 KiB, a fourth would cross it.
+    // Three 30-span batches with their flush margin fit under 256 KiB, a
+    // fourth would cross it.
     let config = IngestConfig {
-        max_memory_bytes: 64 * 1024,
+        max_memory_bytes: 256 * 1024,
         ..test_config()
     };
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
@@ -1846,11 +1847,11 @@ async fn hot_scan_keeps_only_the_requested_traces_and_spans() {
     db.finish().await;
 }
 
-/// A flush reserves its working memory under the cap before preparing the
-/// file. With the cap taken by retained rows the attempt is refused and
-/// backs off; once the retention is swept it runs.
+/// Rows that fill the cap must be the rows that free it: admission keeps
+/// room for the scratch their flush needs, so a flush under resident-only
+/// pressure, with nothing to expire, still runs.
 #[tokio::test]
-async fn flush_waits_for_scratch_under_the_cap() {
+async fn admitted_rows_can_always_be_flushed() {
     let Some(db) = TestDb::new().await else {
         return;
     };
@@ -1865,48 +1866,46 @@ async fn flush_waits_for_scratch_under_the_cap() {
         .create_token(tenant, "collector", TokenScope::Ingest)
         .await
         .unwrap();
-    // One raw 30-span batch is under 20 KiB; preparing it reserves twice that.
-    // The first flush fits under 64 KiB. Its retained rows plus a second
-    // batch still fit, but the second flush's reservation does not until
-    // the retention is swept.
+    // A raw 30-span batch is under 20 KiB; with its flush margin it needs
+    // four times that, so one fits under 128 KiB and a second does not.
     let config = IngestConfig {
-        max_memory_bytes: 64 * 1024,
-        persisted_retain: Duration::from_secs(2),
+        max_memory_bytes: 128 * 1024,
         ..test_config()
     };
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
     let mut client = h.client().await;
-    client
-        .export(authed(request("api", 1, 30), &token))
-        .await
-        .unwrap();
-    h.ingester.flush_all().await;
-    let bucket = h.dir.path().join("bucket");
-    assert_eq!(parquet_files(&bucket).len(), 1);
+    let mut admitted = 0u8;
+    let refused = loop {
+        match client
+            .export(authed(request("api", 1 + admitted, 30), &token))
+            .await
+        {
+            Ok(_) => admitted += 1,
+            Err(status) => break status,
+        }
+        assert!(admitted < 8, "the margin never counted against the cap");
+    };
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+    assert!(
+        refused.message().contains("ingester memory full"),
+        "{refused:?}"
+    );
+    assert!(
+        admitted >= 1,
+        "nothing fits: the cap is too small for the test"
+    );
 
-    client
-        .export(authed(request("api", 2, 30), &token))
-        .await
-        .unwrap();
     h.ingester.flush_all().await;
-    let fs = h.ingester.flush_stats();
-    assert_eq!(fs.attempts.load(Ordering::Relaxed), 2);
     assert_eq!(
         h.ingester.stats().flush_failures.load(Ordering::Relaxed),
-        1,
-        "no room for the working memory while the retention holds"
+        0,
+        "the flush of the admitted rows had its room"
     );
-    assert_eq!(parquet_files(&bucket).len(), 1);
-
-    // The sweep frees the retention and the tick retries after the backoff.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while parquet_files(&bucket).len() < 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the flush never got its room"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    client
+        .export(authed(request("api", 20, 30), &token))
+        .await
+        .expect("the flush freed the cap");
     h.stop().await;
     db.finish().await;
 }

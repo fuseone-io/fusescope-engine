@@ -41,8 +41,10 @@ pub struct IngestConfig {
     /// the whole `max_memory_bytes` and starve the others.
     pub max_tenant_bytes: usize,
     /// Refuse new data when everything held in memory, live, flushing and
-    /// persisted for the hot window, exceeds this. Persisted rows are never
-    /// evicted early to make room: queriers may still need them.
+    /// persisted for the hot window, exceeds this. Live and flushing rows
+    /// also keep room for the scratch their flush will need, three copies,
+    /// so rows once admitted can always be written out. Persisted rows are
+    /// never evicted early to make room: queriers may still need them.
     pub max_memory_bytes: usize,
     /// Refuse new data when the WAL on disk exceeds this.
     pub wal_max_bytes: u64,

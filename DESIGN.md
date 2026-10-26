@@ -138,7 +138,10 @@ Memory the caps do not see is bounded separately: at most `max_conversions`
 requests are converted to Arrow before admission at a time, and a merge
 reserves its inputs inside `max_memory_bytes`, never on top of it, taking at
 most `coalesce_bytes` of them and nothing when the headroom holds fewer than
-two adjacent batches. A batch larger than `coalesce_bytes` is a chunk as it
+two adjacent batches. A flush reserves three copies of its inputs before
+preparing the file, for the merged rows, the sorted rows and the encoder,
+and admission keeps that room free for every live and flushing byte, so the
+rows that fill the cap can always be the rows that free it. A batch larger than `coalesce_bytes` is a chunk as it
 is, whatever the headroom, and groups are chosen around it. The
 gate covers only the append and the push of a request, so a flush cut, a
 checkpoint or a hot-window snapshot waits for the requests in that window,

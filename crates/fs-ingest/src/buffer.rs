@@ -294,6 +294,12 @@ impl Flushing {
     }
 }
 
+/// Copies of its inputs a flush holds while the file is prepared: the
+/// merged rows, the sorted rows, and the encoder's output and buffers,
+/// each at most the size of the inputs. Admission keeps this much room for
+/// every live and flushing byte, so a flush can always reserve it.
+pub const FLUSH_SCRATCH_FACTOR: usize = 3;
+
 /// Longest wait between retries of a failed flush.
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -323,15 +329,15 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Changes the held amount to `bytes`, once the real size is known.
-    pub fn resize(&mut self, bytes: usize) {
+    /// Lowers the held amount to `bytes` once the real size is known. A
+    /// lease never grows: what was not reserved under the cap cannot be
+    /// held.
+    pub fn shrink(&mut self, bytes: usize) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-        if bytes >= self.bytes {
-            self.total.fetch_add(bytes - self.bytes, Ordering::Relaxed);
-        } else {
+        if bytes < self.bytes {
             self.total.fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+            self.bytes = bytes;
         }
-        self.bytes = bytes;
     }
 }
 
@@ -445,6 +451,25 @@ impl Buffers {
     pub fn try_hold_scratch(&self, bytes: usize, cap: usize) -> Option<Scratch> {
         let held = self.total_bytes() + self.reserved_total() + self.scratch_total();
         (held.saturating_add(bytes) <= cap).then(|| self.hold_scratch(bytes))
+    }
+
+    /// Room a flush of every live and flushing byte would need as scratch:
+    /// [`FLUSH_SCRATCH_FACTOR`] copies. Admission and the coalescer keep it
+    /// free, so rows once admitted can always be written out.
+    pub fn flush_margin(&self) -> usize {
+        let (live, flushing, _) = self.memory();
+        (live + flushing).saturating_mul(FLUSH_SCRATCH_FACTOR)
+    }
+
+    /// Bytes still admissible under `cap` with the flush margin kept, for
+    /// the rows held and for the ones admitted but not pushed yet.
+    pub fn headroom(&self, cap: usize) -> usize {
+        let reserved = self
+            .reserved_total()
+            .saturating_mul(1 + FLUSH_SCRATCH_FACTOR);
+        cap.saturating_sub(
+            self.total_bytes() + reserved + self.scratch_total() + self.flush_margin(),
+        )
     }
 
     /// Counts `bytes` of working memory against the global cap until dropped.
@@ -867,12 +892,48 @@ mod tests {
         assert_eq!(buffers.scratch_total(), 0, "a refusal changes nothing");
         let mut held = buffers.try_hold_scratch(resident, resident * 2).unwrap();
         assert_eq!(buffers.scratch_total(), resident);
-        held.resize(10);
+        held.shrink(10);
         assert_eq!(buffers.scratch_total(), 10);
-        held.resize(25);
-        assert_eq!(buffers.scratch_total(), 25);
+        held.shrink(25);
+        assert_eq!(buffers.scratch_total(), 10, "a lease never grows");
         drop(held);
         assert_eq!(buffers.scratch_total(), 0);
+    }
+
+    #[test]
+    fn headroom_keeps_room_for_the_flush_of_every_live_byte() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let mut buffers = Buffers::default();
+        buffers
+            .get_mut(tenant)
+            .push(tagged(4, 1), at(10), Instant::now());
+        let live = buffers.total_bytes();
+        assert_eq!(buffers.flush_margin(), live * FLUSH_SCRATCH_FACTOR);
+        assert_eq!(buffers.headroom(live * 5), live);
+        assert_eq!(buffers.headroom(live * 4), 0);
+        let held = buffers.hold_scratch(1);
+        assert_eq!(buffers.headroom(live * 5), live - 1);
+        drop(held);
+        let reservation = buffers.reserve(tenant, 2);
+        assert_eq!(
+            buffers.headroom(live * 5),
+            live - 2 * (1 + FLUSH_SCRATCH_FACTOR),
+            "a reservation keeps its margin too"
+        );
+        drop(reservation);
+        let file = FileId(uuid::Uuid::from_u128(1));
+        assert!(buffers.begin_flush(tenant, file).is_some());
+        assert_eq!(
+            buffers.flush_margin(),
+            live * FLUSH_SCRATCH_FACTOR,
+            "flushing rows count too"
+        );
+        assert!(
+            buffers
+                .try_hold_scratch(live * FLUSH_SCRATCH_FACTOR, live * 4)
+                .is_some(),
+            "the margin admission kept is exactly what the flush reserves"
+        );
     }
 
     fn values(batches: &[RecordBatch]) -> Vec<i64> {
