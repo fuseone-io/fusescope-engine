@@ -61,6 +61,14 @@ pub struct FlushReport {
     pub batches_per_coalesce: f64,
     /// Milliseconds per chunk.
     pub coalesce_ms: f64,
+    /// Hot-window snapshots during the run.
+    pub hot_scans: u64,
+    /// p95 of the hot-window snapshot latency, milliseconds.
+    pub hot_scan_p95_ms: f64,
+    /// Checkpoints during the run.
+    pub checkpoints: u64,
+    /// p95 of the checkpoint latency, milliseconds.
+    pub checkpoint_p95_ms: f64,
 }
 
 /// Outcome of a load run.
@@ -231,8 +239,14 @@ pub fn print(report: &LoadReport) {
             f.buffer_bytes.2 >> 20
         );
         println!(
-            "coalesces={} batches/coalesce={:.0} {:.1}ms each",
-            f.coalesces, f.batches_per_coalesce, f.coalesce_ms
+            "coalesces={} batches/coalesce={:.0} {:.1}ms each | hot scans={} p95<={:.0}ms | checkpoints={} p95<={:.0}ms",
+            f.coalesces,
+            f.batches_per_coalesce,
+            f.coalesce_ms,
+            f.hot_scans,
+            f.hot_scan_p95_ms,
+            f.checkpoints,
+            f.checkpoint_p95_ms
         );
     }
 }
@@ -302,5 +316,54 @@ fn flush_report(
         coalesces: coalesces as u64,
         batches_per_coalesce: per_coalesce("fusescope_coalesce_batches_total"),
         coalesce_ms: per_coalesce("fusescope_coalesce_nanoseconds_total") / 1e6,
+        hot_scans: delta("fusescope_hot_scan_seconds_count").max(0.0) as u64,
+        hot_scan_p95_ms: p95_ms(before, after, "fusescope_hot_scan_seconds"),
+        checkpoints: delta("fusescope_checkpoint_seconds_count").max(0.0) as u64,
+        checkpoint_p95_ms: p95_ms(before, after, "fusescope_checkpoint_seconds"),
     }
+}
+
+/// p95 of a Prometheus histogram over the run: the upper bound of the first
+/// bucket holding 95% of the observations, so an upper estimate. The
+/// unbounded bucket reports ten times the largest finite bound.
+fn p95_ms(
+    before: &std::collections::HashMap<String, f64>,
+    after: &std::collections::HashMap<String, f64>,
+    name: &str,
+) -> f64 {
+    let delta =
+        |k: &str| after.get(k).copied().unwrap_or(0.0) - before.get(k).copied().unwrap_or(0.0);
+    let total = delta(&format!("{name}_count"));
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let prefix = format!("{name}_bucket{{le=\"");
+    let mut buckets: Vec<(f64, f64)> = after
+        .keys()
+        .filter_map(|k| {
+            let bound = k.strip_prefix(&prefix)?.strip_suffix("\"}")?;
+            let bound = if bound == "+Inf" {
+                f64::INFINITY
+            } else {
+                bound.parse().ok()?
+            };
+            Some((bound, delta(k)))
+        })
+        .collect();
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let largest_finite = buckets
+        .iter()
+        .filter(|(b, _)| b.is_finite())
+        .map(|(b, _)| *b)
+        .fold(0.0, f64::max);
+    buckets
+        .iter()
+        .find(|(_, cumulative)| *cumulative >= 0.95 * total)
+        .map_or(0.0, |(bound, _)| {
+            if bound.is_finite() {
+                bound * 1e3
+            } else {
+                largest_finite * 10.0 * 1e3
+            }
+        })
 }

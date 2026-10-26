@@ -123,6 +123,18 @@ impl Metrics {
                 "Requests refused because buffers or WAL were full",
                 i.over_capacity.load(Ordering::Relaxed),
             );
+            histogram(
+                out,
+                "fusescope_hot_scan_seconds",
+                "Hot-window snapshot latency, gate wait included",
+                &i.hot_scan,
+            );
+            histogram(
+                out,
+                "fusescope_checkpoint_seconds",
+                "WAL checkpoint latency, gate wait and I/O included",
+                &i.checkpoint,
+            );
             counter(
                 out,
                 "fusescope_ingest_files_flushed_total",
@@ -329,6 +341,21 @@ fn counter(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(
         out,
         "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
+    );
+}
+
+fn histogram(out: &mut String, name: &str, help: &str, h: &fs_ingest::histogram::Histogram) {
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
+    let cumulative = h.cumulative();
+    for (bound, count) in fs_ingest::histogram::BOUNDS.iter().zip(cumulative) {
+        let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {count}");
+    }
+    let _ = writeln!(
+        out,
+        "{name}_bucket{{le=\"+Inf\"}} {}\n{name}_sum {}\n{name}_count {}",
+        cumulative[10],
+        std::time::Duration::from_nanos(h.sum_nanos()).as_secs_f64(),
+        h.count()
     );
 }
 

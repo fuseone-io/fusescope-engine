@@ -138,8 +138,10 @@ impl TenantBuffer {
     /// Request batches below `bound` (all of them when `None`), if at least
     /// `min`: marked as taken by coalesce `id` and returned in position order
     /// with their bytes. The run stops before the batch that would take it
-    /// past `max_bytes`, so it stays a prefix. `None` while another coalesce
-    /// is in progress.
+    /// past `max_bytes`, so it stays a prefix. A batch that alone exceeds
+    /// `max_bytes` is already as large as a chunk: it becomes one in place,
+    /// at no cost, and the run continues after it. `None` while another
+    /// coalesce is in progress or when fewer than two batches fit.
     fn take_for_coalesce(
         &mut self,
         bound: Option<Position>,
@@ -154,17 +156,25 @@ impl TenantBuffer {
         if self.entries.iter().filter(|e| complete(e)).count() < min {
             return None;
         }
-        self.coalesce = Some(id);
         let mut taken = Vec::new();
         let mut bytes = 0;
         for entry in self.entries.iter_mut().filter(|e| complete(e)) {
-            if !taken.is_empty() && bytes + entry.bytes > max_bytes {
+            if taken.is_empty() && entry.bytes > max_bytes {
+                entry.kind = Kind::Chunk;
+                continue;
+            }
+            if bytes + entry.bytes > max_bytes {
                 break;
             }
             entry.kind = Kind::Coalescing(id);
             bytes += entry.bytes;
             taken.push(entry.batch.clone());
         }
+        if taken.len() < 2 {
+            self.cancel_coalesce(id);
+            return None;
+        }
+        self.coalesce = Some(id);
         Some((taken, bytes))
     }
 
@@ -330,16 +340,16 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    /// A tenant with at least `min` complete request batches below its bound
-    /// and no coalesce in progress. `bound_of` gives each tenant's bound.
-    pub fn coalesce_candidate(
+    /// Tenants with at least `min` complete request batches below their
+    /// bound and no coalesce in progress. `bound_of` gives each tenant's bound.
+    pub fn coalesce_candidates(
         &self,
         min: usize,
         bound_of: impl Fn(TenantId) -> Option<Position>,
-    ) -> Option<TenantId> {
+    ) -> Vec<TenantId> {
         self.tenants
             .iter()
-            .find(|(tenant, b)| {
+            .filter(|(tenant, b)| {
                 let bound = bound_of(**tenant);
                 b.coalesce.is_none()
                     && b.entries
@@ -349,6 +359,7 @@ impl Buffers {
                         >= min
             })
             .map(|(t, _)| *t)
+            .collect()
     }
 
     /// Takes complete request batches of `tenant` for coalescing, at least
@@ -751,13 +762,13 @@ mod tests {
                 .push(tagged(2, tag), at(offset), now);
         }
         assert_eq!(
-            buffers.coalesce_candidate(4, |_| Some(at(35))),
-            None,
+            buffers.coalesce_candidates(4, |_| Some(at(35))).len(),
+            0,
             "only three are complete"
         );
         assert_eq!(
-            buffers.coalesce_candidate(3, |_| Some(at(35))),
-            Some(tenant)
+            buffers.coalesce_candidates(3, |_| Some(at(35))),
+            vec![tenant]
         );
         let Taken {
             id,
@@ -819,11 +830,13 @@ mod tests {
             arrow::compute::concat_batches(&taken.first().unwrap().schema(), &taken).unwrap();
         assert!(!buffers.finish_coalesce(tenant, id, chunk));
         buffers.get_mut(tenant).push(tagged(1, 3), at(40), now);
+        buffers.get_mut(tenant).push(tagged(1, 4), at(50), now);
         assert_eq!(
             buffers
                 .take_for_coalesce(tenant, None, 1, usize::MAX)
                 .map(|t| values(&t.batches)),
-            Some(vec![300])
+            Some(vec![300, 400]),
+            "the next coalesce starts fresh"
         );
     }
 
@@ -855,11 +868,19 @@ mod tests {
             vec![100, 101, 200, 201, 300, 301, 400, 401]
         );
         assert_eq!(buffers.get_mut(tenant).request_batches(), 2);
-        let tiny = buffers.take_for_coalesce(tenant, None, 1, 1).unwrap();
+        assert!(
+            buffers.take_for_coalesce(tenant, None, 1, 1).is_none(),
+            "fewer than two batches fit"
+        );
         assert_eq!(
-            values(&tiny.batches),
-            vec![300, 301],
-            "at least one batch is always taken"
+            buffers.get_mut(tenant).request_batches(),
+            0,
+            "batches larger than the limit are chunks already"
+        );
+        assert_eq!(
+            values(&buffers.get_mut(tenant).batches()),
+            vec![100, 101, 200, 201, 300, 301, 400, 401],
+            "order is untouched"
         );
     }
 

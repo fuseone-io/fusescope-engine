@@ -17,6 +17,7 @@ pub mod auth;
 pub mod buffer;
 pub mod config;
 pub mod flush;
+pub mod histogram;
 pub mod hot;
 pub mod ingester;
 pub mod ratelimit;

@@ -135,9 +135,14 @@ record accepted while the checkpoint is chosen is above the cut and replay
 still finds it.
 
 Memory the caps do not see is bounded separately: at most `max_conversions`
-requests are converted to Arrow before admission at a time, and a merge holds
-its inputs as scratch against `max_memory_bytes` and takes at most
-`coalesce_bytes` of them.
+requests are converted to Arrow before admission at a time, and a merge
+reserves its inputs inside `max_memory_bytes`, never on top of it, taking at
+most `coalesce_bytes` of them and nothing when the headroom holds fewer than
+two batches. A batch larger than `coalesce_bytes` is a chunk as it is. The
+gate covers only the append and the push of a request, so a flush cut, a
+checkpoint or a hot-window snapshot waits for the requests in that window,
+not for the conversion queue; the hot-scan and checkpoint latencies are
+exposed as histograms.
 
 Buffers keep batches in WAL order, the order replay produces, so a file holds
 the same rows in the same order whether it was built from live batches or

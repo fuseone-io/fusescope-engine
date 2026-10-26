@@ -65,6 +65,10 @@ pub struct IngestStats {
     pub flushes_recovered: AtomicU64,
     /// Retries of a flush whose earlier attempt failed after the intent.
     pub flush_retries: AtomicU64,
+    /// Hot-window snapshot latency, gate wait included.
+    pub hot_scan: crate::histogram::Histogram,
+    /// Checkpoint latency, gate wait and I/O included.
+    pub checkpoint: crate::histogram::Histogram,
 }
 
 /// Per-stage flush timings and buffer memory, for sizing the flush path.
@@ -201,8 +205,9 @@ impl Shared {
     }
 
     /// Converts a request, admits it against the caps, logs it and adds it to
-    /// the tenant buffer, all while holding the flush gate so a concurrent
-    /// flush sees either both the log record and the rows or neither.
+    /// the tenant buffer. The flush gate is held from the append to the push
+    /// only, so a concurrent flush, checkpoint or hot scan sees either both
+    /// the log record and the rows or neither, and waits for no conversion.
     /// Conversion comes first: a request the engine cannot convert or hold is
     /// refused before it reaches the WAL. Conversions run at most
     /// `max_conversions` at a time, which bounds the memory of batches built
@@ -214,7 +219,6 @@ impl Shared {
         record: Vec<u8>,
         now: Instant,
     ) -> Result<Converted, IngestError> {
-        let _shared = self.gate.read().await;
         let slot = self
             .conversions
             .acquire()
@@ -229,6 +233,7 @@ impl Shared {
 
         let reservation = self.admit(tenant, batch.get_array_memory_size()).await?;
         drop(slot);
+        let _shared = self.gate.read().await;
         let tracked = self.append_wal(tenant, record).await?;
         if let Some(delay) = self.config.inject_push_delay {
             if self.push_delay_pending.swap(false, Ordering::Relaxed) {
@@ -433,6 +438,7 @@ impl Shared {
     /// gate, so no request is between its append and its push: every record
     /// accepted after the cut is above it and replay still finds it.
     async fn checkpoint_wal(&self) {
+        let started = Instant::now();
         let cut = {
             let _exclusive = self.gate.write().await;
             let earliest = self.buffers.lock().await.earliest_wal();
@@ -459,6 +465,7 @@ impl Shared {
             Ok(Err(e)) => warn!(error = %e, "wal checkpoint failed; replay may duplicate rows"),
             Err(e) => warn!(error = %e, "wal checkpoint task failed"),
         }
+        self.stats.checkpoint.observe(started.elapsed());
     }
 
     /// Merges each tenant's complete request batches into one chunk, one
@@ -473,14 +480,24 @@ impl Shared {
         loop {
             let taken = {
                 let mut buffers = self.buffers.lock().await;
-                buffers
-                    .coalesce_candidate(min, |tenant| self.writer.stable_bound(tenant))
-                    .and_then(|tenant| {
-                        let bound = self.writer.stable_bound(tenant);
-                        buffers
-                            .take_for_coalesce(tenant, bound, min, max_bytes)
-                            .map(|taken| (tenant, taken))
-                    })
+                // The merge's inputs are reserved inside the cap, never on top
+                // of it: with no headroom nothing is merged until a flush.
+                let headroom = self.config.max_memory_bytes.saturating_sub(
+                    buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total(),
+                );
+                let limit = max_bytes.min(headroom);
+                let candidates =
+                    buffers.coalesce_candidates(min, |tenant| self.writer.stable_bound(tenant));
+                let taken = candidates.into_iter().find_map(|tenant| {
+                    let bound = self.writer.stable_bound(tenant);
+                    buffers
+                        .take_for_coalesce(tenant, bound, min, limit)
+                        .map(|taken| (tenant, taken))
+                });
+                self.flush_stats
+                    .scratch_bytes
+                    .store(buffers.scratch_total() as u64, Ordering::Relaxed);
+                taken
             };
             let Some((tenant, taken)) = taken else {
                 return;
@@ -517,6 +534,10 @@ impl Shared {
                 }
             }
             drop(scratch);
+            let held = self.buffers.lock().await.scratch_total();
+            self.flush_stats
+                .scratch_bytes
+                .store(held as u64, Ordering::Relaxed);
         }
     }
 
@@ -525,10 +546,12 @@ impl Shared {
     /// its push, so the smallest live position, and with it the announced id,
     /// is the one the next flush derives from.
     pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Option<FileId>) {
+        let started = Instant::now();
         let snapshot = {
             let _exclusive = self.gate.write().await;
             self.buffers.lock().await.snapshot(tenant)
         };
+        self.stats.hot_scan.observe(started.elapsed());
         let live_file = snapshot
             .live_first_wal
             .map(|p| FileId::derived(self.instance, tenant, p.segment, p.offset));
@@ -550,9 +573,6 @@ impl Shared {
             self.flush_stats
                 .persisted_bytes
                 .store(persisted as u64, Ordering::Relaxed);
-            self.flush_stats
-                .scratch_bytes
-                .store(buffers.scratch_total() as u64, Ordering::Relaxed);
             if everything {
                 buffers.all()
             } else {
