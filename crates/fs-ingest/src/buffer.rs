@@ -590,37 +590,22 @@ impl Buffers {
         }
     }
 
-    /// Takes the flushes whose next attempt is due at `now`, or every idle
-    /// flush when `force`, marking each as in progress so a concurrent caller
-    /// cannot take it again until it fails or finishes.
-    pub fn take_due(
+    /// Takes one flush whose next attempt is due at `now`, or any idle one
+    /// when `force`, marking it as in progress so no one else takes it until
+    /// it fails or finishes. Callers hold a flush permit before taking, so
+    /// an entry in progress always has an attempt running for it.
+    pub fn take_one_due(
         &mut self,
         now: Instant,
         force: bool,
-    ) -> Vec<(TenantId, FileId, Vec<RecordBatch>)> {
-        let mut out = Vec::new();
-        for (tenant, list) in &mut self.flushing {
-            for f in list
-                .iter_mut()
-                .filter(|f| !f.in_progress && (force || f.next_attempt <= now))
-            {
-                f.in_progress = true;
-                out.push((*tenant, f.file, f.buffer.batches()));
-            }
-        }
-        out
-    }
-
-    /// Gives an entry taken by [`Buffers::take_due`] back to waiting, with
-    /// its attempt count and backoff untouched: no attempt ran.
-    pub fn release_flushing(&mut self, tenant: TenantId, file: FileId) {
-        if let Some(entry) = self
-            .flushing
-            .get_mut(&tenant)
-            .and_then(|l| l.iter_mut().find(|f| f.file == file))
-        {
-            entry.in_progress = false;
-        }
+    ) -> Option<(TenantId, FileId, Vec<RecordBatch>)> {
+        let (tenant, entry) = self.flushing.iter_mut().find_map(|(tenant, list)| {
+            list.iter_mut()
+                .find(|f| !f.in_progress && (force || f.next_attempt <= now))
+                .map(|f| (*tenant, f))
+        })?;
+        entry.in_progress = true;
+        Some((tenant, entry.file, entry.buffer.batches()))
     }
 
     /// Flushes bound by an intent and not being worked on right now.
@@ -1226,13 +1211,9 @@ mod tests {
             chunk_bytes,
             "nothing holds the originals"
         );
-        let retried = buffers.take_due(now, true);
-        assert_eq!(retried.len(), 1);
-        assert_eq!(
-            retried.first().unwrap().2.len(),
-            1,
-            "the retry writes from the chunk"
-        );
+        let (_, _, retried) = buffers.take_one_due(now, true).unwrap();
+        assert_eq!(retried.len(), 1, "the retry writes from the chunk");
+        assert!(buffers.take_one_due(now, true).is_none(), "taken once");
     }
 
     #[test]

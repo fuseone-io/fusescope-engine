@@ -161,6 +161,7 @@ pub struct Shared {
     flushes: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
+    retry_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
     root: Path,
@@ -441,20 +442,30 @@ impl Shared {
 
     /// Retries flushes whose earlier attempt failed after the intent, or
     /// resumes those an earlier run left behind. `force` ignores the backoff
-    /// and waits for a flush permit instead of skipping when none is free.
-    /// Retries share the permits of new cuts: together they never exceed
-    /// `max_flushes` running attempts.
+    /// and waits for a flush permit instead of stopping when none is free.
+    /// A permit is taken before an entry, one entry per permit, so an entry
+    /// marked in progress always has its attempt running, and retries share
+    /// the permits of new cuts: together they never exceed `max_flushes`.
     async fn retry_flushing(self: &Arc<Self>, force: bool) {
-        let pending = self.buffers.lock().await.take_due(Instant::now(), force);
-        for (tenant, file, batches) in pending {
+        loop {
             let Some(permit) = self.flush_permit(force).await else {
-                // No permit: the entry goes back to waiting for the next round.
-                self.buffers.lock().await.release_flushing(tenant, file);
+                return;
+            };
+            let taken = self
+                .buffers
+                .lock()
+                .await
+                .take_one_due(Instant::now(), force);
+            let Some((tenant, file, batches)) = taken else {
                 return;
             };
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
-            self.spawn_materialize(tenant, file, batches, permit);
+            let delay = self
+                .config
+                .inject_retry_delay
+                .filter(|_| self.retry_delay_pending.swap(false, Ordering::Relaxed));
+            self.spawn_materialize(tenant, file, batches, permit, delay);
         }
     }
 
@@ -467,16 +478,21 @@ impl Shared {
         }
     }
 
-    /// Materialises one cut on its own task, holding `permit` until it ends.
+    /// Materialises one cut on its own task, holding `permit` until it ends,
+    /// after `delay` when a test asks for one.
     fn spawn_materialize(
         self: &Arc<Self>,
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
         permit: tokio::sync::OwnedSemaphorePermit,
+        delay: Option<Duration>,
     ) {
         let shared = Arc::clone(self);
         tokio::spawn(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if let Err(e) = shared.materialize(tenant, file_id, batches).await {
                 error!(tenant = %tenant.0, error = %e, "flush error");
             }
@@ -662,7 +678,7 @@ impl Shared {
             };
             match self.cut_tenant(tenant).await {
                 Ok(Some((file_id, batches))) => {
-                    self.spawn_materialize(tenant, file_id, batches, permit);
+                    self.spawn_materialize(tenant, file_id, batches, permit, None);
                 }
                 Ok(None) => {}
                 Err(e) => error!(tenant = %tenant.0, error = %e, "flush error"),
@@ -808,6 +824,7 @@ impl Ingester {
         let config_coalesces = config.max_coalesces;
         let config_flushes = config.max_flushes;
         let push_delay_pending = config.inject_push_delay.is_some();
+        let retry_delay_pending = config.inject_retry_delay.is_some();
         let wal = Arc::new(StdMutex::new(wal));
         let writer = crate::walwriter::WalWriter::spawn(Arc::clone(&wal), config.group_commit);
         let shared = Shared {
@@ -832,6 +849,7 @@ impl Ingester {
             flushes: Arc::new(tokio::sync::Semaphore::new(flush_permits(config_flushes))),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
+            retry_delay_pending: std::sync::atomic::AtomicBool::new(retry_delay_pending),
             catalog,
             store,
             root,

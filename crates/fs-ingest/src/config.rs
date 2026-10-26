@@ -73,6 +73,10 @@ pub struct IngestConfig {
     /// buffer push, so a later request overtakes it. `None` in production;
     /// tests use it to reorder concurrent requests deterministically.
     pub inject_push_delay: Option<Duration>,
+    /// Hold the first retried flush this long before it writes, while it
+    /// keeps its flush permit. `None` in production; tests use it to make
+    /// other retries wait for a permit.
+    pub inject_retry_delay: Option<Duration>,
     /// WAL group commit limits.
     pub group_commit: crate::walwriter::GroupCommitConfig,
 }
@@ -105,6 +109,7 @@ impl Default for IngestConfig {
             checkpoint_after_flush: true,
             inject_register_failures: 0,
             inject_push_delay: None,
+            inject_retry_delay: None,
             group_commit: crate::walwriter::GroupCommitConfig::default(),
         }
     }

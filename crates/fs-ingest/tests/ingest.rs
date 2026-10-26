@@ -1607,3 +1607,65 @@ async fn announced_file_id_survives_a_restart_without_intent() {
     h.stop().await;
     db.finish().await;
 }
+
+/// Retries beyond the flush permits must not be lost: with one permit,
+/// three failed flushes and the first retry holding the permit for a while,
+/// only the flusher tick retries the others, and every one of them must
+/// eventually be written.
+#[tokio::test]
+async fn retries_beyond_the_permits_are_not_lost() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let mut tokens = Vec::new();
+    for name in ["acme", "globex", "initech"] {
+        let tenant = db
+            .catalog
+            .create_tenant(&NewTenant::with_defaults(name))
+            .await
+            .unwrap()
+            .id;
+        let (token, _) = db
+            .catalog
+            .create_token(tenant, "collector", TokenScope::Ingest)
+            .await
+            .unwrap();
+        tokens.push(token);
+    }
+    let config = IngestConfig {
+        max_flushes: 1,
+        inject_retry_delay: Some(Duration::from_secs(3)),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for (i, token) in tokens.iter().enumerate() {
+        client
+            .export(authed(
+                request("api", u8::try_from(i).unwrap() + 1, 5),
+                token,
+            ))
+            .await
+            .unwrap();
+    }
+    let bucket = h.dir.path().join("bucket");
+    std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o555)).unwrap();
+    h.ingester.flush_all().await;
+    assert!(h.ingester.stats().flush_failures.load(Ordering::Relaxed) >= 3);
+    std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // No flush_all from here: the tick alone retries, one permit at a time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while parquet_files(&bucket).len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of 3 retries written",
+            parquet_files(&bucket).len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    h.stop().await;
+    db.finish().await;
+}
