@@ -185,12 +185,15 @@ impl Shared {
     ) -> Result<Reservation, IngestError> {
         let mut buffers = self.buffers.lock().await;
         let reserved = buffers.reserved_of(tenant);
-        if buffers.bytes_of(tenant) + reserved + bytes > self.config.max_buffer_bytes {
+        // Every cap sees the batch with the bound of the trace set it will
+        // get, which its bytes carry from the push until a chunk replaces it.
+        let cost = Buffers::batch_cost(bytes, rows);
+        if buffers.bytes_of(tenant) + reserved + cost > self.config.max_buffer_bytes {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
             return Err(IngestError::Capacity("tenant buffer full, flush pending"));
         }
-        if buffers.tenant_total(tenant) + reserved + bytes > self.config.max_tenant_bytes {
+        if buffers.tenant_total(tenant) + reserved + cost > self.config.max_tenant_bytes {
             // Persisted rows count and are not evicted: queriers with a stale
             // file list still need them. Admission waits instead.
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
@@ -213,7 +216,7 @@ impl Shared {
             self.flush_now.notify_one();
             return Err(IngestError::WalFull);
         }
-        Ok(buffers.reserve(tenant, bytes))
+        Ok(buffers.reserve(tenant, cost))
     }
 
     /// Appends through the group-commit writer; resolves once synced. The

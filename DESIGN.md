@@ -144,8 +144,12 @@ the rows that fill the cap can always be the rows that free it; when the
 rows are cut that room becomes the attempt's lease, held whole until the
 object is in the bucket and its bytes are dropped, then lowered to the rows
 kept for the hot window. Rows whose attempt failed count toward the room
-again until the retry takes them. A batch larger than `coalesce_bytes` is a chunk as it
-is, whatever the headroom, and groups are chosen around it. The
+again until the retry takes them. A batch larger than `coalesce_bytes` is
+merged with nothing: it is taken as a run of its own when the headroom
+allows and gets its trace set like any chunk, and groups are chosen around
+it. Every request batch carries the worst case of its trace set in its
+bytes, one id per row, until the chunk with the real set replaces it, so
+the caps cover the index before it exists. The
 gate covers only the append and the push of a request, so a flush cut, a
 checkpoint or a hot-window snapshot waits for the requests in that window,
 not for the conversion queue; the hot-scan and checkpoint latencies are

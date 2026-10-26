@@ -40,9 +40,12 @@ pub const TRACE_ID_BYTES: usize = 16;
 
 /// Trace ids present in a batch, sorted and without duplicates, built once
 /// when the batch is made, so a scan for a few traces skips the batches
-/// that hold none of them. A sorted vector has a known size, exactly
-/// [`TRACE_ID_BYTES`] per id, which the leases count.
-pub type TraceSet = Arc<Vec<[u8; TRACE_ID_BYTES]>>;
+/// that hold none of them. A shared slice is allocated to its exact length:
+/// [`TRACE_ID_BYTES`] per id plus the counters, which the leases count.
+pub type TraceSet = Arc<[[u8; TRACE_ID_BYTES]]>;
+
+/// Bytes of the shared slice's counters.
+const TRACE_SET_HEADER: usize = 16;
 
 /// A batch the hot window serves, with the trace ids it holds when known.
 #[derive(Debug, Clone)]
@@ -64,19 +67,25 @@ pub fn trace_set(batch: &RecordBatch) -> Option<TraceSet> {
         .collect();
     set.sort_unstable();
     set.dedup();
-    set.shrink_to_fit();
-    Some(Arc::new(set))
+    Some(Arc::from(set))
 }
 
 /// Memory a trace set takes, counted with the batch it describes.
 pub fn trace_set_bytes(set: &Option<TraceSet>) -> usize {
-    set.as_ref()
-        .map_or(0, |s| s.len().saturating_mul(TRACE_ID_BYTES))
+    set.as_ref().map_or(0, |s| {
+        s.len()
+            .saturating_mul(TRACE_ID_BYTES)
+            .saturating_add(TRACE_SET_HEADER)
+    })
 }
 
-/// Most memory the trace set of `rows` rows can take: one id per row.
+/// Most memory the trace set of `rows` rows can take: one id per row. A
+/// request batch carries this bound in its bytes from admission until a
+/// chunk with the real set replaces it, so every cap and lease covers the
+/// index before it exists.
 pub fn trace_set_bound(rows: usize) -> usize {
     rows.saturating_mul(TRACE_ID_BYTES)
+        .saturating_add(TRACE_SET_HEADER)
 }
 
 /// One batch and the position of the request it came from; a chunk carries
@@ -103,7 +112,8 @@ pub struct TenantBuffer {
     requests: usize,
     /// Rows across the entries.
     pub rows: usize,
-    /// Arrow memory across the entries.
+    /// Memory across the entries: Arrow bytes, plus the trace set of each
+    /// chunk and the bound of the one each request batch will get.
     pub bytes: usize,
     /// Smallest WAL position among the records in this buffer. Concurrent
     /// requests reach the buffer in any order, so this is a minimum, never
@@ -120,7 +130,7 @@ impl TenantBuffer {
             return;
         }
         self.rows += batch.num_rows();
-        let bytes = batch.get_array_memory_size();
+        let bytes = batch.get_array_memory_size() + trace_set_bound(batch.num_rows());
         self.bytes += bytes;
         self.first_wal = Some(self.first_wal.map_or(wal, |f| f.min(wal)));
         self.oldest.get_or_insert(now);
@@ -202,7 +212,7 @@ impl TenantBuffer {
     /// While at least `min` request batches wait: the first run of two or
     /// more adjacent ones below `bound` (all of them when `None`) whose bytes
     /// fit both `max_bytes` and `headroom`, marked as taken by coalesce `id`
-    /// and returned in position order with their bytes and rows. A batch
+    /// and returned in position order with their bytes. A batch
     /// larger than `max_bytes` is already as large as a chunk: it is taken as
     /// a run of its own whenever its index fits the headroom, merged with
     /// nothing but given its trace set, and runs are selected around it and
@@ -215,9 +225,8 @@ impl TenantBuffer {
         max_bytes: usize,
         headroom: usize,
         id: u64,
-    ) -> Option<(Vec<RecordBatch>, usize, usize)> {
+    ) -> Option<(Vec<RecordBatch>, usize)> {
         let complete = |e: &Entry| e.kind == Kind::Request && bound.is_none_or(|b| e.position < b);
-        let fits = |bytes: usize, rows: usize| bytes + trace_set_bound(rows) <= headroom;
         let run = if self.requests >= min {
             self.contiguous_run(complete, max_bytes.min(headroom))
         } else {
@@ -228,22 +237,23 @@ impl TenantBuffer {
         let (start, end) = if let Some((start, end, _)) = run {
             (start, end)
         } else {
-            let (i, _) = self.entries.iter().enumerate().find(|(_, e)| {
-                complete(e) && e.bytes > max_bytes && fits(e.bytes, e.batch.num_rows())
-            })?;
+            let (i, _) = self
+                .entries
+                .iter()
+                .enumerate()
+                .find(|(_, e)| complete(e) && e.bytes > max_bytes && e.bytes <= headroom)?;
             (i, i + 1)
         };
         let mut taken = Vec::with_capacity(end - start);
-        let (mut bytes, mut rows) = (0, 0);
+        let mut bytes = 0;
         for entry in self.entries.iter_mut().skip(start).take(end - start) {
             entry.kind = Kind::Coalescing(id);
             bytes += entry.bytes;
-            rows += entry.batch.num_rows();
             taken.push(entry.batch.clone());
         }
         self.requests -= taken.len();
         self.coalescing.push(id);
-        Some((taken, bytes, rows))
+        Some((taken, bytes))
     }
 
     /// A request batch larger than `max_bytes` waits to be indexed alone.
@@ -504,9 +514,9 @@ impl Buffers {
     /// Takes complete request batches of `tenant` for coalescing, at least
     /// `min` of them, at most `max_bytes` of Arrow memory and no more than
     /// `headroom`, the memory left under the cap; see
-    /// [`TenantBuffer::take_for_coalesce`]. Their bytes and the worst case of
-    /// their trace set are held as scratch against the global cap until the
-    /// result is dropped.
+    /// [`TenantBuffer::take_for_coalesce`]. Their bytes, the bound of their
+    /// trace set included, are held as scratch against the global cap until
+    /// the result is dropped.
     pub fn take_for_coalesce(
         &mut self,
         tenant: TenantId,
@@ -516,17 +526,17 @@ impl Buffers {
         headroom: usize,
     ) -> Option<Taken> {
         let id = self.next_coalesce;
-        let (batches, bytes, rows) = self
+        let (batches, bytes) = self
             .tenants
             .get_mut(&tenant)?
             .take_for_coalesce(bound, min, max_bytes, headroom, id)?;
         self.next_coalesce += 1;
-        // The merged chunk is at most the inputs; its trace set at most one
-        // id per row.
+        // The merged chunk is at most the inputs and its trace set at most
+        // the bound the inputs carry.
         Some(Taken {
             id,
             batches,
-            scratch: self.hold_scratch(bytes + trace_set_bound(rows)),
+            scratch: self.hold_scratch(bytes),
         })
     }
 
@@ -540,29 +550,33 @@ impl Buffers {
 
     /// Room the flush of every live byte, and of every flushing byte whose
     /// attempt is not running, would need as scratch: [`FLUSH_SCRATCH_FACTOR`]
-    /// copies plus the worst case of the trace set the file's rows get.
+    /// copies, which cover the merged rows, the sorted rows, the encoder and
+    /// the file's trace set, since every byte carries its index bound.
     /// Admission and the coalescer keep it free, so rows once admitted can
     /// always be written out. A running attempt holds its copies as a lease
     /// instead, so its rows are not counted here too.
     pub fn flush_margin(&self) -> usize {
-        let live = self
-            .tenants
-            .values()
-            .fold((0, 0), |(b, r), buf| (b + buf.bytes, r + buf.rows));
-        let waiting = self
+        let live: usize = self.tenants.values().map(|b| b.bytes).sum();
+        let waiting: usize = self
             .flushing
             .values()
             .flatten()
             .filter(|f| !f.in_progress)
-            .fold((0, 0), |(b, r), f| (b + f.buffer.bytes, r + f.buffer.rows));
-        (live.0 + waiting.0).saturating_mul(FLUSH_SCRATCH_FACTOR)
-            + trace_set_bound(live.1 + waiting.1)
+            .map(|f| f.buffer.bytes)
+            .sum();
+        (live + waiting).saturating_mul(FLUSH_SCRATCH_FACTOR)
     }
 
-    /// Room an admission of `bytes` of rows needs: the rows, the margin
-    /// their flush keeps, and the worst case of their trace set.
+    /// Bytes a batch of `bytes` of Arrow memory and `rows` rows costs every
+    /// cap: itself plus the bound of the trace set it will get.
+    pub fn batch_cost(bytes: usize, rows: usize) -> usize {
+        bytes.saturating_add(trace_set_bound(rows))
+    }
+
+    /// Room an admission needs under the global cap: the batch's cost and
+    /// the margin its flush keeps.
     pub fn admission_cost(bytes: usize, rows: usize) -> usize {
-        bytes.saturating_mul(1 + FLUSH_SCRATCH_FACTOR) + trace_set_bound(rows)
+        Self::batch_cost(bytes, rows).saturating_mul(1 + FLUSH_SCRATCH_FACTOR)
     }
 
     /// Bytes still admissible under `cap` with the flush margin kept, for
@@ -727,9 +741,7 @@ impl Buffers {
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
-        let lease = self.hold_scratch(
-            buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR) + trace_set_bound(buffer.rows),
-        );
+        let lease = self.hold_scratch(buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
             buffer,
@@ -788,7 +800,6 @@ impl Buffers {
                 .find(|f| f.file == file && !f.in_progress)?;
             entry.in_progress = true;
             entry.buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR)
-                + trace_set_bound(entry.buffer.rows)
         };
         let lease = self.hold_scratch(lease_bytes);
         let batches = self
@@ -1054,18 +1065,21 @@ mod tests {
             .get_mut(tenant)
             .push(tagged(4, 1), at(10), Instant::now());
         let live = buffers.total_bytes();
-        let index = trace_set_bound(4);
-        let margin = live * FLUSH_SCRATCH_FACTOR + index;
-        assert_eq!(buffers.flush_margin(), margin);
-        assert_eq!(buffers.headroom(live * 5), live - index);
+        assert_eq!(
+            live,
+            tagged(4, 1).get_array_memory_size() + trace_set_bound(4),
+            "a request batch carries its index bound"
+        );
+        assert_eq!(buffers.flush_margin(), live * FLUSH_SCRATCH_FACTOR);
+        assert_eq!(buffers.headroom(live * 5), live);
         assert_eq!(buffers.headroom(live * 4), 0);
         let held = buffers.hold_scratch(1);
-        assert_eq!(buffers.headroom(live * 5), live - index - 1);
+        assert_eq!(buffers.headroom(live * 5), live - 1);
         drop(held);
         let reservation = buffers.reserve(tenant, 2);
         assert_eq!(
             buffers.headroom(live * 5),
-            live - index - 2 * (1 + FLUSH_SCRATCH_FACTOR),
+            live - 2 * (1 + FLUSH_SCRATCH_FACTOR),
             "a reservation keeps its margin too"
         );
         drop(reservation);
@@ -1073,7 +1087,7 @@ mod tests {
         let (_, lease) = buffers.begin_flush(tenant, file).unwrap();
         assert_eq!(
             buffers.scratch_total(),
-            margin,
+            live * FLUSH_SCRATCH_FACTOR,
             "the margin became the lease"
         );
         assert_eq!(
@@ -1083,22 +1097,22 @@ mod tests {
         );
         assert_eq!(
             buffers.headroom(live * 5),
-            live - index,
-            "the rows cost four copies and one index, not seven"
+            live,
+            "the rows cost four copies, not seven"
         );
         drop(lease);
         buffers.flush_failed(tenant, file, Instant::now());
         assert_eq!(buffers.scratch_total(), 0);
         assert_eq!(
             buffers.flush_margin(),
-            margin,
+            live * FLUSH_SCRATCH_FACTOR,
             "waiting rows keep their margin"
         );
-        assert_eq!(buffers.headroom(live * 5), live - index);
+        assert_eq!(buffers.headroom(live * 5), live);
         let (_, lease) = buffers.take_flushing(tenant, file).unwrap();
         assert_eq!(
             buffers.scratch_total(),
-            margin,
+            live * FLUSH_SCRATCH_FACTOR,
             "a retry takes the lease too"
         );
         assert_eq!(buffers.flush_margin(), 0);
@@ -1391,8 +1405,8 @@ mod tests {
         );
         assert_eq!(
             buffers.scratch_total(),
-            3 * (2 * one + trace_set_bound(4)),
-            "inputs plus the worst case of three trace sets"
+            3 * 2 * one,
+            "the inputs, their index bound included"
         );
         // Results arrive in any order; each chunk lands at its own run.
         for taken in [second, third, first] {
@@ -1473,11 +1487,15 @@ mod tests {
             .unwrap();
         let (originals, lease) = buffers.begin_flush(tenant, file).unwrap();
         drop(lease);
-        let raw: usize = originals
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .sum();
-        assert_eq!(buffers.memory().1, raw);
+        let raw = buffers.memory().1;
+        assert_eq!(
+            raw,
+            originals
+                .iter()
+                .map(|b| b.get_array_memory_size() + trace_set_bound(b.num_rows()))
+                .sum::<usize>(),
+            "the flushing rows carry their index bound"
+        );
         let chunk =
             arrow::compute::concat_batches(&originals.first().unwrap().schema(), &taken.batches)
                 .unwrap();
