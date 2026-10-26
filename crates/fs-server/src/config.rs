@@ -354,7 +354,7 @@ fn default_hot_advertise() -> String {
 }
 
 fn default_persisted_retain() -> u64 {
-    15
+    8
 }
 
 impl IngestSection {
@@ -721,6 +721,14 @@ impl Config {
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
+        }
+        let retention_floor = fs_query::files::STALE_AFTER.as_secs()
+            + fs_query::hot::HotWindowConfig::default().timeout.as_secs()
+            + 1;
+        if self.ingest.persisted_retain_secs < retention_floor {
+            return invalid(
+                "ingest.persisted_retain_secs must cover the querier's file cache TTL plus a hot scan",
+            );
         }
         if self.ingest.coalesce_batches < 2 {
             return invalid("ingest.coalesce_batches must be at least 2");

@@ -120,6 +120,8 @@ impl HotWindow {
             ts_max: pruning.ts_max,
             services: pruning.services.clone(),
             columns,
+            trace_ids: pruning.trace_ids.clone(),
+            span_ids: pruning.span_ids.clone(),
         };
         let calls = ingesters.iter().map(|ingester| {
             let request = request.clone();
@@ -188,18 +190,24 @@ mod tests {
         assert!(config(true).touches_recent(&Pruning {
             ts_min: Some(now - hour),
             ts_max: None,
-            services: None
+            services: None,
+            trace_ids: None,
+            span_ids: None,
         }));
         assert!(!config(true).touches_recent(&Pruning {
             ts_min: Some(now - 2 * hour),
             ts_max: Some(now - hour),
-            services: None
+            services: None,
+            trace_ids: None,
+            span_ids: None,
         }));
         assert!(
             !config(true).touches_recent(&Pruning {
                 ts_min: Some(now + hour),
                 ts_max: None,
-                services: None
+                services: None,
+                trace_ids: None,
+                span_ids: None,
             }),
             "future only"
         );

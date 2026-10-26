@@ -83,7 +83,7 @@ file list by trace id; the per-tenant cap is met by 15 s of retained rows.
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
 | A1 | Parallel coalescer: several coalesce ids per tenant over non-overlapping runs, a global semaphore (`max_coalesces`), group size by bytes, task and bytes gauges; flushes materialised off the flusher loop under `max_flushes` | one chunk at a time fell behind at 32 senders, so the retention held raw batches and the tenant cap tripped | buffer tests for disjoint runs and cancellation; `coalesced_flush_matches_replay_byte_for_byte` green; [benchmark](benchmarks/2026-10-26-parallel-coalesce.md): 98% of batches merged before their flush, 99 k spans/s | M | done (edbccfb, 12b85a4) |
-| A2 | Persisted retention holds chunks only, and a shorter default retention tied to the querier's file cache TTL | retention is the main memory consumer | memory cap test with retention; benchmark persisted bytes | S | todo |
+| A2 | Persisted retention holds the file's rows as written, one sorted batch, and the default retention (8 s) is validated against the querier's file cache TTL plus a hot scan | retention was the main memory consumer | memory cap tests with retention; benchmark of persisted bytes pending | S | done, benchmark pending |
 | A3 | Parquet encode by row group as the buffer fills (streaming), bounded encode concurrency | encode is 2.5 µs per row and the largest flush stage | flush stages benchmark; crash between row groups keeps idempotency (object created once) | M | todo |
 | A4 | Flush concurrency across tenants with a bounded semaphore | one slow tenant must not delay the others | multi-tenant flush test; benchmark with 4 tenants | S | doing: `max_flushes` landed with A1 and covers new cuts and retries; the multi-tenant test and the four-tenant benchmark are missing |
 | A5 | End-of-hour flush boundary so an L0 file never spans two hours | L1 compaction and the trace index are per hour | flush test with spans across an hour boundary produces two files | S | todo |
@@ -93,7 +93,7 @@ file list by trace id; the per-tenant cap is met by 15 s of retained rows.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| B1 | Typed `trace_id` and `span_id` predicates in `HotScanRequest` (`#[serde(default)]`, optional), applied before rows leave the ingester | the hot scan ships every retained row today | hot-window test asserting only matching rows cross the wire; query benchmark `trace by id` under load | S | todo |
+| B1 | Typed `trace_id` and `span_id` predicates in `HotScanRequest` (`#[serde(default)]`, optional), applied before rows leave the ingester | the hot scan shipped every retained row | `hot_scan_keeps_only_the_requested_traces_and_spans`, pruning unit test, SQL lookup test; query benchmark `trace by id` pending | S | done, benchmark pending |
 | B2 | Hot trace index: `trace_id → batches` in the ingester, rebuilt per chunk | narrows the in-memory scan to a few batches | unit test on the index; benchmark | M | todo |
 | B3 | `index/trace_id/*.tix` sidecar per hour written by the flush and the compactor, with the xxh3 header; querier opens only the listed files | thousands of files per trace lookup otherwise | sidecar round-trip test; corrupt sidecar degrades to a scan; `trace by id` within the 9.2 target | L | todo |
 | B4 | Typed action `trace.lookup` over Flight `DoAction` returning the spans of one trace | the Go backend's trace view should not build SQL for the most common query | action test; Go client call | M | todo |

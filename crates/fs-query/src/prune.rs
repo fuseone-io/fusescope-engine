@@ -19,6 +19,10 @@ pub struct Pruning {
     pub ts_max: Option<i64>,
     /// Allowed service names, when the filters pin them.
     pub services: Option<Vec<String>>,
+    /// Trace ids the filters pin, as 16-byte values.
+    pub trace_ids: Option<Vec<Vec<u8>>>,
+    /// Span ids the filters pin, as 8-byte values.
+    pub span_ids: Option<Vec<Vec<u8>>>,
 }
 
 /// Bucket width in seconds as a signed value for timestamp arithmetic. 1800 fits trivially.
@@ -66,6 +70,19 @@ impl Pruning {
                     self.restrict_services(values);
                 }
             }
+            Expr::InList(list)
+                if !list.negated
+                    && matches!(column_name(&list.expr), Some(col::TRACE_ID | col::SPAN_ID)) =>
+            {
+                let values: Option<Vec<Vec<u8>>> = list
+                    .list
+                    .iter()
+                    .map(|e| literal(e).and_then(binary_value))
+                    .collect();
+                if let (Some(values), Some(column)) = (values, column_name(&list.expr)) {
+                    self.restrict_ids(column, values);
+                }
+            }
             _ => {}
         }
     }
@@ -108,8 +125,30 @@ impl Pruning {
                     self.restrict_services(vec![service]);
                 }
             }
+            col::TRACE_ID | col::SPAN_ID if op == Operator::Eq => {
+                if let Some(id) = binary_value(literal) {
+                    self.restrict_ids(column, vec![id]);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Narrows the pinned ids of `column` to `values`, keeping the
+    /// intersection with ids pinned earlier.
+    fn restrict_ids(&mut self, column: &str, values: Vec<Vec<u8>>) {
+        let slot = if column == col::TRACE_ID {
+            &mut self.trace_ids
+        } else {
+            &mut self.span_ids
+        };
+        *slot = Some(match slot.take() {
+            None => values,
+            Some(existing) => existing
+                .into_iter()
+                .filter(|v| values.contains(v))
+                .collect(),
+        });
     }
 
     fn bound(&mut self, op: Operator, ns: i64) {
@@ -181,6 +220,17 @@ fn string_value(v: &ScalarValue) -> Option<String> {
         | ScalarValue::LargeUtf8(Some(s))
         | ScalarValue::Utf8View(Some(s)) => Some(s.clone()),
         ScalarValue::Dictionary(_, inner) => string_value(inner),
+        _ => None,
+    }
+}
+
+fn binary_value(v: &ScalarValue) -> Option<Vec<u8>> {
+    match v {
+        ScalarValue::Binary(Some(b))
+        | ScalarValue::LargeBinary(Some(b))
+        | ScalarValue::BinaryView(Some(b))
+        | ScalarValue::FixedSizeBinary(_, Some(b)) => Some(b.clone()),
+        ScalarValue::Dictionary(_, inner) => binary_value(inner),
         _ => None,
     }
 }
@@ -260,7 +310,9 @@ mod tests {
             Pruning {
                 ts_min: Some(100),
                 ts_max: Some(200),
-                services: Some(vec!["api".into()])
+                services: Some(vec!["api".into()]),
+                trace_ids: None,
+                span_ids: None,
             }
         );
         assert!(pruning.keeps(&file(150, 160, &["api"])));
@@ -288,6 +340,33 @@ mod tests {
         assert_eq!(pruning.services, Some(vec!["a".into(), "b".into()]));
         assert!(!pruning.keeps(&file(0, 100, &["a"])));
         assert!(!pruning.keeps(&file(600, 700, &["c"])));
+    }
+
+    #[test]
+    fn trace_and_span_ids_are_pinned() {
+        let filters = vec![
+            dfcol("trace_id").eq(lit(ScalarValue::Binary(Some(vec![7u8; 16])))),
+            dfcol("span_id").in_list(
+                vec![
+                    lit(ScalarValue::FixedSizeBinary(8, Some(vec![1u8; 8]))),
+                    lit(ScalarValue::Binary(Some(vec![2u8; 8]))),
+                ],
+                false,
+            ),
+        ];
+        let p = Pruning::from_filters(&filters);
+        assert_eq!(p.trace_ids, Some(vec![vec![7u8; 16]]));
+        assert_eq!(p.span_ids, Some(vec![vec![1u8; 8], vec![2u8; 8]]));
+
+        let narrowed = Pruning::from_filters(&[
+            dfcol("trace_id").eq(lit(ScalarValue::Binary(Some(vec![7u8; 16])))),
+            dfcol("trace_id").eq(lit(ScalarValue::Binary(Some(vec![8u8; 16])))),
+        ]);
+        assert_eq!(
+            narrowed.trace_ids,
+            Some(vec![]),
+            "two different ids pin nothing"
+        );
     }
 
     #[test]

@@ -350,7 +350,7 @@ impl Shared {
             .write_and_register(tenant, file_id, batches, &mut timing)
             .await;
         match result {
-            Ok((file, created)) => {
+            Ok((file, created, rows, held)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(
                     tenant = %tenant.0,
@@ -364,7 +364,9 @@ impl Shared {
                 self.buffers
                     .lock()
                     .await
-                    .finish_flush(tenant, file_id, Instant::now());
+                    .finish_flush(tenant, file_id, rows, Instant::now());
+                // Counted as persisted from here on.
+                drop(held);
                 if self.config.checkpoint_after_flush {
                     self.checkpoint_wal().await;
                 }
@@ -404,18 +406,34 @@ impl Shared {
         }
     }
 
-    /// Encode, upload and register, filling `timing` as it goes.
+    /// Encode, upload and register, filling `timing` as it goes. Returns the
+    /// catalog row, whether this attempt created the object, the rows as
+    /// written and the scratch lease that counts them until they are
+    /// persisted.
     async fn write_and_register(
         &self,
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
         timing: &mut StageTiming,
-    ) -> Result<(fs_catalog::NewFile, bool), IngestError> {
+    ) -> Result<
+        (
+            fs_catalog::NewFile,
+            bool,
+            RecordBatch,
+            crate::buffer::Scratch,
+        ),
+        IngestError,
+    > {
         let root = self.root.clone();
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
                 .await??;
+        let held = self
+            .buffers
+            .lock()
+            .await
+            .hold_scratch(prepared.rows.get_array_memory_size());
         timing.concat = nanos(prepared.concat);
         timing.sort = nanos(prepared.sort);
         timing.encode = nanos(prepared.encode);
@@ -425,7 +443,7 @@ impl Shared {
         let register_started = Instant::now();
         self.register(&prepared.file).await?;
         timing.register = nanos(register_started.elapsed());
-        Ok((prepared.file, created))
+        Ok((prepared.file, created, prepared.rows, held))
     }
 
     /// Catalog registration, with the test-only failure injection in front.

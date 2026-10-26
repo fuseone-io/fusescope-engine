@@ -516,6 +516,8 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let got = scan(&addr, &all, Duration::from_secs(5)).await.unwrap();
     assert_eq!(
@@ -534,6 +536,8 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         ts_max: None,
         services: Some(vec!["api".into()]),
         columns: Some(vec!["timestamp".into(), "name".into()]),
+        trace_ids: None,
+        span_ids: None,
     };
     let got = scan(&addr, &api_names, Duration::from_secs(5))
         .await
@@ -846,6 +850,8 @@ async fn hot_window_announces_prospective_file_id() {
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let before = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -1050,7 +1056,9 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
         .create_token(tenant, "collector", TokenScope::Ingest)
         .await
         .unwrap();
-    // Four 30-span batches fit under 80 KiB, a fifth would cross it.
+    // Four raw 30-span batches fit under 80 KiB. After the flush their rows
+    // stay as one compact batch, so a few more requests fit before the
+    // retention plus the live rows cross the cap.
     let config = IngestConfig {
         max_memory_bytes: 80 * 1024,
         persisted_retain: Duration::from_secs(2),
@@ -1066,30 +1074,39 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
             .unwrap();
     }
     h.ingester.flush_all().await; // rows move to persisted, still in memory
-    let refused = client
-        .export(authed(request("api", 9, 30), &token))
-        .await
-        .unwrap_err();
+    let mut admitted = 0u8;
+    let refused = loop {
+        match client
+            .export(authed(request("api", 10 + admitted, 30), &token))
+            .await
+        {
+            Ok(_) => admitted += 1,
+            Err(status) => break status,
+        }
+        assert!(admitted < 8, "the retention never counted against the cap");
+    };
     assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
     assert!(
         refused.message().contains("ingester memory full"),
         "{refused:?}"
     );
 
-    // The persisted rows are still served meanwhile.
+    // The persisted rows are still served meanwhile, with the live ones.
     let all = HotScanRequest {
         tenant,
         ts_min: None,
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(
         got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        120
+        120 + usize::from(admitted) * 30
     );
 
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -1209,6 +1226,8 @@ async fn out_of_order_pushes_keep_intent_and_file_id() {
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -1272,7 +1291,9 @@ async fn tenant_memory_cap_isolates_tenants() {
             .unwrap();
         tokens.push(token);
     }
-    // Four 30-span batches fit under 80 KiB, a fifth would cross it.
+    // Four raw 30-span batches fit under 80 KiB; after the flush the rows
+    // stay compact, so a few more fit before the tenant's retention plus
+    // its live rows cross its cap.
     let config = IngestConfig {
         max_tenant_bytes: 80 * 1024,
         persisted_retain: Duration::from_secs(2),
@@ -1287,10 +1308,17 @@ async fn tenant_memory_cap_isolates_tenants() {
             .unwrap();
     }
     h.ingester.flush_all().await;
-    let refused = client
-        .export(authed(request("api", 9, 30), &tokens[0]))
-        .await
-        .unwrap_err();
+    let mut admitted = 0u8;
+    let refused = loop {
+        match client
+            .export(authed(request("api", 10 + admitted, 30), &tokens[0]))
+            .await
+        {
+            Ok(_) => admitted += 1,
+            Err(status) => break status,
+        }
+        assert!(admitted < 8, "the retention never counted against the cap");
+    };
     assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
     assert!(
         refused.message().contains("tenant memory full"),
@@ -1370,6 +1398,8 @@ async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -1429,6 +1459,8 @@ async fn coalesced_flush_matches_replay_byte_for_byte() {
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let served = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -1577,6 +1609,8 @@ async fn announced_file_id_survives_a_restart_without_intent() {
         ts_max: None,
         services: None,
         columns: None,
+        trace_ids: None,
+        span_ids: None,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -1722,6 +1756,91 @@ async fn forced_retry_tries_each_pending_flush_once() {
     std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o755)).unwrap();
     h.ingester.flush_all().await;
     assert_eq!(parquet_files(&bucket).len(), 1);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The hot scan keeps only the rows of the traces and spans the request
+/// names, so a trace lookup ships a handful of rows, not the whole window.
+#[tokio::test]
+async fn hot_scan_keeps_only_the_requested_traces_and_spans() {
+    use arrow::array::AsArray;
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 6), &token))
+        .await
+        .unwrap();
+    client
+        .export(authed(request("web", 2, 6), &token))
+        .await
+        .unwrap();
+    let base = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: None,
+        span_ids: None,
+    };
+    let hot = h.hot_addr.to_string();
+
+    let by_trace = HotScanRequest {
+        trace_ids: Some(vec![vec![2u8; 16]]),
+        ..base.clone()
+    };
+    let got = scan(&hot, &by_trace, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        6
+    );
+    for batch in &got.batches {
+        let ids = batch
+            .column(batch.schema().index_of("trace_id").unwrap())
+            .as_fixed_size_binary()
+            .iter()
+            .map(|v| v.unwrap().to_vec())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| *id == vec![2u8; 16]));
+    }
+
+    let by_span = HotScanRequest {
+        trace_ids: Some(vec![vec![1u8; 16]]),
+        span_ids: Some(vec![vec![3u8; 8]]),
+        ..base.clone()
+    };
+    let got = scan(&hot, &by_span, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1
+    );
+
+    let unknown = HotScanRequest {
+        trace_ids: Some(vec![vec![9u8; 16]]),
+        ..base
+    };
+    let got = scan(&hot, &unknown, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0
+    );
     h.stop().await;
     db.finish().await;
 }

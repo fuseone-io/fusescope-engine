@@ -344,7 +344,7 @@ pub struct Taken {
 pub struct Persisted {
     /// Catalog id of the file holding these rows.
     pub file: FileId,
-    /// The rows, as they were buffered.
+    /// The rows as written: one sorted batch.
     pub batches: Vec<RecordBatch>,
     /// Arrow memory of `batches`, carried over from the buffer so accounting
     /// never walks the batches again.
@@ -643,13 +643,20 @@ impl Buffers {
         }
     }
 
-    /// The file is registered: its rows become persisted until swept.
-    pub fn finish_flush(&mut self, tenant: TenantId, file: FileId, now: Instant) {
-        if let Some(entry) = self.remove_flushing(tenant, file) {
+    /// The file is registered: `rows`, its content as one sorted batch,
+    /// stays persisted until swept, and the flushing rows are dropped.
+    pub fn finish_flush(
+        &mut self,
+        tenant: TenantId,
+        file: FileId,
+        rows: RecordBatch,
+        now: Instant,
+    ) {
+        if self.remove_flushing(tenant, file).is_some() {
             self.persisted.entry(tenant).or_default().push(Persisted {
                 file,
-                bytes: entry.buffer.bytes,
-                batches: entry.buffer.into_batches(),
+                bytes: rows.get_array_memory_size(),
+                batches: vec![rows],
                 at: now,
             });
         }
@@ -1188,11 +1195,12 @@ mod tests {
         );
         assert_eq!(buffers.bytes_of(tenant), chunk_bytes + raw);
         drop(originals);
-        buffers.finish_flush(tenant, file, now);
+        let written = tagged(6, 9);
+        buffers.finish_flush(tenant, file, written.clone(), now);
         assert_eq!(
             buffers.memory(),
-            (0, 0, chunk_bytes),
-            "persisted keeps the chunk only"
+            (0, 0, written.get_array_memory_size()),
+            "persisted keeps the rows as written, nothing else"
         );
     }
 

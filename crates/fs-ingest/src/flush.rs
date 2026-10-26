@@ -32,6 +32,9 @@ pub struct Prepared {
     pub file: NewFile,
     /// File bytes.
     pub bytes: Bytes,
+    /// The rows as written, one sorted batch: what the hot window keeps for
+    /// the file after registration.
+    pub rows: RecordBatch,
     /// Time spent concatenating the request batches.
     pub concat: std::time::Duration,
     /// Time spent sorting.
@@ -91,6 +94,7 @@ pub fn prepare(
     Ok(Prepared {
         file,
         bytes,
+        rows: sorted,
         concat,
         sort,
         encode,

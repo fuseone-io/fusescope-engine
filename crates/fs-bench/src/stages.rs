@@ -268,6 +268,8 @@ pub async fn run(
             "duration_nano".into(),
             "has_error".into(),
         ]),
+        trace_ids: None,
+        span_ids: None,
     };
     let (filtered, d) = timed(|| {
         batches

@@ -159,8 +159,12 @@ built at a time, each over its own run, so one tenant's backlog is merged
 on several cores. A flush is cut inline but encoded, uploaded and registered
 on its own task, at most `max_flushes` at a time, so the flusher keeps
 coalescing while a file is written; a chunk finished after its rows were
-cut replaces them in the flushing rows, so what the hot window keeps after
-registration is chunks.
+cut replaces them in the flushing rows. What the hot window keeps after
+registration is the file's rows as written, one sorted batch, for
+`persisted_retain`: the querier scans the hot window first and lists files
+after, so the retention must cover its file cache TTL plus one hot scan, and
+the server refuses a shorter value. A hot scan carries the trace and span
+ids a query pins, so a lookup ships those rows and no others.
 
 ### 2.3 Read path
 

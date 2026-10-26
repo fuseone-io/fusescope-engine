@@ -58,9 +58,10 @@ pub struct IngestConfig {
     /// Internal Arrow Flight address serving the hot window to queriers.
     /// `None` disables it.
     pub hot_listen: Option<SocketAddr>,
-    /// How long rows stay served from memory after their file is registered,
-    /// so queriers whose file list predates the file still see them. Must be
-    /// longer than the querier's file cache TTL.
+    /// How long a file's rows stay served from memory after it is registered,
+    /// so a querier whose file list predates the file still sees them. Must
+    /// cover the querier's file cache TTL plus one hot scan: the querier
+    /// scans the hot window first and lists files after.
     pub persisted_retain: Duration,
     /// Advance the WAL checkpoint after a successful flush. Always true in
     /// production; tests set it to false to simulate a crash between
@@ -105,7 +106,7 @@ impl Default for IngestConfig {
             limits: Limits::default(),
             token_cache_ttl: Duration::from_secs(60),
             hot_listen: None,
-            persisted_retain: Duration::from_secs(15),
+            persisted_retain: Duration::from_secs(8),
             checkpoint_after_flush: true,
             inject_register_failures: 0,
             inject_push_delay: None,

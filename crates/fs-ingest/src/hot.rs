@@ -55,6 +55,12 @@ pub struct HotScanRequest {
     pub services: Option<Vec<String>>,
     /// Return only these columns, in this order. `None` returns every column.
     pub columns: Option<Vec<String>>,
+    /// Keep only rows of these traces (16-byte ids). Absent in older tickets.
+    #[serde(default)]
+    pub trace_ids: Option<Vec<Vec<u8>>>,
+    /// Keep only these spans (8-byte ids). Absent in older tickets.
+    #[serde(default)]
+    pub span_ids: Option<Vec<Vec<u8>>>,
 }
 
 impl HotScanRequest {
@@ -117,6 +123,22 @@ pub fn apply(
         add(BooleanArray::from_iter((0..strings.len()).map(|i| {
             Some(strings.is_valid(i) && services.iter().any(|s| s == strings.value(i)))
         })))?;
+    }
+    for (ids, column) in [
+        (&request.trace_ids, col::TRACE_ID),
+        (&request.span_ids, col::SPAN_ID),
+    ] {
+        if let Some(ids) = ids {
+            let wanted: std::collections::HashSet<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+            let values = batch
+                .column(schema.index_of(column)?)
+                .as_fixed_size_binary();
+            add(BooleanArray::from_iter(
+                values
+                    .iter()
+                    .map(|v| Some(v.is_some_and(|v| wanted.contains(v)))),
+            ))?;
+        }
     }
     let filtered = match mask {
         Some(mask) => filter_record_batch(batch, &mask)?,
@@ -374,6 +396,8 @@ mod tests {
             ts_max: None,
             services: Some(vec!["api".into()]),
             columns: Some(vec!["timestamp".into(), "name".into()]),
+            trace_ids: None,
+            span_ids: None,
         };
         assert_eq!(
             HotScanRequest::from_ticket(&request.to_ticket()).unwrap(),

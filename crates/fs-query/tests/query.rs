@@ -578,6 +578,21 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
     assert_eq!(count(&rows), 12);
     assert!(warnings.is_empty(), "{warnings:?}");
 
+    // A trace lookup reaches the hot rows through the typed predicate.
+    let lookup =
+        |hex: String| format!("select count(*) from spans where trace_id = decode('{hex}', 'hex')");
+    let (rows, warnings) = querier
+        .collect_with_warnings(tenant, &lookup("05".repeat(16)))
+        .await
+        .unwrap();
+    assert_eq!(count(&rows), 12);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let (rows, _) = querier
+        .collect_with_warnings(tenant, &lookup("06".repeat(16)))
+        .await
+        .unwrap();
+    assert_eq!(count(&rows), 0);
+
     // Dictionary columns travel hydrated over Flight; grouping and sorting on
     // them must still work on hot rows alone and mixed with files.
     let grouped = querier
