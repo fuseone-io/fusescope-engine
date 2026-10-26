@@ -62,7 +62,10 @@ English.
 - Rust stable (see [`rust-toolchain.toml`](rust-toolchain.toml)); minimum version
   in `Cargo.toml` `rust-version`. Edition 2024.
 - `make dev-up` starts Postgres and an S3-compatible store; `make test`,
-  `make lint`, `make deny` are what CI runs. `make check-env` and `make run`
+  `make lint`, `make deny` are what CI runs. Locally they are throttled
+  (`JOBS`, `TEST_THREADS`, `nice`) so the machine stays usable; only the
+  benchmarks (`make bench-*`) take every core, and `make test-full` runs the
+  suite at full speed when a fast final check is wanted. `make check-env` and `make run`
   drive the real binary against them.
 - Dependency versions are shared in `[workspace.dependencies]` and follow the
   pins of `datafusion` (arrow, parquet, object_store) and `opentelemetry-proto`

@@ -41,7 +41,8 @@ shutdown). What comes next, in order, is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ```sh
 make dev-up               # Postgres on :5433 and an S3 store (RustFS) on :9100 via Docker
-make test                 # cargo test, with FS_TEST_DATABASE_URL pointing at that Postgres
+make test                 # cargo test, throttled (JOBS, TEST_THREADS, nice), with FS_TEST_DATABASE_URL pointing at that Postgres
+make test-full            # the same suite with every core
 make lint                 # fmt and clippy
 make deny                 # licenses, advisories, sources
 make check-env            # fusescope-engine --check: validates config and connectivity

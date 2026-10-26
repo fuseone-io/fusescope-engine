@@ -3,7 +3,14 @@
 export FS_TEST_DATABASE_URL ?= postgres://fusescope:fusescope@localhost:5433/fusescope
 export FS_TEST_S3_ENDPOINT  ?= http://localhost:9100
 
-.PHONY: dev-up dev-down check test lint deny ci run check-env tenant token bench-stages bench-load bench-query
+# Builds and tests are throttled so a developer machine stays usable:
+# fewer compile jobs, few test threads, low priority. Benchmarks keep the
+# whole machine; `make test-full` runs the suite at full speed.
+JOBS         ?= 8
+TEST_THREADS ?= 4
+THROTTLE     ?= nice -n 10
+
+.PHONY: dev-up dev-down check test test-full lint deny ci run check-env tenant token bench-stages bench-load bench-query
 
 dev-up:        ## start Postgres and an S3-compatible store, create the dev bucket
 	docker compose up -d --wait postgres s3
@@ -13,14 +20,17 @@ dev-down:      ## stop them, keeping data volumes
 	docker compose down
 
 check:
-	cargo check --workspace --all-targets
+	$(THROTTLE) cargo check --workspace --all-targets -j $(JOBS)
 
-test:          ## database and bucket tests run when the dev services are reachable
+test:          ## throttled; database and bucket tests run when the dev services are reachable
+	$(THROTTLE) cargo test --workspace -j $(JOBS) -- --test-threads=$(TEST_THREADS)
+
+test-full:     ## the same suite with every core, for a fast final check
 	cargo test --workspace
 
 lint:
 	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
+	$(THROTTLE) cargo clippy --workspace --all-targets -j $(JOBS) -- -D warnings
 
 deny:
 	cargo deny check licenses advisories sources bans
