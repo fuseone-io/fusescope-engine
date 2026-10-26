@@ -453,12 +453,21 @@ impl Buffers {
         (held.saturating_add(bytes) <= cap).then(|| self.hold_scratch(bytes))
     }
 
-    /// Room a flush of every live and flushing byte would need as scratch:
-    /// [`FLUSH_SCRATCH_FACTOR`] copies. Admission and the coalescer keep it
-    /// free, so rows once admitted can always be written out.
+    /// Room the flush of every live byte, and of every flushing byte whose
+    /// attempt is not running, would need as scratch: [`FLUSH_SCRATCH_FACTOR`]
+    /// copies. Admission and the coalescer keep it free, so rows once
+    /// admitted can always be written out. A running attempt holds its
+    /// copies as a lease instead, so its rows are not counted here too.
     pub fn flush_margin(&self) -> usize {
-        let (live, flushing, _) = self.memory();
-        (live + flushing).saturating_mul(FLUSH_SCRATCH_FACTOR)
+        let live: usize = self.tenants.values().map(|b| b.bytes).sum();
+        let waiting: usize = self
+            .flushing
+            .values()
+            .flatten()
+            .filter(|f| !f.in_progress)
+            .map(|f| f.buffer.bytes)
+            .sum();
+        (live + waiting).saturating_mul(FLUSH_SCRATCH_FACTOR)
     }
 
     /// Bytes still admissible under `cap` with the flush margin kept, for
@@ -606,10 +615,18 @@ impl Buffers {
     }
 
     /// Moves the live rows of `tenant` into the flushing state under `file`
-    /// and returns them for writing. `None` when nothing is live.
-    pub fn begin_flush(&mut self, tenant: TenantId, file: FileId) -> Option<Vec<RecordBatch>> {
+    /// and returns them for writing, with the scratch lease of the attempt:
+    /// the margin admission kept for these rows, [`FLUSH_SCRATCH_FACTOR`]
+    /// copies, becomes the lease, so the rows are never counted twice. `None`
+    /// when nothing is live.
+    pub fn begin_flush(
+        &mut self,
+        tenant: TenantId,
+        file: FileId,
+    ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
+        let lease = self.hold_scratch(buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
             buffer,
@@ -618,7 +635,7 @@ impl Buffers {
             in_progress: true,
             detached: 0,
         });
-        Some(batches)
+        Some((batches, lease))
     }
 
     /// Registers rows recovered from the WAL that an intent had already
@@ -651,18 +668,33 @@ impl Buffers {
             .collect()
     }
 
-    /// Marks the flush of `file` as in progress and returns its rows, or
-    /// `None` when it is gone or already being worked on. Callers hold a
-    /// flush permit before taking, so an entry in progress always has an
-    /// attempt running for it.
-    pub fn take_flushing(&mut self, tenant: TenantId, file: FileId) -> Option<Vec<RecordBatch>> {
-        let entry = self
+    /// Marks the flush of `file` as in progress and returns its rows with
+    /// the attempt's scratch lease, or `None` when it is gone or already
+    /// being worked on. Callers hold a flush permit before taking, so an
+    /// entry in progress always has an attempt running for it.
+    pub fn take_flushing(
+        &mut self,
+        tenant: TenantId,
+        file: FileId,
+    ) -> Option<(Vec<RecordBatch>, Scratch)> {
+        let lease_bytes = {
+            let entry = self
+                .flushing
+                .get_mut(&tenant)?
+                .iter_mut()
+                .find(|f| f.file == file && !f.in_progress)?;
+            entry.in_progress = true;
+            entry.buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR)
+        };
+        let lease = self.hold_scratch(lease_bytes);
+        let batches = self
             .flushing
-            .get_mut(&tenant)?
-            .iter_mut()
-            .find(|f| f.file == file && !f.in_progress)?;
-        entry.in_progress = true;
-        Some(entry.buffer.batches())
+            .get(&tenant)?
+            .iter()
+            .find(|f| f.file == file)?
+            .buffer
+            .batches();
+        Some((batches, lease))
     }
 
     /// Flushes bound by an intent and not being worked on right now.
@@ -859,7 +891,8 @@ mod tests {
             .get_mut(tenant)
             .push(batch(1), at(15), Instant::now());
         assert_eq!(buffers.live_first_wal(tenant), Some(at(15)));
-        assert!(buffers.begin_flush(tenant, file).is_some());
+        let (_, lease) = buffers.begin_flush(tenant, file).unwrap();
+        drop(lease);
         assert_eq!(buffers.live_first_wal(tenant), None);
         buffers.abort_flush(tenant, file);
         assert_eq!(buffers.live_first_wal(tenant), Some(at(15)));
@@ -922,18 +955,39 @@ mod tests {
         );
         drop(reservation);
         let file = FileId(uuid::Uuid::from_u128(1));
-        assert!(buffers.begin_flush(tenant, file).is_some());
+        let (_, lease) = buffers.begin_flush(tenant, file).unwrap();
+        assert_eq!(
+            buffers.scratch_total(),
+            live * FLUSH_SCRATCH_FACTOR,
+            "the margin became the lease"
+        );
+        assert_eq!(
+            buffers.flush_margin(),
+            0,
+            "a running attempt is not counted twice"
+        );
+        assert_eq!(
+            buffers.headroom(live * 5),
+            live,
+            "the rows cost four copies, not seven"
+        );
+        drop(lease);
+        buffers.flush_failed(tenant, file, Instant::now());
+        assert_eq!(buffers.scratch_total(), 0);
         assert_eq!(
             buffers.flush_margin(),
             live * FLUSH_SCRATCH_FACTOR,
-            "flushing rows count too"
+            "waiting rows keep their margin"
         );
-        assert!(
-            buffers
-                .try_hold_scratch(live * FLUSH_SCRATCH_FACTOR, live * 4)
-                .is_some(),
-            "the margin admission kept is exactly what the flush reserves"
+        assert_eq!(buffers.headroom(live * 5), live);
+        let (_, lease) = buffers.take_flushing(tenant, file).unwrap();
+        assert_eq!(
+            buffers.scratch_total(),
+            live * FLUSH_SCRATCH_FACTOR,
+            "a retry takes the lease too"
         );
+        assert_eq!(buffers.flush_margin(), 0);
+        drop(lease);
     }
 
     fn values(batches: &[RecordBatch]) -> Vec<i64> {
@@ -1018,7 +1072,7 @@ mod tests {
         } = buffers
             .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
-        let flushed = buffers.begin_flush(tenant, file).unwrap();
+        let (flushed, _lease) = buffers.begin_flush(tenant, file).unwrap();
         assert_eq!(
             values(&flushed),
             vec![100, 200],
@@ -1284,7 +1338,8 @@ mod tests {
         let taken = buffers
             .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
-        let originals = buffers.begin_flush(tenant, file).unwrap();
+        let (originals, lease) = buffers.begin_flush(tenant, file).unwrap();
+        drop(lease);
         let raw: usize = originals
             .iter()
             .map(RecordBatch::get_array_memory_size)
@@ -1322,9 +1377,10 @@ mod tests {
         let taken = buffers
             .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
-        let originals = buffers.begin_flush(tenant, file).unwrap();
+        let (originals, lease) = buffers.begin_flush(tenant, file).unwrap();
         buffers.flush_failed(tenant, file, now);
         drop(originals);
+        drop(lease);
         let chunk = arrow::compute::concat_batches(
             &taken.batches.first().unwrap().schema(),
             &taken.batches,
@@ -1339,7 +1395,7 @@ mod tests {
         );
         let due = buffers.due_flushes(now, true);
         assert_eq!(due, vec![(tenant, file)]);
-        let retried = buffers.take_flushing(tenant, file).unwrap();
+        let (retried, _lease) = buffers.take_flushing(tenant, file).unwrap();
         assert_eq!(retried.len(), 1, "the retry writes from the chunk");
         assert!(buffers.take_flushing(tenant, file).is_none(), "taken once");
         assert_eq!(buffers.due_flushes(now, true).len(), 0);

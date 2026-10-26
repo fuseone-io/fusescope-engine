@@ -299,8 +299,8 @@ impl Shared {
     async fn cut_tenant(
         &self,
         tenant: TenantId,
-    ) -> Result<Option<(FileId, Vec<RecordBatch>)>, IngestError> {
-        let (file_id, intent, batches) = {
+    ) -> Result<Option<(FileId, Vec<RecordBatch>, crate::buffer::Scratch)>, IngestError> {
+        let (file_id, intent, batches, held) = {
             let _exclusive = self.gate.write().await;
             let end = self
                 .wal
@@ -312,7 +312,7 @@ impl Shared {
                 return Ok(None);
             };
             let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
-            let Some(batches) = buffers.begin_flush(tenant, file_id) else {
+            let Some((batches, held)) = buffers.begin_flush(tenant, file_id) else {
                 return Ok(None);
             };
             (
@@ -324,6 +324,7 @@ impl Shared {
                     end,
                 },
                 batches,
+                held,
             )
         };
         if let Err(e) = self.append_wal(tenant, intent.to_record().encode()).await {
@@ -332,7 +333,7 @@ impl Shared {
             self.buffers.lock().await.abort_flush(tenant, file_id);
             return Err(e);
         }
-        Ok(Some((file_id, batches)))
+        Ok(Some((file_id, batches, held)))
     }
 
     /// Steps 3 and 4: encode, upload, register, persist, checkpoint. On failure
@@ -342,6 +343,7 @@ impl Shared {
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
+        held: crate::buffer::Scratch,
     ) -> Result<(), IngestError> {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let fs = &self.flush_stats;
@@ -349,7 +351,7 @@ impl Shared {
         let started = Instant::now();
         let mut timing = StageTiming::default();
         let result = self
-            .write_and_register(tenant, file_id, batches, &mut timing)
+            .write_and_register(tenant, file_id, batches, held, &mut timing)
             .await;
         match result {
             Ok((file, created, rows, held)) => {
@@ -408,15 +410,18 @@ impl Shared {
         }
     }
 
-    /// Encode, upload and register, filling `timing` as it goes. Returns the
-    /// catalog row, whether this attempt created the object, the rows as
-    /// written and the scratch lease that counts them until they are
+    /// Encode, upload and register, filling `timing` as it goes. `held` is
+    /// the attempt's scratch lease, kept whole until the object is in the
+    /// bucket and its bytes are gone, then lowered to the rows as written.
+    /// Returns the catalog row, whether this attempt created the object, the
+    /// rows as written and the lease that counts them until they are
     /// persisted.
     async fn write_and_register(
         &self,
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
+        mut held: crate::buffer::Scratch,
         timing: &mut StageTiming,
     ) -> Result<
         (
@@ -427,25 +432,10 @@ impl Shared {
         ),
         IngestError,
     > {
-        // Preparing holds the merged rows, the sorted rows and the encoder's
-        // output at once, each at most the size of the inputs: reserved under
-        // the cap before the work starts, which admission kept room for, and
-        // lowered to what is really held once known.
-        let inputs: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-        let mut held = self
-            .buffers
-            .lock()
-            .await
-            .try_hold_scratch(
-                inputs.saturating_mul(crate::buffer::FLUSH_SCRATCH_FACTOR),
-                self.config.max_memory_bytes,
-            )
-            .ok_or(IngestError::Backpressure("flush scratch"))?;
         let root = self.root.clone();
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
                 .await??;
-        held.shrink(prepared.rows.get_array_memory_size() + prepared.bytes.len());
         timing.concat = nanos(prepared.concat);
         timing.sort = nanos(prepared.sort);
         timing.encode = nanos(prepared.encode);
@@ -455,7 +445,8 @@ impl Shared {
         let flush::Prepared {
             file, bytes, rows, ..
         } = prepared;
-        // The object is in the bucket: its bytes go before the lease shrinks.
+        // The object is in the bucket: its bytes and the encoder are gone, so
+        // the lease lowers to the rows kept for the hot window.
         drop(bytes);
         held.shrink(rows.get_array_memory_size());
         let register_started = Instant::now();
@@ -492,7 +483,7 @@ impl Shared {
                 return;
             };
             let taken = self.buffers.lock().await.take_flushing(tenant, file);
-            let Some(batches) = taken else {
+            let Some((batches, held)) = taken else {
                 continue;
             };
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
@@ -501,7 +492,7 @@ impl Shared {
                 .config
                 .inject_retry_delay
                 .filter(|_| self.retry_delay_pending.swap(false, Ordering::Relaxed));
-            self.spawn_materialize(tenant, file, batches, permit, delay);
+            self.spawn_materialize(tenant, file, batches, held, permit, delay);
         }
     }
 
@@ -521,6 +512,7 @@ impl Shared {
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
+        held: crate::buffer::Scratch,
         permit: tokio::sync::OwnedSemaphorePermit,
         delay: Option<Duration>,
     ) {
@@ -529,7 +521,7 @@ impl Shared {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            if let Err(e) = shared.materialize(tenant, file_id, batches).await {
+            if let Err(e) = shared.materialize(tenant, file_id, batches, held).await {
                 error!(tenant = %tenant.0, error = %e, "flush error");
             }
             drop(permit);
@@ -711,8 +703,8 @@ impl Shared {
                 return;
             };
             match self.cut_tenant(tenant).await {
-                Ok(Some((file_id, batches))) => {
-                    self.spawn_materialize(tenant, file_id, batches, permit, None);
+                Ok(Some((file_id, batches, held))) => {
+                    self.spawn_materialize(tenant, file_id, batches, held, permit, None);
                 }
                 Ok(None) => {}
                 Err(e) => error!(tenant = %tenant.0, error = %e, "flush error"),
