@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
@@ -136,17 +136,19 @@ impl TenantBuffer {
     }
 
     /// Request batches below `bound` (all of them when `None`), if at least
-    /// `min`: marked as taken by coalesce `id` and returned in position order
-    /// with their bytes. The run stops before the batch that would take it
-    /// past `max_bytes`, so it stays a prefix. A batch that alone exceeds
-    /// `max_bytes` is already as large as a chunk: it becomes one in place,
-    /// at no cost, and the run continues after it. `None` while another
-    /// coalesce is in progress or when fewer than two batches fit.
+    /// `min`: the first run of adjacent ones, two or more, whose bytes fit
+    /// both `max_bytes` and `headroom`, marked as taken by coalesce `id` and
+    /// returned in position order with their bytes. A batch larger than
+    /// `max_bytes` is already as large as a chunk: it becomes one in place, at
+    /// no cost and whatever the headroom, and runs are selected around it.
+    /// `None`, with nothing else changed, while another coalesce is in
+    /// progress or when no two adjacent batches fit.
     fn take_for_coalesce(
         &mut self,
         bound: Option<Position>,
         min: usize,
         max_bytes: usize,
+        headroom: usize,
         id: u64,
     ) -> Option<(Vec<RecordBatch>, usize)> {
         if self.coalesce.is_some() {
@@ -156,26 +158,50 @@ impl TenantBuffer {
         if self.entries.iter().filter(|e| complete(e)).count() < min {
             return None;
         }
-        let mut taken = Vec::new();
-        let mut bytes = 0;
-        for entry in self.entries.iter_mut().filter(|e| complete(e)) {
-            if taken.is_empty() && entry.bytes > max_bytes {
-                entry.kind = Kind::Chunk;
-                continue;
-            }
-            if bytes + entry.bytes > max_bytes {
-                break;
-            }
-            entry.kind = Kind::Coalescing(id);
-            bytes += entry.bytes;
-            taken.push(entry.batch.clone());
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|e| complete(e) && e.bytes > max_bytes)
+        {
+            entry.kind = Kind::Chunk;
         }
-        if taken.len() < 2 {
-            self.cancel_coalesce(id);
-            return None;
+        let (start, end, bytes) = self.contiguous_run(complete, max_bytes.min(headroom))?;
+        let mut taken = Vec::with_capacity(end - start);
+        for entry in self.entries.iter_mut().skip(start).take(end - start) {
+            entry.kind = Kind::Coalescing(id);
+            taken.push(entry.batch.clone());
         }
         self.coalesce = Some(id);
         Some((taken, bytes))
+    }
+
+    /// The first run of two or more adjacent entries that `complete` accepts
+    /// and whose bytes together fit `limit`, as `(start, end, bytes)`.
+    fn contiguous_run(
+        &self,
+        complete: impl Fn(&Entry) -> bool,
+        limit: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let mut start = 0;
+        let mut bytes = 0;
+        for (i, entry) in self.entries.iter().enumerate() {
+            if complete(entry) && bytes + entry.bytes <= limit {
+                bytes += entry.bytes;
+                continue;
+            }
+            if i - start >= 2 {
+                return Some((start, i, bytes));
+            }
+            if complete(entry) && entry.bytes <= limit {
+                start = i;
+                bytes = entry.bytes;
+            } else {
+                start = i + 1;
+                bytes = 0;
+            }
+        }
+        let end = self.entries.len();
+        (end - start >= 2).then_some((start, end, bytes))
     }
 
     /// Replaces the entries taken by coalesce `id` with `chunk`, at the
@@ -277,8 +303,8 @@ impl Drop for Reservation {
 /// being built: the inputs of the merge, an upper bound of its output.
 #[derive(Debug)]
 pub struct Scratch {
-    bytes: usize,
-    total: Arc<AtomicUsize>,
+    bytes: u64,
+    total: Arc<AtomicU64>,
 }
 
 impl Drop for Scratch {
@@ -335,11 +361,20 @@ pub struct Buffers {
     persisted: HashMap<TenantId, Vec<Persisted>>,
     reserved: HashMap<TenantId, Arc<AtomicUsize>>,
     reserved_total: Arc<AtomicUsize>,
-    scratch_total: Arc<AtomicUsize>,
+    scratch_total: Arc<AtomicU64>,
     next_coalesce: u64,
 }
 
 impl Buffers {
+    /// Empty buffers whose scratch bytes are published through `counter`, so
+    /// a metrics page reads the same value every lease updates.
+    pub fn with_scratch_counter(counter: Arc<AtomicU64>) -> Self {
+        Self {
+            scratch_total: counter,
+            ..Self::default()
+        }
+    }
+
     /// Tenants with at least `min` complete request batches below their
     /// bound and no coalesce in progress. `bound_of` gives each tenant's bound.
     pub fn coalesce_candidates(
@@ -363,7 +398,8 @@ impl Buffers {
     }
 
     /// Takes complete request batches of `tenant` for coalescing, at least
-    /// `min` of them and at most `max_bytes` of Arrow memory; see
+    /// `min` of them, at most `max_bytes` of Arrow memory and no more than
+    /// `headroom`, the memory left under the cap; see
     /// [`TenantBuffer::take_for_coalesce`]. Their bytes are held as scratch
     /// against the global cap until the result is dropped.
     pub fn take_for_coalesce(
@@ -372,12 +408,13 @@ impl Buffers {
         bound: Option<Position>,
         min: usize,
         max_bytes: usize,
+        headroom: usize,
     ) -> Option<Taken> {
         let id = self.next_coalesce;
         let (batches, bytes) = self
             .tenants
             .get_mut(&tenant)?
-            .take_for_coalesce(bound, min, max_bytes, id)?;
+            .take_for_coalesce(bound, min, max_bytes, headroom, id)?;
         self.next_coalesce += 1;
         Some(Taken {
             id,
@@ -388,6 +425,7 @@ impl Buffers {
 
     /// Counts `bytes` of working memory against the global cap until dropped.
     pub fn hold_scratch(&self, bytes: usize) -> Scratch {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.scratch_total.fetch_add(bytes, Ordering::Relaxed);
         Scratch {
             bytes,
@@ -397,7 +435,7 @@ impl Buffers {
 
     /// Working memory currently held by chunks being built.
     pub fn scratch_total(&self) -> usize {
-        self.scratch_total.load(Ordering::Relaxed)
+        usize::try_from(self.scratch_total.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
     }
 
     /// Puts the chunk of coalesce `id` in place of the batches it merged.
@@ -775,13 +813,13 @@ mod tests {
             batches: taken,
             scratch,
         } = buffers
-            .take_for_coalesce(tenant, Some(at(35)), 3, usize::MAX)
+            .take_for_coalesce(tenant, Some(at(35)), 3, usize::MAX, usize::MAX)
             .unwrap();
         assert_eq!(values(&taken), vec![100, 101, 200, 201, 300, 301]);
         assert!(buffers.scratch_total() > 0, "inputs are held as scratch");
         assert!(
             buffers
-                .take_for_coalesce(tenant, None, 1, usize::MAX)
+                .take_for_coalesce(tenant, None, 1, usize::MAX, usize::MAX)
                 .is_none(),
             "one at a time"
         );
@@ -818,7 +856,7 @@ mod tests {
         let Taken {
             id, batches: taken, ..
         } = buffers
-            .take_for_coalesce(tenant, None, 2, usize::MAX)
+            .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
         let flushed = buffers.begin_flush(tenant, file).unwrap();
         assert_eq!(
@@ -833,7 +871,7 @@ mod tests {
         buffers.get_mut(tenant).push(tagged(1, 4), at(50), now);
         assert_eq!(
             buffers
-                .take_for_coalesce(tenant, None, 1, usize::MAX)
+                .take_for_coalesce(tenant, None, 1, usize::MAX, usize::MAX)
                 .map(|t| values(&t.batches)),
             Some(vec![300, 400]),
             "the next coalesce starts fresh"
@@ -851,7 +889,9 @@ mod tests {
                 .push(tagged(2, tag), at(offset), now);
         }
         let one = buffers.get_mut(tenant).entries.first().unwrap().bytes;
-        let taken = buffers.take_for_coalesce(tenant, None, 2, one * 2).unwrap();
+        let taken = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
         assert_eq!(
             values(&taken.batches),
             vec![100, 101, 200, 201],
@@ -869,7 +909,9 @@ mod tests {
         );
         assert_eq!(buffers.get_mut(tenant).request_batches(), 2);
         assert!(
-            buffers.take_for_coalesce(tenant, None, 1, 1).is_none(),
+            buffers
+                .take_for_coalesce(tenant, None, 1, 1, usize::MAX)
+                .is_none(),
             "fewer than two batches fit"
         );
         assert_eq!(
@@ -882,6 +924,86 @@ mod tests {
             vec![100, 101, 200, 201, 300, 301, 400, 401],
             "order is untouched"
         );
+    }
+
+    #[test]
+    fn no_headroom_takes_nothing_and_changes_nothing() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4)] {
+            buffers
+                .get_mut(tenant)
+                .push(tagged(2, tag), at(offset), now);
+        }
+        let one = buffers.get_mut(tenant).entries.first().unwrap().bytes;
+        assert!(
+            buffers
+                .take_for_coalesce(tenant, None, 2, usize::MAX, 0)
+                .is_none()
+        );
+        assert!(
+            buffers
+                .take_for_coalesce(tenant, None, 2, usize::MAX, one)
+                .is_none(),
+            "one fits, two do not"
+        );
+        assert_eq!(
+            buffers.get_mut(tenant).request_batches(),
+            4,
+            "still requests, not chunks"
+        );
+        assert_eq!(buffers.scratch_total(), 0);
+        // Memory freed by a flush: the same batches merge now.
+        let taken = buffers
+            .take_for_coalesce(tenant, None, 2, usize::MAX, one * 2)
+            .unwrap();
+        assert_eq!(values(&taken.batches), vec![100, 101, 200, 201]);
+    }
+
+    #[test]
+    fn oversized_batch_between_small_ones_does_not_block_the_rest() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        buffers.get_mut(tenant).push(tagged(1, 1), at(10), now);
+        buffers.get_mut(tenant).push(tagged(200, 2), at(20), now);
+        buffers.get_mut(tenant).push(tagged(1, 3), at(30), now);
+        buffers.get_mut(tenant).push(tagged(1, 4), at(40), now);
+        let small = buffers.get_mut(tenant).entries.first().unwrap().bytes;
+        let taken = buffers
+            .take_for_coalesce(tenant, None, 2, small * 3, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            values(&taken.batches),
+            vec![300, 400],
+            "the run after the large batch"
+        );
+        let chunk = arrow::compute::concat_batches(
+            &taken.batches.first().unwrap().schema(),
+            &taken.batches,
+        )
+        .unwrap();
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        let live = buffers.get_mut(tenant);
+        assert_eq!(
+            live.request_batches(),
+            1,
+            "the first small batch alone stays a request"
+        );
+        assert_eq!(
+            live.entries
+                .iter()
+                .filter(|e| e.kind == Kind::Chunk)
+                .count(),
+            2,
+            "the large batch is a chunk in place"
+        );
+        let order: Vec<i64> = values(&live.batches());
+        assert_eq!(order.first(), Some(&100));
+        assert_eq!(order.get(1), Some(&200));
+        assert_eq!(order.last(), Some(&400));
+        assert_eq!(order.len(), 203);
     }
 
     #[test]

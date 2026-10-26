@@ -107,8 +107,8 @@ pub struct FlushStats {
     pub coalesced_batches: AtomicU64,
     /// Nanoseconds spent merging.
     pub coalesce_nanos: AtomicU64,
-    /// Working memory held by chunks being built, sampled every flusher tick.
-    pub scratch_bytes: AtomicU64,
+    /// Working memory held by chunks being built; the buffers' own counter.
+    pub scratch_bytes: Arc<AtomicU64>,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
@@ -485,19 +485,14 @@ impl Shared {
                 let headroom = self.config.max_memory_bytes.saturating_sub(
                     buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total(),
                 );
-                let limit = max_bytes.min(headroom);
                 let candidates =
                     buffers.coalesce_candidates(min, |tenant| self.writer.stable_bound(tenant));
-                let taken = candidates.into_iter().find_map(|tenant| {
+                candidates.into_iter().find_map(|tenant| {
                     let bound = self.writer.stable_bound(tenant);
                     buffers
-                        .take_for_coalesce(tenant, bound, min, limit)
+                        .take_for_coalesce(tenant, bound, min, max_bytes, headroom)
                         .map(|taken| (tenant, taken))
-                });
-                self.flush_stats
-                    .scratch_bytes
-                    .store(buffers.scratch_total() as u64, Ordering::Relaxed);
-                taken
+                })
             };
             let Some((tenant, taken)) = taken else {
                 return;
@@ -534,10 +529,6 @@ impl Shared {
                 }
             }
             drop(scratch);
-            let held = self.buffers.lock().await.scratch_total();
-            self.flush_stats
-                .scratch_bytes
-                .store(held as u64, Ordering::Relaxed);
         }
     }
 
@@ -652,9 +643,9 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
 
 /// Rebuilds buffers: rows covered by an intent go back to the flushing state
 /// under that file id, everything else is live.
-fn rebuild(replayed: Replayed) -> Buffers {
+fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
     let now = Instant::now();
-    let mut buffers = Buffers::default();
+    let mut buffers = Buffers::with_scratch_counter(scratch);
     let mut groups: Vec<(FlushIntent, TenantBuffer)> = replayed
         .intents
         .into_iter()
@@ -708,7 +699,8 @@ impl Ingester {
         let replayed = replay(config.limits, &mut wal)?;
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
-        let buffers = rebuild(replayed);
+        let flush_stats = Arc::new(FlushStats::default());
+        let buffers = rebuild(replayed, Arc::clone(&flush_stats.scratch_bytes));
         info!(
             records,
             damaged,
@@ -727,7 +719,7 @@ impl Ingester {
             auth,
             limiter,
             stats: Arc::new(IngestStats::default()),
-            flush_stats: Arc::new(FlushStats::default()),
+            flush_stats,
             wal,
             writer,
             instance,
