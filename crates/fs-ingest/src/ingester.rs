@@ -115,6 +115,11 @@ pub struct FlushStats {
     pub coalesce_time: crate::histogram::Histogram,
 }
 
+/// Permits of the flush semaphore for a configured `max_flushes`.
+fn flush_permits(max_flushes: usize) -> usize {
+    max_flushes.clamp(1, u32::MAX as usize / 4)
+}
+
 /// Stage durations of one flush attempt, in nanoseconds.
 #[derive(Debug, Default)]
 struct StageTiming {
@@ -153,6 +158,7 @@ pub struct Shared {
     coalesce_now: Notify,
     conversions: tokio::sync::Semaphore,
     coalesces: Arc<tokio::sync::Semaphore>,
+    flushes: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
@@ -248,6 +254,7 @@ impl Shared {
 
         let (due, coalesce) = {
             let mut buffers = self.buffers.lock().await;
+            let was_due = self.flush_is_due(buffers.get_mut(tenant));
             buffers.get_mut(tenant).push(batch, tracked.position, now);
             // Both released under the lock: no admission runs between the push
             // and the release, and no coalesce takes a run the position
@@ -255,9 +262,11 @@ impl Shared {
             drop(reservation);
             drop(tracked);
             let live = buffers.get_mut(tenant);
+            // Edges, not levels: the flusher is woken once per crossing, not
+            // once per request while the backlog lasts.
             (
-                live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes,
-                live.request_batches() >= self.config.coalesce_batches,
+                self.flush_is_due(live) && !was_due,
+                live.request_batches() == self.config.coalesce_batches,
             )
         };
         if due {
@@ -276,8 +285,18 @@ impl Shared {
         Ok(Converted { accepted, rejected })
     }
 
-    /// Steps 1 and 2 of the flush protocol, then materialisation.
-    async fn flush_tenant(&self, tenant: TenantId) -> Result<bool, IngestError> {
+    /// The live buffer crossed a flush threshold.
+    fn flush_is_due(&self, live: &TenantBuffer) -> bool {
+        live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes
+    }
+
+    /// Steps 1 and 2 of the flush protocol: cut the live rows under the gate
+    /// and log the intent. Returns the file id and the rows to materialise,
+    /// or `None` when nothing was live.
+    async fn cut_tenant(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Option<(FileId, Vec<RecordBatch>)>, IngestError> {
         let (file_id, intent, batches) = {
             let _exclusive = self.gate.write().await;
             let end = self
@@ -287,11 +306,11 @@ impl Shared {
                 .map_err(|_| fs_wal::WalError::EmptyRecord)?;
             let mut buffers = self.buffers.lock().await;
             let Some(first) = buffers.live_first_wal(tenant) else {
-                return Ok(false);
+                return Ok(None);
             };
             let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
             let Some(batches) = buffers.begin_flush(tenant, file_id) else {
-                return Ok(false);
+                return Ok(None);
             };
             (
                 file_id,
@@ -310,9 +329,7 @@ impl Shared {
             self.buffers.lock().await.abort_flush(tenant, file_id);
             return Err(e);
         }
-        self.materialize(tenant, file_id, batches)
-            .await
-            .map(|()| true)
+        Ok(Some((file_id, batches)))
     }
 
     /// Steps 3 and 4: encode, upload, register, persist, checkpoint. On failure
@@ -496,8 +513,7 @@ impl Shared {
                 let headroom = self.config.max_memory_bytes.saturating_sub(
                     buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total(),
                 );
-                let candidates =
-                    buffers.coalesce_candidates(min, |tenant| self.writer.stable_bound(tenant));
+                let candidates = buffers.coalesce_candidates(min);
                 candidates.into_iter().find_map(|tenant| {
                     let bound = self.writer.stable_bound(tenant);
                     buffers
@@ -574,7 +590,13 @@ impl Shared {
         (snapshot, live_file)
     }
 
-    async fn flush_due(&self, everything: bool) {
+    /// Cuts every due tenant (every tenant with live rows when `everything`)
+    /// and materialises each cut on its own task, at most `max_flushes` at a
+    /// time, so the flusher keeps coalescing while files are written. A
+    /// tenant left without a permit stays due for the next round. With
+    /// `everything` the call returns only once every flush, including those
+    /// started earlier, has finished.
+    async fn flush_due(self: &Arc<Self>, everything: bool) {
         let now = Instant::now();
         let tenants = {
             let mut buffers = self.buffers.lock().await;
@@ -602,9 +624,35 @@ impl Shared {
         };
         self.retry_flushing(everything).await;
         for tenant in tenants {
-            if let Err(e) = self.flush_tenant(tenant).await {
-                error!(tenant = %tenant.0, error = %e, "flush error");
+            let permit = if everything {
+                Arc::clone(&self.flushes).acquire_owned().await.ok()
+            } else {
+                Arc::clone(&self.flushes).try_acquire_owned().ok()
+            };
+            let Some(permit) = permit else {
+                return;
+            };
+            match self.cut_tenant(tenant).await {
+                Ok(Some((file_id, batches))) => {
+                    let shared = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = shared.materialize(tenant, file_id, batches).await {
+                            error!(tenant = %tenant.0, error = %e, "flush error");
+                        }
+                        drop(permit);
+                        shared.flush_now.notify_one();
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => error!(tenant = %tenant.0, error = %e, "flush error"),
             }
+        }
+        if everything {
+            // Every permit at once: nothing is still being written.
+            let all = flush_permits(self.config.max_flushes);
+            let _drained = Arc::clone(&self.flushes)
+                .acquire_many_owned(u32::try_from(all).unwrap_or(u32::MAX))
+                .await;
         }
     }
 }
@@ -737,6 +785,7 @@ impl Ingester {
         let config_injected = config.inject_register_failures;
         let config_conversions = config.max_conversions;
         let config_coalesces = config.max_coalesces;
+        let config_flushes = config.max_flushes;
         let push_delay_pending = config.inject_push_delay.is_some();
         let wal = Arc::new(StdMutex::new(wal));
         let writer = crate::walwriter::WalWriter::spawn(Arc::clone(&wal), config.group_commit);
@@ -759,6 +808,7 @@ impl Ingester {
             coalesces: Arc::new(tokio::sync::Semaphore::new(
                 config_coalesces.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             )),
+            flushes: Arc::new(tokio::sync::Semaphore::new(flush_permits(config_flushes))),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             catalog,

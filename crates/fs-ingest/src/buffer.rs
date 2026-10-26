@@ -51,6 +51,9 @@ pub struct TenantBuffer {
     /// Coalesces in progress over this buffer's entries, each over its own
     /// run; runs never overlap because a taken entry bounds the next run.
     coalescing: Vec<u64>,
+    /// Entries of kind `Request`, kept counted so the request path and the
+    /// coalescer never walk the entries to know.
+    requests: usize,
     /// Rows across the entries.
     pub rows: usize,
     /// Arrow memory across the entries.
@@ -74,6 +77,7 @@ impl TenantBuffer {
         self.bytes += bytes;
         self.first_wal = Some(self.first_wal.map_or(wal, |f| f.min(wal)));
         self.oldest.get_or_insert(now);
+        self.requests += 1;
         let entry = Entry {
             position: wal,
             bytes,
@@ -104,12 +108,9 @@ impl TenantBuffer {
         self.entries.into_iter().map(|e| e.batch).collect()
     }
 
-    /// Request batches not yet merged into a chunk.
+    /// Request batches not yet merged into a chunk nor taken by a coalesce.
     pub fn request_batches(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| e.kind == Kind::Request)
-            .count()
+        self.requests
     }
 
     /// Puts batches back in front after a failed flush. Every position in
@@ -123,10 +124,12 @@ impl TenantBuffer {
         for entry in &mut earlier.entries {
             if matches!(entry.kind, Kind::Coalescing(_)) {
                 entry.kind = Kind::Request;
+                earlier.requests += 1;
             }
         }
         earlier.entries.append(&mut self.entries);
         self.entries = earlier.entries;
+        self.requests += earlier.requests;
         self.rows += earlier.rows;
         self.bytes += earlier.bytes;
         self.first_wal = match (earlier.first_wal, self.first_wal) {
@@ -136,8 +139,8 @@ impl TenantBuffer {
         self.oldest = earlier.oldest.or(self.oldest);
     }
 
-    /// Request batches below `bound` (all of them when `None`), if at least
-    /// `min`: the first run of adjacent ones, two or more, whose bytes fit
+    /// While at least `min` request batches wait: the first run of two or
+    /// more adjacent ones below `bound` (all of them when `None`) whose bytes fit
     /// both `max_bytes` and `headroom`, marked as taken by coalesce `id` and
     /// returned in position order with their bytes. A batch larger than
     /// `max_bytes` is already as large as a chunk: it becomes one in place, at
@@ -152,16 +155,17 @@ impl TenantBuffer {
         headroom: usize,
         id: u64,
     ) -> Option<(Vec<RecordBatch>, usize)> {
-        let complete = |e: &Entry| e.kind == Kind::Request && bound.is_none_or(|b| e.position < b);
-        if self.entries.iter().filter(|e| complete(e)).count() < min {
+        if self.requests < min {
             return None;
         }
+        let complete = |e: &Entry| e.kind == Kind::Request && bound.is_none_or(|b| e.position < b);
         for entry in self
             .entries
             .iter_mut()
             .filter(|e| complete(e) && e.bytes > max_bytes)
         {
             entry.kind = Kind::Chunk;
+            self.requests -= 1;
         }
         let (start, end, bytes) = self.contiguous_run(complete, max_bytes.min(headroom))?;
         let mut taken = Vec::with_capacity(end - start);
@@ -169,6 +173,7 @@ impl TenantBuffer {
             entry.kind = Kind::Coalescing(id);
             taken.push(entry.batch.clone());
         }
+        self.requests -= taken.len();
         self.coalescing.push(id);
         Some((taken, bytes))
     }
@@ -252,6 +257,7 @@ impl TenantBuffer {
         for entry in &mut self.entries {
             if entry.kind == Kind::Coalescing(id) {
                 entry.kind = Kind::Request;
+                self.requests += 1;
             }
         }
         self.coalescing.retain(|c| *c != id);
@@ -371,24 +377,12 @@ impl Buffers {
         }
     }
 
-    /// Tenants with at least `min` complete request batches below their
-    /// bound, batches already taken by a coalesce not counted. `bound_of`
-    /// gives each tenant's bound.
-    pub fn coalesce_candidates(
-        &self,
-        min: usize,
-        bound_of: impl Fn(TenantId) -> Option<Position>,
-    ) -> Vec<TenantId> {
+    /// Tenants with at least `min` request batches waiting, batches already
+    /// taken by a coalesce not counted.
+    pub fn coalesce_candidates(&self, min: usize) -> Vec<TenantId> {
         self.tenants
             .iter()
-            .filter(|(tenant, b)| {
-                let bound = bound_of(**tenant);
-                b.entries
-                    .iter()
-                    .filter(|e| e.kind == Kind::Request && bound.is_none_or(|x| e.position < x))
-                    .count()
-                    >= min
-            })
+            .filter(|(_, b)| b.requests >= min)
             .map(|(t, _)| *t)
             .collect()
     }
@@ -434,18 +428,37 @@ impl Buffers {
         usize::try_from(self.scratch_total.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
     }
 
-    /// Puts the chunk of coalesce `id` in place of the batches it merged.
-    /// False when the rows were cut for a flush meanwhile: the flush took
-    /// the original batches and the chunk is dropped.
+    /// Puts the chunk of coalesce `id` in place of the batches it merged, in
+    /// the live buffer or in the flushing rows they were cut into. False when
+    /// the rows are gone or no longer contiguous; the chunk is dropped.
     pub fn finish_coalesce(&mut self, tenant: TenantId, id: u64, chunk: RecordBatch) -> bool {
-        self.tenants
-            .get_mut(&tenant)
+        self.coalescing_buffer(tenant, id)
             .is_some_and(|b| b.finish_coalesce(id, chunk))
+    }
+
+    /// The buffer whose entries coalesce `id` took: the live one, or the
+    /// flushing one the rows were cut into meanwhile. A chunk finished after
+    /// the cut still replaces its batches there, so the rows kept for the
+    /// hot window after registration are chunks, not request batches. The
+    /// file itself was prepared from the batches as cut.
+    fn coalescing_buffer(&mut self, tenant: TenantId, id: u64) -> Option<&mut TenantBuffer> {
+        if self
+            .tenants
+            .get(&tenant)
+            .is_some_and(|b| b.coalescing.contains(&id))
+        {
+            return self.tenants.get_mut(&tenant);
+        }
+        self.flushing
+            .get_mut(&tenant)?
+            .iter_mut()
+            .map(|f| &mut f.buffer)
+            .find(|b| b.coalescing.contains(&id))
     }
 
     /// Gives up coalesce `id`: its batches stay as they are.
     pub fn cancel_coalesce(&mut self, tenant: TenantId, id: u64) {
-        if let Some(b) = self.tenants.get_mut(&tenant) {
+        if let Some(b) = self.coalescing_buffer(tenant, id) {
             b.cancel_coalesce(id);
         }
     }
@@ -795,15 +808,8 @@ mod tests {
                 .get_mut(tenant)
                 .push(tagged(2, tag), at(offset), now);
         }
-        assert_eq!(
-            buffers.coalesce_candidates(4, |_| Some(at(35))).len(),
-            0,
-            "only three are complete"
-        );
-        assert_eq!(
-            buffers.coalesce_candidates(3, |_| Some(at(35))),
-            vec![tenant]
-        );
+        assert_eq!(buffers.coalesce_candidates(5).len(), 0, "four are waiting");
+        assert_eq!(buffers.coalesce_candidates(4), vec![tenant]);
         let Taken {
             id,
             batches: taken,
@@ -842,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_result_after_a_cut_is_dropped() {
+    fn coalesce_result_after_a_cut_lands_in_the_flushing_rows() {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
         let file = FileId(uuid::Uuid::from_u128(1));
         let now = Instant::now();
@@ -862,7 +868,14 @@ mod tests {
         );
         let chunk =
             arrow::compute::concat_batches(&taken.first().unwrap().schema(), &taken).unwrap();
-        assert!(!buffers.finish_coalesce(tenant, id, chunk));
+        assert!(
+            buffers.finish_coalesce(tenant, id, chunk),
+            "applied to the flushing rows"
+        );
+        let snapshot = buffers.snapshot(tenant);
+        let (_, kept) = snapshot.flushing.first().unwrap();
+        assert_eq!(kept.len(), 1, "one chunk kept for the hot window");
+        assert_eq!(values(kept), vec![100, 200]);
         buffers.get_mut(tenant).push(tagged(1, 3), at(40), now);
         buffers.get_mut(tenant).push(tagged(1, 4), at(50), now);
         assert_eq!(

@@ -238,6 +238,9 @@ pub struct IngestSection {
     /// Chunks built at the same time. Defaults to half the cores.
     #[serde(default = "fs_ingest::config::default_coalesces")]
     pub max_coalesces: usize,
+    /// Files written at the same time.
+    #[serde(default = "default_max_flushes")]
+    pub max_flushes: usize,
     /// Refuse a tenant's data when its live and flushing rows would exceed this.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
@@ -302,6 +305,7 @@ impl Default for IngestSection {
             coalesce_bytes: default_coalesce_bytes(),
             max_conversions: fs_ingest::config::default_parallelism(),
             max_coalesces: fs_ingest::config::default_coalesces(),
+            max_flushes: default_max_flushes(),
             max_buffer_bytes: default_max_buffer_bytes(),
             max_tenant_bytes: default_max_tenant_bytes(),
             wal_max_bytes: default_wal_max_bytes(),
@@ -372,6 +376,7 @@ impl IngestSection {
             coalesce_bytes: self.coalesce_bytes,
             max_conversions: self.max_conversions,
             max_coalesces: self.max_coalesces,
+            max_flushes: self.max_flushes,
             max_buffer_bytes: self.max_buffer_bytes,
             max_tenant_bytes: self.max_tenant_bytes,
             wal_max_bytes: self.wal_max_bytes,
@@ -417,6 +422,10 @@ fn default_flush_interval() -> u64 {
 
 fn default_coalesce_batches() -> usize {
     512
+}
+
+fn default_max_flushes() -> usize {
+    2
 }
 
 fn default_coalesce_bytes() -> usize {
@@ -719,9 +728,10 @@ impl Config {
         if self.ingest.coalesce_bytes == 0
             || self.ingest.max_conversions == 0
             || self.ingest.max_coalesces == 0
+            || self.ingest.max_flushes == 0
         {
             return invalid(
-                "ingest.coalesce_bytes, ingest.max_conversions and ingest.max_coalesces must be positive",
+                "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces and ingest.max_flushes must be positive",
             );
         }
         if self.ingest.max_buffer_bytes > self.ingest.max_tenant_bytes

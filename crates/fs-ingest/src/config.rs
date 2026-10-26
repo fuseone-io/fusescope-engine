@@ -30,6 +30,9 @@ pub struct IngestConfig {
     pub max_conversions: usize,
     /// Chunks built at the same time on the blocking pool.
     pub max_coalesces: usize,
+    /// Files written at the same time; a flush is cut inline and encoded,
+    /// uploaded and registered on its own task.
+    pub max_flushes: usize,
     /// Refuse new data for a tenant whose live and flushing rows would exceed
     /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
@@ -88,6 +91,7 @@ impl Default for IngestConfig {
             coalesce_bytes: 64 * 1024 * 1024,
             max_conversions: default_parallelism(),
             max_coalesces: default_coalesces(),
+            max_flushes: 2,
             max_buffer_bytes: 512 * 1024 * 1024,
             max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,

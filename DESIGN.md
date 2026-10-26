@@ -156,7 +156,11 @@ which the WAL writer tracks. Chunks preserve the order, cost a few
 milliseconds each outside every lock, and pack live rows into a fraction of
 the memory of the batches they replace. Up to `max_coalesces` chunks are
 built at a time, each over its own run, so one tenant's backlog is merged
-on several cores.
+on several cores. A flush is cut inline but encoded, uploaded and registered
+on its own task, at most `max_flushes` at a time, so the flusher keeps
+coalescing while a file is written; a chunk finished after its rows were
+cut replaces them in the flushing rows, so what the hot window keeps after
+registration is chunks.
 
 ### 2.3 Read path
 
