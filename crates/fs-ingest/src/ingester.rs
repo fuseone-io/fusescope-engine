@@ -351,10 +351,13 @@ impl Shared {
         let started = Instant::now();
         let mut timing = StageTiming::default();
         let result = self
-            .write_and_register(tenant, file_id, batches, held, &mut timing)
+            .write_and_register(tenant, file_id, batches, &mut timing)
             .await;
+        // The lease and the margin trade places under the buffer lock, in
+        // both outcomes, so no admission ever sees the room without the
+        // rows that will take it back.
         match result {
-            Ok((file, created, rows, held)) => {
+            Ok((file, created, rows)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(
                     tenant = %tenant.0,
@@ -365,12 +368,11 @@ impl Shared {
                     created,
                     "flushed l0"
                 );
-                self.buffers
-                    .lock()
-                    .await
-                    .finish_flush(tenant, file_id, rows, Instant::now());
-                // Counted as persisted from here on.
-                drop(held);
+                {
+                    let mut buffers = self.buffers.lock().await;
+                    buffers.finish_flush(tenant, file_id, rows, Instant::now());
+                    drop(held);
+                }
                 if self.config.checkpoint_after_flush {
                     self.checkpoint_wal().await;
                 }
@@ -401,37 +403,26 @@ impl Shared {
                 // later rows join a file whose object may already exist.
                 self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(tenant = %tenant.0, file = %file_id.0, error = %e, rows, "flush failed; will retry with the same id");
-                self.buffers
-                    .lock()
-                    .await
-                    .flush_failed(tenant, file_id, Instant::now());
+                {
+                    let mut buffers = self.buffers.lock().await;
+                    buffers.flush_failed(tenant, file_id, Instant::now());
+                    drop(held);
+                }
                 Err(e)
             }
         }
     }
 
-    /// Encode, upload and register, filling `timing` as it goes. `held` is
-    /// the attempt's scratch lease, kept whole until the object is in the
-    /// bucket and its bytes are gone, then lowered to the rows as written.
-    /// Returns the catalog row, whether this attempt created the object, the
-    /// rows as written and the lease that counts them until they are
-    /// persisted.
+    /// Encode, upload and register, filling `timing` as it goes. The caller
+    /// keeps the attempt's scratch lease whole throughout. Returns the catalog
+    /// row, whether this attempt created the object and the rows as written.
     async fn write_and_register(
         &self,
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
-        mut held: crate::buffer::Scratch,
         timing: &mut StageTiming,
-    ) -> Result<
-        (
-            fs_catalog::NewFile,
-            bool,
-            RecordBatch,
-            crate::buffer::Scratch,
-        ),
-        IngestError,
-    > {
+    ) -> Result<(fs_catalog::NewFile, bool, RecordBatch), IngestError> {
         let root = self.root.clone();
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
@@ -445,14 +436,13 @@ impl Shared {
         let flush::Prepared {
             file, bytes, rows, ..
         } = prepared;
-        // The object is in the bucket: its bytes and the encoder are gone, so
-        // the lease lowers to the rows kept for the hot window.
+        // The object is in the bucket: its bytes go now; the lease waits for
+        // the outcome.
         drop(bytes);
-        held.shrink(rows.get_array_memory_size());
         let register_started = Instant::now();
         self.register(&file).await?;
         timing.register = nanos(register_started.elapsed());
-        Ok((file, created, rows, held))
+        Ok((file, created, rows))
     }
 
     /// Catalog registration, with the test-only failure injection in front.
@@ -461,6 +451,9 @@ impl Shared {
         if remaining > 0 {
             self.inject_register_failures
                 .store(remaining - 1, Ordering::Relaxed);
+            if let Some(delay) = self.config.inject_register_delay {
+                tokio::time::sleep(delay).await;
+            }
             return Err(IngestError::Injected("catalog registration"));
         }
         self.catalog.register_file(file).await?;

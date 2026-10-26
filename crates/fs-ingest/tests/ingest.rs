@@ -1909,3 +1909,82 @@ async fn admitted_rows_can_always_be_flushed() {
     h.stop().await;
     db.finish().await;
 }
+
+/// A flush keeps its full scratch lease until its outcome is known. While
+/// the registration is pending the room is not free, so an admission in that
+/// window is refused; when the registration then fails, the lease and the
+/// margin trade places under the lock and nothing crosses the cap.
+#[tokio::test]
+async fn lease_holds_until_the_attempt_is_decided() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    // One raw 30-span batch with its margin fills most of 128 KiB: a second
+    // one fits only if the pending flush let go of its lease.
+    let config = IngestConfig {
+        max_memory_bytes: 128 * 1024,
+        inject_register_failures: 1,
+        inject_register_delay: Some(Duration::from_secs(3)),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 30), &token))
+        .await
+        .unwrap();
+    let pending = {
+        let ingester = h.ingester.clone();
+        tokio::spawn(async move { ingester.flush_all().await })
+    };
+    let fs = h.ingester.flush_stats();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fs.attempts.load(Ordering::Relaxed) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the flush never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Past the encode and the upload, inside the held registration.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!pending.is_finished());
+    let refused = client
+        .export(authed(request("api", 2, 30), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+    assert!(
+        refused.message().contains("ingester memory full"),
+        "the lease is still held while the attempt is pending: {refused:?}"
+    );
+
+    pending.await.unwrap();
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    // The failed rows wait with their margin; the same request is refused
+    // for the same reason, and admitted once the retry writes them out.
+    let refused = client
+        .export(authed(request("api", 2, 30), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    client
+        .export(authed(request("api", 2, 30), &token))
+        .await
+        .expect("admitted once the rows are persisted");
+    h.stop().await;
+    db.finish().await;
+}

@@ -49,15 +49,14 @@ ignore = [
   { id = "RUSTSEC-2026-0194", reason = "S3 response parsing only; fixed by object_store 0.14 with datafusion 56" },
   { id = "RUSTSEC-2026-0195", reason = "S3 response parsing only; fixed by object_store 0.14 with datafusion 56" },
   # zstd 0.13 / zstd-safe 7 (via arrow-ipc and parquet 59, pinned by datafusion
-  # 55). The engine only compresses with zstd when writing Parquet and
-  # decompresses pages of files it wrote itself, page by page through
-  # parquet's bulk decoder: no reused streaming context (0391), no
-  # `Seekable::decompress` (0398), no legacy frames (0403). Removed by arrow
-  # and parquet depending on zstd 0.14 / zstd-safe 8, which lands with the
-  # datafusion bump. Revisit by 2026-12-31.
-  { id = "RUSTSEC-2026-0391", reason = "no reused streaming decompression context; fixed by parquet on zstd 0.14" },
-  { id = "RUSTSEC-2026-0398", reason = "Seekable API unused; fixed by parquet on zstd-safe 8" },
-  { id = "RUSTSEC-2026-0403", reason = "no legacy zstd frames, only our own Parquet pages; fixed by parquet on zstd-safe 8" },
+  # 55). Parquet and Arrow IPC use the bulk API only, and zstd-safe is built
+  # with `std` alone: no reused streaming context (0391), no `Seekable`
+  # (0398), no `decompress_stream` and no `legacy` feature (0403). Removed by
+  # arrow and parquet depending on zstd 0.14 / zstd-safe 8, which lands with
+  # the datafusion bump. Revisit by 2026-12-31.
+  { id = "RUSTSEC-2026-0391", reason = "bulk API only, no reused streaming context; fixed by parquet on zstd 0.14" },
+  { id = "RUSTSEC-2026-0398", reason = "Seekable feature and API unused; fixed by parquet on zstd-safe 8" },
+  { id = "RUSTSEC-2026-0403", reason = "decompress_stream unused, bulk path unaffected, legacy feature off; fixed by parquet on zstd-safe 8" },
 ]
 
 [bans]
