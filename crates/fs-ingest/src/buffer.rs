@@ -590,22 +590,33 @@ impl Buffers {
         }
     }
 
-    /// Takes one flush whose next attempt is due at `now`, or any idle one
-    /// when `force`, marking it as in progress so no one else takes it until
-    /// it fails or finishes. Callers hold a flush permit before taking, so
-    /// an entry in progress always has an attempt running for it.
-    pub fn take_one_due(
-        &mut self,
-        now: Instant,
-        force: bool,
-    ) -> Option<(TenantId, FileId, Vec<RecordBatch>)> {
-        let (tenant, entry) = self.flushing.iter_mut().find_map(|(tenant, list)| {
-            list.iter_mut()
-                .find(|f| !f.in_progress && (force || f.next_attempt <= now))
-                .map(|f| (*tenant, f))
-        })?;
+    /// Flushes whose next attempt is due at `now`, or every idle one when
+    /// `force`, as `(tenant, file)`. A pass takes them one by one through
+    /// [`Buffers::take_flushing`], each at most once, so a flush that fails
+    /// during the pass waits for its backoff rather than being tried again.
+    pub fn due_flushes(&self, now: Instant, force: bool) -> Vec<(TenantId, FileId)> {
+        self.flushing
+            .iter()
+            .flat_map(|(tenant, list)| {
+                list.iter()
+                    .filter(move |f| !f.in_progress && (force || f.next_attempt <= now))
+                    .map(move |f| (*tenant, f.file))
+            })
+            .collect()
+    }
+
+    /// Marks the flush of `file` as in progress and returns its rows, or
+    /// `None` when it is gone or already being worked on. Callers hold a
+    /// flush permit before taking, so an entry in progress always has an
+    /// attempt running for it.
+    pub fn take_flushing(&mut self, tenant: TenantId, file: FileId) -> Option<Vec<RecordBatch>> {
+        let entry = self
+            .flushing
+            .get_mut(&tenant)?
+            .iter_mut()
+            .find(|f| f.file == file && !f.in_progress)?;
         entry.in_progress = true;
-        Some((tenant, entry.file, entry.buffer.batches()))
+        Some(entry.buffer.batches())
     }
 
     /// Flushes bound by an intent and not being worked on right now.
@@ -1211,9 +1222,12 @@ mod tests {
             chunk_bytes,
             "nothing holds the originals"
         );
-        let (_, _, retried) = buffers.take_one_due(now, true).unwrap();
+        let due = buffers.due_flushes(now, true);
+        assert_eq!(due, vec![(tenant, file)]);
+        let retried = buffers.take_flushing(tenant, file).unwrap();
         assert_eq!(retried.len(), 1, "the retry writes from the chunk");
-        assert!(buffers.take_one_due(now, true).is_none(), "taken once");
+        assert!(buffers.take_flushing(tenant, file).is_none(), "taken once");
+        assert_eq!(buffers.due_flushes(now, true).len(), 0);
     }
 
     #[test]

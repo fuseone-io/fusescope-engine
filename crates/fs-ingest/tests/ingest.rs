@@ -1669,3 +1669,54 @@ async fn retries_beyond_the_permits_are_not_lost() {
     h.stop().await;
     db.finish().await;
 }
+
+/// A forced pass, as `flush_all` runs at shutdown, tries each pending flush
+/// once and returns: a flush that keeps failing waits for its backoff
+/// instead of being retried for as long as the failure lasts.
+#[tokio::test]
+async fn forced_retry_tries_each_pending_flush_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.client()
+        .await
+        .export(authed(request("api", 1, 5), &token))
+        .await
+        .unwrap();
+    let bucket = h.dir.path().join("bucket");
+    std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o555)).unwrap();
+    h.ingester.flush_all().await;
+    let fs = h.ingester.flush_stats();
+    assert_eq!(fs.attempts.load(Ordering::Relaxed), 1);
+
+    tokio::time::timeout(Duration::from_secs(10), h.ingester.flush_all())
+        .await
+        .expect("a forced pass ends while the failure lasts");
+    assert_eq!(
+        fs.attempts.load(Ordering::Relaxed),
+        2,
+        "exactly one forced attempt, then the backoff"
+    );
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
+    assert_eq!(parquet_files(&bucket).len(), 0);
+
+    std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o755)).unwrap();
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&bucket).len(), 1);
+    h.stop().await;
+    db.finish().await;
+}

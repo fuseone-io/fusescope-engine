@@ -443,21 +443,21 @@ impl Shared {
     /// Retries flushes whose earlier attempt failed after the intent, or
     /// resumes those an earlier run left behind. `force` ignores the backoff
     /// and waits for a flush permit instead of stopping when none is free.
-    /// A permit is taken before an entry, one entry per permit, so an entry
-    /// marked in progress always has its attempt running, and retries share
-    /// the permits of new cuts: together they never exceed `max_flushes`.
+    /// The pass works from the entries due when it started and tries each at
+    /// most once, so a flush that fails during a forced pass waits for its
+    /// backoff instead of holding the pass. A permit is taken before an
+    /// entry is marked, so an entry in progress always has its attempt
+    /// running, and retries share the permits of new cuts: together they
+    /// never exceed `max_flushes`.
     async fn retry_flushing(self: &Arc<Self>, force: bool) {
-        loop {
+        let due = self.buffers.lock().await.due_flushes(Instant::now(), force);
+        for (tenant, file) in due {
             let Some(permit) = self.flush_permit(force).await else {
                 return;
             };
-            let taken = self
-                .buffers
-                .lock()
-                .await
-                .take_one_due(Instant::now(), force);
-            let Some((tenant, file, batches)) = taken else {
-                return;
+            let taken = self.buffers.lock().await.take_flushing(tenant, file);
+            let Some(batches) = taken else {
+                continue;
             };
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
