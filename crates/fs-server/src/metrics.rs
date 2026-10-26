@@ -123,6 +123,12 @@ impl Metrics {
                 "Requests refused because buffers or WAL were full",
                 i.over_capacity.load(Ordering::Relaxed),
             );
+            counter(
+                out,
+                "fusescope_hot_scan_batches_skipped_total",
+                "Hot-window batches skipped by their trace set",
+                i.hot_batches_skipped.load(Ordering::Relaxed),
+            );
             histogram(
                 out,
                 "fusescope_hot_scan_seconds",

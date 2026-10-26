@@ -12,13 +12,15 @@
 //! that order, so a flush concatenates a few large batches and live rows
 //! take the memory of a packed batch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use arrow::array::AsArray;
 use arrow::record_batch::RecordBatch;
 use fs_catalog::{FileId, TenantId};
+use fs_schema::spans::col;
 use fs_wal::Position;
 
 /// Why an entry is in the buffer.
@@ -33,14 +35,45 @@ enum Kind {
     Chunk,
 }
 
+/// Trace ids present in a batch, built once when the batch is made, so a
+/// scan for a few traces skips the batches that hold none of them.
+pub type TraceSet = Arc<HashSet<[u8; 16]>>;
+
+/// A batch the hot window serves, with the trace ids it holds when known.
+#[derive(Debug, Clone)]
+pub struct HotBatch {
+    /// The rows.
+    pub batch: RecordBatch,
+    /// Trace ids in `batch`; `None` for a request batch, filtered row by row.
+    pub traces: Option<TraceSet>,
+}
+
+/// Trace ids of a span batch, or `None` when it has no `trace_id` column.
+pub fn trace_set(batch: &RecordBatch) -> Option<TraceSet> {
+    let index = batch.schema().index_of(col::TRACE_ID).ok()?;
+    let ids = batch.column(index).as_fixed_size_binary_opt()?;
+    Some(Arc::new(
+        ids.iter()
+            .flatten()
+            .filter_map(|v| <[u8; 16]>::try_from(v).ok())
+            .collect(),
+    ))
+}
+
+/// Memory a trace set takes, counted with the batch it describes.
+pub fn trace_set_bytes(set: &Option<TraceSet>) -> usize {
+    set.as_ref().map_or(0, |s| s.capacity().saturating_mul(17))
+}
+
 /// One batch and the position of the request it came from; a chunk carries
-/// the position of its earliest request.
+/// the position of its earliest request and the trace ids it holds.
 #[derive(Debug, Clone)]
 struct Entry {
     position: Position,
     bytes: usize,
     kind: Kind,
     batch: RecordBatch,
+    traces: Option<TraceSet>,
 }
 
 /// Pending rows of one tenant.
@@ -83,6 +116,7 @@ impl TenantBuffer {
             bytes,
             kind: Kind::Request,
             batch,
+            traces: None,
         };
         // Arrivals are almost always in order: search from the back.
         let at = self
@@ -106,6 +140,18 @@ impl TenantBuffer {
     /// The batches in position order, consuming the buffer.
     pub fn into_batches(self) -> Vec<RecordBatch> {
         self.entries.into_iter().map(|e| e.batch).collect()
+    }
+
+    /// The batches in position order with their trace sets, for the hot
+    /// window. Shared, not copied.
+    pub fn hot_batches(&self) -> Vec<HotBatch> {
+        self.entries
+            .iter()
+            .map(|e| HotBatch {
+                batch: e.batch.clone(),
+                traces: e.traces.clone(),
+            })
+            .collect()
     }
 
     /// Request batches not yet merged into a chunk nor taken by a coalesce.
@@ -213,7 +259,12 @@ impl TenantBuffer {
     /// a coalesce in progress or the taken entries are no longer contiguous,
     /// which no push can cause but is checked anyway: a chunk out of order
     /// would change the file content.
-    fn finish_coalesce(&mut self, id: u64, chunk: RecordBatch) -> Option<usize> {
+    fn finish_coalesce(
+        &mut self,
+        id: u64,
+        chunk: RecordBatch,
+        traces: Option<TraceSet>,
+    ) -> Option<usize> {
         if !self.coalescing.contains(&id) {
             self.cancel_coalesce(id);
             return None;
@@ -237,7 +288,7 @@ impl TenantBuffer {
             return None;
         };
         let removed: usize = run.iter().map(|e| e.bytes).sum();
-        let bytes = chunk.get_array_memory_size();
+        let bytes = chunk.get_array_memory_size() + trace_set_bytes(&traces);
         self.entries.drain(first..=last);
         self.entries.insert(
             first,
@@ -246,6 +297,7 @@ impl TenantBuffer {
                 bytes,
                 kind: Kind::Chunk,
                 batch: chunk,
+                traces,
             },
         );
         self.bytes = self.bytes - removed + bytes;
@@ -363,8 +415,8 @@ pub struct Taken {
 pub struct Persisted {
     /// Catalog id of the file holding these rows.
     pub file: FileId,
-    /// The rows as written: one sorted batch.
-    pub batches: Vec<RecordBatch>,
+    /// The rows as written: one sorted batch, with its trace ids.
+    pub batches: Vec<HotBatch>,
     /// Arrow memory of `batches`, carried over from the buffer so accounting
     /// never walks the batches again.
     pub bytes: usize,
@@ -376,13 +428,13 @@ pub struct Persisted {
 #[derive(Debug, Default)]
 pub struct Snapshot {
     /// Rows not yet flushed.
-    pub live: Vec<RecordBatch>,
+    pub live: Vec<HotBatch>,
     /// Smallest WAL position of the live rows, which the next flush derives
     /// its file id from; final when the snapshot was taken with no request
     /// between its append and its push.
     pub live_first_wal: Option<Position>,
     /// Rows being flushed, with the id their file will have.
-    pub flushing: Vec<(FileId, Vec<RecordBatch>)>,
+    pub flushing: Vec<(FileId, Vec<HotBatch>)>,
     /// Rows flushed recently and still served; the querier skips these files.
     pub persisted: Vec<Persisted>,
 }
@@ -499,7 +551,13 @@ impl Buffers {
     /// Puts the chunk of coalesce `id` in place of the batches it merged, in
     /// the live buffer or in the flushing rows they were cut into. False when
     /// the rows are gone or no longer contiguous; the chunk is dropped.
-    pub fn finish_coalesce(&mut self, tenant: TenantId, id: u64, chunk: RecordBatch) -> bool {
+    pub fn finish_coalesce(
+        &mut self,
+        tenant: TenantId,
+        id: u64,
+        chunk: RecordBatch,
+        traces: Option<TraceSet>,
+    ) -> bool {
         if self
             .tenants
             .get(&tenant)
@@ -508,7 +566,7 @@ impl Buffers {
             return self
                 .tenants
                 .get_mut(&tenant)
-                .is_some_and(|b| b.finish_coalesce(id, chunk).is_some());
+                .is_some_and(|b| b.finish_coalesce(id, chunk, traces).is_some());
         }
         // Cut meanwhile: the chunk still replaces its batches in the flushing
         // rows, so what the hot window keeps after registration is chunks.
@@ -521,7 +579,7 @@ impl Buffers {
         else {
             return false;
         };
-        match entry.buffer.finish_coalesce(id, chunk) {
+        match entry.buffer.finish_coalesce(id, chunk, traces) {
             Some(removed) => {
                 if entry.in_progress {
                     entry.detached += removed;
@@ -721,20 +779,25 @@ impl Buffers {
         }
     }
 
-    /// The file is registered: `rows`, its content as one sorted batch,
-    /// stays persisted until swept, and the flushing rows are dropped.
+    /// The file is registered: `rows`, its content as one sorted batch with
+    /// its trace ids, stays persisted until swept, and the flushing rows are
+    /// dropped.
     pub fn finish_flush(
         &mut self,
         tenant: TenantId,
         file: FileId,
         rows: RecordBatch,
+        traces: Option<TraceSet>,
         now: Instant,
     ) {
         if self.remove_flushing(tenant, file).is_some() {
             self.persisted.entry(tenant).or_default().push(Persisted {
                 file,
-                bytes: rows.get_array_memory_size(),
-                batches: vec![rows],
+                bytes: rows.get_array_memory_size() + trace_set_bytes(&traces),
+                batches: vec![HotBatch {
+                    batch: rows,
+                    traces,
+                }],
                 at: now,
             });
         }
@@ -772,12 +835,16 @@ impl Buffers {
     pub fn snapshot(&self, tenant: TenantId) -> Snapshot {
         let live = self.tenants.get(&tenant);
         Snapshot {
-            live: live.map(TenantBuffer::batches).unwrap_or_default(),
+            live: live.map(TenantBuffer::hot_batches).unwrap_or_default(),
             live_first_wal: live.filter(|b| !b.is_empty()).and_then(|b| b.first_wal),
             flushing: self
                 .flushing
                 .get(&tenant)
-                .map(|list| list.iter().map(|f| (f.file, f.buffer.batches())).collect())
+                .map(|list| {
+                    list.iter()
+                        .map(|f| (f.file, f.buffer.hot_batches()))
+                        .collect()
+                })
                 .unwrap_or_default(),
             persisted: self.persisted.get(&tenant).cloned().unwrap_or_default(),
         }
@@ -1044,7 +1111,7 @@ mod tests {
         let before = buffers.get_mut(tenant).bytes;
         let chunk =
             arrow::compute::concat_batches(&taken.first().unwrap().schema(), &taken).unwrap();
-        assert!(buffers.finish_coalesce(tenant, id, chunk));
+        assert!(buffers.finish_coalesce(tenant, id, chunk, None));
         let live = buffers.get_mut(tenant);
         assert_eq!(
             values(&live.batches()),
@@ -1081,13 +1148,14 @@ mod tests {
         let chunk =
             arrow::compute::concat_batches(&taken.first().unwrap().schema(), &taken).unwrap();
         assert!(
-            buffers.finish_coalesce(tenant, id, chunk),
+            buffers.finish_coalesce(tenant, id, chunk, None),
             "applied to the flushing rows"
         );
         let snapshot = buffers.snapshot(tenant);
         let (_, kept) = snapshot.flushing.first().unwrap();
         assert_eq!(kept.len(), 1, "one chunk kept for the hot window");
-        assert_eq!(values(kept), vec![100, 200]);
+        let kept: Vec<RecordBatch> = kept.iter().map(|b| b.batch.clone()).collect();
+        assert_eq!(values(&kept), vec![100, 200]);
         buffers.get_mut(tenant).push(tagged(1, 3), at(40), now);
         buffers.get_mut(tenant).push(tagged(1, 4), at(50), now);
         assert_eq!(
@@ -1123,7 +1191,7 @@ mod tests {
             &taken.batches,
         )
         .unwrap();
-        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk, None));
         assert_eq!(
             values(&buffers.get_mut(tenant).batches()),
             vec![100, 101, 200, 201, 300, 301, 400, 401]
@@ -1205,7 +1273,7 @@ mod tests {
             &taken.batches,
         )
         .unwrap();
-        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk, None));
         let live = buffers.get_mut(tenant);
         assert_eq!(
             live.request_batches(),
@@ -1268,7 +1336,7 @@ mod tests {
                 &taken.batches,
             )
             .unwrap();
-            assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+            assert!(buffers.finish_coalesce(tenant, taken.id, chunk, None));
         }
         let live = buffers.get_mut(tenant);
         assert_eq!(
@@ -1310,7 +1378,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            buffers.finish_coalesce(tenant, second.id, chunk),
+            buffers.finish_coalesce(tenant, second.id, chunk, None),
             "the other group is unaffected"
         );
         let again = buffers
@@ -1349,7 +1417,7 @@ mod tests {
             arrow::compute::concat_batches(&originals.first().unwrap().schema(), &taken.batches)
                 .unwrap();
         let chunk_bytes = chunk.get_array_memory_size();
-        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk, None));
         assert_eq!(
             buffers.memory().1,
             chunk_bytes + raw,
@@ -1358,7 +1426,7 @@ mod tests {
         assert_eq!(buffers.bytes_of(tenant), chunk_bytes + raw);
         drop(originals);
         let written = tagged(6, 9);
-        buffers.finish_flush(tenant, file, written.clone(), now);
+        buffers.finish_flush(tenant, file, written.clone(), None, now);
         assert_eq!(
             buffers.memory(),
             (0, 0, written.get_array_memory_size()),
@@ -1387,7 +1455,7 @@ mod tests {
         )
         .unwrap();
         let chunk_bytes = chunk.get_array_memory_size();
-        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk, None));
         assert_eq!(
             buffers.memory().1,
             chunk_bytes,

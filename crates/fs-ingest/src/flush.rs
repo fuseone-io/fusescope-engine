@@ -18,6 +18,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersi
 use parquet::schema::types::ColumnPath;
 
 use crate::IngestError;
+use crate::buffer::{TraceSet, trace_set};
 
 /// Rows per row group. One group per million rows keeps footers small while
 /// statistics still prune well.
@@ -35,6 +36,8 @@ pub struct Prepared {
     /// The rows as written, one sorted batch: what the hot window keeps for
     /// the file after registration.
     pub rows: RecordBatch,
+    /// Trace ids in `rows`, so the hot window skips the batch for other traces.
+    pub traces: Option<TraceSet>,
     /// Time spent concatenating the request batches.
     pub concat: std::time::Duration,
     /// Time spent sorting.
@@ -91,10 +94,12 @@ pub fn prepare(
         services,
         summary: None,
     };
+    let traces = trace_set(&sorted);
     Ok(Prepared {
         file,
         bytes,
         rows: sorted,
+        traces,
         concat,
         sort,
         encode,

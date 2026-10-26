@@ -281,13 +281,33 @@ impl FlightService for HotService {
             .iter()
             .chain(snapshot.flushing.iter().flat_map(|(_, b)| b.iter()))
             .chain(snapshot.persisted.iter().flat_map(|p| p.batches.iter()));
+        // A batch whose trace set holds none of the requested traces is not
+        // even filtered: the chunks and the persisted rows carry their set.
+        let wanted: Option<std::collections::HashSet<[u8; 16]>> =
+            scan.trace_ids.as_ref().map(|ids| {
+                ids.iter()
+                    .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+                    .collect()
+            });
         let mut batches = Vec::new();
-        for batch in sources {
-            let kept = apply(batch, &scan).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let mut skipped = 0u64;
+        for source in sources {
+            if let (Some(wanted), Some(traces)) = (&wanted, &source.traces) {
+                if !wanted.iter().any(|id| traces.contains(id)) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let kept =
+                apply(&source.batch, &scan).map_err(|e| Status::invalid_argument(e.to_string()))?;
             if kept.num_rows() > 0 {
                 batches.push(kept);
             }
         }
+        self.shared
+            .stats
+            .hot_batches_skipped
+            .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
         // Every file id whose rows are (or will be) in this answer. Excluding
         // an id that is not in the catalog yet is harmless and closes the race
         // where it appears while the querier plans.

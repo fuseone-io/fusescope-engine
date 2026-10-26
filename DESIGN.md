@@ -170,7 +170,10 @@ registration is the file's rows as written, one sorted batch, for
 `persisted_retain`: the querier scans the hot window first and lists files
 after, so the retention must cover its file cache TTL plus one hot scan, and
 the server refuses a shorter value. A hot scan carries the trace and span
-ids a query pins, so a lookup ships those rows and no others.
+ids a query pins, so a lookup ships those rows and no others; every chunk
+and every retained file batch carries the set of trace ids it holds, built
+when the batch is made, so a lookup skips the batches that hold none of
+them without reading a row.
 
 ### 2.3 Read path
 

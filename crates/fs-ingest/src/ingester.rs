@@ -65,6 +65,8 @@ pub struct IngestStats {
     pub flushes_recovered: AtomicU64,
     /// Retries of a flush whose earlier attempt failed after the intent.
     pub flush_retries: AtomicU64,
+    /// Hot-window batches a scan for given traces skipped by their trace set.
+    pub hot_batches_skipped: AtomicU64,
     /// Hot-window snapshot latency, gate wait included.
     pub hot_scan: crate::histogram::Histogram,
     /// Checkpoint latency, gate wait and I/O included.
@@ -360,7 +362,7 @@ impl Shared {
         // both outcomes, so no admission ever sees the room without the
         // rows that will take it back.
         match result {
-            Ok((file, created, rows)) => {
+            Ok((file, created, rows, traces)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(
                     tenant = %tenant.0,
@@ -373,7 +375,7 @@ impl Shared {
                 );
                 {
                     let mut buffers = self.buffers.lock().await;
-                    buffers.finish_flush(tenant, file_id, rows, Instant::now());
+                    buffers.finish_flush(tenant, file_id, rows, traces, Instant::now());
                     drop(held);
                 }
                 if self.config.checkpoint_after_flush {
@@ -425,7 +427,15 @@ impl Shared {
         file_id: FileId,
         batches: Vec<RecordBatch>,
         timing: &mut StageTiming,
-    ) -> Result<(fs_catalog::NewFile, bool, RecordBatch), IngestError> {
+    ) -> Result<
+        (
+            fs_catalog::NewFile,
+            bool,
+            RecordBatch,
+            Option<crate::buffer::TraceSet>,
+        ),
+        IngestError,
+    > {
         let root = self.root.clone();
         let prepared =
             tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
@@ -437,7 +447,11 @@ impl Shared {
         let created = flush::upload(self.store.as_ref(), &prepared).await?;
         timing.upload = nanos(upload_started.elapsed());
         let flush::Prepared {
-            file, bytes, rows, ..
+            file,
+            bytes,
+            rows,
+            traces,
+            ..
         } = prepared;
         // The object is in the bucket: its bytes go now; the lease waits for
         // the outcome.
@@ -445,7 +459,7 @@ impl Shared {
         let register_started = Instant::now();
         self.register(&file).await?;
         timing.register = nanos(register_started.elapsed());
-        Ok((file, created, rows))
+        Ok((file, created, rows, traces))
     }
 
     /// Catalog registration, with the test-only failure injection in front.
@@ -637,12 +651,20 @@ impl Shared {
         fs.coalesce_active.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let merged = tokio::task::spawn_blocking(move || {
-            arrow::compute::concat_batches(&fs_schema::spans::span_schema_v1(), &batches)
+            let chunk =
+                arrow::compute::concat_batches(&fs_schema::spans::span_schema_v1(), &batches)?;
+            let traces = crate::buffer::trace_set(&chunk);
+            Ok::<_, arrow::error::ArrowError>((chunk, traces))
         })
         .await;
         match merged {
-            Ok(Ok(chunk)) => {
-                if self.buffers.lock().await.finish_coalesce(tenant, id, chunk) {
+            Ok(Ok((chunk, traces))) => {
+                if self
+                    .buffers
+                    .lock()
+                    .await
+                    .finish_coalesce(tenant, id, chunk, traces)
+                {
                     fs.coalesces.fetch_add(1, Ordering::Relaxed);
                     fs.coalesced_batches
                         .fetch_add(count as u64, Ordering::Relaxed);

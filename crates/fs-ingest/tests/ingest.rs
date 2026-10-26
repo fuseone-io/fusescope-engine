@@ -1987,3 +1987,118 @@ async fn lease_holds_until_the_attempt_is_decided() {
     h.stop().await;
     db.finish().await;
 }
+
+/// Chunks and retained file batches carry their trace ids: a scan for one
+/// trace skips the batches that hold none of it and reads the rest row by
+/// row, with the same rows as a plain filter.
+#[tokio::test]
+async fn hot_scan_skips_batches_without_the_trace() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        coalesce_batches: 2,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    let fs = h.ingester.flush_stats();
+    // Two chunks of two requests each: traces {1, 2} and {3, 4}.
+    for (chunks, traces) in [(1, [1u8, 2]), (2, [3, 4])] {
+        for trace in traces {
+            client
+                .export(authed(request("api", trace, 5), &token))
+                .await
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fs.coalesces.load(Ordering::Relaxed) < chunks {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "chunk {chunks} never built"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let skipped = || {
+        h.ingester
+            .stats()
+            .hot_batches_skipped
+            .load(Ordering::Relaxed)
+    };
+    let lookup = |trace: u8| HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: Some(vec![vec![trace; 16]]),
+        span_ids: None,
+    };
+    let hot = h.hot_addr.to_string();
+
+    let got = scan(&hot, &lookup(3), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        5
+    );
+    assert_eq!(skipped(), 1, "the chunk without trace 3 is not read");
+
+    let got = scan(&hot, &lookup(1), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        5
+    );
+    assert_eq!(skipped(), 2);
+
+    let everything = HotScanRequest {
+        trace_ids: None,
+        ..lookup(0)
+    };
+    let got = scan(&hot, &everything, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        20
+    );
+    assert_eq!(skipped(), 2, "without traces nothing is skipped");
+
+    // After the flush the retained file batch carries all four traces.
+    h.ingester.flush_all().await;
+    let got = scan(&hot, &lookup(9), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0
+    );
+    assert_eq!(skipped(), 3, "the retained batch holds no trace 9");
+    let got = scan(&hot, &lookup(4), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        5
+    );
+    assert_eq!(skipped(), 3);
+    h.stop().await;
+    db.finish().await;
+}
