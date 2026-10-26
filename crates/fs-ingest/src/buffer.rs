@@ -512,8 +512,9 @@ impl Buffers {
     }
 
     /// Takes complete request batches of `tenant` for coalescing, at least
-    /// `min` of them, at most `max_bytes` of Arrow memory and no more than
-    /// `headroom`, the memory left under the cap; see
+    /// `min` of them, at most `max_bytes` of counted memory, Arrow bytes and
+    /// index bound together, and no more than `headroom`, the memory left
+    /// under the cap; see
     /// [`TenantBuffer::take_for_coalesce`]. Their bytes, the bound of their
     /// trace set included, are held as scratch against the global cap until
     /// the result is dropped.

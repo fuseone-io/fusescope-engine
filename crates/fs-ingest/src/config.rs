@@ -22,8 +22,9 @@ pub struct IngestConfig {
     /// Merge a tenant's complete request batches into one chunk once this
     /// many are waiting, so a flush concatenates a few large batches.
     pub coalesce_batches: usize,
-    /// Most Arrow bytes merged into one chunk at a time; bounds the working
-    /// memory of a merge, which counts against `max_memory_bytes`.
+    /// Most counted bytes merged into one chunk at a time, Arrow memory plus
+    /// the bound of each batch's trace set; bounds the working memory of a
+    /// merge, which counts against `max_memory_bytes`.
     pub coalesce_bytes: usize,
     /// Requests converted to Arrow at the same time; bounds the memory of
     /// batches built but not yet admitted, and the CPU the request path uses.

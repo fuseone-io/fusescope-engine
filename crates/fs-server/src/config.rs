@@ -229,7 +229,8 @@ pub struct IngestSection {
     /// many are waiting. At least 2.
     #[serde(default = "default_coalesce_batches")]
     pub coalesce_batches: usize,
-    /// Most Arrow bytes merged into one chunk at a time.
+    /// Most counted bytes merged into one chunk at a time: Arrow memory plus
+    /// the bound of each batch's trace set.
     #[serde(default = "default_coalesce_bytes")]
     pub coalesce_bytes: usize,
     /// Requests converted to Arrow at the same time. Defaults to the cores.
