@@ -1,0 +1,47 @@
+[
+  {
+    "name": "trace by id",
+    "sql": "select * from spans where trace_id = decode('39d4ee0f9bf80eaafbb21399c765e5ec', 'hex')",
+    "rows": 24,
+    "p50_ms": 196.089906,
+    "p95_ms": 384.005345,
+    "max_ms": 428.671442,
+    "error": null
+  },
+  {
+    "name": "span list, 1 service, 15 min, promoted attribute",
+    "sql": "select timestamp, name, duration_nano, http_route from spans where service_name = 'svc-18' and timestamp > now() - interval '15 minutes' and http_method = 'GET' order by timestamp desc limit 100",
+    "rows": 100,
+    "p50_ms": 157.698901,
+    "p95_ms": 200.05028,
+    "max_ms": 202.040522,
+    "error": null
+  },
+  {
+    "name": "p99 latency per service, 24 h",
+    "sql": "select service_name, approx_percentile_cont(duration_nano, 0.99) as p99, count(*) as n from spans where timestamp > now() - interval '24 hours' group by service_name order by n desc",
+    "rows": 20,
+    "p50_ms": 209.391214,
+    "p95_ms": 309.198794,
+    "max_ms": 351.008061,
+    "error": null
+  },
+  {
+    "name": "dashboard: rate and errors per service, last 5 min",
+    "sql": "select service_name, count(*) as n, sum(case when has_error then 1 else 0 end) as errors from spans where timestamp > now() - interval '5 minutes' group by service_name",
+    "rows": 20,
+    "p50_ms": 135.668467,
+    "p95_ms": 170.228545,
+    "max_ms": 197.99992799999998,
+    "error": null
+  },
+  {
+    "name": "top operations by p95, 1 h",
+    "sql": "select service_name, name, approx_percentile_cont(duration_nano, 0.95) as p95 from spans where timestamp > now() - interval '1 hour' group by service_name, name order by p95 desc limit 20",
+    "rows": 20,
+    "p50_ms": 226.128514,
+    "p95_ms": 370.732281,
+    "max_ms": 428.407592,
+    "error": null
+  }
+]
