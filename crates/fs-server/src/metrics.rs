@@ -299,6 +299,18 @@ impl Metrics {
             "Working memory held by chunks being built",
             ns(&f.scratch_bytes),
         );
+        gauge(
+            out,
+            "fusescope_coalesce_active",
+            "Chunks being built right now",
+            ns(&f.coalesce_active),
+        );
+        histogram(
+            out,
+            "fusescope_coalesce_seconds",
+            "Time to build one chunk",
+            &f.coalesce_time,
+        );
     }
 
     fn render_query(&self, out: &mut String) {

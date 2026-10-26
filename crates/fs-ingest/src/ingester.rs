@@ -109,6 +109,10 @@ pub struct FlushStats {
     pub coalesce_nanos: AtomicU64,
     /// Working memory held by chunks being built; the buffers' own counter.
     pub scratch_bytes: Arc<AtomicU64>,
+    /// Chunks being built right now.
+    pub coalesce_active: AtomicU64,
+    /// Time to build one chunk.
+    pub coalesce_time: crate::histogram::Histogram,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
@@ -148,6 +152,7 @@ pub struct Shared {
     flush_now: Notify,
     coalesce_now: Notify,
     conversions: tokio::sync::Semaphore,
+    coalesces: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
@@ -468,16 +473,22 @@ impl Shared {
         self.stats.checkpoint.observe(started.elapsed());
     }
 
-    /// Merges each tenant's complete request batches into one chunk, one
-    /// tenant at a time, until no tenant has enough. Only batches below the
-    /// writer's stable bound are merged: nothing with a lower position is
-    /// still on its way to a buffer, so the chunk keeps the rows in log
-    /// order, the order replay produces. The concat runs outside the lock;
-    /// the batches stay served and counted meanwhile.
-    async fn coalesce_due(&self) {
+    /// Merges complete request batches into chunks, as many groups at a time
+    /// as `max_coalesces` allows, each on the blocking pool. A group is a
+    /// run of adjacent batches of one tenant below the writer's stable bound
+    /// for that tenant: nothing with a lower position is still on its way to
+    /// a buffer, so the chunk keeps the rows in log order, the order replay
+    /// produces. Its inputs are reserved inside the memory cap before the
+    /// merge starts and stay served meanwhile. Returns once every permit is
+    /// in use or no group is left; a finishing task brings the flusher back
+    /// for more.
+    async fn coalesce_due(self: &Arc<Self>) {
         let min = self.config.coalesce_batches;
         let max_bytes = self.config.coalesce_bytes;
         loop {
+            let Ok(permit) = Arc::clone(&self.coalesces).try_acquire_owned() else {
+                return;
+            };
             let taken = {
                 let mut buffers = self.buffers.lock().await;
                 // The merge's inputs are reserved inside the cap, never on top
@@ -497,39 +508,53 @@ impl Shared {
             let Some((tenant, taken)) = taken else {
                 return;
             };
-            let crate::buffer::Taken {
-                id,
-                batches,
-                scratch,
-            } = taken;
-            let count = batches.len();
-            let started = Instant::now();
-            let merged = tokio::task::spawn_blocking(move || {
-                arrow::compute::concat_batches(&fs_schema::spans::span_schema_v1(), &batches)
-            })
-            .await;
-            match merged {
-                Ok(Ok(chunk)) => {
-                    if self.buffers.lock().await.finish_coalesce(tenant, id, chunk) {
-                        let fs = &self.flush_stats;
-                        fs.coalesces.fetch_add(1, Ordering::Relaxed);
-                        fs.coalesced_batches
-                            .fetch_add(count as u64, Ordering::Relaxed);
-                        fs.coalesce_nanos
-                            .fetch_add(nanos(started.elapsed()), Ordering::Relaxed);
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!(tenant = %tenant.0, error = %e, "coalesce failed; batches stay as they are");
-                    self.buffers.lock().await.cancel_coalesce(tenant, id);
-                }
-                Err(e) => {
-                    warn!(tenant = %tenant.0, error = %e, "coalesce task failed; batches stay as they are");
-                    self.buffers.lock().await.cancel_coalesce(tenant, id);
+            let shared = Arc::clone(self);
+            tokio::spawn(async move {
+                shared.coalesce_group(tenant, taken).await;
+                drop(permit);
+                shared.coalesce_now.notify_one();
+            });
+        }
+    }
+
+    /// Builds the chunk of one group and puts it in place. On any failure
+    /// the batches stay as they are.
+    async fn coalesce_group(&self, tenant: TenantId, taken: crate::buffer::Taken) {
+        let crate::buffer::Taken {
+            id,
+            batches,
+            scratch,
+        } = taken;
+        let count = batches.len();
+        let fs = &self.flush_stats;
+        fs.coalesce_active.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let merged = tokio::task::spawn_blocking(move || {
+            arrow::compute::concat_batches(&fs_schema::spans::span_schema_v1(), &batches)
+        })
+        .await;
+        match merged {
+            Ok(Ok(chunk)) => {
+                if self.buffers.lock().await.finish_coalesce(tenant, id, chunk) {
+                    fs.coalesces.fetch_add(1, Ordering::Relaxed);
+                    fs.coalesced_batches
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    fs.coalesce_nanos
+                        .fetch_add(nanos(started.elapsed()), Ordering::Relaxed);
+                    fs.coalesce_time.observe(started.elapsed());
                 }
             }
-            drop(scratch);
+            Ok(Err(e)) => {
+                warn!(tenant = %tenant.0, error = %e, "coalesce failed; batches stay as they are");
+                self.buffers.lock().await.cancel_coalesce(tenant, id);
+            }
+            Err(e) => {
+                warn!(tenant = %tenant.0, error = %e, "coalesce task failed; batches stay as they are");
+                self.buffers.lock().await.cancel_coalesce(tenant, id);
+            }
         }
+        fs.coalesce_active.fetch_sub(1, Ordering::Relaxed);
+        drop(scratch);
     }
 
     /// Rows of `tenant` in every state, plus the id the live rows will get.
@@ -711,6 +736,7 @@ impl Ingester {
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
         let config_conversions = config.max_conversions;
+        let config_coalesces = config.max_coalesces;
         let push_delay_pending = config.inject_push_delay.is_some();
         let wal = Arc::new(StdMutex::new(wal));
         let writer = crate::walwriter::WalWriter::spawn(Arc::clone(&wal), config.group_commit);
@@ -730,6 +756,9 @@ impl Ingester {
             conversions: tokio::sync::Semaphore::new(
                 config_conversions.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             ),
+            coalesces: Arc::new(tokio::sync::Semaphore::new(
+                config_coalesces.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+            )),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             catalog,

@@ -48,8 +48,9 @@ struct Entry {
 pub struct TenantBuffer {
     /// Sorted by position.
     entries: Vec<Entry>,
-    /// Coalesce in progress over this buffer's entries.
-    coalesce: Option<u64>,
+    /// Coalesces in progress over this buffer's entries, each over its own
+    /// run; runs never overlap because a taken entry bounds the next run.
+    coalescing: Vec<u64>,
     /// Rows across the entries.
     pub rows: usize,
     /// Arrow memory across the entries.
@@ -140,9 +141,9 @@ impl TenantBuffer {
     /// both `max_bytes` and `headroom`, marked as taken by coalesce `id` and
     /// returned in position order with their bytes. A batch larger than
     /// `max_bytes` is already as large as a chunk: it becomes one in place, at
-    /// no cost and whatever the headroom, and runs are selected around it.
-    /// `None`, with nothing else changed, while another coalesce is in
-    /// progress or when no two adjacent batches fit.
+    /// no cost and whatever the headroom, and runs are selected around it
+    /// and around the runs of coalesces already in progress. `None`, with
+    /// nothing else changed, when no two adjacent batches fit.
     fn take_for_coalesce(
         &mut self,
         bound: Option<Position>,
@@ -151,9 +152,6 @@ impl TenantBuffer {
         headroom: usize,
         id: u64,
     ) -> Option<(Vec<RecordBatch>, usize)> {
-        if self.coalesce.is_some() {
-            return None;
-        }
         let complete = |e: &Entry| e.kind == Kind::Request && bound.is_none_or(|b| e.position < b);
         if self.entries.iter().filter(|e| complete(e)).count() < min {
             return None;
@@ -171,7 +169,7 @@ impl TenantBuffer {
             entry.kind = Kind::Coalescing(id);
             taken.push(entry.batch.clone());
         }
-        self.coalesce = Some(id);
+        self.coalescing.push(id);
         Some((taken, bytes))
     }
 
@@ -210,13 +208,13 @@ impl TenantBuffer {
     /// longer contiguous, which no push can cause but is checked anyway: a
     /// chunk out of order would change the file content.
     fn finish_coalesce(&mut self, id: u64, chunk: RecordBatch) -> bool {
-        if self.coalesce != Some(id) {
+        if !self.coalescing.contains(&id) {
             self.cancel_coalesce(id);
             return false;
         }
         let taken = |e: &Entry| e.kind == Kind::Coalescing(id);
         let Some(first) = self.entries.iter().position(taken) else {
-            self.coalesce = None;
+            self.coalescing.retain(|c| *c != id);
             return false;
         };
         let last = self.entries.iter().rposition(taken).unwrap_or(first);
@@ -245,7 +243,7 @@ impl TenantBuffer {
             },
         );
         self.bytes = self.bytes - removed + bytes;
-        self.coalesce = None;
+        self.coalescing.retain(|c| *c != id);
         true
     }
 
@@ -256,9 +254,7 @@ impl TenantBuffer {
                 entry.kind = Kind::Request;
             }
         }
-        if self.coalesce == Some(id) {
-            self.coalesce = None;
-        }
+        self.coalescing.retain(|c| *c != id);
     }
 }
 
@@ -376,7 +372,8 @@ impl Buffers {
     }
 
     /// Tenants with at least `min` complete request batches below their
-    /// bound and no coalesce in progress. `bound_of` gives each tenant's bound.
+    /// bound, batches already taken by a coalesce not counted. `bound_of`
+    /// gives each tenant's bound.
     pub fn coalesce_candidates(
         &self,
         min: usize,
@@ -386,12 +383,11 @@ impl Buffers {
             .iter()
             .filter(|(tenant, b)| {
                 let bound = bound_of(**tenant);
-                b.coalesce.is_none()
-                    && b.entries
-                        .iter()
-                        .filter(|e| e.kind == Kind::Request && bound.is_none_or(|x| e.position < x))
-                        .count()
-                        >= min
+                b.entries
+                    .iter()
+                    .filter(|e| e.kind == Kind::Request && bound.is_none_or(|x| e.position < x))
+                    .count()
+                    >= min
             })
             .map(|(t, _)| *t)
             .collect()
@@ -821,7 +817,7 @@ mod tests {
             buffers
                 .take_for_coalesce(tenant, None, 1, usize::MAX, usize::MAX)
                 .is_none(),
-            "one at a time"
+            "the one batch left is no run"
         );
         drop(scratch);
         assert_eq!(buffers.scratch_total(), 0);
@@ -1004,6 +1000,106 @@ mod tests {
         assert_eq!(order.get(1), Some(&200));
         assert_eq!(order.last(), Some(&400));
         assert_eq!(order.len(), 203);
+    }
+
+    #[test]
+    fn parallel_groups_are_disjoint_and_land_in_order() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6)] {
+            buffers
+                .get_mut(tenant)
+                .push(tagged(2, tag), at(offset), now);
+        }
+        let one = buffers.get_mut(tenant).entries.first().unwrap().bytes;
+        let first = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
+        let second = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
+        let third = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
+        assert_eq!(values(&first.batches), vec![100, 101, 200, 201]);
+        assert_eq!(
+            values(&second.batches),
+            vec![300, 301, 400, 401],
+            "starts after the taken run"
+        );
+        assert_eq!(values(&third.batches), vec![500, 501, 600, 601]);
+        assert!(
+            buffers
+                .take_for_coalesce(tenant, None, 1, one * 2, usize::MAX)
+                .is_none(),
+            "nothing left"
+        );
+        assert_eq!(buffers.scratch_total(), 3 * 2 * one);
+        // Results arrive in any order; each chunk lands at its own run.
+        for taken in [second, third, first] {
+            let chunk = arrow::compute::concat_batches(
+                &taken.batches.first().unwrap().schema(),
+                &taken.batches,
+            )
+            .unwrap();
+            assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        }
+        let live = buffers.get_mut(tenant);
+        assert_eq!(
+            values(&live.batches()),
+            vec![100, 101, 200, 201, 300, 301, 400, 401, 500, 501, 600, 601]
+        );
+        assert_eq!(live.entries.len(), 3);
+        assert_eq!(live.request_batches(), 0);
+        assert_eq!(buffers.scratch_total(), 0);
+    }
+
+    #[test]
+    fn cancelled_group_returns_its_batches_while_another_continues() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4)] {
+            buffers
+                .get_mut(tenant)
+                .push(tagged(2, tag), at(offset), now);
+        }
+        let one = buffers.get_mut(tenant).entries.first().unwrap().bytes;
+        let first = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
+        let second = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
+        buffers.cancel_coalesce(tenant, first.id);
+        drop(first);
+        assert_eq!(
+            buffers.get_mut(tenant).request_batches(),
+            2,
+            "the cancelled run is requests again"
+        );
+        let chunk = arrow::compute::concat_batches(
+            &second.batches.first().unwrap().schema(),
+            &second.batches,
+        )
+        .unwrap();
+        assert!(
+            buffers.finish_coalesce(tenant, second.id, chunk),
+            "the other group is unaffected"
+        );
+        let again = buffers
+            .take_for_coalesce(tenant, None, 2, one * 2, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            values(&again.batches),
+            vec![100, 101, 200, 201],
+            "the cancelled run can be taken again"
+        );
+        assert_eq!(
+            values(&buffers.get_mut(tenant).batches()),
+            vec![100, 101, 200, 201, 300, 301, 400, 401]
+        );
     }
 
     #[test]

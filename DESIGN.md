@@ -154,7 +154,9 @@ into chunks in the background: a run is complete when every position in it
 is below the smallest position still travelling from the log to a buffer,
 which the WAL writer tracks. Chunks preserve the order, cost a few
 milliseconds each outside every lock, and pack live rows into a fraction of
-the memory of the batches they replace.
+the memory of the batches they replace. Up to `max_coalesces` chunks are
+built at a time, each over its own run, so one tenant's backlog is merged
+on several cores.
 
 ### 2.3 Read path
 

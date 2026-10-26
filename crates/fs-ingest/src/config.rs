@@ -28,6 +28,8 @@ pub struct IngestConfig {
     /// Requests converted to Arrow at the same time; bounds the memory of
     /// batches built but not yet admitted, and the CPU the request path uses.
     pub max_conversions: usize,
+    /// Chunks built at the same time on the blocking pool.
+    pub max_coalesces: usize,
     /// Refuse new data for a tenant whose live and flushing rows would exceed
     /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
@@ -85,6 +87,7 @@ impl Default for IngestConfig {
             coalesce_batches: 512,
             coalesce_bytes: 64 * 1024 * 1024,
             max_conversions: default_parallelism(),
+            max_coalesces: default_coalesces(),
             max_buffer_bytes: 512 * 1024 * 1024,
             max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -106,4 +109,9 @@ impl Default for IngestConfig {
 /// Available cores, or 4 when the runtime cannot tell.
 pub fn default_parallelism() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
+}
+
+/// Half the cores, at least one: merges share the machine with the request path.
+pub fn default_coalesces() -> usize {
+    (default_parallelism() / 2).max(1)
 }

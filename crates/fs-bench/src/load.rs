@@ -61,6 +61,10 @@ pub struct FlushReport {
     pub batches_per_coalesce: f64,
     /// Milliseconds per chunk.
     pub coalesce_ms: f64,
+    /// p95 of the time to build one chunk, milliseconds.
+    pub coalesce_p95_ms: f64,
+    /// Chunks being built at the end of the run.
+    pub coalesce_active: u64,
     /// Hot-window snapshots during the run.
     pub hot_scans: u64,
     /// p95 of the hot-window snapshot latency, milliseconds.
@@ -239,10 +243,12 @@ pub fn print(report: &LoadReport) {
             f.buffer_bytes.2 >> 20
         );
         println!(
-            "coalesces={} batches/coalesce={:.0} {:.1}ms each | hot scans={} p95<={:.0}ms | checkpoints={} p95<={:.0}ms",
+            "coalesces={} batches/coalesce={:.0} {:.1}ms each p95<={:.0}ms active at end={} | hot scans={} p95<={:.0}ms | checkpoints={} p95<={:.0}ms",
             f.coalesces,
             f.batches_per_coalesce,
             f.coalesce_ms,
+            f.coalesce_p95_ms,
+            f.coalesce_active,
             f.hot_scans,
             f.hot_scan_p95_ms,
             f.checkpoints,
@@ -316,6 +322,8 @@ fn flush_report(
         coalesces: coalesces as u64,
         batches_per_coalesce: per_coalesce("fusescope_coalesce_batches_total"),
         coalesce_ms: per_coalesce("fusescope_coalesce_nanoseconds_total") / 1e6,
+        coalesce_p95_ms: p95_ms(before, after, "fusescope_coalesce_seconds"),
+        coalesce_active: gauge("fusescope_coalesce_active"),
         hot_scans: delta("fusescope_hot_scan_seconds_count").max(0.0) as u64,
         hot_scan_p95_ms: p95_ms(before, after, "fusescope_hot_scan_seconds"),
         checkpoints: delta("fusescope_checkpoint_seconds_count").max(0.0) as u64,
