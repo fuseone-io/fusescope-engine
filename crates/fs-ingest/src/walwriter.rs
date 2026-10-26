@@ -353,7 +353,16 @@ mod tests {
             "budget returned"
         );
         writer.append(tenant(1), vec![0u8; 10]).await.unwrap();
-        assert_eq!(writer.inflight_bytes(), 0);
+        // The lease is returned when the writer drops the record, which may
+        // be a moment after the reply is received.
+        let returned = async {
+            while writer.inflight_bytes() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), returned)
+            .await
+            .expect("budget returned once the writer dropped the record");
     }
 
     #[tokio::test]
