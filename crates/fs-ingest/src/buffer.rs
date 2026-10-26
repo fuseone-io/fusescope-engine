@@ -208,24 +208,25 @@ impl TenantBuffer {
     }
 
     /// Replaces the entries taken by coalesce `id` with `chunk`, at the
-    /// position of the earliest. False, with the entries back as requests,
-    /// when `id` is not the coalesce in progress or the taken entries are no
-    /// longer contiguous, which no push can cause but is checked anyway: a
-    /// chunk out of order would change the file content.
-    fn finish_coalesce(&mut self, id: u64, chunk: RecordBatch) -> bool {
+    /// position of the earliest, and returns the bytes of the entries it
+    /// replaced. `None`, with the entries back as requests, when `id` is not
+    /// a coalesce in progress or the taken entries are no longer contiguous,
+    /// which no push can cause but is checked anyway: a chunk out of order
+    /// would change the file content.
+    fn finish_coalesce(&mut self, id: u64, chunk: RecordBatch) -> Option<usize> {
         if !self.coalescing.contains(&id) {
             self.cancel_coalesce(id);
-            return false;
+            return None;
         }
         let taken = |e: &Entry| e.kind == Kind::Coalescing(id);
         let Some(first) = self.entries.iter().position(taken) else {
             self.coalescing.retain(|c| *c != id);
-            return false;
+            return None;
         };
         let last = self.entries.iter().rposition(taken).unwrap_or(first);
         let Some(run) = self.entries.get(first..=last) else {
             self.cancel_coalesce(id);
-            return false;
+            return None;
         };
         let (Some(position), true) = (
             run.first().map(|e| e.position),
@@ -233,7 +234,7 @@ impl TenantBuffer {
                 && run.iter().map(|e| e.batch.num_rows()).sum::<usize>() == chunk.num_rows(),
         ) else {
             self.cancel_coalesce(id);
-            return false;
+            return None;
         };
         let removed: usize = run.iter().map(|e| e.bytes).sum();
         let bytes = chunk.get_array_memory_size();
@@ -249,7 +250,7 @@ impl TenantBuffer {
         );
         self.bytes = self.bytes - removed + bytes;
         self.coalescing.retain(|c| *c != id);
-        true
+        Some(removed)
     }
 
     /// Returns the entries taken by coalesce `id` to plain requests.
@@ -279,6 +280,18 @@ pub struct Flushing {
     pub next_attempt: Instant,
     /// An attempt is running right now; the flusher tick must not start another.
     pub in_progress: bool,
+    /// Bytes of request batches a chunk replaced in `buffer` while the running
+    /// attempt still holds the originals it was handed at the cut. Counted
+    /// as held until the attempt ends, when it drops them.
+    pub detached: usize,
+}
+
+impl Flushing {
+    /// Bytes held for this flush: its rows, plus originals a running attempt
+    /// still holds after a chunk replaced them.
+    pub fn bytes(&self) -> usize {
+        self.buffer.bytes + self.detached
+    }
 }
 
 /// Longest wait between retries of a failed flush.
@@ -432,15 +445,40 @@ impl Buffers {
     /// the live buffer or in the flushing rows they were cut into. False when
     /// the rows are gone or no longer contiguous; the chunk is dropped.
     pub fn finish_coalesce(&mut self, tenant: TenantId, id: u64, chunk: RecordBatch) -> bool {
-        self.coalescing_buffer(tenant, id)
-            .is_some_and(|b| b.finish_coalesce(id, chunk))
+        if self
+            .tenants
+            .get(&tenant)
+            .is_some_and(|b| b.coalescing.contains(&id))
+        {
+            return self
+                .tenants
+                .get_mut(&tenant)
+                .is_some_and(|b| b.finish_coalesce(id, chunk).is_some());
+        }
+        // Cut meanwhile: the chunk still replaces its batches in the flushing
+        // rows, so what the hot window keeps after registration is chunks.
+        // The running attempt was handed the originals at the cut and holds
+        // them until it ends, so their bytes stay counted as detached.
+        let Some(entry) = self
+            .flushing
+            .get_mut(&tenant)
+            .and_then(|l| l.iter_mut().find(|f| f.buffer.coalescing.contains(&id)))
+        else {
+            return false;
+        };
+        match entry.buffer.finish_coalesce(id, chunk) {
+            Some(removed) => {
+                if entry.in_progress {
+                    entry.detached += removed;
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// The buffer whose entries coalesce `id` took: the live one, or the
-    /// flushing one the rows were cut into meanwhile. A chunk finished after
-    /// the cut still replaces its batches there, so the rows kept for the
-    /// hot window after registration are chunks, not request batches. The
-    /// file itself was prepared from the batches as cut.
+    /// flushing one the rows were cut into meanwhile.
     fn coalescing_buffer(&mut self, tenant: TenantId, id: u64) -> Option<&mut TenantBuffer> {
         if self
             .tenants
@@ -474,7 +512,7 @@ impl Buffers {
             + self
                 .flushing
                 .get(&tenant)
-                .map_or(0, |f| f.iter().map(|x| x.buffer.bytes).sum())
+                .map_or(0, |f| f.iter().map(Flushing::bytes).sum())
     }
 
     /// Bytes held for `tenant` in every state, persisted included.
@@ -532,6 +570,7 @@ impl Buffers {
             attempts: 0,
             next_attempt: Instant::now(),
             in_progress: true,
+            detached: 0,
         });
         Some(batches)
     }
@@ -546,6 +585,7 @@ impl Buffers {
                 attempts: 0,
                 next_attempt: Instant::now(),
                 in_progress: false,
+                detached: 0,
             });
         }
     }
@@ -571,6 +611,18 @@ impl Buffers {
         out
     }
 
+    /// Gives an entry taken by [`Buffers::take_due`] back to waiting, with
+    /// its attempt count and backoff untouched: no attempt ran.
+    pub fn release_flushing(&mut self, tenant: TenantId, file: FileId) {
+        if let Some(entry) = self
+            .flushing
+            .get_mut(&tenant)
+            .and_then(|l| l.iter_mut().find(|f| f.file == file))
+        {
+            entry.in_progress = false;
+        }
+    }
+
     /// Flushes bound by an intent and not being worked on right now.
     pub fn idle_flushing(&self) -> usize {
         self.flushing
@@ -591,6 +643,7 @@ impl Buffers {
             let backoff = Duration::from_secs(1u64 << entry.attempts.min(6)).min(MAX_RETRY_BACKOFF);
             entry.next_attempt = now + backoff;
             entry.in_progress = false;
+            entry.detached = 0;
         }
     }
 
@@ -689,12 +742,7 @@ impl Buffers {
     /// Sums per-entry counters; it never walks batches.
     pub fn memory(&self) -> (usize, usize, usize) {
         let live = self.tenants.values().map(|b| b.bytes).sum();
-        let flushing = self
-            .flushing
-            .values()
-            .flatten()
-            .map(|f| f.buffer.bytes)
-            .sum();
+        let flushing = self.flushing.values().flatten().map(Flushing::bytes).sum();
         let persisted = self.persisted.values().flatten().map(|p| p.bytes).sum();
         (live, flushing, persisted)
     }
@@ -1112,6 +1160,78 @@ mod tests {
         assert_eq!(
             values(&buffers.get_mut(tenant).batches()),
             vec![100, 101, 200, 201, 300, 301, 400, 401]
+        );
+    }
+
+    #[test]
+    fn replaced_batches_stay_counted_while_an_attempt_holds_them() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let file = FileId(uuid::Uuid::from_u128(1));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        buffers.get_mut(tenant).push(tagged(3, 1), at(10), now);
+        buffers.get_mut(tenant).push(tagged(3, 2), at(20), now);
+        let taken = buffers
+            .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
+            .unwrap();
+        let originals = buffers.begin_flush(tenant, file).unwrap();
+        let raw: usize = originals
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        assert_eq!(buffers.memory().1, raw);
+        let chunk =
+            arrow::compute::concat_batches(&originals.first().unwrap().schema(), &taken.batches)
+                .unwrap();
+        let chunk_bytes = chunk.get_array_memory_size();
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert_eq!(
+            buffers.memory().1,
+            chunk_bytes + raw,
+            "the attempt still holds the originals: both are counted"
+        );
+        assert_eq!(buffers.bytes_of(tenant), chunk_bytes + raw);
+        drop(originals);
+        buffers.finish_flush(tenant, file, now);
+        assert_eq!(
+            buffers.memory(),
+            (0, 0, chunk_bytes),
+            "persisted keeps the chunk only"
+        );
+    }
+
+    #[test]
+    fn replaced_batches_are_not_counted_when_no_attempt_holds_them() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let file = FileId(uuid::Uuid::from_u128(1));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        buffers.get_mut(tenant).push(tagged(3, 1), at(10), now);
+        buffers.get_mut(tenant).push(tagged(3, 2), at(20), now);
+        let taken = buffers
+            .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
+            .unwrap();
+        let originals = buffers.begin_flush(tenant, file).unwrap();
+        buffers.flush_failed(tenant, file, now);
+        drop(originals);
+        let chunk = arrow::compute::concat_batches(
+            &taken.batches.first().unwrap().schema(),
+            &taken.batches,
+        )
+        .unwrap();
+        let chunk_bytes = chunk.get_array_memory_size();
+        assert!(buffers.finish_coalesce(tenant, taken.id, chunk));
+        assert_eq!(
+            buffers.memory().1,
+            chunk_bytes,
+            "nothing holds the originals"
+        );
+        let retried = buffers.take_due(now, true);
+        assert_eq!(retried.len(), 1);
+        assert_eq!(
+            retried.first().unwrap().2.len(),
+            1,
+            "the retry writes from the chunk"
         );
     }
 

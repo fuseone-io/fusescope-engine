@@ -25,8 +25,10 @@ at the same time.
 
 Coalescer, with queries at 32 senders: 417 chunks of 520 batches, 46 ms
 each, p95 within 100 ms, never more than a few in flight. Hot-window
-snapshot over the session: 402 snapshots, 95% within 2 ms, worst within
-20 ms, no hot scan timed out. Checkpoints p95 within 20 ms.
+snapshot: within the 32-sender window, 15 snapshots with p95 within 20 ms;
+over the whole session (warm-up and both runs, 402 snapshots) 95% within
+2 ms and the worst within 20 ms. No hot scan timed out. Checkpoints p95
+within 20 ms.
 
 Buffers at the end of the 32-sender run with queries: live 69 MiB, flushing
 0, persisted 735 MiB.

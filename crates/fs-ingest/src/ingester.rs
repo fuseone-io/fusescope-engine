@@ -440,16 +440,49 @@ impl Shared {
     }
 
     /// Retries flushes whose earlier attempt failed after the intent, or
-    /// resumes those an earlier run left behind. `force` ignores the backoff.
-    async fn retry_flushing(&self, force: bool) {
+    /// resumes those an earlier run left behind. `force` ignores the backoff
+    /// and waits for a flush permit instead of skipping when none is free.
+    /// Retries share the permits of new cuts: together they never exceed
+    /// `max_flushes` running attempts.
+    async fn retry_flushing(self: &Arc<Self>, force: bool) {
         let pending = self.buffers.lock().await.take_due(Instant::now(), force);
         for (tenant, file, batches) in pending {
+            let Some(permit) = self.flush_permit(force).await else {
+                // No permit: the entry goes back to waiting for the next round.
+                self.buffers.lock().await.release_flushing(tenant, file);
+                return;
+            };
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
-            if let Err(e) = self.materialize(tenant, file, batches).await {
-                warn!(tenant = %tenant.0, file = %file.0, error = %e, "flush retry failed");
-            }
+            self.spawn_materialize(tenant, file, batches, permit);
         }
+    }
+
+    /// A flush permit: awaited when `wait`, otherwise only if one is free.
+    async fn flush_permit(&self, wait: bool) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if wait {
+            Arc::clone(&self.flushes).acquire_owned().await.ok()
+        } else {
+            Arc::clone(&self.flushes).try_acquire_owned().ok()
+        }
+    }
+
+    /// Materialises one cut on its own task, holding `permit` until it ends.
+    fn spawn_materialize(
+        self: &Arc<Self>,
+        tenant: TenantId,
+        file_id: FileId,
+        batches: Vec<RecordBatch>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = shared.materialize(tenant, file_id, batches).await {
+                error!(tenant = %tenant.0, error = %e, "flush error");
+            }
+            drop(permit);
+            shared.flush_now.notify_one();
+        });
     }
 
     /// Records that everything before the earliest still-buffered record is
@@ -624,24 +657,12 @@ impl Shared {
         };
         self.retry_flushing(everything).await;
         for tenant in tenants {
-            let permit = if everything {
-                Arc::clone(&self.flushes).acquire_owned().await.ok()
-            } else {
-                Arc::clone(&self.flushes).try_acquire_owned().ok()
-            };
-            let Some(permit) = permit else {
+            let Some(permit) = self.flush_permit(everything).await else {
                 return;
             };
             match self.cut_tenant(tenant).await {
                 Ok(Some((file_id, batches))) => {
-                    let shared = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = shared.materialize(tenant, file_id, batches).await {
-                            error!(tenant = %tenant.0, error = %e, "flush error");
-                        }
-                        drop(permit);
-                        shared.flush_now.notify_one();
-                    });
+                    self.spawn_materialize(tenant, file_id, batches, permit);
                 }
                 Ok(None) => {}
                 Err(e) => error!(tenant = %tenant.0, error = %e, "flush error"),
