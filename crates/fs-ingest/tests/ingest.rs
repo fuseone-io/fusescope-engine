@@ -1948,17 +1948,16 @@ async fn lease_holds_until_the_attempt_is_decided() {
         let ingester = h.ingester.clone();
         tokio::spawn(async move { ingester.flush_all().await })
     };
+    // Inside the held registration: past the encode and the upload.
     let fs = h.ingester.flush_stats();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fs.attempts.load(Ordering::Relaxed) < 1 {
+    while fs.registrations_held.load(Ordering::SeqCst) < 1 {
         assert!(
             std::time::Instant::now() < deadline,
-            "the flush never started"
+            "the registration was never held"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // Past the encode and the upload, inside the held registration.
-    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!pending.is_finished());
     let refused = client
         .export(authed(request("api", 2, 30), &token))

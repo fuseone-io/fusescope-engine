@@ -113,6 +113,9 @@ pub struct FlushStats {
     pub coalesce_active: AtomicU64,
     /// Time to build one chunk.
     pub coalesce_time: crate::histogram::Histogram,
+    /// Injected registration failures being held by the test delay right
+    /// now, so a test can act inside that window.
+    pub registrations_held: AtomicU64,
 }
 
 /// Permits of the flush semaphore for a configured `max_flushes`.
@@ -447,12 +450,32 @@ impl Shared {
 
     /// Catalog registration, with the test-only failure injection in front.
     async fn register(&self, file: &fs_catalog::NewFile) -> Result<(), IngestError> {
-        let remaining = self.inject_register_failures.load(Ordering::Relaxed);
-        if remaining > 0 {
-            self.inject_register_failures
-                .store(remaining - 1, Ordering::Relaxed);
+        // One injected failure per attempt, exactly as many as configured,
+        // whatever the number of concurrent attempts.
+        let mut remaining = self.inject_register_failures.load(Ordering::SeqCst);
+        let injected = loop {
+            if remaining == 0 {
+                break false;
+            }
+            match self.inject_register_failures.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => remaining = actual,
+            }
+        };
+        if injected {
             if let Some(delay) = self.config.inject_register_delay {
+                self.flush_stats
+                    .registrations_held
+                    .fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
+                self.flush_stats
+                    .registrations_held
+                    .fetch_sub(1, Ordering::SeqCst);
             }
             return Err(IngestError::Injected("catalog registration"));
         }
