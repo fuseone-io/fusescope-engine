@@ -293,7 +293,7 @@ impl FlightService for HotService {
         let mut skipped = 0u64;
         for source in sources {
             if let (Some(wanted), Some(traces)) = (&wanted, &source.traces) {
-                if !wanted.iter().any(|id| traces.contains(id)) {
+                if !wanted.iter().any(|id| traces.binary_search(id).is_ok()) {
                     skipped += 1;
                     continue;
                 }

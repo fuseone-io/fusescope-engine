@@ -12,7 +12,7 @@
 //! that order, so a flush concatenates a few large batches and live rows
 //! take the memory of a packed batch.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -35,9 +35,14 @@ enum Kind {
     Chunk,
 }
 
-/// Trace ids present in a batch, built once when the batch is made, so a
-/// scan for a few traces skips the batches that hold none of them.
-pub type TraceSet = Arc<HashSet<[u8; 16]>>;
+/// Bytes of a trace id.
+pub const TRACE_ID_BYTES: usize = 16;
+
+/// Trace ids present in a batch, sorted and without duplicates, built once
+/// when the batch is made, so a scan for a few traces skips the batches
+/// that hold none of them. A sorted vector has a known size, exactly
+/// [`TRACE_ID_BYTES`] per id, which the leases count.
+pub type TraceSet = Arc<Vec<[u8; TRACE_ID_BYTES]>>;
 
 /// A batch the hot window serves, with the trace ids it holds when known.
 #[derive(Debug, Clone)]
@@ -52,17 +57,26 @@ pub struct HotBatch {
 pub fn trace_set(batch: &RecordBatch) -> Option<TraceSet> {
     let index = batch.schema().index_of(col::TRACE_ID).ok()?;
     let ids = batch.column(index).as_fixed_size_binary_opt()?;
-    Some(Arc::new(
-        ids.iter()
-            .flatten()
-            .filter_map(|v| <[u8; 16]>::try_from(v).ok())
-            .collect(),
-    ))
+    let mut set: Vec<[u8; TRACE_ID_BYTES]> = ids
+        .iter()
+        .flatten()
+        .filter_map(|v| <[u8; TRACE_ID_BYTES]>::try_from(v).ok())
+        .collect();
+    set.sort_unstable();
+    set.dedup();
+    set.shrink_to_fit();
+    Some(Arc::new(set))
 }
 
 /// Memory a trace set takes, counted with the batch it describes.
 pub fn trace_set_bytes(set: &Option<TraceSet>) -> usize {
-    set.as_ref().map_or(0, |s| s.capacity().saturating_mul(17))
+    set.as_ref()
+        .map_or(0, |s| s.len().saturating_mul(TRACE_ID_BYTES))
+}
+
+/// Most memory the trace set of `rows` rows can take: one id per row.
+pub fn trace_set_bound(rows: usize) -> usize {
+    rows.saturating_mul(TRACE_ID_BYTES)
 }
 
 /// One batch and the position of the request it came from; a chunk carries
@@ -186,13 +200,14 @@ impl TenantBuffer {
     }
 
     /// While at least `min` request batches wait: the first run of two or
-    /// more adjacent ones below `bound` (all of them when `None`) whose bytes fit
-    /// both `max_bytes` and `headroom`, marked as taken by coalesce `id` and
-    /// returned in position order with their bytes. A batch larger than
-    /// `max_bytes` is already as large as a chunk: it becomes one in place, at
-    /// no cost and whatever the headroom, and runs are selected around it
-    /// and around the runs of coalesces already in progress. `None`, with
-    /// nothing else changed, when no two adjacent batches fit.
+    /// more adjacent ones below `bound` (all of them when `None`) whose bytes
+    /// fit both `max_bytes` and `headroom`, marked as taken by coalesce `id`
+    /// and returned in position order with their bytes and rows. A batch
+    /// larger than `max_bytes` is already as large as a chunk: it is taken as
+    /// a run of its own whenever its index fits the headroom, merged with
+    /// nothing but given its trace set, and runs are selected around it and
+    /// around the runs of coalesces already in progress. `None`, with nothing
+    /// else changed, when no run fits.
     fn take_for_coalesce(
         &mut self,
         bound: Option<Position>,
@@ -200,28 +215,42 @@ impl TenantBuffer {
         max_bytes: usize,
         headroom: usize,
         id: u64,
-    ) -> Option<(Vec<RecordBatch>, usize)> {
-        if self.requests < min {
-            return None;
-        }
+    ) -> Option<(Vec<RecordBatch>, usize, usize)> {
         let complete = |e: &Entry| e.kind == Kind::Request && bound.is_none_or(|b| e.position < b);
-        for entry in self
-            .entries
-            .iter_mut()
-            .filter(|e| complete(e) && e.bytes > max_bytes)
-        {
-            entry.kind = Kind::Chunk;
-            self.requests -= 1;
-        }
-        let (start, end, bytes) = self.contiguous_run(complete, max_bytes.min(headroom))?;
+        let fits = |bytes: usize, rows: usize| bytes + trace_set_bound(rows) <= headroom;
+        let run = if self.requests >= min {
+            self.contiguous_run(complete, max_bytes.min(headroom))
+        } else {
+            None
+        };
+        // A batch larger than a chunk is a run of its own: nothing to merge,
+        // but it gets its trace set like any chunk.
+        let (start, end) = if let Some((start, end, _)) = run {
+            (start, end)
+        } else {
+            let (i, _) = self.entries.iter().enumerate().find(|(_, e)| {
+                complete(e) && e.bytes > max_bytes && fits(e.bytes, e.batch.num_rows())
+            })?;
+            (i, i + 1)
+        };
         let mut taken = Vec::with_capacity(end - start);
+        let (mut bytes, mut rows) = (0, 0);
         for entry in self.entries.iter_mut().skip(start).take(end - start) {
             entry.kind = Kind::Coalescing(id);
+            bytes += entry.bytes;
+            rows += entry.batch.num_rows();
             taken.push(entry.batch.clone());
         }
         self.requests -= taken.len();
         self.coalescing.push(id);
-        Some((taken, bytes))
+        Some((taken, bytes, rows))
+    }
+
+    /// A request batch larger than `max_bytes` waits to be indexed alone.
+    fn has_oversized(&self, max_bytes: usize) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.kind == Kind::Request && e.bytes > max_bytes)
     }
 
     /// The first run of two or more adjacent entries that `complete` accepts
@@ -462,11 +491,12 @@ impl Buffers {
     }
 
     /// Tenants with at least `min` request batches waiting, batches already
-    /// taken by a coalesce not counted.
-    pub fn coalesce_candidates(&self, min: usize) -> Vec<TenantId> {
+    /// taken by a coalesce not counted, or with a request batch larger than
+    /// `max_bytes` waiting to be indexed alone.
+    pub fn coalesce_candidates(&self, min: usize, max_bytes: usize) -> Vec<TenantId> {
         self.tenants
             .iter()
-            .filter(|(_, b)| b.requests >= min)
+            .filter(|(_, b)| b.requests >= min || b.has_oversized(max_bytes))
             .map(|(t, _)| *t)
             .collect()
     }
@@ -474,8 +504,9 @@ impl Buffers {
     /// Takes complete request batches of `tenant` for coalescing, at least
     /// `min` of them, at most `max_bytes` of Arrow memory and no more than
     /// `headroom`, the memory left under the cap; see
-    /// [`TenantBuffer::take_for_coalesce`]. Their bytes are held as scratch
-    /// against the global cap until the result is dropped.
+    /// [`TenantBuffer::take_for_coalesce`]. Their bytes and the worst case of
+    /// their trace set are held as scratch against the global cap until the
+    /// result is dropped.
     pub fn take_for_coalesce(
         &mut self,
         tenant: TenantId,
@@ -485,15 +516,17 @@ impl Buffers {
         headroom: usize,
     ) -> Option<Taken> {
         let id = self.next_coalesce;
-        let (batches, bytes) = self
+        let (batches, bytes, rows) = self
             .tenants
             .get_mut(&tenant)?
             .take_for_coalesce(bound, min, max_bytes, headroom, id)?;
         self.next_coalesce += 1;
+        // The merged chunk is at most the inputs; its trace set at most one
+        // id per row.
         Some(Taken {
             id,
             batches,
-            scratch: self.hold_scratch(bytes),
+            scratch: self.hold_scratch(bytes + trace_set_bound(rows)),
         })
     }
 
@@ -507,19 +540,29 @@ impl Buffers {
 
     /// Room the flush of every live byte, and of every flushing byte whose
     /// attempt is not running, would need as scratch: [`FLUSH_SCRATCH_FACTOR`]
-    /// copies. Admission and the coalescer keep it free, so rows once
-    /// admitted can always be written out. A running attempt holds its
-    /// copies as a lease instead, so its rows are not counted here too.
+    /// copies plus the worst case of the trace set the file's rows get.
+    /// Admission and the coalescer keep it free, so rows once admitted can
+    /// always be written out. A running attempt holds its copies as a lease
+    /// instead, so its rows are not counted here too.
     pub fn flush_margin(&self) -> usize {
-        let live: usize = self.tenants.values().map(|b| b.bytes).sum();
-        let waiting: usize = self
+        let live = self
+            .tenants
+            .values()
+            .fold((0, 0), |(b, r), buf| (b + buf.bytes, r + buf.rows));
+        let waiting = self
             .flushing
             .values()
             .flatten()
             .filter(|f| !f.in_progress)
-            .map(|f| f.buffer.bytes)
-            .sum();
-        (live + waiting).saturating_mul(FLUSH_SCRATCH_FACTOR)
+            .fold((0, 0), |(b, r), f| (b + f.buffer.bytes, r + f.buffer.rows));
+        (live.0 + waiting.0).saturating_mul(FLUSH_SCRATCH_FACTOR)
+            + trace_set_bound(live.1 + waiting.1)
+    }
+
+    /// Room an admission of `bytes` of rows needs: the rows, the margin
+    /// their flush keeps, and the worst case of their trace set.
+    pub fn admission_cost(bytes: usize, rows: usize) -> usize {
+        bytes.saturating_mul(1 + FLUSH_SCRATCH_FACTOR) + trace_set_bound(rows)
     }
 
     /// Bytes still admissible under `cap` with the flush margin kept, for
@@ -684,7 +727,9 @@ impl Buffers {
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
-        let lease = self.hold_scratch(buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
+        let lease = self.hold_scratch(
+            buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR) + trace_set_bound(buffer.rows),
+        );
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
             buffer,
@@ -743,6 +788,7 @@ impl Buffers {
                 .find(|f| f.file == file && !f.in_progress)?;
             entry.in_progress = true;
             entry.buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR)
+                + trace_set_bound(entry.buffer.rows)
         };
         let lease = self.hold_scratch(lease_bytes);
         let batches = self
@@ -1008,16 +1054,18 @@ mod tests {
             .get_mut(tenant)
             .push(tagged(4, 1), at(10), Instant::now());
         let live = buffers.total_bytes();
-        assert_eq!(buffers.flush_margin(), live * FLUSH_SCRATCH_FACTOR);
-        assert_eq!(buffers.headroom(live * 5), live);
+        let index = trace_set_bound(4);
+        let margin = live * FLUSH_SCRATCH_FACTOR + index;
+        assert_eq!(buffers.flush_margin(), margin);
+        assert_eq!(buffers.headroom(live * 5), live - index);
         assert_eq!(buffers.headroom(live * 4), 0);
         let held = buffers.hold_scratch(1);
-        assert_eq!(buffers.headroom(live * 5), live - 1);
+        assert_eq!(buffers.headroom(live * 5), live - index - 1);
         drop(held);
         let reservation = buffers.reserve(tenant, 2);
         assert_eq!(
             buffers.headroom(live * 5),
-            live - 2 * (1 + FLUSH_SCRATCH_FACTOR),
+            live - index - 2 * (1 + FLUSH_SCRATCH_FACTOR),
             "a reservation keeps its margin too"
         );
         drop(reservation);
@@ -1025,7 +1073,7 @@ mod tests {
         let (_, lease) = buffers.begin_flush(tenant, file).unwrap();
         assert_eq!(
             buffers.scratch_total(),
-            live * FLUSH_SCRATCH_FACTOR,
+            margin,
             "the margin became the lease"
         );
         assert_eq!(
@@ -1035,22 +1083,22 @@ mod tests {
         );
         assert_eq!(
             buffers.headroom(live * 5),
-            live,
-            "the rows cost four copies, not seven"
+            live - index,
+            "the rows cost four copies and one index, not seven"
         );
         drop(lease);
         buffers.flush_failed(tenant, file, Instant::now());
         assert_eq!(buffers.scratch_total(), 0);
         assert_eq!(
             buffers.flush_margin(),
-            live * FLUSH_SCRATCH_FACTOR,
+            margin,
             "waiting rows keep their margin"
         );
-        assert_eq!(buffers.headroom(live * 5), live);
+        assert_eq!(buffers.headroom(live * 5), live - index);
         let (_, lease) = buffers.take_flushing(tenant, file).unwrap();
         assert_eq!(
             buffers.scratch_total(),
-            live * FLUSH_SCRATCH_FACTOR,
+            margin,
             "a retry takes the lease too"
         );
         assert_eq!(buffers.flush_margin(), 0);
@@ -1087,8 +1135,12 @@ mod tests {
                 .get_mut(tenant)
                 .push(tagged(2, tag), at(offset), now);
         }
-        assert_eq!(buffers.coalesce_candidates(5).len(), 0, "four are waiting");
-        assert_eq!(buffers.coalesce_candidates(4), vec![tenant]);
+        assert_eq!(
+            buffers.coalesce_candidates(5, usize::MAX).len(),
+            0,
+            "four are waiting"
+        );
+        assert_eq!(buffers.coalesce_candidates(4, usize::MAX), vec![tenant]);
         let Taken {
             id,
             batches: taken,
@@ -1197,17 +1249,15 @@ mod tests {
             vec![100, 101, 200, 201, 300, 301, 400, 401]
         );
         assert_eq!(buffers.get_mut(tenant).request_batches(), 2);
-        assert!(
-            buffers
-                .take_for_coalesce(tenant, None, 1, 1, usize::MAX)
-                .is_none(),
-            "fewer than two batches fit"
-        );
+        let alone = buffers
+            .take_for_coalesce(tenant, None, 1, 1, usize::MAX)
+            .unwrap();
         assert_eq!(
-            buffers.get_mut(tenant).request_batches(),
-            0,
-            "batches larger than the limit are chunks already"
+            values(&alone.batches),
+            vec![300, 301],
+            "a batch larger than a chunk is taken alone, to be indexed"
         );
+        assert_eq!(buffers.get_mut(tenant).request_batches(), 1);
         assert_eq!(
             values(&buffers.get_mut(tenant).batches()),
             vec![100, 101, 200, 201, 300, 301, 400, 401],
@@ -1274,6 +1324,17 @@ mod tests {
         )
         .unwrap();
         assert!(buffers.finish_coalesce(tenant, taken.id, chunk, None));
+        assert!(
+            buffers.coalesce_candidates(2, small * 3).contains(&tenant),
+            "the large batch waits alone"
+        );
+        let alone = buffers
+            .take_for_coalesce(tenant, None, 2, small * 3, usize::MAX)
+            .unwrap();
+        assert_eq!(alone.batches.len(), 1, "taken alone, merged with nothing");
+        assert_eq!(alone.batches.first().unwrap().num_rows(), 200);
+        let big = alone.batches.first().unwrap().clone();
+        assert!(buffers.finish_coalesce(tenant, alone.id, big, None));
         let live = buffers.get_mut(tenant);
         assert_eq!(
             live.request_batches(),
@@ -1286,7 +1347,7 @@ mod tests {
                 .filter(|e| e.kind == Kind::Chunk)
                 .count(),
             2,
-            "the large batch is a chunk in place"
+            "the large batch is a chunk too"
         );
         let order: Vec<i64> = values(&live.batches());
         assert_eq!(order.first(), Some(&100));
@@ -1328,7 +1389,11 @@ mod tests {
                 .is_none(),
             "nothing left"
         );
-        assert_eq!(buffers.scratch_total(), 3 * 2 * one);
+        assert_eq!(
+            buffers.scratch_total(),
+            3 * (2 * one + trace_set_bound(4)),
+            "inputs plus the worst case of three trace sets"
+        );
         // Results arrive in any order; each chunk lands at its own run.
         for taken in [second, third, first] {
             let chunk = arrow::compute::concat_batches(

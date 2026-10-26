@@ -177,7 +177,12 @@ impl Shared {
     /// every other admission and push, and reserves them until the rows are
     /// in a buffer. A request that would cross a cap is refused: the caps are
     /// ceilings, not watermarks.
-    async fn admit(&self, tenant: TenantId, bytes: usize) -> Result<Reservation, IngestError> {
+    async fn admit(
+        &self,
+        tenant: TenantId,
+        bytes: usize,
+        rows: usize,
+    ) -> Result<Reservation, IngestError> {
         let mut buffers = self.buffers.lock().await;
         let reserved = buffers.reserved_of(tenant);
         if buffers.bytes_of(tenant) + reserved + bytes > self.config.max_buffer_bytes {
@@ -195,9 +200,7 @@ impl Shared {
         }
         // Admitted rows must always be writable: besides the batch itself,
         // room for the scratch its flush will reserve stays free.
-        if bytes.saturating_mul(1 + crate::buffer::FLUSH_SCRATCH_FACTOR)
-            > buffers.headroom(self.config.max_memory_bytes)
-        {
+        if Buffers::admission_cost(bytes, rows) > buffers.headroom(self.config.max_memory_bytes) {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             return Err(IngestError::Capacity(
                 "ingester memory full, hot-window retention pending",
@@ -250,7 +253,9 @@ impl Shared {
         let accepted = batch.num_rows();
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
 
-        let reservation = self.admit(tenant, batch.get_array_memory_size()).await?;
+        let reservation = self
+            .admit(tenant, batch.get_array_memory_size(), batch.num_rows())
+            .await?;
         drop(slot);
         let _shared = self.gate.read().await;
         let tracked = self.append_wal(tenant, record).await?;
@@ -618,7 +623,7 @@ impl Shared {
                 // The merge's inputs are reserved inside the cap, never on top
                 // of it: with no headroom nothing is merged until a flush.
                 let headroom = buffers.headroom(self.config.max_memory_bytes);
-                let candidates = buffers.coalesce_candidates(min);
+                let candidates = buffers.coalesce_candidates(min, max_bytes);
                 candidates.into_iter().find_map(|tenant| {
                     let bound = self.writer.stable_bound(tenant);
                     buffers

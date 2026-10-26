@@ -2102,3 +2102,79 @@ async fn hot_scan_skips_batches_without_the_trace() {
     h.stop().await;
     db.finish().await;
 }
+
+/// A request larger than a chunk is never merged, but it gets its trace set
+/// on its own, so a lookup skips it like any chunk.
+#[tokio::test]
+async fn oversized_requests_are_indexed_alone() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    // Every request is larger than a chunk, and none waits for company.
+    let config = IngestConfig {
+        coalesce_bytes: 1024,
+        coalesce_batches: 64,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for trace in [1u8, 2] {
+        client
+            .export(authed(request("api", trace, 5), &token))
+            .await
+            .unwrap();
+    }
+    let fs = h.ingester.flush_stats();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fs.coalesces.load(Ordering::Relaxed) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "oversized requests never indexed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fs.coalesced_batches.load(Ordering::Relaxed),
+        2,
+        "each one alone"
+    );
+    let lookup = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: Some(vec![vec![2u8; 16]]),
+        span_ids: None,
+    };
+    let got = scan(&h.hot_addr.to_string(), &lookup, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        5
+    );
+    assert_eq!(
+        h.ingester
+            .stats()
+            .hot_batches_skipped
+            .load(Ordering::Relaxed),
+        1,
+        "the other request has its trace set and is skipped"
+    );
+    h.stop().await;
+    db.finish().await;
+}
