@@ -1691,7 +1691,12 @@ async fn forced_retry_tries_each_pending_flush_once() {
         .create_token(tenant, "collector", TokenScope::Ingest)
         .await
         .unwrap();
-    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    // One permit: a pass that re-took a failed entry would never run out.
+    let config = IngestConfig {
+        max_flushes: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
     h.client()
         .await
         .export(authed(request("api", 1, 5), &token))
