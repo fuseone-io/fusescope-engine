@@ -1,0 +1,39 @@
+{
+  "requests_ok": 220410,
+  "requests_err": 2648,
+  "spans_ok": 2644920,
+  "seconds": 30.008713912,
+  "rps": 7344.866582631574,
+  "spans_per_sec": 88138.39899157888,
+  "p50_ms": 2.234946,
+  "p95_ms": 16.595848,
+  "p99_ms": 40.671022,
+  "errors": [
+    "ResourceExhausted: tenant memory full, hot-window retention pending"
+  ],
+  "flush": {
+    "flushes": 13,
+    "rows_per_flush": 201776.3076923077,
+    "parquet_mib_per_flush": 11.112629376924955,
+    "concat_ms": 70.8393426923077,
+    "sort_ms": 187.41319915384614,
+    "encode_ms": 592.014377,
+    "upload_ms": 65.54493276923077,
+    "register_ms": 4.732200307692308,
+    "total_ms": 968.919789,
+    "buffer_bytes": [
+      72602089,
+      0,
+      770949052
+    ],
+    "coalesces": 417,
+    "batches_per_coalesce": 520.2925659472422,
+    "coalesce_ms": 46.395240282973624,
+    "coalesce_p95_ms": 100.0,
+    "coalesce_active": 0,
+    "hot_scans": 15,
+    "hot_scan_p95_ms": 20.0,
+    "checkpoints": 13,
+    "checkpoint_p95_ms": 20.0
+  }
+}

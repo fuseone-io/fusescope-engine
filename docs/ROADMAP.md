@@ -69,11 +69,12 @@ Done, in this repository (phase 0 and most of the engine side of phase 1):
   Flight SQL query suite. Benchmarks recorded for the baseline, group
   commit, flush stages, coalescing and the gate.
 
-Measured today (32 senders, one tenant, NVMe WAL): about 7 000 requests/s,
-85 000 spans/s; flush of 230 k rows in about 1 s, dominated by Parquet
-encode; hot-window snapshot p95 within 2 ms; `trace by id` up to 4 s p95
-under load because nothing narrows the hot scan or the file list by trace
-id.
+Measured today (32 senders, one tenant, NVMe WAL): about 8 000 requests/s,
+99 000 spans/s alone and 88 000 with queries running; flush of 200 k rows in
+about 0.9 s, 60% of it Parquet encode; 98% of request batches merged into
+chunks before their flush; hot-window snapshot p95 within 2 ms; `trace by
+id` up to 2 s p95 under load because nothing narrows the hot scan or the
+file list by trace id; the per-tenant cap is met by 15 s of retained rows.
 
 ## M1 · traces end to end
 
@@ -81,10 +82,10 @@ id.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| A1 | Parallel coalescer: several coalesce ids per tenant over non-overlapping runs, a global semaphore (`max_coalesces`), group size by bytes, task and bytes gauges | one chunk at a time falls behind at 32 senders, so the retention holds raw batches and the tenant cap trips | buffer tests for disjoint runs and cancellation; `coalesced_flush_matches_replay_byte_for_byte` stays green; benchmark shows chunks keeping up and persisted memory near the chunk size | M | todo |
+| A1 | Parallel coalescer: several coalesce ids per tenant over non-overlapping runs, a global semaphore (`max_coalesces`), group size by bytes, task and bytes gauges; flushes materialised off the flusher loop under `max_flushes` | one chunk at a time fell behind at 32 senders, so the retention held raw batches and the tenant cap tripped | buffer tests for disjoint runs and cancellation; `coalesced_flush_matches_replay_byte_for_byte` green; [benchmark](benchmarks/2026-10-26-parallel-coalesce.md): 98% of batches merged before their flush, 99 k spans/s | M | done (edbccfb, 12b85a4) |
 | A2 | Persisted retention holds chunks only, and a shorter default retention tied to the querier's file cache TTL | retention is the main memory consumer | memory cap test with retention; benchmark persisted bytes | S | todo |
 | A3 | Parquet encode by row group as the buffer fills (streaming), bounded encode concurrency | encode is 2.5 µs per row and the largest flush stage | flush stages benchmark; crash between row groups keeps idempotency (object created once) | M | todo |
-| A4 | Flush concurrency across tenants with a bounded semaphore | one slow tenant must not delay the others | multi-tenant flush test; benchmark with 4 tenants | S | todo |
+| A4 | Flush concurrency across tenants with a bounded semaphore | one slow tenant must not delay the others | multi-tenant flush test; benchmark with 4 tenants | S | done with A1 (`max_flushes`); the multi-tenant benchmark is still to run |
 | A5 | End-of-hour flush boundary so an L0 file never spans two hours | L1 compaction and the trace index are per hour | flush test with spans across an hour boundary produces two files | S | todo |
 | A6 | Ingest health: `/healthz` with WAL, bucket and catalog state; shutdown drains in-flight requests with a deadline | staging needs liveness and readiness | server test for the endpoints and the drain | S | todo |
 
