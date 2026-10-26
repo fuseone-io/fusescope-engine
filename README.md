@@ -4,7 +4,8 @@ Storage and query engine for OpenTelemetry traces, logs and metrics on object
 storage. Built in Rust on Apache Arrow, Parquet and DataFusion. It is the
 candidate replacement for ClickHouse in [FuseScope](https://github.com/fuseone-io/fusescope).
 
-Read [DESIGN.md](DESIGN.md) first. Decisions are recorded in [docs/adr](docs/adr).
+Read [DESIGN.md](DESIGN.md) first. Decisions are recorded in [docs/adr](docs/adr);
+the order of work is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Status
 
@@ -13,12 +14,12 @@ Phase 1 in progress. Done: `fs-schema` (span schema v1, OTLP conversion),
 catalog, tenants and ingest tokens, atomic compaction swaps, change
 notifications), `fs-ingest` (OTLP gRPC with bearer-token authentication and
 per-tenant limits, WAL, buffers, sorted Parquet L0 flush with bloom filters,
-catalog registration), `fs-query` (DataFusion over the catalog's files with
-tenant-scoped read-only sessions, catalog-level pruning, byte budgets and an
-Arrow Flight SQL front end) and `fs-server` (configuration, bootstrap, roles,
-admin commands, graceful shutdown). Next: hot-window scans from ingesters,
-the Go backend's Flight telemetrystore, and the first comparison against
-ClickHouse.
+catalog registration, hot window, WAL-ordered buffers with background
+coalescing), `fs-query` (DataFusion over the catalog's files with
+tenant-scoped read-only sessions, catalog-level pruning, byte budgets, the
+hot-window union and an Arrow Flight SQL front end) and `fs-server`
+(configuration, bootstrap, roles, admin commands, `/metrics`, graceful
+shutdown). What comes next, in order, is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Layout
 
