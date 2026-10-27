@@ -91,14 +91,10 @@ pub fn prepare(
     let concat = sort_started.elapsed();
 
     let mut out = Vec::new();
-    // Row groups end on the explicit flush below, never inside `write`, so
-    // the writer's memory is read while it still holds the whole group: the
-    // writer's own limit sits above any group gathered here. It is not
-    // unbounded because the writer sizes work by it.
     let mut writer = ArrowWriter::try_new(
         &mut out,
         Arc::clone(&schema),
-        Some(writer_properties(row_group_rows.saturating_mul(2))?),
+        Some(writer_properties(row_group_rows)?),
     )?;
 
     let mut merge = std::time::Duration::ZERO;
@@ -171,12 +167,17 @@ pub fn prepare(
     })
 }
 
-/// The engine's Parquet writer settings for L0.
+/// The engine's Parquet writer settings for L0 with row groups of
+/// `row_group_rows`. Row groups end on an explicit flush, never inside
+/// `write`: the writer's own limit sits one row above any group handed to
+/// it, so its memory can be read while it still holds the whole group. The
+/// bloom filters are sized to the group, not to that limit.
 fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, IngestError> {
     Ok(WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
-        .set_max_row_group_row_count(Some(row_group_rows))
+        .set_max_row_group_row_count(Some(row_group_rows.saturating_add(1)))
+        .set_bloom_filter_max_ndv(u64::try_from(row_group_rows).unwrap_or(u64::MAX))
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
         .set_column_bloom_filter_enabled(ColumnPath::from(col::SPAN_ID), true)
@@ -318,6 +319,42 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
         None,
     )?;
     Ok(take_record_batch(batch, &indices)?)
+}
+
+/// Refuses a layout this engine does not write: the rows wait, bound to
+/// their id, for an engine that does, rather than being written as other
+/// bytes under the same id.
+///
+/// # Errors
+/// A layout version other than the current one.
+pub fn check_layout(layout: &crate::record::FileLayout) -> Result<(), IngestError> {
+    if layout.version == crate::record::FileLayout::CURRENT_VERSION {
+        Ok(())
+    } else {
+        Err(IngestError::Encode(format!(
+            "file layout version {} is not this engine's {}",
+            layout.version,
+            crate::record::FileLayout::CURRENT_VERSION
+        )))
+    }
+}
+
+/// The size the catalog row carries when an object is already in the
+/// bucket: an intent with a recorded layout reproduces its bytes exactly,
+/// so another size is a corrupt object or a broken encoder and the attempt
+/// fails; an intent logged before layouts were recorded (`legacy`) may find
+/// an object another encoder wrote, whose size is registered as is.
+///
+/// # Errors
+/// A size mismatch for a non-legacy intent.
+pub fn reconcile_existing(existing: u64, prepared: u64, legacy: bool) -> Result<u64, IngestError> {
+    if existing == prepared || legacy {
+        Ok(existing)
+    } else {
+        Err(IngestError::Encode(format!(
+            "object already in the bucket has {existing} bytes, this layout gives {prepared}"
+        )))
+    }
 }
 
 /// Outcome of an upload.
@@ -597,7 +634,8 @@ mod tests {
             }
         );
 
-        // Another layout wrote this id first: the catalog must carry its size.
+        // Another encoder wrote this id first: the size is reported as is;
+        // whether it is accepted is the intent's call.
         let other = FileId(uuid::Uuid::from_u128(3));
         let mut foreign = prepare(tenant, &Path::from(""), other, &inputs, 3).unwrap();
         let path = Path::from(foreign.file.path.as_str());
@@ -609,6 +647,37 @@ mod tests {
         assert_eq!(
             upload(&store, &foreign).await.unwrap(),
             Upload::Existing { size: 18 }
+        );
+    }
+
+    #[test]
+    fn unknown_layout_versions_are_refused() {
+        use crate::record::FileLayout;
+        assert!(check_layout(&FileLayout::current(8)).is_ok());
+        let future = FileLayout {
+            version: FileLayout::CURRENT_VERSION + 1,
+            row_group_rows: 8,
+        };
+        assert!(check_layout(&future).is_err());
+        let past = FileLayout {
+            version: 2,
+            row_group_rows: 8,
+        };
+        assert!(check_layout(&past).is_err(), "version 2 never shipped");
+    }
+
+    #[test]
+    fn existing_sizes_are_accepted_only_when_equal_or_legacy() {
+        assert_eq!(reconcile_existing(10, 10, false).unwrap(), 10);
+        assert_eq!(reconcile_existing(10, 10, true).unwrap(), 10);
+        assert_eq!(
+            reconcile_existing(12, 10, true).unwrap(),
+            12,
+            "legacy keeps the bucket's size"
+        );
+        assert!(
+            reconcile_existing(12, 10, false).is_err(),
+            "a recorded layout must reproduce the bytes"
         );
     }
 }

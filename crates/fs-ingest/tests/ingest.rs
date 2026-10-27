@@ -27,6 +27,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use prost::Message;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Executor, PgConnection};
 use tonic::metadata::MetadataValue;
@@ -2262,6 +2263,148 @@ async fn flush_writes_row_groups_and_retains_each() {
             >= 1,
         "at least one retained row group holds no trace 3"
     );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// An intent recorded by a newer engine names a layout this one does not
+/// write. The rows stay bound to their id and nothing reaches the bucket:
+/// writing other bytes under that id would break every later retry.
+#[tokio::test]
+async fn future_layout_version_fails_closed() {
+    use fs_ingest::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let dir = tempfile::tempdir().unwrap();
+    // A log left by that newer engine: one request and the intent covering it.
+    {
+        let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+        let record = WalRecord {
+            tenant,
+            signal: RecordSignal::Traces,
+            payload: bytes::Bytes::from(request("api", 1, 5).encode_to_vec()),
+        };
+        let first = wal.append(&record.encode()).unwrap();
+        let end = wal.position();
+        let intent = FlushIntent {
+            tenant,
+            file: fs_catalog::FileId::new(),
+            first,
+            end,
+            layout: Some(FileLayout {
+                version: FileLayout::CURRENT_VERSION + 1,
+                row_group_rows: 7,
+            }),
+        };
+        wal.append(&intent.to_record().encode()).unwrap();
+        wal.sync().unwrap();
+    }
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert!(
+        h.ingester.stats().flush_failures.load(Ordering::Relaxed) >= 1,
+        "the attempt is refused"
+    );
+    assert_eq!(
+        parquet_files(&h.dir.path().join("bucket")).len(),
+        0,
+        "nothing is written under that id"
+    );
+    assert_eq!(
+        h.ingester.stats().flushes_recovered.load(Ordering::Relaxed),
+        1,
+        "the rows are still bound to the intent"
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The object is uploaded, the registration fails, and the engine restarts
+/// with another row group size: the retry reproduces the intent's layout,
+/// finds the same bytes in the bucket and registers them.
+#[tokio::test]
+async fn retry_after_restart_with_another_row_group_size_reproduces_the_object() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        row_group_rows: 7,
+        inject_register_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for (service, trace) in [("api", 1u8), ("db", 2), ("web", 3)] {
+        client
+            .export(authed(request(service, trace, 5), &token))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let bucket = h.dir.path().join("bucket");
+    let written = parquet_files(&bucket);
+    assert_eq!(written.len(), 1, "uploaded before the registration failed");
+    let before = sha256_of(&written[0]);
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let config = IngestConfig {
+        row_group_rows: 4096,
+        ..test_config()
+    };
+    let h = start(&db.catalog, dir, config).await;
+    h.ingester.flush_all().await;
+    assert_eq!(
+        h.ingester.stats().flush_failures.load(Ordering::Relaxed),
+        0,
+        "the retry reproduced the bytes the intent recorded"
+    );
+    let after = parquet_files(&bucket);
+    assert_eq!(after, written);
+    assert_eq!(sha256_of(&after[0]), before, "the object is untouched");
+    let reader = SerializedFileReader::new(std::fs::File::open(&after[0]).unwrap()).unwrap();
+    assert_eq!(
+        reader.metadata().num_row_groups(),
+        3,
+        "the intent's seven-row groups, not the new configuration"
+    );
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].row_count, 15);
     h.stop().await;
     db.finish().await;
 }

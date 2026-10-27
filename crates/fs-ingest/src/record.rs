@@ -64,8 +64,10 @@ pub struct FileLayout {
 
 impl FileLayout {
     /// Version of the current encoder: per-batch sort, k-way merge, one row
-    /// group at a time.
-    pub const CURRENT_VERSION: u32 = 2;
+    /// group at a time, bloom filters sized to the row group. Version 2 was
+    /// the same merge with the writer's limit at twice the group and bloom
+    /// filters sized by it; it never shipped and is refused like any other.
+    pub const CURRENT_VERSION: u32 = 3;
 
     /// The current encoder with `row_group_rows` rows per row group.
     pub fn current(row_group_rows: usize) -> Self {

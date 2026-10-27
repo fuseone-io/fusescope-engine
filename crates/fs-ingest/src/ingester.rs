@@ -138,7 +138,9 @@ struct Attempt {
     file: FileId,
     batches: Vec<RecordBatch>,
     held: crate::buffer::Scratch,
-    layout: FileLayout,
+    /// The intent's layout; `None` for an intent logged before layouts were
+    /// recorded, which uses the current layout and trusts the object it finds.
+    layout: Option<FileLayout>,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
@@ -375,7 +377,7 @@ impl Shared {
         file_id: FileId,
         batches: Vec<RecordBatch>,
         held: crate::buffer::Scratch,
-        layout: FileLayout,
+        layout: Option<FileLayout>,
     ) -> Result<(), IngestError> {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let fs = &self.flush_stats;
@@ -459,7 +461,7 @@ impl Shared {
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
-        layout: FileLayout,
+        layout: Option<FileLayout>,
         timing: &mut StageTiming,
     ) -> Result<
         (
@@ -470,6 +472,9 @@ impl Shared {
         ),
         IngestError,
     > {
+        let legacy = layout.is_none();
+        let layout = layout.unwrap_or_else(|| FileLayout::current(self.config.row_group_rows));
+        flush::check_layout(&layout)?;
         let root = self.root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             flush::prepare(tenant, &root, file_id, &batches, layout.row_group_rows)
@@ -494,13 +499,11 @@ impl Shared {
         let created = match outcome {
             flush::Upload::Created => true,
             flush::Upload::Existing { size } => {
-                // The rows are the intent's whichever attempt wrote them; the
-                // bytes may differ when that attempt used another layout, so
-                // the catalog carries what the bucket holds.
                 let ours = u64::try_from(file.size_bytes).unwrap_or(0);
-                if size != ours {
-                    warn!(tenant = %tenant.0, file = %file_id.0, existing = size, prepared = ours, "object already in the bucket with another size; registering the existing one");
-                    file.size_bytes = i64::try_from(size).unwrap_or(i64::MAX);
+                let registered = flush::reconcile_existing(size, ours, legacy)?;
+                if registered != ours {
+                    warn!(tenant = %tenant.0, file = %file_id.0, existing = size, prepared = ours, "legacy intent: registering the object another encoder wrote");
+                    file.size_bytes = i64::try_from(registered).unwrap_or(i64::MAX);
                 }
                 false
             }
@@ -565,9 +568,6 @@ impl Shared {
             let Some((batches, held, layout)) = taken else {
                 continue;
             };
-            // An intent without a layout predates layouts: the current one is
-            // used and the object found in the bucket is trusted as is.
-            let layout = layout.unwrap_or_else(|| FileLayout::current(self.config.row_group_rows));
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
             let delay = self
@@ -813,7 +813,7 @@ impl Shared {
                         file: file_id,
                         batches,
                         held,
-                        layout: FileLayout::current(self.config.row_group_rows),
+                        layout: Some(FileLayout::current(self.config.row_group_rows)),
                     };
                     self.spawn_materialize(attempt, permit, None);
                 }

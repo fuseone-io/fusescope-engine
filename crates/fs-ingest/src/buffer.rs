@@ -881,7 +881,9 @@ impl Buffers {
             let (batches, bytes) = if written <= budget {
                 (rows, written)
             } else {
-                (entry.buffer.hot_batches(), budget)
+                let flushed = entry.buffer.hot_batches();
+                let cost = hot_batches_bytes(&flushed);
+                (flushed, cost)
             };
             self.persisted.entry(tenant).or_default().push(Persisted {
                 file,
@@ -1630,10 +1632,12 @@ mod tests {
         buffers.finish_flush(tenant, file, bigger, now);
         let kept = buffers.snapshot(tenant).persisted;
         assert_eq!(kept.len(), 1);
+        let flushed = kept.first().unwrap();
+        assert!(flushed.bytes <= budget, "the batches as flushed are kept");
         assert_eq!(
-            kept.first().unwrap().bytes,
-            budget,
-            "the batches as flushed are kept"
+            flushed.bytes,
+            hot_batches_bytes(&flushed.batches),
+            "and charged what they cost, not the budget"
         );
         assert_eq!(
             values(
@@ -1647,7 +1651,7 @@ mod tests {
             ),
             vec![100, 101, 102, 103]
         );
-        assert_eq!(buffers.memory(), (0, 0, budget));
+        assert_eq!(buffers.memory(), (0, 0, flushed.bytes));
     }
 
     #[test]
