@@ -23,7 +23,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_schema::spans::{col, span_schema_v1};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
@@ -56,9 +56,11 @@ pub struct Prepared {
     pub sort: std::time::Duration,
     /// Time spent encoding Parquet.
     pub encode: std::time::Duration,
-    /// Most bytes the writer held after a row group was written and before
-    /// it was flushed: the writer's working memory, which the flush lease
-    /// must cover on top of the inputs and the row group being gathered.
+    /// Most bytes the writer estimated holding after a row group was written
+    /// and before it was flushed: its pages, dictionaries and bloom filters
+    /// for that group. It leaves out the compressed output, the sorted
+    /// inputs, the merge keys and the row groups kept for the hot window,
+    /// which the flush lease covers on top of it.
     pub writer_peak: usize,
 }
 
@@ -89,10 +91,14 @@ pub fn prepare(
     let concat = sort_started.elapsed();
 
     let mut out = Vec::new();
+    // Row groups end on the explicit flush below, never inside `write`, so
+    // the writer's memory is read while it still holds the whole group: the
+    // writer's own limit sits above any group gathered here. It is not
+    // unbounded because the writer sizes work by it.
     let mut writer = ArrowWriter::try_new(
         &mut out,
         Arc::clone(&schema),
-        Some(writer_properties(row_group_rows)?),
+        Some(writer_properties(row_group_rows.saturating_mul(2))?),
     )?;
 
     let mut merge = std::time::Duration::ZERO;
@@ -314,15 +320,28 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
     Ok(take_record_batch(batch, &indices)?)
 }
 
+/// Outcome of an upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upload {
+    /// This call created the object.
+    Created,
+    /// An earlier attempt created it; this is its size in the bucket, which
+    /// the catalog row must carry even when a later layout gave other bytes.
+    Existing {
+        /// Size of the object in the bucket.
+        size: u64,
+    },
+}
+
 /// Uploads a prepared file to its path without overwriting: a retried flush
-/// finds the object already there and leaves it. Returns whether this call
-/// created it. A store without conditional writes is an error, not a plain
-/// put: overwriting is never allowed.
+/// finds the object already there, leaves it and reads its size. A store
+/// without conditional writes is an error, not a plain put: overwriting is
+/// never allowed.
 ///
 /// # Errors
 /// Bucket failure other than "already exists", including missing support for
 /// conditional writes.
-pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<bool, IngestError> {
+pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<Upload, IngestError> {
     let path = Path::from(prepared.file.path.as_str());
     let payload = PutPayload::from_bytes(prepared.bytes.clone());
     let create = PutOptions {
@@ -330,8 +349,11 @@ pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<bool
         ..PutOptions::default()
     };
     match store.put_opts(&path, payload, create).await {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Ok(_) => Ok(Upload::Created),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let meta = store.head(&path).await?;
+            Ok(Upload::Existing { size: meta.size })
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -381,6 +403,7 @@ pub fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
 mod tests {
     use fs_schema::limits::Limits;
     use fs_schema::spans::SpanBatchBuilder;
+    use object_store::local::LocalFileSystem;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -528,6 +551,64 @@ mod tests {
         assert_eq!(
             again.bytes, prepared.bytes,
             "batching does not change the file"
+        );
+    }
+
+    /// Rows that fill every row group exactly: nothing is left for a partial
+    /// group, and the writer's memory is still read while it holds a full
+    /// group, before the explicit flush.
+    #[test]
+    fn full_row_groups_are_measured_and_counted() {
+        let inputs = vec![
+            batch("api", 1, &[T0 + 1, T0 + 2, T0 + 3]),
+            batch("api", 2, &[T0 + 4, T0 + 5, T0 + 6]),
+        ];
+        let tenant = TenantId(uuid::Uuid::from_u128(1));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        assert_eq!(
+            prepared.rows.len(),
+            2,
+            "six rows in groups of three, no remainder"
+        );
+        assert!(
+            prepared.writer_peak > 0,
+            "a full group is measured before it is flushed"
+        );
+        let reader = SerializedFileReader::new(prepared.bytes.clone()).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+    }
+
+    /// An object already at the path is left alone and its size reported,
+    /// so a retry after a crash registers what is in the bucket.
+    #[tokio::test]
+    async fn upload_reports_an_existing_object_and_its_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let inputs = vec![batch("api", 1, &[T0 + 1, T0 + 2])];
+        let tenant = TenantId(uuid::Uuid::from_u128(1));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        assert_eq!(upload(&store, &prepared).await.unwrap(), Upload::Created);
+        assert_eq!(
+            upload(&store, &prepared).await.unwrap(),
+            Upload::Existing {
+                size: prepared.bytes.len() as u64
+            }
+        );
+
+        // Another layout wrote this id first: the catalog must carry its size.
+        let other = FileId(uuid::Uuid::from_u128(3));
+        let mut foreign = prepare(tenant, &Path::from(""), other, &inputs, 3).unwrap();
+        let path = Path::from(foreign.file.path.as_str());
+        store
+            .put(&path, PutPayload::from_static(b"not the same bytes"))
+            .await
+            .unwrap();
+        foreign.bytes = Bytes::from_static(b"xyz");
+        assert_eq!(
+            upload(&store, &foreign).await.unwrap(),
+            Upload::Existing { size: 18 }
         );
     }
 }

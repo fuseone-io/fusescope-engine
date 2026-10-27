@@ -40,7 +40,7 @@ use crate::auth::Authenticator;
 use crate::buffer::{Buffers, Reservation, Snapshot, TenantBuffer};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
-use crate::record::{FlushIntent, RecordSignal, WalRecord};
+use crate::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
 use crate::server::TraceReceiver;
 use crate::{IngestError, flush};
 
@@ -129,6 +129,16 @@ pub struct FlushStats {
 /// Permits of the flush semaphore for a configured `max_flushes`.
 fn flush_permits(max_flushes: usize) -> usize {
     max_flushes.clamp(1, u32::MAX as usize / 4)
+}
+
+/// One flush attempt handed to its task: the rows as cut, the scratch lease
+/// held for them and the layout the intent recorded.
+struct Attempt {
+    tenant: TenantId,
+    file: FileId,
+    batches: Vec<RecordBatch>,
+    held: crate::buffer::Scratch,
+    layout: FileLayout,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
@@ -331,7 +341,8 @@ impl Shared {
                 return Ok(None);
             };
             let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
-            let Some((batches, held)) = buffers.begin_flush(tenant, file_id) else {
+            let layout = FileLayout::current(self.config.row_group_rows);
+            let Some((batches, held)) = buffers.begin_flush(tenant, file_id, layout) else {
                 return Ok(None);
             };
             (
@@ -341,6 +352,7 @@ impl Shared {
                     file: file_id,
                     first,
                     end,
+                    layout: Some(layout),
                 },
                 batches,
                 held,
@@ -363,6 +375,7 @@ impl Shared {
         file_id: FileId,
         batches: Vec<RecordBatch>,
         held: crate::buffer::Scratch,
+        layout: FileLayout,
     ) -> Result<(), IngestError> {
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let fs = &self.flush_stats;
@@ -370,13 +383,13 @@ impl Shared {
         let started = Instant::now();
         let mut timing = StageTiming::default();
         let result = self
-            .write_and_register(tenant, file_id, batches, &mut timing)
+            .write_and_register(tenant, file_id, batches, layout, &mut timing)
             .await;
         // The lease and the margin trade places under the buffer lock, in
         // both outcomes, so no admission ever sees the room without the
         // rows that will take it back.
         match result {
-            Ok((file, created, rows)) => {
+            Ok((file, created, rows, writer_peak)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(
                     tenant = %tenant.0,
@@ -387,6 +400,7 @@ impl Shared {
                     created,
                     "flushed l0"
                 );
+                let row_groups = rows.len();
                 {
                     let mut buffers = self.buffers.lock().await;
                     buffers.finish_flush(tenant, file_id, rows, Instant::now());
@@ -404,6 +418,11 @@ impl Shared {
                 fs.register_nanos
                     .fetch_add(timing.register, Ordering::Relaxed);
                 fs.flushes.fetch_add(1, Ordering::Relaxed);
+                let peak = u64::try_from(writer_peak).unwrap_or(u64::MAX);
+                fs.writer_peak_bytes.fetch_max(peak, Ordering::Relaxed);
+                fs.writer_bytes.fetch_add(peak, Ordering::Relaxed);
+                fs.row_groups
+                    .fetch_add(row_groups as u64, Ordering::Relaxed);
                 fs.rows.fetch_add(
                     u64::try_from(file.row_count).unwrap_or(0),
                     Ordering::Relaxed,
@@ -440,36 +459,56 @@ impl Shared {
         tenant: TenantId,
         file_id: FileId,
         batches: Vec<RecordBatch>,
+        layout: FileLayout,
         timing: &mut StageTiming,
-    ) -> Result<(fs_catalog::NewFile, bool, Vec<crate::buffer::HotBatch>), IngestError> {
+    ) -> Result<
+        (
+            fs_catalog::NewFile,
+            bool,
+            Vec<crate::buffer::HotBatch>,
+            usize,
+        ),
+        IngestError,
+    > {
         let root = self.root.clone();
-        let row_group_rows = self.config.row_group_rows;
         let prepared = tokio::task::spawn_blocking(move || {
-            flush::prepare(tenant, &root, file_id, &batches, row_group_rows)
+            flush::prepare(tenant, &root, file_id, &batches, layout.row_group_rows)
         })
         .await??;
-        let fs = &self.flush_stats;
-        let peak = u64::try_from(prepared.writer_peak).unwrap_or(u64::MAX);
-        fs.writer_peak_bytes.fetch_max(peak, Ordering::Relaxed);
-        fs.writer_bytes.fetch_add(peak, Ordering::Relaxed);
-        fs.row_groups
-            .fetch_add(prepared.rows.len() as u64, Ordering::Relaxed);
         timing.concat = nanos(prepared.concat);
         timing.sort = nanos(prepared.sort);
         timing.encode = nanos(prepared.encode);
         let upload_started = Instant::now();
-        let created = flush::upload(self.store.as_ref(), &prepared).await?;
+        let outcome = flush::upload(self.store.as_ref(), &prepared).await?;
         timing.upload = nanos(upload_started.elapsed());
         let flush::Prepared {
-            file, bytes, rows, ..
+            mut file,
+            bytes,
+            rows,
+            writer_peak,
+            ..
         } = prepared;
         // The object is in the bucket: its bytes go now; the lease waits for
         // the outcome.
         drop(bytes);
+        let created = match outcome {
+            flush::Upload::Created => true,
+            flush::Upload::Existing { size } => {
+                // The rows are the intent's whichever attempt wrote them; the
+                // bytes may differ when that attempt used another layout, so
+                // the catalog carries what the bucket holds.
+                let ours = u64::try_from(file.size_bytes).unwrap_or(0);
+                if size != ours {
+                    warn!(tenant = %tenant.0, file = %file_id.0, existing = size, prepared = ours, "object already in the bucket with another size; registering the existing one");
+                    file.size_bytes = i64::try_from(size).unwrap_or(i64::MAX);
+                }
+                false
+            }
+        };
         let register_started = Instant::now();
         self.register(&file).await?;
         timing.register = nanos(register_started.elapsed());
-        Ok((file, created, rows))
+        Ok((file, created, rows, writer_peak))
     }
 
     /// Catalog registration, with the test-only failure injection in front.
@@ -523,16 +562,26 @@ impl Shared {
                 return;
             };
             let taken = self.buffers.lock().await.take_flushing(tenant, file);
-            let Some((batches, held)) = taken else {
+            let Some((batches, held, layout)) = taken else {
                 continue;
             };
+            // An intent without a layout predates layouts: the current one is
+            // used and the object found in the bucket is trusted as is.
+            let layout = layout.unwrap_or_else(|| FileLayout::current(self.config.row_group_rows));
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
             let delay = self
                 .config
                 .inject_retry_delay
                 .filter(|_| self.retry_delay_pending.swap(false, Ordering::Relaxed));
-            self.spawn_materialize(tenant, file, batches, held, permit, delay);
+            let attempt = Attempt {
+                tenant,
+                file,
+                batches,
+                held,
+                layout,
+            };
+            self.spawn_materialize(attempt, permit, delay);
         }
     }
 
@@ -549,10 +598,7 @@ impl Shared {
     /// after `delay` when a test asks for one.
     fn spawn_materialize(
         self: &Arc<Self>,
-        tenant: TenantId,
-        file_id: FileId,
-        batches: Vec<RecordBatch>,
-        held: crate::buffer::Scratch,
+        attempt: Attempt,
         permit: tokio::sync::OwnedSemaphorePermit,
         delay: Option<Duration>,
     ) {
@@ -561,7 +607,17 @@ impl Shared {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            if let Err(e) = shared.materialize(tenant, file_id, batches, held).await {
+            let Attempt {
+                tenant,
+                file,
+                batches,
+                held,
+                layout,
+            } = attempt;
+            if let Err(e) = shared
+                .materialize(tenant, file, batches, held, layout)
+                .await
+            {
                 error!(tenant = %tenant.0, error = %e, "flush error");
             }
             drop(permit);
@@ -752,7 +808,14 @@ impl Shared {
             };
             match self.cut_tenant(tenant).await {
                 Ok(Some((file_id, batches, held))) => {
-                    self.spawn_materialize(tenant, file_id, batches, held, permit, None);
+                    let attempt = Attempt {
+                        tenant,
+                        file: file_id,
+                        batches,
+                        held,
+                        layout: FileLayout::current(self.config.row_group_rows),
+                    };
+                    self.spawn_materialize(attempt, permit, None);
                 }
                 Ok(None) => {}
                 Err(e) => error!(tenant = %tenant.0, error = %e, "flush error"),
@@ -845,7 +908,7 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
         }
     }
     for (intent, buffer) in groups {
-        buffers.insert_flushing(intent.tenant, intent.file, buffer);
+        buffers.insert_flushing(intent.tenant, intent.file, buffer, intent.layout);
     }
     buffers
 }

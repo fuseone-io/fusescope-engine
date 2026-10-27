@@ -224,13 +224,13 @@ impl Metrics {
         counter(
             out,
             "fusescope_flush_concat_nanoseconds_total",
-            "Nanoseconds concatenating request batches, completed flushes",
+            "Nanoseconds sorting each input batch, completed flushes",
             ns(&f.concat_nanos),
         );
         counter(
             out,
             "fusescope_flush_sort_nanoseconds_total",
-            "Nanoseconds sorting, completed flushes",
+            "Nanoseconds merging sorted inputs into row groups, completed flushes",
             ns(&f.sort_nanos),
         );
         counter(

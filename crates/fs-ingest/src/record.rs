@@ -45,6 +45,35 @@ pub struct FlushIntent {
     pub first: fs_wal::Position,
     /// Position just past the last record in the file.
     pub end: fs_wal::Position,
+    /// How the bytes are laid out, so a retry reproduces them. Absent in
+    /// intents logged before layouts were recorded: those retries use the
+    /// current layout and trust the object they find.
+    #[serde(default)]
+    pub layout: Option<FileLayout>,
+}
+
+/// The encoder and its parameters that turn a set of rows into one exact
+/// sequence of bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileLayout {
+    /// Encoder version; bumped whenever the same rows would give other bytes.
+    pub version: u32,
+    /// Rows per Parquet row group.
+    pub row_group_rows: usize,
+}
+
+impl FileLayout {
+    /// Version of the current encoder: per-batch sort, k-way merge, one row
+    /// group at a time.
+    pub const CURRENT_VERSION: u32 = 2;
+
+    /// The current encoder with `row_group_rows` rows per row group.
+    pub fn current(row_group_rows: usize) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            row_group_rows,
+        }
+    }
 }
 
 impl FlushIntent {
@@ -155,6 +184,7 @@ mod tests {
                 segment: 1,
                 offset: 4096,
             },
+            layout: Some(FileLayout::current(4096)),
         };
         let record = intent.to_record();
         assert_eq!(record.signal, RecordSignal::FlushIntent);
@@ -192,6 +222,15 @@ mod tests {
             }
         ));
         assert!(FlushIntent::from_payload(b"nope").is_err());
+
+        // An intent logged before layouts were recorded.
+        let old = format!(
+            r#"{{"tenant":"{}","file":"{}","first":{{"segment":1,"offset":16}},"end":{{"segment":1,"offset":4096}}}}"#,
+            tenant.0, intent.file.0
+        );
+        let decoded = FlushIntent::from_payload(old.as_bytes()).unwrap();
+        assert_eq!(decoded.layout, None);
+        assert_eq!(decoded.file, intent.file);
     }
 
     #[test]
