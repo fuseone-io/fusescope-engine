@@ -1647,6 +1647,10 @@ version = "0.0.1"
 [[package]]
 name = "fs-index"
 version = "0.0.1"
+dependencies = [
+ "thiserror",
+ "twox-hash",
+]
 
 [[package]]
 name = "fs-ingest"
@@ -1657,6 +1661,7 @@ dependencies = [
  "bytes",
  "chrono",
  "fs-catalog",
+ "fs-index",
  "fs-schema",
  "fs-wal",
  "futures-util",
@@ -1689,6 +1694,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "fs-catalog",
+ "fs-index",
  "fs-ingest",
  "fs-schema",
  "fs-wal",
