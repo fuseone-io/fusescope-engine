@@ -110,6 +110,30 @@ impl TraceIndex {
         traces.iter().any(|t| !self.range_of(t).is_empty())
     }
 
+    /// True when the index covers the file at `path`.
+    pub fn covers(&self, path: &str) -> bool {
+        self.files.iter().any(|f| f == path)
+    }
+
+    /// True when the index lists any of `traces` in the file at `path`.
+    /// False for a path the index does not cover.
+    pub fn file_holds(&self, path: &str, traces: &[[u8; TRACE_ID_BYTES]]) -> bool {
+        let Some(file) = self.files.iter().position(|f| f == path) else {
+            return false;
+        };
+        let Ok(file) = u32::try_from(file) else {
+            return false;
+        };
+        traces.iter().any(|trace| {
+            self.entries
+                .binary_search(&Entry {
+                    trace: *trace,
+                    file,
+                })
+                .is_ok()
+        })
+    }
+
     fn range_of(&self, trace: &[u8; TRACE_ID_BYTES]) -> Range<usize> {
         let start = self.entries.partition_point(|e| e.trace < *trace);
         let end = start
@@ -381,6 +405,49 @@ mod tests {
             TraceIndex::decode(&bytes).unwrap_err(),
             IndexError::BadBody("entries out of order")
         );
+    }
+
+    #[test]
+    fn a_file_holds_a_trace_only_when_the_pair_is_listed() {
+        let index = sample();
+        assert!(index.file_holds("a.parquet", &[trace(1), trace(9)]));
+        assert!(index.file_holds("b.parquet", &[trace(2)]));
+        assert!(
+            !index.file_holds("b.parquet", &[trace(1)]),
+            "trace 1 is in a only"
+        );
+        assert!(!index.file_holds("c.parquet", &[trace(1)]), "not covered");
+        assert!(index.covers("a.parquet") && !index.covers("c.parquet"));
+    }
+
+    /// The bytes of version 1 for a canonical input. Changing the encoder
+    /// or the decoder without bumping `VERSION` fails here.
+    #[test]
+    fn canonical_input_gives_the_pinned_bytes_for_version_1() {
+        let index = TraceIndex::new(
+            vec!["t/a/traces/l0/dt=2026-10-24/hr=14/f.parquet".into()],
+            [(trace(2), 0), (trace(1), 0)],
+        )
+        .unwrap();
+        let pinned = "46535449580001005d000000fbbda878620547bc010000002b00742f612f7472616365732f6c302f64743d323032362d31302d32342f68723d31342f662e706172717565740200000001010101010101010101010101010101000000000202020202020202020202020202020200000000";
+        let bytes = index.encode();
+        assert_eq!(hex(&bytes), pinned);
+        assert_eq!(TraceIndex::decode(&unhex(pinned)).unwrap(), index);
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        bytes.iter().fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
