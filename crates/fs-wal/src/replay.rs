@@ -1,7 +1,7 @@
 //! Sequential reading of segments with damage reporting.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::format::{
@@ -74,6 +74,22 @@ impl Replay {
     }
 }
 
+/// Offset just after the last marker pattern at or past `from`, at any
+/// alignment.
+///
+/// # Errors
+/// The bytes could not be read: the caller knows nothing about them.
+fn last_marker_after(reader: &mut (impl Read + Seek), from: u64) -> io::Result<Option<u64>> {
+    let mut rest = Vec::new();
+    reader.seek(SeekFrom::Start(from))?;
+    reader.read_to_end(&mut rest)?;
+    let marker = encode_marker();
+    Ok(rest
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .map(|at| from + (at + marker.len()) as u64))
+}
+
 impl Iterator for Replay {
     type Item = Event;
 
@@ -133,7 +149,9 @@ pub(crate) struct Scan {
     /// corruption of acknowledged records. Framing is lost after damage, so
     /// the bytes behind it are searched for the marker pattern instead: a
     /// payload that happens to contain it only makes recovery refuse to cut.
-    pub(crate) confirmed: u64,
+    /// `None` when those bytes could not be read, so nothing is known about
+    /// what lies behind the damage and nothing may be cut.
+    pub(crate) confirmed: Option<u64>,
 }
 
 pub(crate) struct SegmentReader {
@@ -178,13 +196,15 @@ impl SegmentReader {
                     return Scan {
                         valid_len: self.offset,
                         damage: None,
-                        confirmed,
+                        confirmed: Some(confirmed),
                     };
                 }
                 Step::Damaged(position, damage) => {
-                    if let Some(after) = self.last_marker_after(position.offset) {
-                        confirmed = after;
-                    }
+                    let confirmed = match last_marker_after(&mut self.reader, position.offset) {
+                        Ok(Some(after)) => Some(after),
+                        Ok(None) => Some(confirmed),
+                        Err(_) => None,
+                    };
                     return Scan {
                         valid_len: position.offset,
                         damage: Some(damage),
@@ -193,17 +213,6 @@ impl SegmentReader {
                 }
             }
         }
-    }
-
-    /// Offset just after the last marker pattern found at or past `from`,
-    /// at any alignment. Unreadable bytes count as having none.
-    fn last_marker_after(&mut self, from: u64) -> Option<u64> {
-        let mut rest = Vec::new();
-        self.reader.seek(SeekFrom::Start(from)).ok()?;
-        self.reader.read_to_end(&mut rest).ok()?;
-        let marker = encode_marker();
-        let at = rest.windows(marker.len()).rposition(|w| w == marker)?;
-        Some(from + (at + marker.len()) as u64)
     }
 
     fn next_record(&mut self, max_record_bytes: usize) -> Step {
@@ -246,5 +255,47 @@ impl SegmentReader {
             position: start,
             payload,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    struct Failing;
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("bad sector"))
+        }
+    }
+
+    impl Seek for Failing {
+        fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn the_last_marker_behind_damage_is_found_at_any_alignment() {
+        let marker = encode_marker();
+        let mut bytes = vec![7u8; 3];
+        bytes.extend_from_slice(&marker);
+        bytes.extend_from_slice(&[9u8; 5]);
+        bytes.extend_from_slice(&marker);
+        bytes.push(1);
+        let found = last_marker_after(&mut Cursor::new(bytes), 0).unwrap();
+        assert_eq!(found, Some(3 + 8 + 5 + 8));
+        assert_eq!(
+            last_marker_after(&mut Cursor::new(vec![0u8; 20]), 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_suffix_is_an_error_not_an_absence() {
+        assert!(last_marker_after(&mut Failing, 0).is_err());
     }
 }

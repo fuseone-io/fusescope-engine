@@ -2627,6 +2627,6 @@ async fn corruption_in_the_active_segment_refuses_to_open() {
     let Err(err) = Wal::open(WalConfig::new(wal_dir)) else {
         panic!("the log must not open over corrupted, acknowledged records")
     };
-    assert!(err.to_string().contains("corruption"), "{err}");
+    assert!(matches!(err, fs_wal::WalError::Corrupt { .. }), "{err}");
     db.finish().await;
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::WalError;
 use crate::checkpoint::{read_checkpoint, write_checkpoint};
 use crate::format::{parse_segment_file_name, segment_file_name};
-use crate::replay::{Damage, Replay, SegmentReader};
+use crate::replay::{Damage, Replay, Scan, SegmentReader};
 use crate::segment::{SegmentWriter, sync_dir};
 
 /// When appended data reaches the disk.
@@ -194,12 +194,14 @@ impl Wal {
         self.sync_active()
     }
 
-    /// Syncs the active segment, counting the commit marker it appends.
+    /// Syncs the active segment, counting the commit marker it appends. The
+    /// marker is written before the flush that can fail, so it is counted
+    /// whether or not the sync succeeded.
     fn sync_active(&mut self) -> Result<(), WalError> {
         let before = self.active.len();
-        self.active.sync()?;
+        let synced = self.active.sync();
         self.bytes += self.active.len() - before;
-        Ok(())
+        synced
     }
 
     /// Closes the active segment and starts the next one.
@@ -288,6 +290,17 @@ impl Wal {
 }
 
 /// Validates the last segment and cuts a torn tail so appends can continue.
+/// True when the damage a scan stopped at is proven to lie after the last
+/// completed sync, so cutting it loses nothing anyone was told about. A
+/// read failure proves nothing, neither as the damage itself nor while
+/// examining the bytes behind it.
+fn unacknowledged(scan: &Scan) -> bool {
+    match (&scan.damage, scan.confirmed) {
+        (None | Some(Damage::Io(_)), _) | (Some(_), None) => false,
+        (Some(_), Some(confirmed)) => scan.valid_len >= confirmed,
+    }
+}
+
 fn recover_last(
     config: &WalConfig,
     id: u64,
@@ -296,6 +309,13 @@ fn recover_last(
     let file_len = fs::metadata(path).map_err(|e| WalError::io(path, e))?.len();
     let scan = match SegmentReader::open(id, path) {
         Ok(reader) => reader.scan(config.max_record_bytes),
+        Err(damage @ Damage::Io(_)) => {
+            return Err(WalError::Corrupt {
+                segment: id,
+                offset: 0,
+                damage,
+            });
+        }
         Err(damage) => {
             // Unreadable header: leave the file for forensics and start a new segment.
             let next = id.checked_add(1).ok_or(WalError::SegmentIdOverflow)?;
@@ -307,10 +327,9 @@ fn recover_last(
         }
     };
     if let Some(damage) = &scan.damage {
-        if scan.valid_len < scan.confirmed {
-            // Damage before the last commit marker: records that were
-            // acknowledged. Cutting them would lose them silently; the log
-            // stays as it is for the operator.
+        if !unacknowledged(&scan) {
+            // The log stays as it is for the operator: cutting could lose
+            // records that were acknowledged.
             return Err(WalError::Corrupt {
                 segment: id,
                 offset: scan.valid_len,
@@ -355,4 +374,59 @@ fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
     }
     out.sort_unstable();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(damage: Damage, valid_len: u64, confirmed: Option<u64>) -> Scan {
+        Scan {
+            valid_len,
+            damage: Some(damage),
+            confirmed,
+        }
+    }
+
+    #[test]
+    fn only_damage_proven_behind_the_last_marker_is_cut() {
+        assert!(unacknowledged(&scan(Damage::TruncatedTail, 100, Some(100))));
+        assert!(unacknowledged(&scan(
+            Damage::ChecksumMismatch,
+            150,
+            Some(100)
+        )));
+        assert!(!unacknowledged(&scan(Damage::TruncatedTail, 99, Some(100))));
+        assert!(!unacknowledged(&scan(Damage::BadLength, 50, Some(100))));
+    }
+
+    #[test]
+    fn read_failures_never_authorise_a_cut() {
+        assert!(!unacknowledged(&scan(Damage::TruncatedTail, 150, None)));
+        assert!(!unacknowledged(&scan(
+            Damage::Io("bad sector".into()),
+            150,
+            Some(100)
+        )));
+        assert!(!unacknowledged(&scan(
+            Damage::Io("bad sector".into()),
+            150,
+            None
+        )));
+    }
+
+    #[test]
+    fn a_marker_written_before_a_failed_sync_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(WalConfig::new(dir.path())).unwrap();
+        wal.append(b"record").unwrap();
+        let before = wal.bytes();
+        wal.active.fail_next_flush();
+        assert!(wal.sync().is_err());
+        assert_eq!(wal.bytes(), before + 8, "the marker went into the buffer");
+        assert_eq!(wal.bytes(), wal.active.len());
+        wal.sync().unwrap();
+        assert_eq!(wal.bytes(), before + 8, "the retry adds no second marker");
+        assert_eq!(wal.bytes(), wal.active.len());
+    }
 }

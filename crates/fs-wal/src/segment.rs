@@ -19,6 +19,8 @@ pub(crate) struct SegmentWriter {
     len: u64,
     /// Records appended since the last commit marker.
     unmarked: bool,
+    #[cfg(test)]
+    fail_next_flush: bool,
 }
 
 impl SegmentWriter {
@@ -40,6 +42,8 @@ impl SegmentWriter {
             file: BufWriter::with_capacity(WRITE_BUFFER, file),
             len: HEADER_LEN,
             unmarked: false,
+            #[cfg(test)]
+            fail_next_flush: false,
         })
     }
 
@@ -55,6 +59,8 @@ impl SegmentWriter {
             file: BufWriter::with_capacity(WRITE_BUFFER, file),
             len,
             unmarked: false,
+            #[cfg(test)]
+            fail_next_flush: false,
         })
     }
 
@@ -98,11 +104,23 @@ impl SegmentWriter {
             self.len += marker.len() as u64;
             self.unmarked = false;
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_flush) {
+            return Err(WalError::io(&self.path, std::io::Error::other("injected")));
+        }
         self.file.flush().map_err(|e| WalError::io(&self.path, e))?;
         self.file
             .get_ref()
             .sync_data()
             .map_err(|e| WalError::io(&self.path, e))
+    }
+}
+
+#[cfg(test)]
+impl SegmentWriter {
+    /// Makes the next `sync` fail after it has buffered its marker.
+    pub(crate) fn fail_next_flush(&mut self) {
+        self.fail_next_flush = true;
     }
 }
 

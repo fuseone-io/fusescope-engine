@@ -32,7 +32,7 @@
 //! acknowledged records and the log refuses to open rather than cut them.
 //! Damage after the last marker belongs to a batch whose sync never completed,
 //! which no one was told about: it is cut off so appends continue from a
-//! consistent point. Earlier segments are never modified; damage in them is
+//! consistent point. A read failure proves nothing and is never cut. Earlier segments are never modified; damage in them is
 //! reported during replay and the scan continues with the next segment.
 //!
 //! # Checkpoints
@@ -87,10 +87,11 @@ pub enum WalError {
     /// The segment id space is exhausted. Practically unreachable.
     #[error("segment id overflow")]
     SegmentIdOverflow,
-    /// Damage inside the last segment with framed records after it: the
-    /// records there were acknowledged, so the log is not cut and does not
-    /// open. Only a tail torn by a crash is cut.
-    #[error("corruption at segment {segment} offset {offset} with records after it ({damage:?})")]
+    /// Damage in the last segment that recovery cannot prove unacknowledged:
+    /// a commit marker follows it, the bytes behind it could not be read, or
+    /// the damage is a read failure itself. Cutting could lose acknowledged
+    /// records, so the log stays as it is and does not open.
+    #[error("damage at segment {segment} offset {offset} that recovery must not cut ({damage:?})")]
     Corrupt {
         /// Segment id.
         segment: u64,
