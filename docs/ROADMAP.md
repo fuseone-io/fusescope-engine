@@ -49,7 +49,9 @@ Done, in this repository (phase 0 and most of the engine side of phase 1):
 - Workspace, lints, cargo-deny allow-list, CI (`check`, `deny`).
 - `fs-schema`: span schema v1, clean-room OTLP conversion, limits, compacted
   batches.
-- `fs-wal`: segments, crc32c, checkpoint file, instance id, replay.
+- `fs-wal`: segments, crc32c, checkpoint file, instance id, replay, a
+  commit marker per synced batch so recovery cuts only unacknowledged bytes
+  and refuses to open on any damage it cannot prove unacknowledged.
 - `fs-catalog`: migrations 0001 to 0003, files, tenants, tokens
   (`ingest` and `query` scopes), idempotent registration with content
   verification, atomic swaps, purge of quarantined files, change
