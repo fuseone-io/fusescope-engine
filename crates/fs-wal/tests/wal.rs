@@ -321,3 +321,74 @@ fn instance_id_survives_restart_and_differs_per_directory() {
     let other = tempfile::tempdir().unwrap();
     assert_ne!(Wal::open(config(other.path())).unwrap().instance_id(), id);
 }
+
+/// Damage in the middle of the last segment, with acknowledged records
+/// after it, is not a torn tail: the log refuses to open rather than cut
+/// records that were confirmed.
+#[test]
+fn corruption_before_acknowledged_records_refuses_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let last_segment = {
+        let mut wal = Wal::open(config(dir.path())).unwrap();
+        for i in 0..5 {
+            wal.append(&payload(i)).unwrap();
+        }
+        wal.sync().unwrap();
+        wal.position().segment
+    };
+    let path = dir.path().join(format!("{last_segment:020}.wal"));
+    let mut bytes = fs::read(&path).unwrap();
+    // Inside the payload of the second record.
+    let hit = usize::try_from(HEADER_LEN).unwrap() + 8 + payload(0).len() + 8 + 2;
+    bytes[hit] ^= 0xff;
+    fs::write(&path, &bytes).unwrap();
+
+    let Err(err) = Wal::open(config(dir.path())) else {
+        panic!("corruption before acknowledged records must not open")
+    };
+    assert!(
+        matches!(
+            err,
+            WalError::Corrupt {
+                damage: Damage::ChecksumMismatch,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the segment is left as it was"
+    );
+}
+
+/// A checksum mismatch in the last record of the last segment is a torn
+/// write: cut like a short tail, and the log opens.
+#[test]
+fn corrupted_last_record_is_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let last_segment = {
+        let mut wal = Wal::open(config(dir.path())).unwrap();
+        for i in 0..5 {
+            wal.append(&payload(i)).unwrap();
+        }
+        wal.sync().unwrap();
+        wal.position().segment
+    };
+    let path = dir.path().join(format!("{last_segment:020}.wal"));
+    let mut bytes = fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    fs::write(&path, &bytes).unwrap();
+
+    let mut wal = Wal::open(config(dir.path())).unwrap();
+    assert_eq!(wal.recovery().damage, Some(Damage::ChecksumMismatch));
+    assert_eq!(
+        usize::try_from(wal.recovery().truncated_bytes).unwrap(),
+        8 + payload(4).len()
+    );
+    let (payloads, damaged) = records(&mut wal);
+    assert_eq!(damaged, vec![]);
+    assert_eq!(payloads.len(), 4);
+}

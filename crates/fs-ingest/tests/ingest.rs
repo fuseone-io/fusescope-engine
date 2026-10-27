@@ -2579,6 +2579,54 @@ async fn damage_in_a_sealed_segment_refuses_to_start() {
         Ok(_) => panic!("damage in a sealed segment must stop the start"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("sealed segment"), "{err}");
+    assert!(err.contains("cannot be trusted"), "{err}");
+    db.finish().await;
+}
+
+/// Corruption in the middle of the only, active segment, with acknowledged
+/// records after it, is not a torn tail: the log does not open, so no
+/// replay can send an intent's rows back to live.
+#[tokio::test]
+async fn corruption_in_the_active_segment_refuses_to_open() {
+    use fs_ingest::record::{RecordSignal, WalRecord};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    {
+        let mut wal = Wal::open(WalConfig::new(wal_dir.clone())).unwrap();
+        for i in 0..10u8 {
+            let record = WalRecord {
+                tenant,
+                signal: RecordSignal::Traces,
+                payload: bytes::Bytes::from(request("api", i, 5).encode_to_vec()),
+            };
+            wal.append(&record.encode()).unwrap();
+        }
+        wal.sync().unwrap();
+    }
+    let segment = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "wal"))
+        .unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&segment, &bytes).unwrap();
+
+    let Err(err) = Wal::open(WalConfig::new(wal_dir)) else {
+        panic!("the log must not open over corrupted, acknowledged records")
+    };
+    assert!(err.to_string().contains("corruption"), "{err}");
     db.finish().await;
 }

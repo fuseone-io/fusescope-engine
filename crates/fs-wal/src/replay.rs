@@ -121,6 +121,11 @@ pub(crate) struct Scan {
     pub(crate) valid_len: u64,
     /// Damage found at `valid_len`, if the scan did not reach a clean end.
     pub(crate) damage: Option<Damage>,
+    /// The damage is confined to the end of the file: a record cut short,
+    /// the last framed record failing its checksum, or zeros to the end.
+    /// That is what a write torn by a crash looks like; damage with framed
+    /// bytes after it is not, and nothing after it can be trusted.
+    pub(crate) tail: bool,
 }
 
 pub(crate) struct SegmentReader {
@@ -128,6 +133,8 @@ pub(crate) struct SegmentReader {
     reader: BufReader<File>,
     file_len: u64,
     offset: u64,
+    /// Where the frame of the last record read would end, valid or not.
+    frame_end: u64,
 }
 
 impl SegmentReader {
@@ -150,6 +157,7 @@ impl SegmentReader {
             reader,
             file_len,
             offset: HEADER_LEN,
+            frame_end: HEADER_LEN,
         })
     }
 
@@ -162,14 +170,43 @@ impl SegmentReader {
                     return Scan {
                         valid_len: self.offset,
                         damage: None,
+                        tail: false,
                     };
                 }
                 Step::Damaged(position, damage) => {
+                    let tail = match damage {
+                        Damage::TruncatedTail => true,
+                        Damage::ChecksumMismatch => self.frame_end == self.file_len,
+                        Damage::BadLength => self.rest_is_zero(position.offset),
+                        Damage::BadHeader | Damage::Io(_) => false,
+                    };
                     return Scan {
                         valid_len: position.offset,
                         damage: Some(damage),
+                        tail,
                     };
                 }
+            }
+        }
+    }
+
+    /// True when every byte from `from` to the end of the file is zero, as
+    /// a torn or preallocated tail is.
+    fn rest_is_zero(&mut self, from: u64) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        if self.reader.seek(SeekFrom::Start(from)).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.reader.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(n) => {
+                    if buf.get(..n).is_some_and(|b| b.iter().any(|x| *x != 0)) {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
             }
         }
     }
@@ -198,6 +235,7 @@ impl SegmentReader {
         if u64::from(len) > remaining - RECORD_HEADER_LEN as u64 {
             return Step::Damaged(start, Damage::TruncatedTail);
         }
+        self.frame_end = self.offset + (RECORD_HEADER_LEN + len_usize) as u64;
         let mut payload = vec![0u8; len_usize];
         if let Err(e) = self.reader.read_exact(&mut payload) {
             return Step::Damaged(start, Damage::Io(e.to_string()));

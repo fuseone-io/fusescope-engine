@@ -847,12 +847,12 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
         records: 0,
         damaged: 0,
     };
-    // Any record this engine cannot read, and any damage in a sealed
-    // segment, may hide a flush intent; skipping it would send the intent's
-    // rows back to live and write them as other bytes under an id already
-    // taken. Only the tail of the active segment may be unreadable: a record
-    // torn there was never acknowledged, so no flush ever depended on it.
-    let active = wal.position().segment;
+    // Any record this engine cannot read and any damage the log reports may
+    // hide a flush intent; skipping it would send the intent's rows back to
+    // live and write them as other bytes under an id already taken. The
+    // only damage ever tolerated, a tail torn by a crash, was cut when the
+    // log opened: a record torn there was never acknowledged, so no flush
+    // ever depended on it.
     for event in wal.replay()? {
         match event {
             Event::Record(entry) => {
@@ -889,17 +889,9 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                     },
                 }
             }
-            Event::Damaged { position, damage } if position.segment == active => {
-                out.damaged += 1;
-                warn!(
-                    ?position,
-                    ?damage,
-                    "wal damage at the tail of the active segment; records past it were never acknowledged"
-                );
-            }
             Event::Damaged { position, damage } => {
                 return Err(IngestError::Record(format!(
-                    "wal damage at {position:?} in a sealed segment ({damage:?}); records past it cannot be trusted and may include a flush intent"
+                    "wal damage at {position:?} ({damage:?}); records past it cannot be trusted and may include a flush intent"
                 )));
             }
         }

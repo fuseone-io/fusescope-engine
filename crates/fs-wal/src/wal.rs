@@ -67,7 +67,8 @@ pub struct SegmentInfo {
 /// What recovery found when the log was opened.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Recovery {
-    /// Bytes cut from the end of the last segment because they were not a valid record.
+    /// Bytes cut from the end of the last segment because they were not a
+    /// valid record: a tail torn by a crash, the only damage that is cut.
     pub truncated_bytes: u64,
     /// Damage found at the cut point, if any.
     pub damage: Option<Damage>,
@@ -296,6 +297,15 @@ fn recover_last(
             return Ok((SegmentWriter::create(&config.dir, next)?, recovery));
         }
     };
+    if let (Some(damage), false) = (&scan.damage, scan.tail) {
+        // Framed bytes follow the damage: records that were acknowledged.
+        // Cutting them would lose them silently; the log stays as it is.
+        return Err(WalError::Corrupt {
+            segment: id,
+            offset: scan.valid_len,
+            damage: damage.clone(),
+        });
+    }
     let mut recovery = Recovery {
         truncated_bytes: file_len - scan.valid_len,
         damage: scan.damage,

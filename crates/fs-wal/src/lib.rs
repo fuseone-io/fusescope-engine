@@ -81,6 +81,18 @@ pub enum WalError {
     /// The segment id space is exhausted. Practically unreachable.
     #[error("segment id overflow")]
     SegmentIdOverflow,
+    /// Damage inside the last segment with framed records after it: the
+    /// records there were acknowledged, so the log is not cut and does not
+    /// open. Only a tail torn by a crash is cut.
+    #[error("corruption at segment {segment} offset {offset} with records after it ({damage:?})")]
+    Corrupt {
+        /// Segment id.
+        segment: u64,
+        /// Byte offset where valid data stops.
+        offset: u64,
+        /// Why.
+        damage: Damage,
+    },
 }
 
 impl WalError {
