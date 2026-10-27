@@ -850,9 +850,9 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
     // Any record this engine cannot read and any damage the log reports may
     // hide a flush intent; skipping it would send the intent's rows back to
     // live and write them as other bytes under an id already taken. The
-    // only damage ever tolerated, a tail torn by a crash, was cut when the
-    // log opened: a record torn there was never acknowledged, so no flush
-    // ever depended on it.
+    // only damage ever tolerated, bytes after the last commit marker, was
+    // cut when the log opened: no sync completed for them, so nothing was
+    // acknowledged and no flush ever depended on them.
     for event in wal.replay()? {
         match event {
             Event::Record(entry) => {

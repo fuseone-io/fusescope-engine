@@ -1,7 +1,13 @@
 //! On-disk encoding of segment headers and record headers.
 
-/// Magic bytes at the start of every segment. The last byte is the format version.
-pub(crate) const MAGIC: [u8; 8] = *b"FSWAL\0\0\x01";
+/// Magic bytes at the start of every segment. The last byte is the format
+/// version: 2 added the commit marker after every synced batch.
+pub(crate) const MAGIC: [u8; 8] = *b"FSWAL\0\0\x02";
+
+/// Bytes the crc of a commit marker frame is computed over. A marker is a
+/// frame of length zero carrying this crc, appended before every fsync, so
+/// recovery knows where the acknowledged part of a segment ends.
+const MARKER_TAG: &[u8] = b"FSWAL commit";
 
 /// Bytes of the segment header: magic plus the segment id.
 pub const HEADER_LEN: u64 = 16;
@@ -33,6 +39,18 @@ pub(crate) fn encode_record_header(payload: &[u8]) -> Option<[u8; RECORD_HEADER_
     out[..4].copy_from_slice(&len.to_le_bytes());
     out[4..].copy_from_slice(&crc32c::crc32c(payload).to_le_bytes());
     Some(out)
+}
+
+/// Encodes a commit marker frame.
+pub(crate) fn encode_marker() -> [u8; RECORD_HEADER_LEN] {
+    let mut out = [0u8; RECORD_HEADER_LEN];
+    out[4..].copy_from_slice(&crc32c::crc32c(MARKER_TAG).to_le_bytes());
+    out
+}
+
+/// True when a frame of length `len` with `crc` is a commit marker.
+pub(crate) fn is_marker(len: u32, crc: u32) -> bool {
+    len == 0 && crc == crc32c::crc32c(MARKER_TAG)
 }
 
 /// Splits a record header into `(payload_len, crc)`.
@@ -83,6 +101,17 @@ mod tests {
         assert_eq!(len, 5);
         assert!(verify(payload, crc));
         assert!(!verify(b"hellp", crc));
+    }
+
+    #[test]
+    fn markers_are_zero_length_frames_with_their_own_crc() {
+        let (len, crc) = decode_record_header(encode_marker());
+        assert!(is_marker(len, crc));
+        assert!(
+            !is_marker(0, 0),
+            "an empty frame with another crc is damage"
+        );
+        assert!(!is_marker(1, crc));
     }
 
     #[test]

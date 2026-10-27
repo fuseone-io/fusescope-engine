@@ -1,10 +1,13 @@
 //! Sequential reading of segments with damage reporting.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::format::{HEADER_LEN, RECORD_HEADER_LEN, decode_header, decode_record_header, verify};
+use crate::format::{
+    HEADER_LEN, RECORD_HEADER_LEN, decode_header, decode_record_header, encode_marker, is_marker,
+    verify,
+};
 use crate::wal::Position;
 
 /// One record read back from the log.
@@ -81,6 +84,7 @@ impl Iterator for Replay {
                     Step::Record(entry)
                         if self.skip_before.is_some_and(|cut| entry.position < cut) => {}
                     Step::Record(entry) => return Some(Event::Record(entry)),
+                    Step::Marker => {}
                     Step::End => self.current = None,
                     Step::Damaged(position, damage) => {
                         self.current = None;
@@ -111,6 +115,8 @@ impl Iterator for Replay {
 
 enum Step {
     Record(Entry),
+    /// A commit marker: everything before it was acknowledged.
+    Marker,
     End,
     Damaged(Position, Damage),
 }
@@ -121,11 +127,13 @@ pub(crate) struct Scan {
     pub(crate) valid_len: u64,
     /// Damage found at `valid_len`, if the scan did not reach a clean end.
     pub(crate) damage: Option<Damage>,
-    /// The damage is confined to the end of the file: a record cut short,
-    /// the last framed record failing its checksum, or zeros to the end.
-    /// That is what a write torn by a crash looks like; damage with framed
-    /// bytes after it is not, and nothing after it can be trusted.
-    pub(crate) tail: bool,
+    /// Offset just after the last commit marker: everything before it was
+    /// acknowledged. Damage at or after it belongs to a batch whose sync
+    /// never completed, which no one was told about; damage before it is
+    /// corruption of acknowledged records. Framing is lost after damage, so
+    /// the bytes behind it are searched for the marker pattern instead: a
+    /// payload that happens to contain it only makes recovery refuse to cut.
+    pub(crate) confirmed: u64,
 }
 
 pub(crate) struct SegmentReader {
@@ -133,8 +141,6 @@ pub(crate) struct SegmentReader {
     reader: BufReader<File>,
     file_len: u64,
     offset: u64,
-    /// Where the frame of the last record read would end, valid or not.
-    frame_end: u64,
 }
 
 impl SegmentReader {
@@ -157,58 +163,47 @@ impl SegmentReader {
             reader,
             file_len,
             offset: HEADER_LEN,
-            frame_end: HEADER_LEN,
         })
     }
 
-    /// Scans to the end, returning where valid data stops.
+    /// Scans to the end, returning where valid data stops and where the
+    /// acknowledged part ends.
     pub(crate) fn scan(mut self, max_record_bytes: usize) -> Scan {
+        let mut confirmed = HEADER_LEN;
         loop {
             match self.next_record(max_record_bytes) {
                 Step::Record(_) => {}
+                Step::Marker => confirmed = self.offset,
                 Step::End => {
                     return Scan {
                         valid_len: self.offset,
                         damage: None,
-                        tail: false,
+                        confirmed,
                     };
                 }
                 Step::Damaged(position, damage) => {
-                    let tail = match damage {
-                        Damage::TruncatedTail => true,
-                        Damage::ChecksumMismatch => self.frame_end == self.file_len,
-                        Damage::BadLength => self.rest_is_zero(position.offset),
-                        Damage::BadHeader | Damage::Io(_) => false,
-                    };
+                    if let Some(after) = self.last_marker_after(position.offset) {
+                        confirmed = after;
+                    }
                     return Scan {
                         valid_len: position.offset,
                         damage: Some(damage),
-                        tail,
+                        confirmed,
                     };
                 }
             }
         }
     }
 
-    /// True when every byte from `from` to the end of the file is zero, as
-    /// a torn or preallocated tail is.
-    fn rest_is_zero(&mut self, from: u64) -> bool {
-        use std::io::{Read, Seek, SeekFrom};
-        if self.reader.seek(SeekFrom::Start(from)).is_err() {
-            return false;
-        }
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.reader.read(&mut buf) {
-                Ok(0) => return true,
-                Ok(n) => {
-                    if buf.get(..n).is_some_and(|b| b.iter().any(|x| *x != 0)) {
-                        return false;
-                    }
-                }
-                Err(_) => return false,
-            }
-        }
+    /// Offset just after the last marker pattern found at or past `from`,
+    /// at any alignment. Unreadable bytes count as having none.
+    fn last_marker_after(&mut self, from: u64) -> Option<u64> {
+        let mut rest = Vec::new();
+        self.reader.seek(SeekFrom::Start(from)).ok()?;
+        self.reader.read_to_end(&mut rest).ok()?;
+        let marker = encode_marker();
+        let at = rest.windows(marker.len()).rposition(|w| w == marker)?;
+        Some(from + (at + marker.len()) as u64)
     }
 
     fn next_record(&mut self, max_record_bytes: usize) -> Step {
@@ -228,6 +223,10 @@ impl SegmentReader {
             return Step::Damaged(start, Damage::Io(e.to_string()));
         }
         let (len, crc) = decode_record_header(header);
+        if is_marker(len, crc) {
+            self.offset += RECORD_HEADER_LEN as u64;
+            return Step::Marker;
+        }
         let len_usize = len as usize;
         if len == 0 || len_usize > max_record_bytes {
             return Step::Damaged(start, Damage::BadLength);
@@ -235,7 +234,6 @@ impl SegmentReader {
         if u64::from(len) > remaining - RECORD_HEADER_LEN as u64 {
             return Step::Damaged(start, Damage::TruncatedTail);
         }
-        self.frame_end = self.offset + (RECORD_HEADER_LEN + len_usize) as u64;
         let mut payload = vec![0u8; len_usize];
         if let Err(e) = self.reader.read_exact(&mut payload) {
             return Step::Damaged(start, Damage::Io(e.to_string()));

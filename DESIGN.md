@@ -569,7 +569,7 @@ surface and is handled as follows:
   a per-tenant drop counter, so a cardinality attack does not take down the
   pipeline of the tenant under attack.
 - Per-tenant rate limit in bytes per second.
-- WAL with crc32c per record and fsync per batch. PVC volume encrypted by the
+- WAL with crc32c per record, fsync per batch and a commit marker after each synced batch, so recovery cuts only what was never acknowledged and refuses to open on damage before it. PVC volume encrypted by the
   provider.
 
 ### 10.4 Data at rest and in transit

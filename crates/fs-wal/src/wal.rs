@@ -68,7 +68,8 @@ pub struct SegmentInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Recovery {
     /// Bytes cut from the end of the last segment because they were not a
-    /// valid record: a tail torn by a crash, the only damage that is cut.
+    /// valid record: everything after the last commit marker, which no sync
+    /// completed for and no one was told about. The only damage that is cut.
     pub truncated_bytes: u64,
     /// Damage found at the cut point, if any.
     pub damage: Option<Damage>,
@@ -177,7 +178,7 @@ impl Wal {
         let offset = self.active.append(payload)?;
         self.bytes += self.active.len() - before;
         if self.config.sync == SyncPolicy::Always {
-            self.active.sync()?;
+            self.sync_active()?;
         }
         Ok(Position {
             segment: self.active.id(),
@@ -190,12 +191,20 @@ impl Wal {
     /// # Errors
     /// Filesystem errors.
     pub fn sync(&mut self) -> Result<(), WalError> {
-        self.active.sync()
+        self.sync_active()
+    }
+
+    /// Syncs the active segment, counting the commit marker it appends.
+    fn sync_active(&mut self) -> Result<(), WalError> {
+        let before = self.active.len();
+        self.active.sync()?;
+        self.bytes += self.active.len() - before;
+        Ok(())
     }
 
     /// Closes the active segment and starts the next one.
     fn rotate(&mut self) -> Result<(), WalError> {
-        self.active.sync()?;
+        self.sync_active()?;
         let next = self
             .active
             .id()
@@ -212,7 +221,7 @@ impl Wal {
     /// # Errors
     /// Filesystem errors while listing segments.
     pub fn replay(&mut self) -> Result<Replay, WalError> {
-        self.active.sync()?;
+        self.sync_active()?;
         Ok(Replay::new(
             list_segments(&self.config.dir)?,
             self.config.max_record_bytes,
@@ -230,7 +239,7 @@ impl Wal {
         if self.checkpoint.is_some_and(|current| position <= current) {
             return Ok(());
         }
-        self.active.sync()?;
+        self.sync_active()?;
         write_checkpoint(&self.config.dir, position)?;
         self.checkpoint = Some(position);
         self.truncate_before(position)?;
@@ -297,14 +306,17 @@ fn recover_last(
             return Ok((SegmentWriter::create(&config.dir, next)?, recovery));
         }
     };
-    if let (Some(damage), false) = (&scan.damage, scan.tail) {
-        // Framed bytes follow the damage: records that were acknowledged.
-        // Cutting them would lose them silently; the log stays as it is.
-        return Err(WalError::Corrupt {
-            segment: id,
-            offset: scan.valid_len,
-            damage: damage.clone(),
-        });
+    if let Some(damage) = &scan.damage {
+        if scan.valid_len < scan.confirmed {
+            // Damage before the last commit marker: records that were
+            // acknowledged. Cutting them would lose them silently; the log
+            // stays as it is for the operator.
+            return Err(WalError::Corrupt {
+                segment: id,
+                offset: scan.valid_len,
+                damage: damage.clone(),
+            });
+        }
     }
     let mut recovery = Recovery {
         truncated_bytes: file_len - scan.valid_len,

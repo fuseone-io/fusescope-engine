@@ -17,15 +17,21 @@
 //!
 //! Payloads are opaque to this crate. The crc covers the payload only; the
 //! length is validated against the segment bounds and the configured maximum.
+//! A frame of length zero carrying the crc of a fixed tag is a commit marker,
+//! appended by [`Wal::sync`] after the records of the batch it syncs.
 //!
 //! # Durability and recovery
 //!
-//! Appends go through a buffered writer. [`Wal::sync`] flushes and fsyncs the
-//! active segment; [`SyncPolicy::Always`] does that on every append. New segment
-//! files are fsynced together with their directory so they survive a crash.
+//! Appends go through a buffered writer. [`Wal::sync`] appends a commit
+//! marker, flushes and fsyncs the active segment; [`SyncPolicy::Always`] does
+//! that on every append. New segment files are fsynced together with their
+//! directory so they survive a crash.
 //!
-//! On open, the last segment is scanned and anything after the last valid
-//! record (a torn write from a crash) is cut off so appends continue from a
+//! On open, the last segment is scanned. Everything before its last commit
+//! marker was acknowledged by a completed sync; damage there is corruption of
+//! acknowledged records and the log refuses to open rather than cut them.
+//! Damage after the last marker belongs to a batch whose sync never completed,
+//! which no one was told about: it is cut off so appends continue from a
 //! consistent point. Earlier segments are never modified; damage in them is
 //! reported during replay and the scan continues with the next segment.
 //!

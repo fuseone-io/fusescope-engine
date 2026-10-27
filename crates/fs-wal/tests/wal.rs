@@ -363,10 +363,11 @@ fn corruption_before_acknowledged_records_refuses_to_open() {
     );
 }
 
-/// A checksum mismatch in the last record of the last segment is a torn
-/// write: cut like a short tail, and the log opens.
+/// The last record of a synced batch is acknowledged like any other: a
+/// checksum mismatch there is corruption, not a torn write, and the log
+/// refuses to open.
 #[test]
-fn corrupted_last_record_is_a_torn_tail() {
+fn corrupted_last_synced_record_refuses_to_open() {
     let dir = tempfile::tempdir().unwrap();
     let last_segment = {
         let mut wal = Wal::open(config(dir.path())).unwrap();
@@ -378,17 +379,95 @@ fn corrupted_last_record_is_a_torn_tail() {
     };
     let path = dir.path().join(format!("{last_segment:020}.wal"));
     let mut bytes = fs::read(&path).unwrap();
-    let last = bytes.len() - 1;
+    // The last byte of the fifth record's payload, just before the marker.
+    let last = bytes.len() - 8 - 1;
     bytes[last] ^= 0xff;
     fs::write(&path, &bytes).unwrap();
+    let Err(err) = Wal::open(config(dir.path())) else {
+        panic!("a corrupted acknowledged record must not open")
+    };
+    assert!(
+        matches!(
+            err,
+            WalError::Corrupt {
+                damage: Damage::ChecksumMismatch,
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// A length field is not covered by the crc. Pointing one past the end of
+/// the file inside a synced batch looks like a short tail, but the marker
+/// after it proves the batch was acknowledged: the log refuses to open.
+#[test]
+fn corrupted_length_before_a_marker_refuses_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let last_segment = {
+        let mut wal = Wal::open(config(dir.path())).unwrap();
+        for i in 0..5 {
+            wal.append(&payload(i)).unwrap();
+        }
+        wal.sync().unwrap();
+        wal.position().segment
+    };
+    let path = dir.path().join(format!("{last_segment:020}.wal"));
+    let mut bytes = fs::read(&path).unwrap();
+    let second = usize::try_from(HEADER_LEN).unwrap() + 8 + payload(0).len();
+    // Within the configured maximum, but past the end of the file.
+    bytes[second..second + 4].copy_from_slice(&1000u32.to_le_bytes());
+    fs::write(&path, &bytes).unwrap();
+    let Err(err) = Wal::open(config(dir.path())) else {
+        panic!("a bad length before acknowledged records must not open")
+    };
+    assert!(
+        matches!(
+            err,
+            WalError::Corrupt {
+                damage: Damage::TruncatedTail,
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// Records written after the last marker, whose sync never completed, are
+/// cut whatever shape the damage takes, because no one was told about them.
+#[test]
+fn unacknowledged_records_after_the_marker_are_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let last_segment = {
+        let mut wal = Wal::open(config(dir.path())).unwrap();
+        for i in 0..3 {
+            wal.append(&payload(i)).unwrap();
+        }
+        wal.sync().unwrap();
+        wal.position().segment
+    };
+    let path = dir.path().join(format!("{last_segment:020}.wal"));
+    let synced = fs::metadata(&path).unwrap().len();
+    // Two whole records and a third one torn, never synced: no marker follows.
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    for i in 3..5 {
+        let p = payload(i);
+        f.write_all(&u32::try_from(p.len()).unwrap().to_le_bytes())
+            .unwrap();
+        f.write_all(&crc32c::crc32c(&p).to_le_bytes()).unwrap();
+        f.write_all(&p).unwrap();
+    }
+    f.write_all(&[200u8, 0, 0, 0, 1, 2, 3, 4, 9, 9]).unwrap();
+    drop(f);
 
     let mut wal = Wal::open(config(dir.path())).unwrap();
-    assert_eq!(wal.recovery().damage, Some(Damage::ChecksumMismatch));
+    assert_eq!(wal.recovery().damage, Some(Damage::TruncatedTail));
     assert_eq!(
-        usize::try_from(wal.recovery().truncated_bytes).unwrap(),
-        8 + payload(4).len()
+        fs::metadata(&path).unwrap().len(),
+        synced + 2 * (8 + payload(3).len()) as u64,
+        "the whole unacknowledged records stay, the torn one goes"
     );
     let (payloads, damaged) = records(&mut wal);
     assert_eq!(damaged, vec![]);
-    assert_eq!(payloads.len(), 4);
+    assert_eq!(payloads.len(), 5);
 }

@@ -5,7 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::WalError;
-use crate::format::{HEADER_LEN, encode_header, encode_record_header};
+use crate::format::{HEADER_LEN, encode_header, encode_marker, encode_record_header};
 
 /// Buffer in front of the segment file. Records are usually a few KiB to a
 /// few MiB; the buffer absorbs small appends between syncs.
@@ -17,6 +17,8 @@ pub(crate) struct SegmentWriter {
     file: BufWriter<File>,
     /// Bytes written so far, including the header and anything still buffered.
     len: u64,
+    /// Records appended since the last commit marker.
+    unmarked: bool,
 }
 
 impl SegmentWriter {
@@ -37,6 +39,7 @@ impl SegmentWriter {
             path,
             file: BufWriter::with_capacity(WRITE_BUFFER, file),
             len: HEADER_LEN,
+            unmarked: false,
         })
     }
 
@@ -51,6 +54,7 @@ impl SegmentWriter {
             path,
             file: BufWriter::with_capacity(WRITE_BUFFER, file),
             len,
+            unmarked: false,
         })
     }
 
@@ -76,11 +80,24 @@ impl SegmentWriter {
             .write_all(payload)
             .map_err(|e| WalError::io(&self.path, e))?;
         self.len += (header.len() + payload.len()) as u64;
+        self.unmarked = true;
         Ok(offset)
     }
 
-    /// Flushes the buffer and fsyncs the file.
+    /// Appends a commit marker after the records since the last one, then
+    /// flushes the buffer and fsyncs the file. The marker is durable with
+    /// the batch it closes, so on recovery everything before the last
+    /// marker is known to have been acknowledged and everything after it
+    /// known not to.
     pub(crate) fn sync(&mut self) -> Result<(), WalError> {
+        if self.unmarked {
+            let marker = encode_marker();
+            self.file
+                .write_all(&marker)
+                .map_err(|e| WalError::io(&self.path, e))?;
+            self.len += marker.len() as u64;
+            self.unmarked = false;
+        }
         self.file.flush().map_err(|e| WalError::io(&self.path, e))?;
         self.file
             .get_ref()
