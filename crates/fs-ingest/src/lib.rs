@@ -48,6 +48,9 @@ pub enum IngestError {
     /// Arrow or Parquet failure while building a file.
     #[error("encode: {0}")]
     Encode(String),
+    /// The trace index sidecar could not be built.
+    #[error("trace index: {0}")]
+    Index(#[from] fs_index::IndexError),
     /// A WAL record could not be decoded during replay.
     #[error("wal record: {0}")]
     Record(String),

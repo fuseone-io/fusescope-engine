@@ -329,6 +329,12 @@ impl Metrics {
             "Parquet row groups written",
             ns(&f.row_groups),
         );
+        counter(
+            out,
+            "fusescope_flush_trace_index_bytes_total",
+            "Bytes of trace_id sidecars created",
+            ns(&f.trace_index_bytes),
+        );
         histogram(
             out,
             "fusescope_coalesce_seconds",
@@ -368,6 +374,24 @@ impl Metrics {
                 "fusescope_query_hot_unavailable_total",
                 "Ingesters that did not answer a fan-out",
                 q.hot_unavailable.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_trace_index_fetches_total",
+                "trace_id sidecars fetched from the bucket",
+                q.trace_index_fetches.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_trace_index_misses_total",
+                "Sidecars missing, unreadable or unreachable; their files were scanned",
+                q.trace_index_misses.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_trace_index_pruned_total",
+                "Files a trace lookup skipped because their sidecar lacked the trace",
+                q.trace_index_pruned.load(Ordering::Relaxed),
             );
         }
     }

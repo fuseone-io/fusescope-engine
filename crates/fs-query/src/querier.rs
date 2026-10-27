@@ -54,6 +54,12 @@ pub struct QueryStats {
     pub hot_fanouts: std::sync::atomic::AtomicU64,
     /// Ingesters that did not answer a fan-out.
     pub hot_unavailable: std::sync::atomic::AtomicU64,
+    /// `trace_id` sidecars fetched from the bucket.
+    pub trace_index_fetches: std::sync::atomic::AtomicU64,
+    /// Sidecars missing, unreadable or unreachable; their files were scanned.
+    pub trace_index_misses: std::sync::atomic::AtomicU64,
+    /// Files a trace lookup skipped because their sidecar lacked the trace.
+    pub trace_index_pruned: std::sync::atomic::AtomicU64,
 }
 
 /// Resource limits applied to every query.
@@ -69,6 +75,9 @@ pub struct QueryLimits {
     pub batch_size: usize,
     /// Hot-window fan-out settings.
     pub hot_window: crate::hot::HotWindowConfig,
+    /// Decoded `trace_id` sidecars kept in memory for trace lookups. Zero
+    /// disables the sidecars.
+    pub trace_index_cache_bytes: usize,
 }
 
 impl Default for QueryLimits {
@@ -79,6 +88,7 @@ impl Default for QueryLimits {
             max_rows: 1_000_000,
             batch_size: 8192,
             hot_window: crate::hot::HotWindowConfig::default(),
+            trace_index_cache_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -92,6 +102,7 @@ pub struct Querier {
     catalog: Catalog,
     cache: Arc<FileCache>,
     hot: Arc<crate::hot::HotWindow>,
+    trace_index: Arc<crate::trace_index::TraceIndexCache>,
     runtime: Arc<RuntimeEnv>,
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
@@ -116,9 +127,13 @@ impl Querier {
             builder = builder.with_temp_file_path(dir);
         }
         let runtime = builder.build_arc()?;
-        runtime.register_object_store(store_url.as_ref(), store);
+        runtime.register_object_store(store_url.as_ref(), Arc::clone(&store));
         let cache = Arc::new(FileCache::new(catalog.clone()));
         let stats = Arc::new(QueryStats::default());
+        let trace_index = Arc::new(
+            crate::trace_index::TraceIndexCache::new(store, limits.trace_index_cache_bytes)
+                .with_stats(Arc::clone(&stats)),
+        );
         let hot = Arc::new(
             crate::hot::HotWindow::new(catalog.clone(), limits.hot_window)
                 .with_stats(Arc::clone(&stats)),
@@ -127,12 +142,14 @@ impl Querier {
             memory_bytes = limits.memory_bytes,
             timeout = ?limits.timeout,
             hot_window = limits.hot_window.enabled,
+            trace_index_cache_bytes = limits.trace_index_cache_bytes,
             "querier ready"
         );
         Ok(Self {
             catalog,
             cache,
             hot,
+            trace_index,
             runtime,
             store_url,
             limits,
@@ -143,6 +160,11 @@ impl Querier {
     /// The file cache, for the notification follower.
     pub fn cache(&self) -> Arc<FileCache> {
         Arc::clone(&self.cache)
+    }
+
+    /// The sidecar cache trace lookups consult.
+    pub fn trace_index(&self) -> Arc<crate::trace_index::TraceIndexCache> {
+        Arc::clone(&self.trace_index)
     }
 
     /// Limits in force.
@@ -187,6 +209,7 @@ impl Querier {
             tenant,
             Arc::clone(&self.cache),
             Arc::clone(&self.hot),
+            Arc::clone(&self.trace_index),
             Arc::clone(&warnings),
             Arc::clone(&self.runtime),
             &self.store_url,

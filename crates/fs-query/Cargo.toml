@@ -29,6 +29,7 @@ bytes = { workspace = true }
 fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
 fs-ingest = { path = "../fs-ingest" }
+fs-index = { path = "../fs-index" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

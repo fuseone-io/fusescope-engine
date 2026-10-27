@@ -205,17 +205,26 @@ fn sha256_of(path: &std::path::Path) -> [u8; 32] {
 }
 
 fn parquet_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    files_with_extension(dir, "parquet")
+}
+
+fn sidecar_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    files_with_extension(dir, "tix")
+}
+
+fn files_with_extension(dir: &std::path::Path, extension: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                out.extend(parquet_files(&path));
-            } else if path.extension().is_some_and(|e| e == "parquet") {
+                out.extend(files_with_extension(&path, extension));
+            } else if path.extension().is_some_and(|e| e == extension) {
                 out.push(path);
             }
         }
     }
+    out.sort();
     out
 }
 
@@ -2263,6 +2272,146 @@ async fn flush_writes_row_groups_and_retains_each() {
             >= 1,
         "at least one retained row group holds no trace 3"
     );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Every flush leaves a `trace_id` sidecar next to its file, under the
+/// path the querier derives from the catalog row, listing exactly the
+/// traces the file holds.
+#[tokio::test]
+async fn flush_writes_a_trace_index_sidecar_listing_its_traces() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    let mut client = h.client().await;
+    for (service, trace) in [("api", 1u8), ("db", 2), ("web", 3)] {
+        client
+            .export(authed(request(service, trace, 5), &token))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await;
+    let bucket = h.dir.path().join("bucket");
+    let sidecars = sidecar_files(&bucket);
+    assert_eq!(sidecars.len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(
+        sidecars[0],
+        bucket.join(fs_index::sidecar_path(&registered[0].path).unwrap())
+    );
+    let index = fs_index::TraceIndex::decode(&std::fs::read(&sidecars[0]).unwrap()).unwrap();
+    assert_eq!(index.files(), std::slice::from_ref(&registered[0].path));
+    assert_eq!(index.len(), 3);
+    for trace in 1u8..=3 {
+        assert!(index.contains_any(&[[trace; 16]]), "trace {trace}");
+    }
+    assert!(!index.contains_any(&[[4u8; 16]]));
+    assert_eq!(
+        h.ingester
+            .flush_stats()
+            .trace_index_bytes
+            .load(Ordering::Relaxed),
+        std::fs::metadata(&sidecars[0]).unwrap().len()
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A crash after the Parquet upload and before the sidecar leaves an
+/// unregistered object. The retry after restart finds it, writes the
+/// sidecar from the same rows and registers the file once.
+#[tokio::test]
+async fn crash_between_parquet_and_sidecar_is_resumed() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_index_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for (service, trace) in [("api", 1u8), ("db", 2)] {
+        client
+            .export(authed(request(service, trace, 4), &token))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let bucket = h.dir.path().join("bucket");
+    let written = parquet_files(&bucket);
+    assert_eq!(
+        written.len(),
+        1,
+        "the object was uploaded before the failure"
+    );
+    assert_eq!(sidecar_files(&bucket).len(), 0);
+    let before = sha256_of(&written[0]);
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(parquet_files(&bucket), written);
+    assert_eq!(sha256_of(&written[0]), before, "the object is untouched");
+    let sidecars = sidecar_files(&bucket);
+    assert_eq!(sidecars.len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].row_count, 8);
+    let index = fs_index::TraceIndex::decode(&std::fs::read(&sidecars[0]).unwrap()).unwrap();
+    assert_eq!(index.files(), std::slice::from_ref(&registered[0].path));
+    assert!(index.contains_any(&[[1u8; 16]]) && index.contains_any(&[[2u8; 16]]));
     h.stop().await;
     db.finish().await;
 }

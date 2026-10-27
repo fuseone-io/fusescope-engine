@@ -34,6 +34,7 @@ pub struct SpansTable {
         Arc<crate::hot::HotWindow>,
         Arc<crate::querier::QueryWarnings>,
     )>,
+    trace_index: Option<Arc<crate::trace_index::TraceIndexCache>>,
 }
 
 impl SpansTable {
@@ -50,7 +51,15 @@ impl SpansTable {
             store_url,
             bytes_budget,
             hot: None,
+            trace_index: None,
         }
+    }
+
+    /// Consults `trace_id` sidecars when the filters pin trace ids.
+    #[must_use]
+    pub fn with_trace_index(mut self, cache: Arc<crate::trace_index::TraceIndexCache>) -> Self {
+        self.trace_index = Some(cache);
+        self
     }
 
     /// Adds the hot-window fan-out; ingesters that fail are noted in `warnings`.
@@ -83,10 +92,18 @@ impl SpansTable {
     ) -> Result<(Vec<PartitionedFile>, u64), QueryError> {
         let pruning = Pruning::from_filters(filters);
         let all = self.cache.files(self.tenant, Signal::Traces).await?;
-        let mut bytes = 0u64;
-        let files: Vec<PartitionedFile> = all
+        let candidates: Vec<&fs_catalog::FileRecord> = all
             .iter()
             .filter(|f| pruning.keeps(f) && !excluded.contains(&f.id))
+            .collect();
+        let after_catalog = candidates.len();
+        let candidates = match (&self.trace_index, pinned_traces(&pruning)) {
+            (Some(index), Some(traces)) => index.files_holding(candidates, &traces).await,
+            _ => candidates,
+        };
+        let mut bytes = 0u64;
+        let files: Vec<PartitionedFile> = candidates
+            .into_iter()
             .map(|f| {
                 let size = u64::try_from(f.size_bytes).unwrap_or(0);
                 bytes = bytes.saturating_add(size);
@@ -96,6 +113,7 @@ impl SpansTable {
         debug!(
             tenant = %self.tenant.0,
             candidates = all.len(),
+            after_catalog,
             kept = files.len(),
             excluded = excluded.len(),
             bytes,
@@ -222,6 +240,17 @@ impl TableProvider for SpansTable {
             None => files_exec,
         })
     }
+}
+
+/// The 16-byte trace ids the filters pin; `None` when they pin none.
+fn pinned_traces(pruning: &Pruning) -> Option<Vec<[u8; 16]>> {
+    let ids: Vec<[u8; 16]> = pruning
+        .trace_ids
+        .as_ref()?
+        .iter()
+        .filter_map(|id| id.as_slice().try_into().ok())
+        .collect();
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// Casts every column whose type differs from `schema` to the declared type.

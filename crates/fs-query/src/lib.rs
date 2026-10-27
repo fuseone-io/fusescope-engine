@@ -14,6 +14,7 @@ pub mod prune;
 pub mod querier;
 pub mod session;
 pub mod spans_table;
+pub mod trace_index;
 
 pub use querier::{Querier, QueryLimits, QueryStats, STORE_URL};
 

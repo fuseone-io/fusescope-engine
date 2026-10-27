@@ -143,8 +143,34 @@ async fn write_file(
     )
     .unwrap();
     flush::upload(store, &prepared).await.unwrap();
+    flush::upload_index(store, &prepared).await.unwrap();
     catalog.register_file(&prepared.file).await.unwrap();
     prepared.file.size_bytes
+}
+
+/// Every `.tix` under `dir`, decoded, with its path on disk.
+fn sidecars(dir: &std::path::Path) -> Vec<(std::path::PathBuf, fs_index::TraceIndex)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(sidecars(&path));
+            } else if path.extension().is_some_and(|e| e == "tix") {
+                let index = fs_index::TraceIndex::decode(&std::fs::read(&path).unwrap()).unwrap();
+                out.push((path, index));
+            }
+        }
+    }
+    out
+}
+
+fn trace_filter(trace: u8) -> datafusion::logical_expr::Expr {
+    col("trace_id").eq(lit(ScalarValue::Binary(Some(vec![trace; 16]))))
+}
+
+fn stat(f: &Fixture, pick: impl Fn(&fs_query::QueryStats) -> &std::sync::atomic::AtomicU64) -> u64 {
+    pick(&f.querier.stats()).load(std::sync::atomic::Ordering::Relaxed)
 }
 
 struct Fixture {
@@ -319,6 +345,123 @@ async fn prunes_files_by_time_and_service_before_reading() {
         .await
         .unwrap();
     assert_eq!(count(&n), 7);
+    f.db.finish().await;
+}
+
+/// A lookup pinning a trace opens only the files whose sidecar lists it;
+/// sidecars are fetched once and served from memory after.
+#[tokio::test]
+async fn trace_index_prunes_files_without_the_trace() {
+    let Some(f) = fixture().await else { return };
+    let table = fs_query::spans_table::SpansTable::new(
+        f.tenant,
+        f.querier.cache(),
+        datafusion::execution::object_store::ObjectStoreUrl::parse(fs_query::STORE_URL).unwrap(),
+        u64::MAX,
+    )
+    .with_trace_index(f.querier.trace_index());
+
+    let (files, _) = table.plan_files(&[trace_filter(2)]).await.unwrap();
+    assert_eq!(files.len(), 1, "only the worker file holds trace 2");
+    assert_eq!(
+        stat(&f, |s| &s.trace_index_fetches),
+        3,
+        "one sidecar per visible file"
+    );
+    assert_eq!(stat(&f, |s| &s.trace_index_misses), 0);
+    assert_eq!(stat(&f, |s| &s.trace_index_pruned), 2);
+
+    let (none, _) = table.plan_files(&[trace_filter(7)]).await.unwrap();
+    assert_eq!(none.len(), 0, "no file holds trace 7");
+    assert_eq!(
+        stat(&f, |s| &s.trace_index_fetches),
+        3,
+        "served from memory"
+    );
+    assert_eq!(stat(&f, |s| &s.trace_index_pruned), 5);
+    assert!(f.querier.trace_index().bytes().await > 0);
+
+    let (all, _) = table.plan_files(&[]).await.unwrap();
+    assert_eq!(all.len(), 3, "without a pinned trace nothing is consulted");
+
+    let hex = "02".repeat(16);
+    let rows = f
+        .querier
+        .collect(
+            f.tenant,
+            &format!("select count(*) from spans where trace_id = decode('{hex}', 'hex')"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&rows), 5);
+    assert_eq!(
+        stat(&f, |s| &s.trace_index_pruned),
+        7,
+        "SQL goes through the same pruning"
+    );
+    f.db.finish().await;
+}
+
+/// A file whose sidecar is missing or damaged is scanned, counted as a
+/// miss, and never fails the query; the other sidecars still prune.
+#[tokio::test]
+async fn missing_or_damaged_sidecars_degrade_to_a_scan() {
+    let Some(f) = fixture().await else { return };
+    let bucket = f.dir.path().join("bucket");
+    let found = sidecars(&bucket);
+    assert_eq!(found.len(), 4, "one per file, the other tenant's included");
+    let path_of = |trace: u8| {
+        found
+            .iter()
+            .find(|(_, index)| index.contains_any(&[[trace; 16]]))
+            .map(|(path, _)| path.clone())
+            .unwrap()
+    };
+    std::fs::remove_file(path_of(2)).unwrap();
+    let damaged = path_of(1);
+    let mut bytes = std::fs::read(&damaged).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&damaged, bytes).unwrap();
+
+    let hex = "02".repeat(16);
+    let rows = f
+        .querier
+        .collect(
+            f.tenant,
+            &format!("select count(*) from spans where trace_id = decode('{hex}', 'hex')"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&rows),
+        5,
+        "the worker file is scanned without its sidecar"
+    );
+    assert_eq!(stat(&f, |s| &s.trace_index_fetches), 3);
+    assert_eq!(
+        stat(&f, |s| &s.trace_index_misses),
+        2,
+        "one missing, one damaged"
+    );
+    assert_eq!(
+        stat(&f, |s| &s.trace_index_pruned),
+        1,
+        "the hour-2 file's sidecar still prunes"
+    );
+
+    // Misses are remembered: the second lookup fetches nothing.
+    let rows = f
+        .querier
+        .collect(
+            f.tenant,
+            &format!("select count(*) from spans where trace_id = decode('{hex}', 'hex')"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count(&rows), 5);
+    assert_eq!(stat(&f, |s| &s.trace_index_fetches), 3);
+    assert_eq!(stat(&f, |s| &s.trace_index_misses), 2);
     f.db.finish().await;
 }
 

@@ -21,6 +21,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
+use fs_index::TraceIndex;
 use fs_schema::spans::{col, span_schema_v1};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -65,6 +66,10 @@ pub struct Prepared {
     pub file: NewFile,
     /// File bytes.
     pub bytes: Bytes,
+    /// The `trace_id` sidecar listing the traces of the file, encoded.
+    pub index: Bytes,
+    /// Where the sidecar goes, derived from the file's path.
+    pub index_path: String,
     /// The rows as written, one batch per row group in file order, each with
     /// its trace ids: what the hot window keeps for the file after
     /// registration.
@@ -160,6 +165,9 @@ pub fn prepare(
     }
     let start = Utc.timestamp_nanos(ts_min);
     let path = l0_path(root, tenant, start, id);
+    let index_path = fs_index::sidecar_path(path.as_ref())
+        .ok_or(fs_index::IndexError::BadBody("file path has no sidecar"))?;
+    let index = Bytes::from(trace_index(path.as_ref(), &rows)?.encode());
     let file = NewFile {
         id,
         tenant_id: tenant,
@@ -178,12 +186,23 @@ pub fn prepare(
     Ok(Prepared {
         file,
         bytes,
+        index,
+        index_path,
         rows,
         concat,
         sort: merge,
         encode,
         writer_peak,
     })
+}
+
+/// The sidecar of one file: every trace of every row group, file index 0.
+fn trace_index(path: &str, rows: &[HotBatch]) -> Result<TraceIndex, IngestError> {
+    let pairs = rows
+        .iter()
+        .filter_map(|r| r.traces.as_ref())
+        .flat_map(|set| set.iter().map(|t| (*t, 0u32)));
+    Ok(TraceIndex::new(vec![path.to_owned()], pairs)?)
 }
 
 /// The engine's Parquet writer settings for L0 with row groups of
@@ -398,13 +417,36 @@ pub enum Upload {
 /// Bucket failure other than "already exists", including missing support for
 /// conditional writes.
 pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<Upload, IngestError> {
-    let path = Path::from(prepared.file.path.as_str());
-    let payload = PutPayload::from_bytes(prepared.bytes.clone());
+    put_once(store, &prepared.file.path, prepared.bytes.clone()).await
+}
+
+/// Uploads the file's `trace_id` sidecar under the same create-once rule.
+/// Goes after the file and before the catalog row, so a registered file
+/// has its sidecar unless another writer put a different one first.
+///
+/// # Errors
+/// Store failure.
+pub async fn upload_index(
+    store: &dyn ObjectStore,
+    prepared: &Prepared,
+) -> Result<Upload, IngestError> {
+    put_once(store, &prepared.index_path, prepared.index.clone()).await
+}
+
+async fn put_once(
+    store: &dyn ObjectStore,
+    path: &str,
+    bytes: Bytes,
+) -> Result<Upload, IngestError> {
+    let path = Path::from(path);
     let create = PutOptions {
         mode: PutMode::Create,
         ..PutOptions::default()
     };
-    match store.put_opts(&path, payload, create).await {
+    match store
+        .put_opts(&path, PutPayload::from_bytes(bytes), create)
+        .await
+    {
         Ok(_) => Ok(Upload::Created),
         Err(object_store::Error::AlreadyExists { .. }) => {
             let meta = store.head(&path).await?;
@@ -637,6 +679,50 @@ mod tests {
 
     /// An object already at the path is left alone and its size reported,
     /// so a retry after a crash registers what is in the bucket.
+    #[tokio::test]
+    async fn the_sidecar_lists_every_trace_of_the_file_and_only_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let inputs = vec![
+            batch("api", 1, &[T0 + 1, T0 + 2]),
+            batch("db", 2, &[T0 + 3]),
+            batch("api", 1, &[T0 + 4]),
+        ];
+        let tenant = TenantId(uuid::Uuid::from_u128(1));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let prepared = prepare(tenant, &Path::from("engine"), id, &inputs, 2).unwrap();
+        assert_eq!(
+            prepared.index_path,
+            fs_index::sidecar_path(&prepared.file.path).unwrap()
+        );
+        let index = fs_index::TraceIndex::decode(&prepared.index).unwrap();
+        assert_eq!(index.files(), std::slice::from_ref(&prepared.file.path));
+        assert_eq!(
+            index.len(),
+            2,
+            "two traces over two row groups, listed once each"
+        );
+        assert!(index.contains_any(&[[1u8; 16]]));
+        assert!(index.contains_any(&[[2u8; 16]]));
+        assert!(!index.contains_any(&[[3u8; 16]]));
+
+        assert_eq!(
+            upload_index(&store, &prepared).await.unwrap(),
+            Upload::Created
+        );
+        assert_eq!(
+            upload_index(&store, &prepared).await.unwrap(),
+            Upload::Existing {
+                size: prepared.index.len() as u64
+            }
+        );
+        let stored = store
+            .get(&Path::from(prepared.index_path.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(stored.bytes().await.unwrap(), prepared.index);
+    }
+
     #[tokio::test]
     async fn upload_reports_an_existing_object_and_its_size() {
         let dir = tempfile::tempdir().unwrap();

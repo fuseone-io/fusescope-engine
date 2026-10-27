@@ -124,9 +124,27 @@ pub struct FlushStats {
     pub writer_bytes: AtomicU64,
     /// Row groups written.
     pub row_groups: AtomicU64,
+    /// Bytes of `trace_id` sidecars created.
+    pub trace_index_bytes: AtomicU64,
 }
 
 /// Permits of the flush semaphore for a configured `max_flushes`.
+/// Takes one injected failure when any is left: exactly as many as
+/// configured fire, whatever the number of concurrent attempts.
+fn take_injected(counter: &std::sync::atomic::AtomicU32) -> bool {
+    let mut remaining = counter.load(Ordering::SeqCst);
+    loop {
+        if remaining == 0 {
+            return false;
+        }
+        match counter.compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return true,
+            Err(actual) => remaining = actual,
+        }
+    }
+}
+
 fn flush_permits(max_flushes: usize) -> usize {
     max_flushes.clamp(1, u32::MAX as usize / 4)
 }
@@ -183,6 +201,7 @@ pub struct Shared {
     coalesces: Arc<tokio::sync::Semaphore>,
     flushes: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
+    inject_index_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
     retry_delay_pending: std::sync::atomic::AtomicBool,
     catalog: Catalog,
@@ -485,6 +504,7 @@ impl Shared {
         timing.encode = nanos(prepared.encode);
         let upload_started = Instant::now();
         let outcome = flush::upload(self.store.as_ref(), &prepared).await?;
+        self.upload_index(&prepared).await?;
         timing.upload = nanos(upload_started.elapsed());
         let flush::Prepared {
             mut file,
@@ -514,26 +534,32 @@ impl Shared {
         Ok((file, created, rows, writer_peak))
     }
 
+    /// Sidecar upload, with the test-only failure injection in front. A
+    /// sidecar another writer put first is kept whatever its size: the
+    /// querier verifies what it reads and scans the file when that fails.
+    async fn upload_index(&self, prepared: &flush::Prepared) -> Result<(), IngestError> {
+        if take_injected(&self.inject_index_failures) {
+            return Err(IngestError::Injected("trace index upload"));
+        }
+        match flush::upload_index(self.store.as_ref(), prepared).await? {
+            flush::Upload::Created => {
+                self.flush_stats.trace_index_bytes.fetch_add(
+                    u64::try_from(prepared.index.len()).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+            }
+            flush::Upload::Existing { size } => {
+                if size != u64::try_from(prepared.index.len()).unwrap_or(0) {
+                    warn!(file = %prepared.file.id.0, existing = size, prepared = prepared.index.len(), "trace index another writer put differs; keeping it");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Catalog registration, with the test-only failure injection in front.
     async fn register(&self, file: &fs_catalog::NewFile) -> Result<(), IngestError> {
-        // One injected failure per attempt, exactly as many as configured,
-        // whatever the number of concurrent attempts.
-        let mut remaining = self.inject_register_failures.load(Ordering::SeqCst);
-        let injected = loop {
-            if remaining == 0 {
-                break false;
-            }
-            match self.inject_register_failures.compare_exchange(
-                remaining,
-                remaining - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break true,
-                Err(actual) => remaining = actual,
-            }
-        };
-        if injected {
+        if take_injected(&self.inject_register_failures) {
             if let Some(delay) = self.config.inject_register_delay {
                 self.flush_stats
                     .registrations_held
@@ -968,6 +994,7 @@ impl Ingester {
         );
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
+        let config_index_injected = config.inject_index_failures;
         let config_conversions = config.max_conversions;
         let config_coalesces = config.max_coalesces;
         let config_flushes = config.max_flushes;
@@ -996,6 +1023,7 @@ impl Ingester {
             )),
             flushes: Arc::new(tokio::sync::Semaphore::new(flush_permits(config_flushes))),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
+            inject_index_failures: std::sync::atomic::AtomicU32::new(config_index_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             retry_delay_pending: std::sync::atomic::AtomicBool::new(retry_delay_pending),
             catalog,

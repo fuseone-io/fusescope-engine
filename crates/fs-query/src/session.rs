@@ -34,6 +34,7 @@ pub fn tenant_session(
     tenant: TenantId,
     cache: Arc<FileCache>,
     hot: Arc<crate::hot::HotWindow>,
+    trace_index: Arc<crate::trace_index::TraceIndexCache>,
     warnings: Arc<crate::querier::QueryWarnings>,
     runtime: Arc<RuntimeEnv>,
     store_url: &ObjectStoreUrl,
@@ -63,7 +64,8 @@ pub fn tenant_session(
         "spans".into(),
         Arc::new(
             SpansTable::new(tenant, cache, store_url.clone(), bytes_budget)
-                .with_hot_window(hot, warnings),
+                .with_hot_window(hot, warnings)
+                .with_trace_index(trace_index),
         ),
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());

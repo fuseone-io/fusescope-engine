@@ -59,12 +59,12 @@ Done, in this repository (phase 0 and most of the engine side of phase 1):
 - `fs-ingest`: OTLP gRPC with bearer tokens and per-tenant limits, group
   commit WAL writer, strict admission against per-tenant and global caps,
   flush intents and the gate, file ids derived from the log, retries that
-  never change a file's content, hot window over internal Flight with final
-  file-id announcements, WAL-ordered buffers with background coalescing,
+  never change a file's content, a `trace_id` sidecar per file, hot window
+  over internal Flight with final file-id announcements, WAL-ordered buffers with background coalescing,
   histograms for hot-scan and checkpoint latency.
 - `fs-query`: tenant-scoped DataFusion sessions, SELECT-only gate, catalog
-  pruning, byte budget, hot-window union with partial-result warnings,
-  Flight SQL front end.
+  pruning, `trace_id` sidecar pruning with an in-memory cache, byte budget,
+  hot-window union with partial-result warnings, Flight SQL front end.
 - `fs-server`: configuration, bootstrap, roles, admin commands, `/metrics`,
   graceful shutdown. `fs-compactor`: purge of quarantined files only.
 - `fs-bench`: ingest stages, OTLP load generator with `/metrics` deltas,
@@ -97,7 +97,7 @@ retention holds about 570 bytes per span.
 |---|---|---|---|---|---|
 | B1 | Typed `trace_id` and `span_id` predicates in `HotScanRequest` (`#[serde(default)]`, optional), applied before rows leave the ingester | the hot scan shipped every retained row | `hot_scan_keeps_only_the_requested_traces_and_spans`, pruning unit test, SQL lookup test; [benchmark](benchmarks/2026-10-26-retention-and-trace-lookup.md): `trace by id` p95 2.1 s → 384 ms under load | S | done (e6fb243) |
 | B2 | Hot trace index: every chunk and retained file batch carries its set of trace ids, built when the batch is made; a lookup skips batches holding none of the requested traces | narrows the in-memory scan to a few batches | `hot_scan_skips_batches_without_the_trace`; benchmark pending | M | done, benchmark pending |
-| B3 | `index/trace_id/*.tix` sidecar per hour written by the flush and the compactor, with the xxh3 header; querier opens only the listed files | thousands of files per trace lookup otherwise | sidecar round-trip test; corrupt sidecar degrades to a scan; `trace by id` within the 9.2 target | L | todo |
+| B3 | `index/trace_id/*.tix` sidecar per hour written by the flush and the compactor, with the xxh3 header; querier opens only the listed files | thousands of files per trace lookup otherwise | sidecar round-trip test; corrupt sidecar degrades to a scan; `trace by id` within the 9.2 target | L | done for L0: `fs-index::trace_index` format v1, one sidecar per flush (`flush_writes_a_trace_index_sidecar_listing_its_traces`, `crash_between_parquet_and_sidecar_is_resumed`), querier cache with byte budget (`trace_index_prunes_files_without_the_trace`, `missing_or_damaged_sidecars_degrade_to_a_scan`); the per-hour merge lands with C2; benchmark pending |
 | B4 | Typed action `trace.lookup` over Flight `DoAction` returning the spans of one trace | the Go backend's trace view should not build SQL for the most common query | action test; Go client call | M | todo |
 | B5 | Prepared-plan ticket: `GetFlightInfo` plans once, `DoGet` executes the ticket bound to the tenant | every statement is planned twice today, a 125 ms floor | query test asserting one planning per statement; query benchmark | M | todo |
 | B6 | Service and operation metadata actions (`metadata.services`, `metadata.operations`) and the `attribute_keys` derived table | the UI's service list and filter suggestions need them | action tests; Go client call | M | todo |

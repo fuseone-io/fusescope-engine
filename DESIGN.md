@@ -391,6 +391,19 @@ compactor** at every level. They are never the source of truth.
 Every sidecar carries a header with version, length and an xxh3 checksum. A
 corrupt or missing sidecar degrades to a file scan, never to an error.
 
+The `trace_id` sidecar (`fs-index::trace_index`, format version 1) is a
+sorted table of `(trace_id, file)` pairs over a list of file paths. The flush
+writes one per L0 file, derived from the trace sets of its row groups, after
+the Parquet object and before the catalog row, under the create-once rule;
+the compactor will merge them into one per hour. The querier derives the
+sidecar path from the file path, so the catalog does not list sidecars. A
+lookup that pins trace ids fetches the sidecars of the files the catalog
+keeps, in parallel, and opens only those listing one of the ids; decoded
+sidecars stay in memory up to `query.trace_index_cache_bytes`, evicted least
+recently used, and a file whose sidecar is missing or unreadable is
+remembered as such and scanned. Fetches, misses and pruned files are
+counted.
+
 ## 6. Hot window
 
 Data from the last seconds up to the flush exists only in the ingester. The

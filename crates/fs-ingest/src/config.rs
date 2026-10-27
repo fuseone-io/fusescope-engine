@@ -76,6 +76,10 @@ pub struct IngestConfig {
     /// Make this many catalog registrations fail artificially. Zero in
     /// production; tests use it to exercise the retry path.
     pub inject_register_failures: u32,
+    /// Make this many trace index uploads fail artificially, after the
+    /// Parquet object is in the bucket. Zero in production; tests use it to
+    /// crash between the two uploads.
+    pub inject_index_failures: u32,
     /// Hold each injected registration failure this long before failing.
     /// `None` in production; tests use it to act while a flush is pending.
     pub inject_register_delay: Option<Duration>,
@@ -119,6 +123,7 @@ impl Default for IngestConfig {
             persisted_retain: Duration::from_secs(8),
             checkpoint_after_flush: true,
             inject_register_failures: 0,
+            inject_index_failures: 0,
             inject_register_delay: None,
             inject_push_delay: None,
             inject_retry_delay: None,

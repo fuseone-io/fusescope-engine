@@ -473,6 +473,10 @@ pub struct QuerySection {
     pub max_rows: usize,
     /// Directory for spill files. Unset disables spilling.
     pub spill_dir: Option<PathBuf>,
+    /// Decoded `trace_id` sidecars kept in memory for trace lookups. Zero
+    /// disables the sidecars and every lookup opens every overlapping file.
+    #[serde(default = "default_trace_index_cache_bytes")]
+    pub trace_index_cache_bytes: usize,
 }
 
 impl Default for QuerySection {
@@ -482,6 +486,7 @@ impl Default for QuerySection {
             timeout_secs: default_query_timeout(),
             max_rows: default_query_max_rows(),
             spill_dir: None,
+            trace_index_cache_bytes: default_trace_index_cache_bytes(),
         }
     }
 }
@@ -493,9 +498,14 @@ impl QuerySection {
             memory_bytes: self.memory_bytes,
             timeout: std::time::Duration::from_secs(self.timeout_secs),
             max_rows: self.max_rows,
+            trace_index_cache_bytes: self.trace_index_cache_bytes,
             ..fs_query::QueryLimits::default()
         }
     }
+}
+
+fn default_trace_index_cache_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 fn default_query_memory() -> usize {
