@@ -2467,3 +2467,118 @@ async fn unreadable_intent_refuses_to_start() {
     assert_eq!(parquet_files(&dir.path().join("bucket")).len(), 0);
     db.finish().await;
 }
+
+/// A record framed by a newer engine, with a valid checksum but a record
+/// version this one does not know, may be a flush intent: the start fails
+/// rather than replaying around it.
+#[tokio::test]
+async fn future_record_version_refuses_to_start() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        use fs_ingest::record::{RecordSignal, WalRecord};
+        let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+        let record = WalRecord {
+            tenant,
+            signal: RecordSignal::Traces,
+            payload: bytes::Bytes::from(request("api", 1, 5).encode_to_vec()),
+        };
+        wal.append(&record.encode()).unwrap();
+        // The same header layout with a record version from the future.
+        let mut newer = record.encode();
+        newer[0] = 9;
+        wal.append(&newer).unwrap();
+        wal.sync().unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    let outcome = Ingester::new(
+        test_config(),
+        db.catalog.clone(),
+        store,
+        Path::from(""),
+        wal,
+    );
+    let err = match outcome {
+        Ok(_) => panic!("an unreadable record must stop the start"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("cannot be read"), "{err}");
+    db.finish().await;
+}
+
+/// Damage inside a sealed segment, where every record was acknowledged,
+/// may hide a flush intent: the start fails. Damage at the tail of the
+/// active segment is a torn write of records never acknowledged and is
+/// replayed around.
+#[tokio::test]
+async fn damage_in_a_sealed_segment_refuses_to_start() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    let small = WalConfig {
+        segment_max_bytes: 4096,
+        ..WalConfig::new(wal_dir.clone())
+    };
+    {
+        use fs_ingest::record::{RecordSignal, WalRecord};
+        let mut wal = Wal::open(small.clone()).unwrap();
+        for i in 0..40u8 {
+            let record = WalRecord {
+                tenant,
+                signal: RecordSignal::Traces,
+                payload: bytes::Bytes::from(request("api", i, 5).encode_to_vec()),
+            };
+            wal.append(&record.encode()).unwrap();
+        }
+        wal.sync().unwrap();
+    }
+    let mut segments: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "wal"))
+        .collect();
+    segments.sort();
+    assert!(segments.len() >= 2, "the log rolled over at least once");
+    // Flip a byte in the middle of the first, sealed segment.
+    let first = &segments[0];
+    let mut bytes = std::fs::read(first).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(first, bytes).unwrap();
+
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let wal = Wal::open(small).unwrap();
+    let outcome = Ingester::new(
+        test_config(),
+        db.catalog.clone(),
+        store,
+        Path::from(""),
+        wal,
+    );
+    let err = match outcome {
+        Ok(_) => panic!("damage in a sealed segment must stop the start"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("sealed segment"), "{err}");
+    db.finish().await;
+}

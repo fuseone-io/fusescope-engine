@@ -847,18 +847,22 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
         records: 0,
         damaged: 0,
     };
+    // Any record this engine cannot read, and any damage in a sealed
+    // segment, may hide a flush intent; skipping it would send the intent's
+    // rows back to live and write them as other bytes under an id already
+    // taken. Only the tail of the active segment may be unreadable: a record
+    // torn there was never acknowledged, so no flush ever depended on it.
+    let active = wal.position().segment;
     for event in wal.replay()? {
         match event {
             Event::Record(entry) => {
                 out.records += 1;
-                let record = match WalRecord::decode(&entry.payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        out.damaged += 1;
-                        warn!(position = ?entry.position, error = %e, "skipping undecodable wal record");
-                        continue;
-                    }
-                };
+                let record = WalRecord::decode(&entry.payload).map_err(|e| {
+                    IngestError::Record(format!(
+                        "wal record at {:?} cannot be read by this engine ({e}); it was written by a newer one",
+                        entry.position
+                    ))
+                })?;
                 match record.signal {
                     RecordSignal::Traces => {
                         let Ok(message) = ExportTraceServiceRequest::decode(record.payload) else {
@@ -885,9 +889,18 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                     },
                 }
             }
-            Event::Damaged { position, damage } => {
+            Event::Damaged { position, damage } if position.segment == active => {
                 out.damaged += 1;
-                warn!(?position, ?damage, "wal damage during replay");
+                warn!(
+                    ?position,
+                    ?damage,
+                    "wal damage at the tail of the active segment; records past it were never acknowledged"
+                );
+            }
+            Event::Damaged { position, damage } => {
+                return Err(IngestError::Record(format!(
+                    "wal damage at {position:?} in a sealed segment ({damage:?}); records past it cannot be trusted and may include a flush intent"
+                )));
             }
         }
     }
