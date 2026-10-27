@@ -2416,6 +2416,82 @@ async fn crash_between_parquet_and_sidecar_is_resumed() {
     db.finish().await;
 }
 
+/// A sidecar already under the file's path that is valid but lists other
+/// traces would make the querier skip the file: the retry refuses it and
+/// the file stays unregistered, with the object and the sidecar untouched.
+#[tokio::test]
+async fn a_foreign_sidecar_under_the_files_path_blocks_registration() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_index_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for (service, trace) in [("api", 1u8), ("db", 2)] {
+        client
+            .export(authed(request(service, trace, 4), &token))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await;
+    let bucket = h.dir.path().join("bucket");
+    let written = parquet_files(&bucket);
+    assert_eq!(written.len(), 1);
+    let relative = written[0].strip_prefix(&bucket).unwrap().to_str().unwrap();
+    let sidecar = bucket.join(fs_index::sidecar_path(relative).unwrap());
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    let foreign = fs_index::TraceIndex::new(vec![relative.to_owned()], [([1u8; 16], 0)])
+        .unwrap()
+        .encode();
+    std::fs::write(&sidecar, &foreign).unwrap();
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert!(h.ingester.stats().flush_failures.load(Ordering::Relaxed) >= 1);
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap(),
+        foreign,
+        "the sidecar is not overwritten"
+    );
+    assert_eq!(parquet_files(&bucket), written);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registered.len(),
+        0,
+        "never registered behind an index that hides it"
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
 /// An intent recorded by a newer engine names a layout this one does not
 /// write. The rows stay bound to their id and nothing reaches the bucket:
 /// writing other bytes under that id would break every later retry.

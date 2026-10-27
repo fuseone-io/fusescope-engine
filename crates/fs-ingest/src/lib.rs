@@ -51,6 +51,13 @@ pub enum IngestError {
     /// The trace index sidecar could not be built.
     #[error("trace index: {0}")]
     Index(#[from] fs_index::IndexError),
+    /// A sidecar under the file's path holds other bytes than the file's
+    /// rows produce; the file is not registered over it.
+    #[error("trace index at {path} differs from the file's rows")]
+    IndexMismatch {
+        /// Sidecar path.
+        path: String,
+    },
     /// A WAL record could not be decoded during replay.
     #[error("wal record: {0}")]
     Record(String),

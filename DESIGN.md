@@ -394,15 +394,21 @@ corrupt or missing sidecar degrades to a file scan, never to an error.
 The `trace_id` sidecar (`fs-index::trace_index`, format version 1) is a
 sorted table of `(trace_id, file)` pairs over a list of file paths. The flush
 writes one per L0 file, derived from the trace sets of its row groups, after
-the Parquet object and before the catalog row, under the create-once rule;
-the compactor will merge them into one per hour. The querier derives the
-sidecar path from the file path, so the catalog does not list sidecars. A
-lookup that pins trace ids fetches the sidecars of the files the catalog
-keeps, in parallel, and opens only those listing one of the ids; decoded
-sidecars stay in memory up to `query.trace_index_cache_bytes`, evicted least
-recently used, and a file whose sidecar is missing or unreadable is
-remembered as such and scanned. Fetches, misses and pruned files are
-counted.
+the Parquet object and before the catalog row, under the create-once rule: a
+sidecar already there must be byte for byte the one the rows produce, or the
+file is not registered, since a valid sidecar listing other traces would hide
+the file. The compactor will merge them into one per hour. The querier
+derives the sidecar path from the file path, so the catalog does not list
+sidecars. A lookup that pins trace ids fetches the sidecars of the files the
+catalog keeps, in parallel, and opens only those listing one of the ids in
+that file; a sidecar that does not cover the file is not trusted. Decoded
+sidecars stay in memory up to `query.trace_index_cache_bytes`, a ceiling that
+counts downloads in flight: a download is reserved from its announced size
+before a byte is read, idle entries are evicted to make room, one larger than
+the budget is never read, and one that finds the budget busy is skipped for
+that query. A file whose sidecar is missing, unreadable, too large or naming
+other files is remembered as such and scanned. Fetches, misses and pruned
+files are counted.
 
 ## 6. Hot window
 

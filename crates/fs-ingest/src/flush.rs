@@ -421,16 +421,30 @@ pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<Uplo
 }
 
 /// Uploads the file's `trace_id` sidecar under the same create-once rule.
-/// Goes after the file and before the catalog row, so a registered file
-/// has its sidecar unless another writer put a different one first.
+/// Goes after the file and before the catalog row. A sidecar already
+/// there must be byte for byte the one these rows produce: a valid one
+/// listing other traces would make the querier skip the file.
 ///
 /// # Errors
-/// Store failure.
+/// Store failure, or an existing sidecar with other bytes.
 pub async fn upload_index(
     store: &dyn ObjectStore,
     prepared: &Prepared,
 ) -> Result<Upload, IngestError> {
-    put_once(store, &prepared.index_path, prepared.index.clone()).await
+    let outcome = put_once(store, &prepared.index_path, prepared.index.clone()).await?;
+    if let Upload::Existing { .. } = outcome {
+        let existing = store
+            .get(&Path::from(prepared.index_path.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        if existing != prepared.index {
+            return Err(IngestError::IndexMismatch {
+                path: prepared.index_path.clone(),
+            });
+        }
+    }
+    Ok(outcome)
 }
 
 async fn put_once(
@@ -721,6 +735,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.bytes().await.unwrap(), prepared.index);
+    }
+
+    #[tokio::test]
+    async fn an_existing_sidecar_with_other_bytes_refuses_the_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let inputs = vec![batch("api", 1, &[T0 + 1]), batch("db", 2, &[T0 + 2])];
+        let tenant = TenantId(uuid::Uuid::from_u128(1));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        // Valid, internally consistent, and missing trace 2.
+        let partial = fs_index::TraceIndex::new(vec![prepared.file.path.clone()], [([1u8; 16], 0)])
+            .unwrap()
+            .encode();
+        store
+            .put(
+                &Path::from(prepared.index_path.as_str()),
+                partial.clone().into(),
+            )
+            .await
+            .unwrap();
+        let err = upload_index(&store, &prepared).await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::IndexMismatch { ref path } if *path == prepared.index_path),
+            "{err}"
+        );
+        let stored = store
+            .get(&Path::from(prepared.index_path.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.bytes().await.unwrap(),
+            partial,
+            "nothing overwritten"
+        );
     }
 
     #[tokio::test]

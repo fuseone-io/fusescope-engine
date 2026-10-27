@@ -535,24 +535,17 @@ impl Shared {
     }
 
     /// Sidecar upload, with the test-only failure injection in front. A
-    /// sidecar another writer put first is kept whatever its size: the
-    /// querier verifies what it reads and scans the file when that fails.
+    /// sidecar already there with other bytes fails the attempt, so the
+    /// file is never registered behind an index that would hide it.
     async fn upload_index(&self, prepared: &flush::Prepared) -> Result<(), IngestError> {
         if take_injected(&self.inject_index_failures) {
             return Err(IngestError::Injected("trace index upload"));
         }
-        match flush::upload_index(self.store.as_ref(), prepared).await? {
-            flush::Upload::Created => {
-                self.flush_stats.trace_index_bytes.fetch_add(
-                    u64::try_from(prepared.index.len()).unwrap_or(0),
-                    Ordering::Relaxed,
-                );
-            }
-            flush::Upload::Existing { size } => {
-                if size != u64::try_from(prepared.index.len()).unwrap_or(0) {
-                    warn!(file = %prepared.file.id.0, existing = size, prepared = prepared.index.len(), "trace index another writer put differs; keeping it");
-                }
-            }
+        if let flush::Upload::Created = flush::upload_index(self.store.as_ref(), prepared).await? {
+            self.flush_stats.trace_index_bytes.fetch_add(
+                u64::try_from(prepared.index.len()).unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
         Ok(())
     }
