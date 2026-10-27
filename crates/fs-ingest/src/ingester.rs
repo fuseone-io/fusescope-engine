@@ -85,9 +85,9 @@ pub struct FlushStats {
     pub rows: AtomicU64,
     /// Parquet bytes written.
     pub parquet_bytes: AtomicU64,
-    /// Nanoseconds concatenating request batches.
+    /// Nanoseconds sorting each input batch.
     pub concat_nanos: AtomicU64,
-    /// Nanoseconds sorting.
+    /// Nanoseconds merging the sorted inputs into row groups.
     pub sort_nanos: AtomicU64,
     /// Nanoseconds encoding Parquet.
     pub encode_nanos: AtomicU64,
@@ -118,6 +118,12 @@ pub struct FlushStats {
     /// Injected registration failures being held by the test delay right
     /// now, so a test can act inside that window.
     pub registrations_held: AtomicU64,
+    /// Most bytes the Parquet writer held for one row group, ever.
+    pub writer_peak_bytes: AtomicU64,
+    /// Sum over flushes of the writer's peak bytes; `/ flushes` is the mean.
+    pub writer_bytes: AtomicU64,
+    /// Row groups written.
+    pub row_groups: AtomicU64,
 }
 
 /// Permits of the flush semaphore for a configured `max_flushes`.
@@ -370,7 +376,7 @@ impl Shared {
         // both outcomes, so no admission ever sees the room without the
         // rows that will take it back.
         match result {
-            Ok((file, created, rows, traces)) => {
+            Ok((file, created, rows)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(
                     tenant = %tenant.0,
@@ -383,7 +389,7 @@ impl Shared {
                 );
                 {
                     let mut buffers = self.buffers.lock().await;
-                    buffers.finish_flush(tenant, file_id, rows, traces, Instant::now());
+                    buffers.finish_flush(tenant, file_id, rows, Instant::now());
                     drop(held);
                 }
                 if self.config.checkpoint_after_flush {
@@ -435,19 +441,19 @@ impl Shared {
         file_id: FileId,
         batches: Vec<RecordBatch>,
         timing: &mut StageTiming,
-    ) -> Result<
-        (
-            fs_catalog::NewFile,
-            bool,
-            RecordBatch,
-            Option<crate::buffer::TraceSet>,
-        ),
-        IngestError,
-    > {
+    ) -> Result<(fs_catalog::NewFile, bool, Vec<crate::buffer::HotBatch>), IngestError> {
         let root = self.root.clone();
-        let prepared =
-            tokio::task::spawn_blocking(move || flush::prepare(tenant, &root, file_id, &batches))
-                .await??;
+        let row_group_rows = self.config.row_group_rows;
+        let prepared = tokio::task::spawn_blocking(move || {
+            flush::prepare(tenant, &root, file_id, &batches, row_group_rows)
+        })
+        .await??;
+        let fs = &self.flush_stats;
+        let peak = u64::try_from(prepared.writer_peak).unwrap_or(u64::MAX);
+        fs.writer_peak_bytes.fetch_max(peak, Ordering::Relaxed);
+        fs.writer_bytes.fetch_add(peak, Ordering::Relaxed);
+        fs.row_groups
+            .fetch_add(prepared.rows.len() as u64, Ordering::Relaxed);
         timing.concat = nanos(prepared.concat);
         timing.sort = nanos(prepared.sort);
         timing.encode = nanos(prepared.encode);
@@ -455,11 +461,7 @@ impl Shared {
         let created = flush::upload(self.store.as_ref(), &prepared).await?;
         timing.upload = nanos(upload_started.elapsed());
         let flush::Prepared {
-            file,
-            bytes,
-            rows,
-            traces,
-            ..
+            file, bytes, rows, ..
         } = prepared;
         // The object is in the bucket: its bytes go now; the lease waits for
         // the outcome.
@@ -467,7 +469,7 @@ impl Shared {
         let register_started = Instant::now();
         self.register(&file).await?;
         timing.register = nanos(register_started.elapsed());
-        Ok((file, created, rows, traces))
+        Ok((file, created, rows))
     }
 
     /// Catalog registration, with the test-only failure injection in front.

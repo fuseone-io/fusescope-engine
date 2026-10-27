@@ -98,7 +98,8 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
          fsyncs once and acknowledges every request in it; rotate every 64 MB
      ──► in-memory buffer: RecordBatches per (tenant, signal), sorted at flush
      ──► flush when: 128 MB, or 30 s, or end of hour
-         1. sort by (service_name, timestamp)
+         1. sort each batch by (service_name, timestamp, row), merge them
+            into row groups of `row_group_rows`, encode each as it completes
          2. write Parquet L0 to the bucket under a temporary path
          3. write index sidecars (section 5)
          4. INSERT into the catalog with state "visible"
@@ -158,7 +159,11 @@ exposed as histograms.
 Buffers keep batches in WAL order, the order replay produces, so a file holds
 the same rows in the same order whether it was built from live batches or
 from replayed records, and a retry after a crash reproduces the object byte
-for byte. Request batches are small, a dozen spans, and a flush would
+for byte: every batch is sorted on its own with its row position as the last
+key, and the k-way merge breaks ties by input order, so the batching of the
+rows never shows in the file. The writer holds one row group of pages at a
+time; its peak is measured per flush and published, which is what turns the
+flush lease's three copies from an estimate into a checked bound. Request batches are small, a dozen spans, and a flush would
 concatenate thousands of them, so a coalescer merges complete runs of them
 into chunks in the background: a run is complete when every position in it
 is below the smallest position still travelling from the log to a buffer,

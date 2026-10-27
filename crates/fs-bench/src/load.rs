@@ -41,9 +41,9 @@ pub struct FlushReport {
     pub rows_per_flush: f64,
     /// Parquet MiB per flush.
     pub parquet_mib_per_flush: f64,
-    /// Milliseconds per flush concatenating request batches.
+    /// Milliseconds per flush sorting each input batch.
     pub concat_ms: f64,
-    /// Milliseconds per flush in sort.
+    /// Milliseconds per flush merging the sorted inputs into row groups.
     pub sort_ms: f64,
     /// Milliseconds per flush encoding Parquet.
     pub encode_ms: f64,
@@ -65,6 +65,12 @@ pub struct FlushReport {
     pub coalesce_p95_ms: f64,
     /// Chunks being built at the end of the run.
     pub coalesce_active: u64,
+    /// Most bytes the Parquet writer held for one row group.
+    pub writer_peak_bytes: u64,
+    /// Mean of the writer's peak bytes per flush.
+    pub writer_mean_bytes: f64,
+    /// Row groups per flush.
+    pub row_groups_per_flush: f64,
     /// Hot-window snapshots during the run.
     pub hot_scans: u64,
     /// p95 of the hot-window snapshot latency, milliseconds.
@@ -243,6 +249,12 @@ pub fn print(report: &LoadReport) {
             f.buffer_bytes.2 >> 20
         );
         println!(
+            "row groups/flush={:.1} writer peak={} MiB mean={:.1} MiB",
+            f.row_groups_per_flush,
+            f.writer_peak_bytes >> 20,
+            f.writer_mean_bytes / (1024.0 * 1024.0)
+        );
+        println!(
             "coalesces={} batches/coalesce={:.0} {:.1}ms each p95<={:.0}ms active at end={} | hot scans={} p95<={:.0}ms | checkpoints={} p95<={:.0}ms",
             f.coalesces,
             f.batches_per_coalesce,
@@ -324,6 +336,9 @@ fn flush_report(
         coalesce_ms: per_coalesce("fusescope_coalesce_nanoseconds_total") / 1e6,
         coalesce_p95_ms: p95_ms(before, after, "fusescope_coalesce_seconds"),
         coalesce_active: gauge("fusescope_coalesce_active"),
+        writer_peak_bytes: gauge("fusescope_flush_writer_peak_bytes"),
+        writer_mean_bytes: per("fusescope_flush_writer_bytes_total"),
+        row_groups_per_flush: per("fusescope_flush_row_groups_total"),
         hot_scans: delta("fusescope_hot_scan_seconds_count").max(0.0) as u64,
         hot_scan_p95_ms: p95_ms(before, after, "fusescope_hot_scan_seconds"),
         checkpoints: delta("fusescope_checkpoint_seconds_count").max(0.0) as u64,

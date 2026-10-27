@@ -79,6 +79,14 @@ pub fn trace_set_bytes(set: &Option<TraceSet>) -> usize {
     })
 }
 
+/// Memory of batches with their trace sets, as the hot window counts them.
+pub fn hot_batches_bytes(batches: &[HotBatch]) -> usize {
+    batches
+        .iter()
+        .map(|b| b.batch.get_array_memory_size() + trace_set_bytes(&b.traces))
+        .sum()
+}
+
 /// Most memory the trace set of `rows` rows can take: one id per row. A
 /// request batch carries this bound in its bytes from admission until a
 /// chunk with the real set replaces it, so every cap and lease covers the
@@ -454,7 +462,7 @@ pub struct Taken {
 pub struct Persisted {
     /// Catalog id of the file holding these rows.
     pub file: FileId,
-    /// The rows as written: one sorted batch, with its trace ids.
+    /// The rows as written: one batch per row group, each with its trace ids.
     pub batches: Vec<HotBatch>,
     /// Arrow memory of `batches`, carried over from the buffer so accounting
     /// never walks the batches again.
@@ -837,25 +845,21 @@ impl Buffers {
         }
     }
 
-    /// The file is registered: `rows`, its content as one sorted batch with
-    /// its trace ids, stays persisted until swept, and the flushing rows are
-    /// dropped.
+    /// The file is registered: `rows`, its content as written, one batch per
+    /// row group with its trace ids, stays persisted until swept, and the
+    /// flushing rows are dropped.
     pub fn finish_flush(
         &mut self,
         tenant: TenantId,
         file: FileId,
-        rows: RecordBatch,
-        traces: Option<TraceSet>,
+        rows: Vec<HotBatch>,
         now: Instant,
     ) {
         if self.remove_flushing(tenant, file).is_some() {
             self.persisted.entry(tenant).or_default().push(Persisted {
                 file,
-                bytes: rows.get_array_memory_size() + trace_set_bytes(&traces),
-                batches: vec![HotBatch {
-                    batch: rows,
-                    traces,
-                }],
+                bytes: hot_batches_bytes(&rows),
+                batches: rows,
                 at: now,
             });
         }
@@ -1510,7 +1514,11 @@ mod tests {
         assert_eq!(buffers.bytes_of(tenant), chunk_bytes + raw);
         drop(originals);
         let written = tagged(6, 9);
-        buffers.finish_flush(tenant, file, written.clone(), None, now);
+        let groups = vec![HotBatch {
+            batch: written.clone(),
+            traces: None,
+        }];
+        buffers.finish_flush(tenant, file, groups, now);
         assert_eq!(
             buffers.memory(),
             (0, 0, written.get_array_memory_size()),

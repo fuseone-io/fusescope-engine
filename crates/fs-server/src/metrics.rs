@@ -311,6 +311,24 @@ impl Metrics {
             "Chunks being built right now",
             ns(&f.coalesce_active),
         );
+        gauge(
+            out,
+            "fusescope_flush_writer_peak_bytes",
+            "Most bytes the Parquet writer held for one row group",
+            ns(&f.writer_peak_bytes),
+        );
+        counter(
+            out,
+            "fusescope_flush_writer_bytes_total",
+            "Sum over flushes of the writer's peak bytes",
+            ns(&f.writer_bytes),
+        );
+        counter(
+            out,
+            "fusescope_flush_row_groups_total",
+            "Parquet row groups written",
+            ns(&f.row_groups),
+        );
         histogram(
             out,
             "fusescope_coalesce_seconds",

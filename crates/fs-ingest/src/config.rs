@@ -34,6 +34,9 @@ pub struct IngestConfig {
     /// Files written at the same time; a flush is cut inline and encoded,
     /// uploaded and registered on its own task.
     pub max_flushes: usize,
+    /// Rows per Parquet row group. A flush gathers, writes and flushes one
+    /// row group at a time, so this bounds what the writer holds.
+    pub row_group_rows: usize,
     /// Refuse new data for a tenant whose live and flushing rows would exceed
     /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
@@ -103,6 +106,7 @@ impl Default for IngestConfig {
             max_conversions: default_parallelism(),
             max_coalesces: default_coalesces(),
             max_flushes: 2,
+            row_group_rows: crate::flush::DEFAULT_ROW_GROUP_ROWS,
             max_buffer_bytes: 512 * 1024 * 1024,
             max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,

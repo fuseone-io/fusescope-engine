@@ -1,10 +1,22 @@
-//! Writes a tenant buffer as one sorted Parquet L0 file.
+//! Writes a tenant buffer as one sorted Parquet L0 file, one row group at a
+//! time.
+//!
+//! Every input batch is sorted on its own by `(service_name, timestamp,
+//! row)`, so equal keys keep their log order and the sort is a total order.
+//! The sorted inputs are then merged, k ways, into row groups of a fixed
+//! number of rows; each row group is gathered, written and flushed before
+//! the next is built, so the writer holds one row group of pages at a time
+//! and the rows it has written live only in the compressed output. Ties
+//! between inputs break by input order, which is log order, so a file
+//! written from chunks and a file written from the same rows replayed one
+//! request at a time are the same bytes.
 
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray};
-use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
-use arrow::datatypes::{Int32Type, TimestampNanosecondType};
+use arrow::array::{Array, AsArray, UInt32Array};
+use arrow::compute::{SortColumn, cast, interleave, lexsort_to_indices, take_record_batch};
+use arrow::datatypes::{DataType, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
@@ -18,11 +30,12 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersi
 use parquet::schema::types::ColumnPath;
 
 use crate::IngestError;
-use crate::buffer::{TraceSet, trace_set};
+use crate::buffer::{HotBatch, trace_set};
 
-/// Rows per row group. One group per million rows keeps footers small while
-/// statistics still prune well.
-const ROW_GROUP_ROWS: usize = 1_000_000;
+/// Rows per row group when the caller gives no size. Statistics still prune
+/// well at this size and a flush of a few hundred thousand rows makes a few
+/// groups, so the writer never holds the whole file.
+pub const DEFAULT_ROW_GROUP_ROWS: usize = 262_144;
 
 /// zstd level for L0: fast, the compactor recompresses at L2.
 const ZSTD_LEVEL: i32 = 3;
@@ -33,20 +46,24 @@ pub struct Prepared {
     pub file: NewFile,
     /// File bytes.
     pub bytes: Bytes,
-    /// The rows as written, one sorted batch: what the hot window keeps for
-    /// the file after registration.
-    pub rows: RecordBatch,
-    /// Trace ids in `rows`, so the hot window skips the batch for other traces.
-    pub traces: Option<TraceSet>,
-    /// Time spent concatenating the request batches.
+    /// The rows as written, one batch per row group in file order, each with
+    /// its trace ids: what the hot window keeps for the file after
+    /// registration.
+    pub rows: Vec<HotBatch>,
+    /// Time spent sorting each input batch.
     pub concat: std::time::Duration,
-    /// Time spent sorting.
+    /// Time spent merging the sorted inputs into row groups.
     pub sort: std::time::Duration,
     /// Time spent encoding Parquet.
     pub encode: std::time::Duration,
+    /// Most bytes the writer held after a row group was written and before
+    /// it was flushed: the writer's working memory, which the flush lease
+    /// must cover on top of the inputs and the row group being gathered.
+    pub writer_peak: usize,
 }
 
-/// Concatenates, sorts by `(service_name, timestamp)` and encodes `batches`.
+/// Sorts each of `batches`, merges them into row groups of `row_group_rows`
+/// rows and encodes each as it completes.
 ///
 /// CPU bound: callers run it on a blocking thread.
 ///
@@ -57,28 +74,71 @@ pub fn prepare(
     root: &Path,
     id: FileId,
     batches: &[RecordBatch],
+    row_group_rows: usize,
 ) -> Result<Prepared, IngestError> {
-    let concat_started = std::time::Instant::now();
     let schema = span_schema_v1();
-    let merged = concat_batches(&schema, batches)?;
-    let concat = concat_started.elapsed();
+    let row_group_rows = row_group_rows.max(1);
+
     let sort_started = std::time::Instant::now();
-    let sorted = sort_spans(&merged)?;
-    let sort = sort_started.elapsed();
+    let inputs: Vec<RecordBatch> = batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .map(sort_batch)
+        .collect::<Result<_, _>>()?;
+    let keys = MergeKeys::new(&inputs)?;
+    let concat = sort_started.elapsed();
 
-    let ts = sorted
-        .column(schema.index_of(col::TIMESTAMP)?)
-        .as_primitive::<TimestampNanosecondType>();
-    let ts_min = arrow::compute::min(ts).unwrap_or(0);
-    let ts_max = arrow::compute::max(ts).unwrap_or(0);
-    let services = distinct_services(&sorted)?;
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(
+        &mut out,
+        Arc::clone(&schema),
+        Some(writer_properties(row_group_rows)?),
+    )?;
 
+    let mut merge = std::time::Duration::ZERO;
+    let mut encode = std::time::Duration::ZERO;
+    let mut writer_peak = 0;
+    let mut rows = Vec::new();
+    let (mut ts_min, mut ts_max) = (i64::MAX, i64::MIN);
+    let mut heads = keys.heads();
+    loop {
+        let merge_started = std::time::Instant::now();
+        let indices = keys.next_group(&mut heads, row_group_rows);
+        if indices.is_empty() {
+            break;
+        }
+        let group = gather(&schema, &inputs, &indices)?;
+        merge += merge_started.elapsed();
+
+        let ts = group
+            .column(schema.index_of(col::TIMESTAMP)?)
+            .as_primitive::<TimestampNanosecondType>();
+        ts_min = ts_min.min(arrow::compute::min(ts).unwrap_or(ts_min));
+        ts_max = ts_max.max(arrow::compute::max(ts).unwrap_or(ts_max));
+
+        let encode_started = std::time::Instant::now();
+        writer.write(&group)?;
+        writer_peak = writer_peak.max(writer.memory_size());
+        writer.flush()?;
+        encode += encode_started.elapsed();
+
+        let traces = trace_set(&group);
+        rows.push(HotBatch {
+            batch: group,
+            traces,
+        });
+    }
+    let encode_started = std::time::Instant::now();
+    writer.close()?;
+    encode += encode_started.elapsed();
+    let bytes = Bytes::from(out);
+
+    let row_count: usize = rows.iter().map(|r| r.batch.num_rows()).sum();
+    if row_count == 0 {
+        (ts_min, ts_max) = (0, 0);
+    }
     let start = Utc.timestamp_nanos(ts_min);
     let path = l0_path(root, tenant, start, id);
-    let encode_started = std::time::Instant::now();
-    let bytes = encode_parquet(&sorted)?;
-    let encode = encode_started.elapsed();
-
     let file = NewFile {
         id,
         tenant_id: tenant,
@@ -86,24 +146,172 @@ pub fn prepare(
         level: Level::L0,
         path: path.to_string(),
         size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-        row_count: i64::try_from(sorted.num_rows()).unwrap_or(i64::MAX),
+        row_count: i64::try_from(row_count).unwrap_or(i64::MAX),
         range: TimeRange {
             start,
             end: Utc.timestamp_nanos(ts_max),
         },
-        services,
+        services: keys.services,
         summary: None,
     };
-    let traces = trace_set(&sorted);
     Ok(Prepared {
         file,
         bytes,
-        rows: sorted,
-        traces,
+        rows,
         concat,
-        sort,
+        sort: merge,
         encode,
+        writer_peak,
     })
+}
+
+/// The engine's Parquet writer settings for L0.
+fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, IngestError> {
+    Ok(WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_2_0)
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from(col::SPAN_ID), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("service_name"), true)
+        .set_bloom_filter_fpp(0.01)
+        .build())
+}
+
+/// Sort keys of every input, as integers: the rank of the service among all
+/// services of the file, the timestamp, then input and row for a total
+/// order that is the log order on ties.
+struct MergeKeys {
+    /// Per input, per row: service rank, null names first.
+    ranks: Vec<Vec<u32>>,
+    /// Per input: timestamps.
+    timestamps: Vec<Vec<i64>>,
+    /// Distinct services of the file, sorted.
+    services: Vec<String>,
+}
+
+/// One row waiting at the head of its input, ordered by its key; the heap is
+/// a max-heap, so the key is reversed.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Head(std::cmp::Reverse<(u32, i64, usize, usize)>);
+
+impl MergeKeys {
+    fn new(inputs: &[RecordBatch]) -> Result<Self, IngestError> {
+        let mut services = BTreeMap::new();
+        let mut names: Vec<Vec<Option<String>>> = Vec::with_capacity(inputs.len());
+        let mut timestamps = Vec::with_capacity(inputs.len());
+        for batch in inputs {
+            let schema = batch.schema();
+            let service = cast(
+                batch.column(schema.index_of("service_name")?),
+                &DataType::Utf8,
+            )?;
+            let service = service.as_string::<i32>();
+            let column: Vec<Option<String>> =
+                service.iter().map(|s| s.map(str::to_owned)).collect();
+            for name in column.iter().flatten() {
+                services.entry(name.clone()).or_insert(0u32);
+            }
+            names.push(column);
+            let ts = batch
+                .column(schema.index_of(col::TIMESTAMP)?)
+                .as_primitive::<TimestampNanosecondType>();
+            timestamps.push(ts.values().to_vec());
+        }
+        for (rank, slot) in services.values_mut().enumerate() {
+            *slot = u32::try_from(rank).unwrap_or(u32::MAX);
+        }
+        let ranks = names
+            .into_iter()
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|name| {
+                        name.as_ref()
+                            .map_or(0, |n| services.get(n).map_or(0, |r| r + 1))
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(Self {
+            ranks,
+            timestamps,
+            services: services.into_keys().collect(),
+        })
+    }
+
+    fn key(&self, input: usize, row: usize) -> Option<Head> {
+        let rank = *self.ranks.get(input)?.get(row)?;
+        let ts = *self.timestamps.get(input)?.get(row)?;
+        Some(Head(std::cmp::Reverse((rank, ts, input, row))))
+    }
+
+    /// The first row of every non-empty input.
+    fn heads(&self) -> BinaryHeap<Head> {
+        (0..self.ranks.len())
+            .filter_map(|input| self.key(input, 0))
+            .collect()
+    }
+
+    /// The next `limit` rows in merged order, as `(input, row)` pairs.
+    fn next_group(&self, heads: &mut BinaryHeap<Head>, limit: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(Head(std::cmp::Reverse((_, _, input, row)))) = heads.pop() else {
+                break;
+            };
+            out.push((input, row));
+            if let Some(next) = self.key(input, row + 1) {
+                heads.push(next);
+            }
+        }
+        out
+    }
+}
+
+/// Builds one row group from `indices` into `inputs`.
+fn gather(
+    schema: &arrow::datatypes::SchemaRef,
+    inputs: &[RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch, IngestError> {
+    let columns = (0..schema.fields().len())
+        .map(|c| {
+            let sources: Vec<&dyn Array> = inputs.iter().map(|b| b.column(c).as_ref()).collect();
+            interleave(&sources, indices)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
+
+/// Sorts one batch by `(service_name, timestamp, row)`: a total order, so
+/// the result does not depend on the sort algorithm.
+fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
+    let schema = batch.schema();
+    let service = batch.column(schema.index_of("service_name")?);
+    let timestamp = batch.column(schema.index_of(col::TIMESTAMP)?);
+    let rows = u32::try_from(batch.num_rows())
+        .map_err(|_| IngestError::Encode("batch too large to sort".into()))?;
+    let position: Arc<dyn Array> = Arc::new(UInt32Array::from_iter_values(0..rows));
+    let indices = lexsort_to_indices(
+        &[
+            SortColumn {
+                values: Arc::clone(service),
+                options: None,
+            },
+            SortColumn {
+                values: Arc::clone(timestamp),
+                options: None,
+            },
+            SortColumn {
+                values: position,
+                options: None,
+            },
+        ],
+        None,
+    )?;
+    Ok(take_record_batch(batch, &indices)?)
 }
 
 /// Uploads a prepared file to its path without overwriting: a retried flush
@@ -144,62 +352,26 @@ pub fn l0_path(root: &Path, tenant: TenantId, start: DateTime<Utc>, id: FileId) 
     }
 }
 
-/// Sorts a span batch by `(service_name, timestamp)`.
+/// Sorts a span batch by `(service_name, timestamp, row)`.
 ///
 /// # Errors
 /// Arrow failures or a missing column.
 pub fn sort_spans(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
-    let schema = batch.schema();
-    let service = batch.column(schema.index_of("service_name")?);
-    let timestamp = batch.column(schema.index_of(col::TIMESTAMP)?);
-    let indices = lexsort_to_indices(
-        &[
-            SortColumn {
-                values: Arc::clone(service),
-                options: None,
-            },
-            SortColumn {
-                values: Arc::clone(timestamp),
-                options: None,
-            },
-        ],
-        None,
-    )?;
-    Ok(take_record_batch(batch, &indices)?)
+    sort_batch(batch)
 }
 
-fn distinct_services(batch: &RecordBatch) -> Result<Vec<String>, IngestError> {
-    let column = batch.column(batch.schema().index_of("service_name")?);
-    let dict = column.as_dictionary::<Int32Type>();
-    let values = dict.values().as_string::<i32>();
-    let mut seen = std::collections::BTreeSet::new();
-    for key in dict.keys().iter().flatten() {
-        if let Ok(i) = usize::try_from(key) {
-            if values.is_valid(i) {
-                seen.insert(values.value(i).to_owned());
-            }
-        }
-    }
-    Ok(seen.into_iter().collect())
-}
-
-/// Encodes a sorted span batch as a Parquet L0 file with the engine's writer settings.
+/// Encodes a sorted span batch as a Parquet L0 file with the engine's writer
+/// settings, in row groups of [`DEFAULT_ROW_GROUP_ROWS`].
 ///
 /// # Errors
 /// Parquet failures.
 pub fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
-    let props = WriterProperties::builder()
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
-        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::SPAN_ID), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("service_name"), true)
-        .set_bloom_filter_fpp(0.01)
-        .build();
     let mut out = Vec::with_capacity(batch.get_array_memory_size() / 2);
-    let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), Some(props))?;
+    let mut writer = ArrowWriter::try_new(
+        &mut out,
+        batch.schema(),
+        Some(writer_properties(DEFAULT_ROW_GROUP_ROWS)?),
+    )?;
     writer.write(batch)?;
     writer.close()?;
     Ok(Bytes::from(out))
@@ -207,7 +379,83 @@ pub fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
 
 #[cfg(test)]
 mod tests {
+    use fs_schema::limits::Limits;
+    use fs_schema::spans::SpanBatchBuilder;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
     use super::*;
+
+    /// 2026-10-24T14:17:03Z.
+    const T0: u64 = 1_792_678_623_000_000_000;
+
+    fn batch(service: &str, trace: u8, timestamps: &[u64]) -> RecordBatch {
+        let spans = timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| Span {
+                trace_id: vec![trace; 16],
+                span_id: vec![u8::try_from(i).unwrap() + 1; 8],
+                name: format!("op-{i}"),
+                kind: 2,
+                start_time_unix_nano: *ts,
+                end_time_unix_nano: *ts + 1_000,
+                ..Span::default()
+            })
+            .collect();
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue(service.into())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut builder = SpanBatchBuilder::new(Limits::default());
+        builder.append_request(&request).unwrap();
+        builder.finish().unwrap()
+    }
+
+    fn keys_of(batch: &RecordBatch) -> Vec<(String, i64, u8)> {
+        let schema = batch.schema();
+        let service = cast(
+            batch.column(schema.index_of("service_name").unwrap()),
+            &DataType::Utf8,
+        )
+        .unwrap();
+        let service = service.as_string::<i32>();
+        let ts = batch
+            .column(schema.index_of(col::TIMESTAMP).unwrap())
+            .as_primitive::<TimestampNanosecondType>();
+        let trace = batch
+            .column(schema.index_of(col::TRACE_ID).unwrap())
+            .as_fixed_size_binary();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    service.value(i).to_owned(),
+                    ts.value(i),
+                    *trace.value(i).first().unwrap(),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn l0_paths_partition_by_hour() {
@@ -222,6 +470,64 @@ mod tests {
             l0_path(&Path::from("engine"), tenant, start, id)
                 .to_string()
                 .starts_with("engine/t/")
+        );
+    }
+
+    /// Three unsorted inputs with interleaved services, ties on the key and
+    /// a row-group size that splits the file: the row groups come out in
+    /// one global order, ties in input order, the file has one row group
+    /// per gathered batch, and batching the same rows differently gives
+    /// the same bytes.
+    #[test]
+    fn merge_orders_rows_across_inputs_and_splits_row_groups() {
+        let inputs = vec![
+            batch("web", 1, &[T0 + 5, T0 + 1, T0 + 3]),
+            batch("api", 2, &[T0 + 2, T0 + 2, T0 + 9]),
+            batch("api", 3, &[T0 + 2, T0 + 4]),
+        ];
+        let tenant = TenantId(uuid::Uuid::from_u128(1));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+
+        assert_eq!(prepared.rows.len(), 3, "eight rows in groups of three");
+        let rows: Vec<(String, i64, u8)> = prepared
+            .rows
+            .iter()
+            .flat_map(|r| keys_of(&r.batch))
+            .collect();
+        let t = |d: u64| i64::try_from(T0 + d).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("api".into(), t(2), 2),
+                ("api".into(), t(2), 2),
+                ("api".into(), t(2), 3),
+                ("api".into(), t(4), 3),
+                ("api".into(), t(9), 2),
+                ("web".into(), t(1), 1),
+                ("web".into(), t(3), 1),
+                ("web".into(), t(5), 1),
+            ],
+            "sorted by service and timestamp, ties in input order"
+        );
+        assert_eq!(prepared.file.services, vec!["api", "web"]);
+        assert_eq!(prepared.file.row_count, 8);
+        assert_eq!(prepared.file.range.start, Utc.timestamp_nanos(t(1)));
+        assert_eq!(prepared.file.range.end, Utc.timestamp_nanos(t(9)));
+        assert!(prepared.writer_peak > 0, "the writer's memory was measured");
+        assert!(
+            prepared.rows.iter().all(|r| r.traces.is_some()),
+            "every row group carries its trace set"
+        );
+
+        let reader = SerializedFileReader::new(prepared.bytes.clone()).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 3);
+
+        let whole = arrow::compute::concat_batches(&span_schema_v1(), &inputs).unwrap();
+        let again = prepare(tenant, &Path::from(""), id, &[whole], 3).unwrap();
+        assert_eq!(
+            again.bytes, prepared.bytes,
+            "batching does not change the file"
         );
     }
 }

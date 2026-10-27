@@ -242,6 +242,9 @@ pub struct IngestSection {
     /// Files written at the same time.
     #[serde(default = "default_max_flushes")]
     pub max_flushes: usize,
+    /// Rows per Parquet row group; the writer holds one at a time.
+    #[serde(default = "default_row_group_rows")]
+    pub row_group_rows: usize,
     /// Refuse a tenant's data when its live and flushing rows would exceed this.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
@@ -307,6 +310,7 @@ impl Default for IngestSection {
             max_conversions: fs_ingest::config::default_parallelism(),
             max_coalesces: fs_ingest::config::default_coalesces(),
             max_flushes: default_max_flushes(),
+            row_group_rows: default_row_group_rows(),
             max_buffer_bytes: default_max_buffer_bytes(),
             max_tenant_bytes: default_max_tenant_bytes(),
             wal_max_bytes: default_wal_max_bytes(),
@@ -378,6 +382,7 @@ impl IngestSection {
             max_conversions: self.max_conversions,
             max_coalesces: self.max_coalesces,
             max_flushes: self.max_flushes,
+            row_group_rows: self.row_group_rows,
             max_buffer_bytes: self.max_buffer_bytes,
             max_tenant_bytes: self.max_tenant_bytes,
             wal_max_bytes: self.wal_max_bytes,
@@ -427,6 +432,10 @@ fn default_coalesce_batches() -> usize {
 
 fn default_max_flushes() -> usize {
     2
+}
+
+fn default_row_group_rows() -> usize {
+    fs_ingest::flush::DEFAULT_ROW_GROUP_ROWS
 }
 
 fn default_coalesce_bytes() -> usize {
@@ -742,6 +751,9 @@ impl Config {
             return invalid(
                 "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces and ingest.max_flushes must be positive",
             );
+        }
+        if self.ingest.row_group_rows < 1024 {
+            return invalid("ingest.row_group_rows must be at least 1024");
         }
         if self.ingest.max_buffer_bytes > self.ingest.max_tenant_bytes
             || self.ingest.max_tenant_bytes > self.ingest.max_memory_bytes

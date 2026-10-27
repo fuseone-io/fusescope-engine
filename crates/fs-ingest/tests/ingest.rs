@@ -2178,3 +2178,90 @@ async fn oversized_requests_are_indexed_alone() {
     h.stop().await;
     db.finish().await;
 }
+
+/// A flush writes the file one row group at a time and keeps each row group
+/// for the hot window, so a lookup after registration skips the groups
+/// that hold none of the trace.
+#[tokio::test]
+async fn flush_writes_row_groups_and_retains_each() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        row_group_rows: 7,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    // One service per trace: sorted by service, the rows of trace 3 are the
+    // last five, so the first row group holds none of them.
+    for (service, trace) in [("api", 1u8), ("db", 2), ("web", 3)] {
+        client
+            .export(authed(request(service, trace, 5), &token))
+            .await
+            .unwrap();
+    }
+    h.ingester.flush_all().await;
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(files.len(), 1);
+    let reader = SerializedFileReader::new(std::fs::File::open(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        reader.metadata().num_row_groups(),
+        3,
+        "15 rows in groups of 7"
+    );
+    assert_eq!(reader.metadata().file_metadata().num_rows(), 15);
+    assert_eq!(
+        h.ingester.flush_stats().row_groups.load(Ordering::Relaxed),
+        3
+    );
+    assert!(
+        h.ingester
+            .flush_stats()
+            .writer_peak_bytes
+            .load(Ordering::Relaxed)
+            > 0
+    );
+
+    // Every row group is served and carries its own trace set.
+    let lookup = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: Some(vec![vec![3u8; 16]]),
+        span_ids: None,
+    };
+    let got = scan(&h.hot_addr.to_string(), &lookup, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        5
+    );
+    assert!(
+        h.ingester
+            .stats()
+            .hot_batches_skipped
+            .load(Ordering::Relaxed)
+            >= 1,
+        "at least one retained row group holds no trace 3"
+    );
+    h.stop().await;
+    db.finish().await;
+}
