@@ -37,6 +37,25 @@ use crate::buffer::{HotBatch, trace_set};
 /// groups, so the writer never holds the whole file.
 pub const DEFAULT_ROW_GROUP_ROWS: usize = 262_144;
 
+/// Most rows one row group may hold, from configuration or from an intent.
+/// The size feeds the bloom filters of three columns, each sized by it and
+/// held outside the flush lease, so it is bounded here and nowhere else.
+pub const MAX_ROW_GROUP_ROWS: usize = 1_048_576;
+
+/// Refuses a row group size outside `1..=MAX_ROW_GROUP_ROWS`.
+///
+/// # Errors
+/// Zero, or more than [`MAX_ROW_GROUP_ROWS`].
+pub fn check_row_group_rows(rows: usize) -> Result<(), IngestError> {
+    if (1..=MAX_ROW_GROUP_ROWS).contains(&rows) {
+        Ok(())
+    } else {
+        Err(IngestError::Encode(format!(
+            "row group of {rows} rows is outside 1..={MAX_ROW_GROUP_ROWS}"
+        )))
+    }
+}
+
 /// zstd level for L0: fast, the compactor recompresses at L2.
 const ZSTD_LEVEL: i32 = 3;
 
@@ -79,7 +98,7 @@ pub fn prepare(
     row_group_rows: usize,
 ) -> Result<Prepared, IngestError> {
     let schema = span_schema_v1();
-    let row_group_rows = row_group_rows.max(1);
+    check_row_group_rows(row_group_rows)?;
 
     let sort_started = std::time::Instant::now();
     let inputs: Vec<RecordBatch> = batches
@@ -326,17 +345,17 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
 /// bytes under the same id.
 ///
 /// # Errors
-/// A layout version other than the current one.
+/// A layout version other than the current one, or a row group size
+/// outside the supported range.
 pub fn check_layout(layout: &crate::record::FileLayout) -> Result<(), IngestError> {
-    if layout.version == crate::record::FileLayout::CURRENT_VERSION {
-        Ok(())
-    } else {
-        Err(IngestError::Encode(format!(
+    if layout.version != crate::record::FileLayout::CURRENT_VERSION {
+        return Err(IngestError::Encode(format!(
             "file layout version {} is not this engine's {}",
             layout.version,
             crate::record::FileLayout::CURRENT_VERSION
-        )))
+        )));
     }
+    check_row_group_rows(layout.row_group_rows)
 }
 
 /// The size the catalog row carries when an object is already in the
@@ -664,6 +683,50 @@ mod tests {
             row_group_rows: 8,
         };
         assert!(check_layout(&past).is_err(), "version 2 never shipped");
+        for rows in [0, MAX_ROW_GROUP_ROWS + 1] {
+            let outside = FileLayout {
+                version: FileLayout::CURRENT_VERSION,
+                row_group_rows: rows,
+            };
+            assert!(check_layout(&outside).is_err(), "{rows} rows per group");
+            let inputs = vec![batch("api", 1, &[T0 + 1])];
+            let tenant = TenantId(uuid::Uuid::from_u128(1));
+            let id = FileId(uuid::Uuid::from_u128(2));
+            assert!(prepare(tenant, &Path::from(""), id, &inputs, rows).is_err());
+        }
+        assert!(
+            check_layout(&FileLayout::current(MAX_ROW_GROUP_ROWS)).is_ok(),
+            "the bound itself is allowed"
+        );
+    }
+
+    /// The bytes of a canonical input, pinned with the layout version. When
+    /// an upgrade of the Parquet or compression crates, or a change here,
+    /// gives other bytes, this fails: bump `FileLayout::CURRENT_VERSION` and
+    /// the digest together, never one without the other, because a retry
+    /// after a crash must reproduce what an earlier engine wrote.
+    #[test]
+    fn canonical_input_gives_the_pinned_bytes_for_the_pinned_version() {
+        use sha2::{Digest, Sha256};
+        let inputs = vec![
+            batch("web", 1, &[T0 + 5, T0 + 1, T0 + 3]),
+            batch("api", 2, &[T0 + 2, T0 + 2, T0 + 9]),
+            batch("api", 3, &[T0 + 2, T0 + 4]),
+        ];
+        let tenant = TenantId(uuid::Uuid::from_u128(0x7e5a));
+        let id = FileId(uuid::Uuid::from_u128(0xf11e));
+        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&prepared.bytes).into();
+        let hex = digest.iter().fold(String::new(), |mut out, b| {
+            use std::fmt::Write;
+            let _ = write!(out, "{b:02x}");
+            out
+        });
+        assert_eq!(crate::record::FileLayout::CURRENT_VERSION, 3);
+        assert_eq!(
+            hex, "e97e37bb01c1cbf4fdd5d57489da73187111d6cbb18540dc1e583e00be75f68c",
+            "layout version 3 bytes changed: bump the version with the digest"
+        );
     }
 
     #[test]

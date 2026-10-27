@@ -752,8 +752,10 @@ impl Config {
                 "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces and ingest.max_flushes must be positive",
             );
         }
-        if self.ingest.row_group_rows < 1024 {
-            return invalid("ingest.row_group_rows must be at least 1024");
+        if self.ingest.row_group_rows < 1024
+            || self.ingest.row_group_rows > fs_ingest::flush::MAX_ROW_GROUP_ROWS
+        {
+            return invalid("ingest.row_group_rows must be between 1024 and 1048576");
         }
         if self.ingest.max_buffer_bytes > self.ingest.max_tenant_bytes
             || self.ingest.max_tenant_bytes > self.ingest.max_memory_bytes

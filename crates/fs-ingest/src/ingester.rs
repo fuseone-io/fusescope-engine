@@ -870,11 +870,17 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                         out.rows
                             .push((record.tenant, entry.position, builder.finish()?));
                     }
+                    // An intent this engine cannot read was written by a newer
+                    // one. Skipping it would send its rows back to live and
+                    // write them as other bytes under an id already taken, so
+                    // the replay stops here: the log needs an engine that reads it.
                     RecordSignal::FlushIntent => match FlushIntent::from_payload(&record.payload) {
                         Ok(intent) => out.intents.push(intent),
                         Err(e) => {
-                            out.damaged += 1;
-                            warn!(position = ?entry.position, error = %e, "skipping undecodable flush intent");
+                            return Err(IngestError::Record(format!(
+                                "flush intent at {:?} cannot be read by this engine ({e}); it was written by a newer one",
+                                entry.position
+                            )));
                         }
                     },
                 }

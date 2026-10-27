@@ -2408,3 +2408,62 @@ async fn retry_after_restart_with_another_row_group_size_reproduces_the_object()
     h.stop().await;
     db.finish().await;
 }
+
+/// An intent whose layout this engine cannot even read, left by a newer
+/// one, stops the replay: the log must not be served by an engine that
+/// would write those rows as other bytes under the same id.
+#[tokio::test]
+async fn unreadable_intent_refuses_to_start() {
+    use fs_ingest::record::{RecordSignal, WalRecord};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let dir = tempfile::tempdir().unwrap();
+    let file = fs_catalog::FileId::new();
+    {
+        let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+        let record = WalRecord {
+            tenant,
+            signal: RecordSignal::Traces,
+            payload: bytes::Bytes::from(request("api", 1, 5).encode_to_vec()),
+        };
+        let first = wal.append(&record.encode()).unwrap();
+        let end = wal.position();
+        // A layout with a shape this version does not know.
+        let payload = format!(
+            r#"{{"tenant":"{}","file":"{}","first":{{"segment":{},"offset":{}}},"end":{{"segment":{},"offset":{}}},"layout":{{"version":9,"codec":"zstd","groups":[7]}}}}"#,
+            tenant.0, file.0, first.segment, first.offset, end.segment, end.offset
+        );
+        let intent = WalRecord {
+            tenant,
+            signal: RecordSignal::FlushIntent,
+            payload: bytes::Bytes::from(payload),
+        };
+        wal.append(&intent.encode()).unwrap();
+        wal.sync().unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    let outcome = Ingester::new(
+        test_config(),
+        db.catalog.clone(),
+        store,
+        Path::from(""),
+        wal,
+    );
+    let err = match outcome {
+        Ok(_) => panic!("an unreadable intent must stop the start"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("cannot be read"), "{err}");
+    assert_eq!(parquet_files(&dir.path().join("bucket")).len(), 0);
+    db.finish().await;
+}
