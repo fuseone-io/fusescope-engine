@@ -1085,6 +1085,45 @@ mod tests {
         assert_eq!(buffers.earliest_wal(), Some(at(15)));
     }
 
+    /// A flush that changes id while its attempt is still in progress is
+    /// never taken under the old id, and becomes due under the new one
+    /// only once the attempt has reported its failure.
+    #[test]
+    fn a_renamed_flush_stays_in_progress_until_it_fails_under_the_new_id() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let old = FileId(uuid::Uuid::from_u128(1));
+        let new = FileId(uuid::Uuid::from_u128(2));
+        let mut buffers = Buffers::default();
+        buffers
+            .get_mut(tenant)
+            .push(batch(1), at(20), Instant::now());
+        let (_, lease) = buffers
+            .begin_flush(tenant, old, FileLayout::current(8), (at(20), at(21)))
+            .unwrap();
+        assert_eq!(
+            buffers.flushing_range(tenant, old),
+            Some(((at(20), at(21)), Some(FileLayout::current(8))))
+        );
+        assert!(buffers.rename_flushing(tenant, old, new));
+        assert!(
+            !buffers.rename_flushing(tenant, old, new),
+            "nothing under the old id"
+        );
+        assert!(buffers.take_flushing(tenant, old).is_none());
+        assert!(
+            buffers.take_flushing(tenant, new).is_none(),
+            "still in progress under the new id"
+        );
+        assert_eq!(buffers.due_flushes(Instant::now(), true), vec![]);
+        buffers.flush_failed(tenant, new, Instant::now());
+        drop(lease);
+        assert_eq!(
+            buffers.due_flushes(Instant::now(), true),
+            vec![(tenant, new)]
+        );
+        assert_eq!(buffers.flushing_range(tenant, old), None);
+    }
+
     #[test]
     fn scratch_counts_until_dropped() {
         let buffers = Buffers::default();

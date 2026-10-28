@@ -2602,6 +2602,107 @@ async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
     db.finish().await;
 }
 
+/// The ingester never sees the refusal: it is down while the sweep marks,
+/// deletes and tombstones its object. After the restart the old intent
+/// is retried, the tombstone refuses it, the rows take a fresh id, and the
+/// deleted path is never written again.
+#[tokio::test]
+async fn a_path_deleted_while_the_ingester_was_down_is_never_written_again() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_register_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 5), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    let bucket = h.dir.path().join("bucket");
+    let written = parquet_files(&bucket);
+    assert_eq!(written.len(), 1);
+    let old = written[0].clone();
+    let bytes = sha256_of(&old);
+    let old_relative = old
+        .strip_prefix(&bucket)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    // The sweep, meanwhile: mark, delete, tombstone.
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&old_relative))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog
+            .orphan_doom(&old_relative, std::slice::from_ref(&old_relative))
+            .await
+            .unwrap(),
+        fs_catalog::Doom::Marked
+    );
+    let claim = db
+        .catalog
+        .orphan_claim(&old_relative)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&old).unwrap();
+    claim.deleted().await.unwrap();
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(
+        h.ingester.stats().flush_failures.load(Ordering::Relaxed),
+        1,
+        "refused by the tombstone"
+    );
+    assert_eq!(
+        h.ingester.flush_stats().superseded.load(Ordering::Relaxed),
+        1
+    );
+    h.ingester.flush_all().await;
+    let now = parquet_files(&bucket);
+    assert_eq!(now.len(), 1);
+    assert_ne!(now[0], old, "the deleted path is never written again");
+    assert_eq!(sha256_of(&now[0]), bytes);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(bucket.join(&registered[0].path), now[0]);
+    h.stop().await;
+    db.finish().await;
+}
+
 /// An intent recorded by a newer engine names a layout this one does not
 /// write. The rows stay bound to their id and nothing reaches the bucket:
 /// writing other bytes under that id would break every later retry.

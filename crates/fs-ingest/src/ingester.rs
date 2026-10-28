@@ -465,13 +465,18 @@ impl Shared {
                 // later rows join a file whose object may already exist.
                 self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(tenant = %tenant.0, file = %file_id.0, error = %e, rows, "flush failed; will retry");
+                // The entry is still in progress here, so no retry can take
+                // it under the old id while it changes id.
+                let file_id = match &e {
+                    IngestError::Catalog(CatalogError::ObjectDoomed { .. }) => {
+                        self.supersede(tenant, file_id).await
+                    }
+                    _ => file_id,
+                };
                 {
                     let mut buffers = self.buffers.lock().await;
                     buffers.flush_failed(tenant, file_id, Instant::now());
                     drop(held);
-                }
-                if let IngestError::Catalog(CatalogError::ObjectDoomed { .. }) = &e {
-                    self.supersede(tenant, file_id).await;
                 }
                 Err(e)
             }
@@ -483,14 +488,17 @@ impl Shared {
     /// flight when the sweep lost its lease could remove the new object.
     /// The new intent for the same records goes to the log before the
     /// rows take the id, so a restart retries under the new id too; a log
-    /// failure keeps the old id, whose next attempt is refused again.
-    async fn supersede(&self, tenant: TenantId, old: FileId) {
+    /// failure keeps the old id, whose next attempt is refused again,
+    /// since the catalog keeps a deleted path refused as a tombstone.
+    /// Called while the flush is still in progress, so no retry takes the
+    /// old id meanwhile. Returns the id the rows have afterwards.
+    async fn supersede(&self, tenant: TenantId, old: FileId) -> FileId {
         let range = {
             let buffers = self.buffers.lock().await;
             buffers.flushing_range(tenant, old)
         };
         let Some((range, layout)) = range else {
-            return;
+            return old;
         };
         let new = FileId::new();
         let intent = FlushIntent {
@@ -502,11 +510,14 @@ impl Shared {
         };
         if let Err(e) = self.append_wal(tenant, intent.to_record().encode()).await {
             warn!(tenant = %tenant.0, file = %old.0, error = %e, "superseding intent could not be logged; keeping the id");
-            return;
+            return old;
         }
         if self.buffers.lock().await.rename_flushing(tenant, old, new) {
             self.flush_stats.superseded.fetch_add(1, Ordering::Relaxed);
             info!(tenant = %tenant.0, old = %old.0, new = %new.0, "flush takes a fresh id: its object was marked as an orphan");
+            new
+        } else {
+            old
         }
     }
 
@@ -540,6 +551,11 @@ impl Shared {
         timing.concat = nanos(prepared.concat);
         timing.sort = nanos(prepared.sort);
         timing.encode = nanos(prepared.encode);
+        // A path the orphan sweep marked or deleted is never written again,
+        // not even as an orphan: the registration would refuse it anyway.
+        if let Some(path) = self.catalog.object_refused(&prepared.file.path).await? {
+            return Err(IngestError::Catalog(CatalogError::ObjectDoomed { path }));
+        }
         let upload_started = Instant::now();
         let outcome = flush::upload(self.store.as_ref(), &prepared).await?;
         self.upload_index(&prepared).await?;
