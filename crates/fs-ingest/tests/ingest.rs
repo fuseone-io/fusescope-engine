@@ -1431,6 +1431,129 @@ async fn requests_are_bounded_by_the_hours_they_span_and_the_hours_live() {
     db.finish().await;
 }
 
+/// The hours a tenant holds count a request from its admission, not its
+/// push: two requests of new hours admitted together cannot both fit under
+/// the cap.
+#[tokio::test]
+async fn the_live_hours_cap_counts_requests_admitted_but_not_yet_pushed() {
+    const HOUR: u64 = 3_600_000_000_000;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_hours_per_batch: 1,
+        max_live_hours: 1,
+        inject_push_delay: Some(Duration::from_secs(2)),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client_a = h.client().await;
+    let token_a = token.clone();
+    let a = tokio::spawn(async move {
+        client_a
+            .export(authed(request_at("api", 1, 1, T0), &token_a))
+            .await
+    });
+    // Once A's record is synced, A sleeps before its push: its hour is
+    // admitted and not yet in the buffer.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.ingester.writer_stats().records.load(Ordering::Relaxed) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first request never reached the wal"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let status = h
+        .client()
+        .await
+        .export(authed(request_at("api", 2, 1, T0 + HOUR), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(status.message().contains("too many hours"), "{status:?}");
+    a.await.unwrap().unwrap();
+    h.client()
+        .await
+        .export(authed(request_at("api", 3, 1, T0), &token))
+        .await
+        .expect("the hour A holds costs nothing more");
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A tenant refused a request for the hours it holds is cut by the next
+/// flusher pass, whatever its rows, bytes and age, so the request is
+/// admitted again without waiting for the flush interval.
+#[tokio::test]
+async fn a_tenant_refused_for_its_hours_is_cut_without_waiting_for_the_interval() {
+    const HOUR: u64 = 3_600_000_000_000;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_hours_per_batch: 1,
+        max_live_hours: 2,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for hours_later in 0..2 {
+        client
+            .export(authed(
+                request_at("api", 1, 1, T0 + hours_later * HOUR),
+                &token,
+            ))
+            .await
+            .unwrap();
+    }
+    let third = || authed(request_at("api", 2, 1, T0 + 2 * HOUR), &token);
+    let status = client.export(third()).await.unwrap_err();
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.export(third()).await.is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refusal did not make the tenant due"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The cut freed the hours before its file was written; the write lands.
+    while h.ingester.stats().files_flushed.load(Ordering::Relaxed) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flusher cut the tenant on its own"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.stop().await;
+    db.finish().await;
+}
+
 /// Crash after the intent but before the upload succeeded: the retry after
 /// restart writes exactly the intended file, once.
 #[tokio::test]

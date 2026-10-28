@@ -12,9 +12,9 @@
 //! that order, so a flush concatenates a few large batches and live rows
 //! take the memory of a packed batch.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
@@ -580,20 +580,42 @@ fn retry_backoff(attempts: u32) -> Duration {
     Duration::from_secs(1u64 << attempts.min(6)).min(MAX_RETRY_BACKOFF)
 }
 
-/// Bytes admitted against the caps but not yet in a buffer. Dropping it
-/// releases them, so a request cancelled between admission and its push
-/// cannot pin the caps.
+/// Bytes and hours admitted against the caps but not yet in a buffer.
+/// Dropping it releases them, so a request cancelled between admission and
+/// its push cannot pin the caps.
 #[derive(Debug)]
 pub struct Reservation {
     bytes: usize,
     tenant: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
+    tenant_id: TenantId,
+    hours: Vec<DateTime<Utc>>,
+    reserved_hours: Arc<StdMutex<ReservedHours>>,
 }
+
+/// Hours of requests admitted but not yet pushed, counted per tenant so a
+/// cap on the hours a tenant holds sees them while they travel.
+type ReservedHours = HashMap<TenantId, HashMap<DateTime<Utc>, usize>>;
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.tenant.fetch_sub(self.bytes, Ordering::Relaxed);
         self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+        if let Ok(mut reserved) = self.reserved_hours.lock() {
+            if let Some(hours) = reserved.get_mut(&self.tenant_id) {
+                for hour in &self.hours {
+                    if let Some(count) = hours.get_mut(hour) {
+                        *count -= 1;
+                        if *count == 0 {
+                            hours.remove(hour);
+                        }
+                    }
+                }
+                if hours.is_empty() {
+                    reserved.remove(&self.tenant_id);
+                }
+            }
+        }
     }
 }
 
@@ -679,6 +701,10 @@ pub struct Buffers {
     /// confirms.
     unconfirmed: HashMap<FileId, Unconfirmed>,
     reserved: HashMap<TenantId, Arc<AtomicUsize>>,
+    reserved_hours: Arc<StdMutex<ReservedHours>>,
+    /// Tenants refused a request for the hours they hold: due for a cut
+    /// whatever their rows, bytes and age, until one takes them.
+    pressed: HashSet<TenantId>,
     reserved_total: Arc<AtomicUsize>,
     scratch_total: Arc<AtomicU64>,
     next_coalesce: u64,
@@ -905,15 +931,35 @@ impl Buffers {
     /// dropped. Callers check the caps and reserve under the same lock, and
     /// drop the reservation under the lock that pushed the rows, so no
     /// admission ever sees the bytes missing from both sides.
-    pub fn reserve(&mut self, tenant: TenantId, bytes: usize) -> Reservation {
+    pub fn reserve(
+        &mut self,
+        tenant: TenantId,
+        bytes: usize,
+        hours: &[DateTime<Utc>],
+    ) -> Reservation {
         let counter = self.reserved.entry(tenant).or_default();
         counter.fetch_add(bytes, Ordering::Relaxed);
         self.reserved_total.fetch_add(bytes, Ordering::Relaxed);
+        if let Ok(mut reserved) = self.reserved_hours.lock() {
+            let of_tenant = reserved.entry(tenant).or_default();
+            for hour in hours {
+                *of_tenant.entry(*hour).or_default() += 1;
+            }
+        }
         Reservation {
             bytes,
             tenant: Arc::clone(counter),
             total: Arc::clone(&self.reserved_total),
+            tenant_id: tenant,
+            hours: hours.to_vec(),
+            reserved_hours: Arc::clone(&self.reserved_hours),
         }
+    }
+
+    /// Marks `tenant` as refused for the hours it holds: due for the next
+    /// cut whatever its rows, bytes and age.
+    pub fn press(&mut self, tenant: TenantId) {
+        self.pressed.insert(tenant);
     }
 
     /// Smallest WAL position among the live rows of `tenant`, if any.
@@ -938,6 +984,7 @@ impl Buffers {
         hour: Option<DateTime<Utc>>,
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
+        self.pressed.remove(&tenant);
         let batches = buffer.batches();
         let lease = self.hold_scratch(buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
         self.flushing.entry(tenant).or_default().push(Flushing {
@@ -972,6 +1019,7 @@ impl Buffers {
         let Some(buffer) = self.tenants.remove(&tenant).filter(|b| !b.is_empty()) else {
             return Ok(None);
         };
+        self.pressed.remove(&tenant);
         let hours: Vec<_> = parts.iter().map(|(_, hour)| *hour).collect();
         let (split, rest) = match buffer.split_by_hours(&hours) {
             Ok(split) => split,
@@ -1024,14 +1072,20 @@ impl Buffers {
             .unwrap_or_default()
     }
 
-    /// How many hours the live rows of `tenant` would fall in with rows of
-    /// `hours` added.
+    /// How many hours the rows of `tenant` would fall in with rows of
+    /// `hours` added: the live rows and the requests admitted but not yet
+    /// pushed, so two requests admitted together cannot both fit.
     pub fn live_hours_with(&self, tenant: TenantId, hours: &[DateTime<Utc>]) -> usize {
         let mut all = self
             .tenants
             .get(&tenant)
             .map(TenantBuffer::hours)
             .unwrap_or_default();
+        if let Ok(reserved) = self.reserved_hours.lock() {
+            if let Some(travelling) = reserved.get(&tenant) {
+                all.extend(travelling.keys().copied());
+            }
+        }
         all.extend(hours.iter().copied());
         all.len()
     }
@@ -1294,14 +1348,16 @@ impl Buffers {
         }
     }
 
-    /// Tenants whose live buffer crossed a threshold or aged past `max_age`.
+    /// Tenants whose live buffer crossed a threshold, aged past `max_age`
+    /// or was refused a request for the hours it holds.
     pub fn due(&self, rows: usize, bytes: usize, max_age: Duration, now: Instant) -> Vec<TenantId> {
         self.tenants
             .iter()
-            .filter(|(_, b)| {
+            .filter(|(t, b)| {
                 !b.is_empty()
                     && (b.rows >= rows
                         || b.bytes >= bytes
+                        || self.pressed.contains(t)
                         || b.oldest
                             .is_some_and(|o| now.saturating_duration_since(o) >= max_age))
             })
@@ -1687,7 +1743,7 @@ mod tests {
         let held = buffers.hold_scratch(1);
         assert_eq!(buffers.headroom(live * 5), live - 1);
         drop(held);
-        let reservation = buffers.reserve(tenant, 2);
+        let reservation = buffers.reserve(tenant, 2, &[]);
         assert_eq!(
             buffers.headroom(live * 5),
             live - 2 * (1 + FLUSH_SCRATCH_FACTOR),
@@ -2263,8 +2319,8 @@ mod tests {
     fn reservations_count_until_dropped() {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
         let mut buffers = Buffers::default();
-        let first = buffers.reserve(tenant, 100);
-        let second = buffers.reserve(tenant, 50);
+        let first = buffers.reserve(tenant, 100, &[]);
+        let second = buffers.reserve(tenant, 50, &[]);
         assert_eq!(buffers.reserved_of(tenant), 150);
         assert_eq!(buffers.reserved_total(), 150);
         drop(first);

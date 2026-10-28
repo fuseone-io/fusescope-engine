@@ -141,9 +141,12 @@ arriving meanwhile:
   read them, a batch of one hour moves whole, and only a batch spanning the
   hours cut and others is partitioned, in one pass. A request whose spans
   fall in more than `ingest.max_hours_per_batch` hours (48) is refused, and
-  a tenant whose live rows would fall in more than `ingest.max_live_hours`
-  (64) is refused until the cuts drain them, so no cut, scan or
-  announcement grows past that. An intent naming an hour is written
+  a tenant whose rows would fall in more than `ingest.max_live_hours`
+  (64), the hours of requests admitted but not yet pushed counted, is
+  refused and marked due, so the next flusher pass cuts it whatever its
+  rows, bytes and age and the request is admitted again as soon as the
+  cuts drain the hours; no cut, scan or announcement grows past that. An
+  intent naming an hour is written
   under WAL record version 2, so an ingester of the previous version fails
   on it instead of reading the intent as the whole range; the reader fails
   closed on a version and an hour that do not match. The hot window

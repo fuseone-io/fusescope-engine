@@ -255,6 +255,7 @@ impl Shared {
         let mut buffers = self.buffers.lock().await;
         if buffers.live_hours_with(tenant, hours) > self.config.max_live_hours {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
+            buffers.press(tenant);
             self.flush_now.notify_one();
             return Err(IngestError::Capacity(
                 "tenant rows span too many hours, flush pending",
@@ -292,7 +293,7 @@ impl Shared {
             self.flush_now.notify_one();
             return Err(IngestError::WalFull);
         }
-        Ok(buffers.reserve(tenant, cost))
+        Ok(buffers.reserve(tenant, cost, hours))
     }
 
     /// Appends through the group-commit writer; resolves once synced. The
