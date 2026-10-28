@@ -114,14 +114,17 @@ impl Catalog {
 }
 
 /// True inside `tx` when `fence` still names the unexpired holder and
-/// generation of its lease.
+/// generation of its lease. The row stays locked until `tx` ends, so no
+/// one takes the lease between this check and the commit of what it
+/// fences; a taker waits for the commit and finds the lease as it was.
 pub(crate) async fn fence_holds(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     fence: &LeaseFence,
 ) -> Result<bool, CatalogError> {
     let row: Option<(i64,)> = sqlx::query_as(
         "select generation from engine_lease
-         where name = $1 and holder = $2 and generation = $3 and expires_at > now()",
+         where name = $1 and holder = $2 and generation = $3 and expires_at > now()
+         for update",
     )
     .bind(&fence.name)
     .bind(&fence.holder)

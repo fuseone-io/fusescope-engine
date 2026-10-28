@@ -600,6 +600,102 @@ async fn a_fenced_swap_is_refused_once_the_lease_changed_hands() {
     db.finish().await;
 }
 
+/// The fence check locks the lease row until the swap commits: a takeover
+/// started in the window between the check and the commit waits, and a
+/// swap whose fence went stale while it waited for the lock is refused.
+#[tokio::test]
+async fn a_fenced_swap_is_serialised_with_takeovers() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let input = db
+        .catalog
+        .register_file(&file(t, Signal::Logs, 0, 1, &[]))
+        .await
+        .unwrap();
+    let generation = db
+        .catalog
+        .acquire_lease("compactor", "a", StdDuration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = LeaseFence {
+        name: "compactor".into(),
+        holder: "a".into(),
+        generation,
+    };
+
+    // Someone holds the row as a swap would while it writes its outputs.
+    let mut holding = db.catalog.pool().begin().await.unwrap();
+    sqlx::query("select generation from engine_lease where name = 'compactor' for update")
+        .execute(&mut *holding)
+        .await
+        .unwrap();
+    let takeover = tokio::spawn({
+        let catalog = db.catalog.clone();
+        async move {
+            catalog
+                .acquire_lease("compactor", "b", StdDuration::from_secs(30))
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    assert!(!takeover.is_finished(), "the takeover waits for the swap");
+    holding.commit().await.unwrap();
+    assert_eq!(
+        takeover.await.unwrap(),
+        None,
+        "and then finds the lease still a's"
+    );
+
+    // The other way round: a swap that waits behind a takeover is refused.
+    let mut taking = db.catalog.pool().begin().await.unwrap();
+    sqlx::query(
+        "update engine_lease set holder = 'b', generation = generation + 1,
+         expires_at = now() + interval '30 seconds' where name = 'compactor'",
+    )
+    .execute(&mut *taking)
+    .await
+    .unwrap();
+    let swap = tokio::spawn({
+        let catalog = db.catalog.clone();
+        let fence = fence.clone();
+        let output = file(t, Signal::Logs, 0, 1, &[]);
+        async move {
+            catalog
+                .swap_files_fenced(t, Signal::Logs, &[input.id], &[output], Some(&fence))
+                .await
+        }
+    });
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    assert!(!swap.is_finished(), "the swap waits for the takeover");
+    taking.commit().await.unwrap();
+    let err = swap.await.unwrap().unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err}");
+    let visible = db
+        .catalog
+        .visible_files(
+            t,
+            Signal::Logs,
+            TimeRange {
+                start: hour(0),
+                end: hour(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id, input.id, "nothing published");
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn watcher_sees_file_changes() {
     let Some(db) = TestDb::new().await else {
