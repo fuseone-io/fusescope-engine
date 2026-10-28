@@ -525,6 +525,13 @@ pub struct QuerySection {
     /// disables the sidecars and every lookup opens every overlapping file.
     #[serde(default = "default_trace_index_cache_bytes")]
     pub trace_index_cache_bytes: usize,
+    /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
+    /// oldest is dropped and its ticket plans again.
+    #[serde(default = "default_prepared_plans")]
+    pub prepared_plans: usize,
+    /// Seconds a prepared plan waits for its `DoGet` before it is dropped.
+    #[serde(default = "default_prepared_ttl")]
+    pub prepared_ttl_secs: u64,
 }
 
 impl Default for QuerySection {
@@ -535,6 +542,8 @@ impl Default for QuerySection {
             max_rows: default_query_max_rows(),
             spill_dir: None,
             trace_index_cache_bytes: default_trace_index_cache_bytes(),
+            prepared_plans: default_prepared_plans(),
+            prepared_ttl_secs: default_prepared_ttl(),
         }
     }
 }
@@ -547,6 +556,8 @@ impl QuerySection {
             timeout: std::time::Duration::from_secs(self.timeout_secs),
             max_rows: self.max_rows,
             trace_index_cache_bytes: self.trace_index_cache_bytes,
+            prepared_plans: self.prepared_plans,
+            prepared_ttl: std::time::Duration::from_secs(self.prepared_ttl_secs),
             ..fs_query::QueryLimits::default()
         }
     }
@@ -554,6 +565,14 @@ impl QuerySection {
 
 fn default_trace_index_cache_bytes() -> usize {
     256 * 1024 * 1024
+}
+
+fn default_prepared_plans() -> usize {
+    fs_query::QueryLimits::default().prepared_plans
+}
+
+fn default_prepared_ttl() -> u64 {
+    fs_query::QueryLimits::default().prepared_ttl.as_secs()
 }
 
 fn default_query_memory() -> usize {
@@ -1049,6 +1068,9 @@ impl Config {
                 "query.max_rows and query.timeout_secs must be positive and query.memory_bytes at least 64 MiB",
             );
         }
+        if self.query.prepared_plans == 0 || self.query.prepared_ttl_secs == 0 {
+            return invalid("query.prepared_plans and query.prepared_ttl_secs must be positive");
+        }
         Ok(())
     }
 
@@ -1331,6 +1353,32 @@ mod tests {
                 .to_string()
                 .contains("wal_queue")
         );
+    }
+
+    #[test]
+    fn prepared_plan_limits_are_validated() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        for bad in ["prepared_plans = 0", "prepared_ttl_secs = 0"] {
+            let err = Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\n{bad}\n"
+            ))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("prepared"), "{err}");
+        }
+        let limits = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\nprepared_plans = 7\nprepared_ttl_secs = 9\n",
+        )
+        .unwrap()
+        .query
+        .to_limits();
+        assert_eq!(limits.prepared_plans, 7);
+        assert_eq!(limits.prepared_ttl, std::time::Duration::from_secs(9));
     }
 
     #[test]

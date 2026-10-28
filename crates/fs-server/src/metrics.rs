@@ -517,6 +517,24 @@ impl Metrics {
                 "Files a trace lookup skipped because their sidecar lacked the trace",
                 q.trace_index_pruned.load(Ordering::Relaxed),
             );
+            counter(
+                out,
+                "fusescope_query_plannings_total",
+                "Times a statement went through the planner",
+                q.plannings.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_prepared_hits_total",
+                "Tickets executed from their prepared plan",
+                q.prepared_hits.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_prepared_misses_total",
+                "Tickets whose prepared plan was gone and whose SQL was planned again",
+                q.prepared_misses.load(Ordering::Relaxed),
+            );
         }
     }
 }
