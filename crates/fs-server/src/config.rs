@@ -562,7 +562,8 @@ pub struct CompactorConfig {
     pub orphan_ttl_secs: u64,
     /// A sweep stops walking once it has listed this many objects, after
     /// finishing the partition (tenant, level, day) it is in; the next
-    /// sweep continues from there.
+    /// sweep continues from there. A goal, overshot by at most one
+    /// partition, not a ceiling.
     #[serde(default = "default_sweep_objects")]
     pub sweep_objects_per_pass: usize,
     /// Most objects one sweep deletes.

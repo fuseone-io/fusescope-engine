@@ -10,7 +10,9 @@
 //! takes the same lock and checks the same mark, so a writer still
 //! retrying its registration either commits before the mark or is refused
 //! and uploads again once the object is gone. A mark is never undone by
-//! another sweeper.
+//! another sweeper, and the delete itself runs under a claim that holds
+//! the path's lock, so two sweepers never delete the same path and a
+//! registration re-uploading it waits for the claim to end.
 //!
 //! Only paths the engine lays out are considered
 //! ([`fs_index::SpanObject`]), checked again just before an object is
@@ -18,17 +20,20 @@
 //! version, is left alone or forgotten. The bucket is walked by
 //! partitions, one tenant, level and day each, found with delimiter
 //! listings as the walk reaches them, so no listing order is assumed and
-//! nothing is enumerated ahead. A pass walks whole partitions until it
-//! has listed `objects_per_pass` objects, then stops and the next pass
-//! continues from the next partition; it deletes at most
-//! `deletes_per_pass`. Memory holds one chunk of paths and one partition
-//! list at a time.
+//! nothing is enumerated ahead but the list of tenants. A pass walks
+//! whole partitions until it has listed `objects_per_pass` objects, then
+//! stops and the next pass continues from the next partition: the cap is
+//! a goal, not a ceiling, since a partition is always walked whole and
+//! the local store lists in no order a cursor could resume from. A
+//! partition is one tenant, level and day, so its size is bounded by the
+//! ingest rate. A pass deletes at most `deletes_per_pass`. Memory holds
+//! one chunk of paths, one partition list and the tenant list at a time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fs_catalog::{Catalog, Doom};
+use fs_catalog::{Catalog, Doom, OrphanClaim};
 use fs_index::SpanObject;
 use futures_util::StreamExt;
 use object_store::path::Path;
@@ -51,7 +56,8 @@ pub struct SweepConfig {
     pub ttl: Duration,
     /// A pass stops walking once it has listed this many objects, after
     /// finishing the partition it is in; one partition is one tenant,
-    /// level and day.
+    /// level and day, so this is a goal, overshot by at most one
+    /// partition, not a ceiling.
     pub objects_per_pass: usize,
     /// Most objects one pass deletes.
     pub deletes_per_pass: usize,
@@ -146,7 +152,7 @@ impl Sweeper {
     /// Catalog or bucket failure; the next pass redoes what this one left.
     pub async fn sweep_once(&mut self) -> Result<Swept, CompactError> {
         let mut swept = Swept::default();
-        swept.deleted += self.finish_marked().await?;
+        self.finish_marked(&mut swept).await?;
         self.walk(&mut swept).await?;
         self.reap(&mut swept).await?;
         self.stats.sweeps.fetch_add(1, Ordering::Relaxed);
@@ -179,12 +185,12 @@ impl Sweeper {
 
     /// Deletes the objects of orphans already marked, as a pass that
     /// stopped between marking and deleting would leave.
-    async fn finish_marked(&self) -> Result<usize, CompactError> {
+    async fn finish_marked(&self, swept: &mut Swept) -> Result<(), CompactError> {
         let marked = self
             .catalog
             .orphans_doomed(i64::try_from(self.config.deletes_per_pass).unwrap_or(i64::MAX))
             .await?;
-        self.delete_all(&marked).await
+        self.delete_all(&marked, swept).await
     }
 
     /// Walks partitions, whole, until `objects_per_pass` objects have been
@@ -336,29 +342,37 @@ impl Sweeper {
         }
         self.catalog.orphans_forget(&forgotten).await?;
         swept.forgotten += forgotten.len();
-        swept.deleted += self.delete_all(&doomed).await?;
-        Ok(())
+        self.delete_all(&doomed, swept).await
     }
 
-    /// Deletes marked objects and forgets them; an object already gone
-    /// counts as deleted, one that fails to delete stays marked for the
-    /// next pass.
-    async fn delete_all(&self, marked: &[String]) -> Result<usize, CompactError> {
-        let mut deleted = Vec::new();
+    /// Deletes marked objects and forgets them, each under its claim; an
+    /// object already gone counts as deleted, one that fails to delete
+    /// stays marked for the next pass, one that is not the engine's is
+    /// forgotten and left in place, and one another sweeper finished
+    /// meanwhile is skipped.
+    async fn delete_all(&self, marked: &[String], swept: &mut Swept) -> Result<(), CompactError> {
         for path in marked {
+            let Some(claim) = self.catalog.orphan_claim(path).await? else {
+                continue;
+            };
             if !self.is_engine_object(path) {
-                warn!(role = "compactor", path = %path, "marked path is not an engine object; left in place");
+                warn!(role = "compactor", path = %path, "marked path is not an engine object; forgotten, left in place");
+                claim.finish().await?;
+                swept.forgotten += 1;
                 continue;
             }
             match self.store.delete(&Path::from(path.as_str())).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted.push(path.clone()),
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                    claim.finish().await?;
+                    swept.deleted += 1;
+                }
                 Err(e) => {
                     warn!(role = "compactor", path = %path, error = %e, "orphan delete failed; the next sweep retries");
+                    drop::<OrphanClaim>(claim);
                 }
             }
         }
-        self.catalog.orphans_forget(&deleted).await?;
-        Ok(deleted.len())
+        Ok(())
     }
 
     /// True when `path`, a full object path, is one the engine lays out

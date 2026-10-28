@@ -531,11 +531,15 @@ publish, or a cancelled pass leaves objects no row points at. The leader
 sweeps the engine's prefix every `compactor.orphan_interval_secs`. The
 bucket is walked by partitions, one tenant, level and day each, found with
 delimiter listings as the walk reaches them, so no listing order is assumed
-and nothing is enumerated ahead; a pass walks whole partitions until it has
-listed `compactor.sweep_objects_per_pass` objects, then stops and the next
-pass continues from the next partition, and it deletes at most
-`compactor.sweep_deletes_per_pass`. Memory holds one chunk of paths and one
-partition list at a time. Only paths the engine lays out count, parsed
+and nothing is enumerated ahead but the list of tenants; a pass walks whole
+partitions until it has listed `compactor.sweep_objects_per_pass` objects,
+then stops and the next pass continues from the next partition. That cap is
+a goal, overshot by at most one partition, not a ceiling: a partition is
+always walked whole, since the local store lists in no order a cursor could
+resume from, and a partition is one tenant, level and day, so its size is
+bounded by the ingest rate. A pass deletes at most
+`compactor.sweep_deletes_per_pass`. Memory holds one chunk of paths, one
+partition list and the tenant list at a time. Only paths the engine lays out count, parsed
 strictly (tenant id, signal, level, a calendar date and hour, file id,
 extension) when walked and again just before an object is marked; anything
 else under the prefix, or remembered by an older version, is left alone or
@@ -557,7 +561,11 @@ keeps its object, a mark that wins means the writer retries, is refused
 until the object is gone and forgotten, then uploads the same bytes again.
 A mark is never undone: a sweeper that finds a row already marked, by an
 earlier pass or by another instance during a handover, deletes the object
-itself; only a path a file row owns is forgotten. A pass that stops
+itself; only a path a file row owns, or one that is not the engine's, is
+forgotten. The delete and the forgetting run under a claim that holds the
+path's lock in an open transaction, so two sweepers never delete the same
+path, a registration re-uploading it waits for the claim to end, and a
+sweeper whose claim finds the mark gone does nothing. A pass that stops
 between marking and deleting is finished by the next. Objects deleted by a
 cancelled request to the bucket are the one case the sweep cannot see, and
 the TTL covers it.

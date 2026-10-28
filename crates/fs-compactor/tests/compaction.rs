@@ -1074,13 +1074,37 @@ async fn the_sweep_forgets_foreign_paths_and_finishes_another_sweepers_marks() {
         fs_catalog::Doom::Marked,
         "another sweeper marked the stray"
     );
+    // A foreign path an older version marked already: forgotten too.
+    let marked_foreign = "t/old.parquet".to_owned();
+    f.store
+        .put(&Path::from(marked_foreign.as_str()), b"x".to_vec().into())
+        .await
+        .unwrap();
+    f.db.catalog
+        .orphans_seen(std::slice::from_ref(&marked_foreign))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.db.catalog
+            .orphan_doom(&marked_foreign, std::slice::from_ref(&marked_foreign))
+            .await
+            .unwrap(),
+        fs_catalog::Doom::Marked
+    );
     let mut sweeper = sweeper(&f, 1000);
     let swept = sweeper.sweep_once().await.unwrap();
-    assert_eq!(swept.forgotten, 1, "the foreign path");
+    assert_eq!(
+        swept.forgotten, 2,
+        "the foreign path and the marked foreign path"
+    );
     assert_eq!(swept.deleted, 1, "the stray, by the mark it found");
     assert!(
         present(&f, &foreign).await,
         "not the engine's: left in place"
+    );
+    assert!(
+        present(&f, &marked_foreign).await,
+        "not the engine's: left in place, mark gone"
     );
     assert!(!present(&f, &stray).await);
     assert_eq!(
