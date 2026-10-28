@@ -242,6 +242,17 @@ pub struct IngestSection {
     /// Files written at the same time.
     #[serde(default = "default_max_flushes")]
     pub max_flushes: usize,
+    /// Most calendar hours one cut flushes, at most 64; rows of later hours
+    /// wait for the next cut.
+    #[serde(default = "default_max_hours_per_cut")]
+    pub max_hours_per_cut: usize,
+    /// Refuse a request whose spans fall in more calendar hours than this.
+    #[serde(default = "default_max_hours_per_batch")]
+    pub max_hours_per_batch: usize,
+    /// Refuse a tenant's request when its unflushed rows would fall in more
+    /// calendar hours than this. At least `max_hours_per_batch`.
+    #[serde(default = "default_max_live_hours")]
+    pub max_live_hours: usize,
     /// Registration confirmations attempted at the same time, off the flusher.
     #[serde(default = "default_max_confirms")]
     pub max_confirms: usize,
@@ -317,6 +328,9 @@ impl Default for IngestSection {
             max_conversions: fs_ingest::config::default_parallelism(),
             max_coalesces: fs_ingest::config::default_coalesces(),
             max_flushes: default_max_flushes(),
+            max_hours_per_cut: default_max_hours_per_cut(),
+            max_hours_per_batch: default_max_hours_per_batch(),
+            max_live_hours: default_max_live_hours(),
             max_confirms: default_max_confirms(),
             confirm_timeout_secs: default_confirm_timeout(),
             row_group_rows: default_row_group_rows(),
@@ -391,6 +405,9 @@ impl IngestSection {
             max_conversions: self.max_conversions,
             max_coalesces: self.max_coalesces,
             max_flushes: self.max_flushes,
+            max_hours_per_cut: self.max_hours_per_cut,
+            max_hours_per_batch: self.max_hours_per_batch,
+            max_live_hours: self.max_live_hours,
             max_confirms: self.max_confirms,
             confirm_timeout: std::time::Duration::from_secs(self.confirm_timeout_secs),
             row_group_rows: self.row_group_rows,
@@ -439,6 +456,18 @@ fn default_flush_interval() -> u64 {
 
 fn default_coalesce_batches() -> usize {
     512
+}
+
+fn default_max_hours_per_cut() -> usize {
+    fs_ingest::IngestConfig::default().max_hours_per_cut
+}
+
+fn default_max_hours_per_batch() -> usize {
+    fs_ingest::IngestConfig::default().max_hours_per_batch
+}
+
+fn default_max_live_hours() -> usize {
+    fs_ingest::IngestConfig::default().max_live_hours
 }
 
 fn default_max_confirms() -> usize {
@@ -900,6 +929,35 @@ impl Config {
         Ok(())
     }
 
+    /// The ingest bounds the runtime or the cut enforces as hard ceilings.
+    fn validate_ingest_bounds(&self) -> Result<(), ServerError> {
+        let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
+        if self.ingest.wal_batch_records == 0
+            || self.ingest.wal_batch_bytes == 0
+            || self.ingest.wal_queue_records == 0
+            || self.ingest.wal_queue_bytes == 0
+        {
+            return invalid("ingest.wal_batch_* and ingest.wal_queue_* must be positive");
+        }
+        if self.ingest.wal_queue_records > tokio::sync::Semaphore::MAX_PERMITS {
+            return invalid("ingest.wal_queue_records is larger than the runtime can track");
+        }
+        if self.ingest.max_confirms > tokio::sync::Semaphore::MAX_PERMITS {
+            return invalid("ingest.max_confirms is larger than the runtime can track");
+        }
+        if self.ingest.max_hours_per_cut > fs_ingest::config::MAX_HOURS_PER_CUT {
+            return invalid("ingest.max_hours_per_cut is above the ceiling of 64");
+        }
+        if self.ingest.max_hours_per_batch == 0
+            || self.ingest.max_live_hours < self.ingest.max_hours_per_batch
+        {
+            return invalid(
+                "ingest.max_hours_per_batch must be positive and ingest.max_live_hours at least that",
+            );
+        }
+        Ok(())
+    }
+
     /// Checks internal consistency. Connectivity is checked by the server.
     ///
     /// # Errors
@@ -964,9 +1022,10 @@ impl Config {
             || self.ingest.max_flushes == 0
             || self.ingest.max_confirms == 0
             || self.ingest.confirm_timeout_secs == 0
+            || self.ingest.max_hours_per_cut == 0
         {
             return invalid(
-                "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces, ingest.max_flushes, ingest.max_confirms and ingest.confirm_timeout_secs must be positive",
+                "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces, ingest.max_flushes, ingest.max_confirms, ingest.confirm_timeout_secs and ingest.max_hours_per_cut must be positive",
             );
         }
         if self.ingest.row_group_rows < 1024
@@ -981,19 +1040,7 @@ impl Config {
                 "ingest.max_buffer_bytes <= ingest.max_tenant_bytes <= ingest.max_memory_bytes must hold",
             );
         }
-        if self.ingest.wal_batch_records == 0
-            || self.ingest.wal_batch_bytes == 0
-            || self.ingest.wal_queue_records == 0
-            || self.ingest.wal_queue_bytes == 0
-        {
-            return invalid("ingest.wal_batch_* and ingest.wal_queue_* must be positive");
-        }
-        if self.ingest.wal_queue_records > tokio::sync::Semaphore::MAX_PERMITS {
-            return invalid("ingest.wal_queue_records is larger than the runtime can track");
-        }
-        if self.ingest.max_confirms > tokio::sync::Semaphore::MAX_PERMITS {
-            return invalid("ingest.max_confirms is larger than the runtime can track");
-        }
+        self.validate_ingest_bounds()?;
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
             || self.query.memory_bytes < 64 * 1024 * 1024
@@ -1284,6 +1331,37 @@ mod tests {
                 .to_string()
                 .contains("wal_queue")
         );
+    }
+
+    #[test]
+    fn hour_limits_are_validated() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        for (bad, key) in [
+            ("max_hours_per_cut = 65", "max_hours_per_cut"),
+            ("max_hours_per_cut = 0", "max_hours_per_cut"),
+            ("max_hours_per_batch = 0", "max_hours_per_batch"),
+            (
+                "max_hours_per_batch = 10\nmax_live_hours = 9",
+                "max_live_hours",
+            ),
+        ] {
+            let err = Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\n{bad}\n"
+            ))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(key), "{err}");
+        }
+        let edge = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nmax_hours_per_cut = 64\nmax_hours_per_batch = 9\nmax_live_hours = 9\n",
+        )
+        .unwrap();
+        assert!(edge.validate(&secrets).is_ok());
     }
 
     #[test]
