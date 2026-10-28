@@ -9,11 +9,13 @@
 )]
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::Ticket;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use datafusion::logical_expr::{col, lit};
 use datafusion::scalar::ScalarValue;
@@ -678,6 +680,188 @@ async fn flight_sql_round_trip_with_query_token() {
         matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::Unauthenticated),
         "{err}"
     );
+
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
+/// A Flight SQL server over `f.querier`: its address, the shutdown switch
+/// and the task.
+async fn serve_flight(
+    f: &Fixture,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<(), fs_query::QueryError>>,
+) {
+    let service = FlightSql::new(f.querier.clone(), f.db.catalog.clone());
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
+    let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    (addr, shutdown, server)
+}
+
+async fn sql_client(addr: std::net::SocketAddr, token: &str) -> FlightSqlServiceClient<Channel> {
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightSqlServiceClient::new(channel);
+    client.set_token(token.to_owned());
+    client
+}
+
+async fn rows_of(client: &mut FlightSqlServiceClient<Channel>, ticket: Ticket) -> usize {
+    let batches: Vec<RecordBatch> = client
+        .do_get(ticket)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+const BY_SERVICE: &str =
+    "select service_name, count(*) as n from spans group by service_name order by n desc";
+
+/// `GetFlightInfo` plans the statement once and `DoGet` executes that plan;
+/// the plan is consumed, so the same ticket presented again plans its SQL
+/// again and still answers.
+#[tokio::test]
+async fn a_statement_is_planned_once_between_get_flight_info_and_do_get() {
+    let Some(f) = fixture().await else { return };
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let stats = f.querier.stats();
+
+    let info = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    assert_eq!(stats.plannings.load(Ordering::Relaxed), 1);
+    assert_eq!(f.querier.prepared_count(), 1);
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    assert_eq!(rows_of(&mut client, ticket.clone()).await, 2);
+    assert_eq!(
+        stats.plannings.load(Ordering::Relaxed),
+        1,
+        "executed from the prepared plan"
+    );
+    assert_eq!(stats.prepared_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(f.querier.prepared_count(), 0, "consumed");
+
+    assert_eq!(
+        rows_of(&mut client, ticket).await,
+        2,
+        "a ticket outlives its plan"
+    );
+    assert_eq!(stats.plannings.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.prepared_misses.load(Ordering::Relaxed), 1);
+
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
+/// A prepared plan is dropped after its TTL or to make room beyond the cap,
+/// oldest first; its ticket plans the SQL again. A ticket of one tenant
+/// presented with another tenant's token is refused and consumes nothing.
+#[tokio::test]
+async fn a_ticket_whose_plan_is_gone_plans_again() {
+    let Some(mut f) = fixture().await else { return };
+    f.querier = Querier::new(
+        f.db.catalog.clone(),
+        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
+        None,
+        QueryLimits {
+            timeout: Duration::from_secs(30),
+            prepared_plans: 2,
+            prepared_ttl: Duration::from_millis(300),
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (other_token, _) =
+        f.db.catalog
+            .create_token(f.other_tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let counters = f.querier.stats();
+
+    // Expired.
+    let info = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    assert_eq!(rows_of(&mut client, ticket).await, 2);
+    assert_eq!(counters.prepared_misses.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.plannings.load(Ordering::Relaxed), 2);
+
+    // Beyond the cap: the oldest of three is dropped.
+    let first = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    let second = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    let third = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    assert_eq!(f.querier.prepared_count(), 2);
+    let plannings = counters.plannings.load(Ordering::Relaxed);
+    assert_eq!(
+        rows_of(&mut client, third.endpoint[0].ticket.clone().unwrap()).await,
+        2
+    );
+    assert_eq!(
+        rows_of(&mut client, second.endpoint[0].ticket.clone().unwrap()).await,
+        2
+    );
+    assert_eq!(
+        counters.plannings.load(Ordering::Relaxed),
+        plannings,
+        "both kept"
+    );
+    assert_eq!(
+        rows_of(&mut client, first.endpoint[0].ticket.clone().unwrap()).await,
+        2
+    );
+    assert_eq!(
+        counters.plannings.load(Ordering::Relaxed),
+        plannings + 1,
+        "the oldest was dropped"
+    );
+
+    // Another tenant's token: refused, the plan untouched for its owner.
+    let info = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let mut other = sql_client(addr, &other_token).await;
+    let err = other.do_get(ticket.clone()).await.unwrap_err();
+    assert!(
+        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::PermissionDenied),
+        "{err}"
+    );
+    assert_eq!(f.querier.prepared_count(), 1);
+    let hits = counters.prepared_hits.load(Ordering::Relaxed);
+    assert_eq!(rows_of(&mut client, ticket).await, 2);
+    assert_eq!(counters.prepared_hits.load(Ordering::Relaxed), hits + 1);
 
     shutdown.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)

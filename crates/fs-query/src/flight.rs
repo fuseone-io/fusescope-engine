@@ -2,11 +2,12 @@
 //!
 //! Clients authenticate with `authorization: Bearer <query token>`. A
 //! statement is planned on `GetFlightInfo` (so schema and errors surface
-//! early) and executed on `DoGet`. The ticket carries the tenant id, and
-//! `DoGet` re-authenticates and refuses a ticket from another tenant.
+//! early), kept under a handle, and executed on `DoGet` from that plan.
+//! The ticket carries the tenant id, the handle and the SQL: `DoGet`
+//! re-authenticates, refuses a ticket from another tenant, and plans the
+//! SQL again only when the kept plan is gone.
 
 use std::pin::Pin;
-use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -24,7 +25,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::QueryError;
-use crate::querier::Querier;
+use crate::querier::{PreparedHandle, Querier};
 
 /// Response header set when the result may be incomplete, with the reasons.
 pub const PARTIAL_HEADER: &str = "x-fusescope-partial";
@@ -95,21 +96,23 @@ impl FlightSql {
     }
 }
 
-/// Ticket payload: tenant id then SQL text.
-fn encode_handle(tenant: TenantId, sql: &str) -> bytes::Bytes {
-    let mut out = Vec::with_capacity(16 + sql.len());
+/// Ticket payload: tenant id, prepared plan handle, then SQL text.
+fn encode_handle(tenant: TenantId, prepared: PreparedHandle, sql: &str) -> bytes::Bytes {
+    let mut out = Vec::with_capacity(32 + sql.len());
     out.extend_from_slice(tenant.0.as_bytes());
+    out.extend_from_slice(prepared.as_bytes());
     out.extend_from_slice(sql.as_bytes());
     bytes::Bytes::from(out)
 }
 
-fn decode_handle(handle: &[u8]) -> Result<(TenantId, String), Status> {
-    let (id, sql) = handle
-        .split_at_checked(16)
-        .ok_or_else(|| Status::invalid_argument("bad ticket"))?;
-    let uuid = uuid::Uuid::from_slice(id).map_err(|_| Status::invalid_argument("bad ticket"))?;
-    let sql = std::str::from_utf8(sql).map_err(|_| Status::invalid_argument("bad ticket"))?;
-    Ok((TenantId(uuid), sql.to_owned()))
+fn decode_handle(handle: &[u8]) -> Result<(TenantId, PreparedHandle, String), Status> {
+    let bad = || Status::invalid_argument("bad ticket");
+    let (id, rest) = handle.split_at_checked(16).ok_or_else(bad)?;
+    let (prepared, sql) = rest.split_at_checked(16).ok_or_else(bad)?;
+    let tenant = uuid::Uuid::from_slice(id).map_err(|_| bad())?;
+    let prepared = uuid::Uuid::from_slice(prepared).map_err(|_| bad())?;
+    let sql = std::str::from_utf8(sql).map_err(|_| bad())?;
+    Ok((TenantId(tenant), prepared, sql.to_owned()))
 }
 
 fn status_of(error: &QueryError) -> Status {
@@ -145,14 +148,13 @@ impl FlightSqlService for FlightSql {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let tenant = self.authenticate(request.metadata()).await?;
-        let (_, plan, _) = self
+        let (prepared, schema): (PreparedHandle, SchemaRef) = self
             .querier
-            .plan(tenant, &query.query)
+            .prepare(tenant, &query.query)
             .await
             .map_err(|e| status_of(&e))?;
-        let schema: SchemaRef = Arc::new(plan.schema().as_arrow().clone());
         let ticket = TicketStatementQuery {
-            statement_handle: encode_handle(tenant, &query.query),
+            statement_handle: encode_handle(tenant, prepared, &query.query),
         };
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -174,7 +176,7 @@ impl FlightSqlService for FlightSql {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let tenant = self.authenticate(request.metadata()).await?;
-        let (ticket_tenant, sql) = decode_handle(&ticket.statement_handle)?;
+        let (ticket_tenant, prepared, sql) = decode_handle(&ticket.statement_handle)?;
         if ticket_tenant != tenant {
             warn!(tenant = %tenant.0, "ticket from another tenant refused");
             return Err(Status::permission_denied(
@@ -182,11 +184,19 @@ impl FlightSqlService for FlightSql {
             ));
         }
         let limits = self.querier.limits();
-        let (stream, warnings) = self
+        let kept = self
             .querier
-            .execute(tenant, &sql)
+            .execute_prepared(tenant, prepared)
             .await
             .map_err(|e| status_of(&e))?;
+        let (stream, warnings) = match kept {
+            Some(kept) => kept,
+            None => self
+                .querier
+                .execute(tenant, &sql)
+                .await
+                .map_err(|e| status_of(&e))?,
+        };
         let schema = stream.schema();
         let max_rows = limits.max_rows;
         let mut rows = 0usize;
@@ -239,11 +249,16 @@ mod tests {
     #[test]
     fn handle_round_trip_and_rejects_garbage() {
         let tenant = TenantId::new();
-        let handle = encode_handle(tenant, "select 1");
+        let prepared = uuid::Uuid::new_v4();
+        let handle = encode_handle(tenant, prepared, "select 1");
         assert_eq!(
             decode_handle(&handle).unwrap(),
-            (tenant, "select 1".to_owned())
+            (tenant, prepared, "select 1".to_owned())
         );
         assert!(decode_handle(b"short").is_err());
+        assert!(
+            decode_handle(handle.get(..20).unwrap()).is_err(),
+            "no handle"
+        );
     }
 }

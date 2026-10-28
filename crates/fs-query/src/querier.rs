@@ -1,5 +1,6 @@
 //! The querier facade: sessions, limits and execution.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,15 @@ impl QueryWarnings {
 pub struct QueryStats {
     /// Statements planned.
     pub queries: std::sync::atomic::AtomicU64,
+    /// Times a statement went through the planner: once per statement
+    /// when its ticket is executed where it was prepared, twice when the
+    /// prepared plan was gone and the ticket's SQL was planned again.
+    pub plannings: std::sync::atomic::AtomicU64,
+    /// Tickets executed from their prepared plan.
+    pub prepared_hits: std::sync::atomic::AtomicU64,
+    /// Tickets whose prepared plan was gone: expired, evicted, consumed, or
+    /// prepared by another querier; their SQL was planned again.
+    pub prepared_misses: std::sync::atomic::AtomicU64,
     /// Statements that failed to plan or were refused.
     pub errors: std::sync::atomic::AtomicU64,
     /// Rows returned by `collect`.
@@ -78,6 +88,11 @@ pub struct QueryLimits {
     /// Decoded `trace_id` sidecars kept in memory for trace lookups. Zero
     /// disables the sidecars.
     pub trace_index_cache_bytes: usize,
+    /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
+    /// oldest is dropped and its ticket plans again.
+    pub prepared_plans: usize,
+    /// How long a prepared plan waits for its `DoGet` before it is dropped.
+    pub prepared_ttl: Duration,
 }
 
 impl Default for QueryLimits {
@@ -89,9 +104,23 @@ impl Default for QueryLimits {
             batch_size: 8192,
             hot_window: crate::hot::HotWindowConfig::default(),
             trace_index_cache_bytes: 256 * 1024 * 1024,
+            prepared_plans: 1024,
+            prepared_ttl: Duration::from_secs(60),
         }
     }
 }
+
+/// A statement planned on `GetFlightInfo`, waiting for its `DoGet`.
+struct Prepared {
+    tenant: TenantId,
+    ctx: datafusion::execution::context::SessionContext,
+    plan: LogicalPlan,
+    warnings: Arc<QueryWarnings>,
+    at: std::time::Instant,
+}
+
+/// Opaque handle of a prepared plan, carried by the ticket.
+pub type PreparedHandle = uuid::Uuid;
 
 /// URL under which the engine bucket is registered with DataFusion.
 pub const STORE_URL: &str = "fusescope://bucket/";
@@ -107,6 +136,7 @@ pub struct Querier {
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
     stats: Arc<QueryStats>,
+    prepared: Arc<std::sync::Mutex<HashMap<PreparedHandle, Prepared>>>,
 }
 
 impl Querier {
@@ -154,6 +184,7 @@ impl Querier {
             store_url,
             limits,
             stats,
+            prepared: Arc::default(),
         })
     }
 
@@ -216,6 +247,9 @@ impl Querier {
             budget,
             self.limits.batch_size,
         )?;
+        self.stats
+            .plannings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let plan = match plan_read_only(&ctx, sql).await {
             Ok(plan) => plan,
             Err(e) => {
@@ -226,6 +260,89 @@ impl Querier {
             }
         };
         Ok((ctx, plan, warnings))
+    }
+
+    /// Plans `sql` for `tenant` and keeps the plan for one execution under
+    /// the returned handle, for `prepared_ttl` at most. Returns the handle
+    /// and the result schema. When `prepared_plans` plans wait already, the
+    /// oldest is dropped: its ticket plans again when executed.
+    ///
+    /// # Errors
+    /// See [`Querier::plan`].
+    pub async fn prepare(
+        &self,
+        tenant: TenantId,
+        sql: &str,
+    ) -> Result<(PreparedHandle, arrow::datatypes::SchemaRef), QueryError> {
+        let (ctx, plan, warnings) = self.plan(tenant, sql).await?;
+        let schema: arrow::datatypes::SchemaRef = Arc::new(plan.schema().as_arrow().clone());
+        let handle = uuid::Uuid::new_v4();
+        let now = std::time::Instant::now();
+        let mut prepared = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
+        prepared.retain(|_, p| now.duration_since(p.at) < self.limits.prepared_ttl);
+        while prepared.len() >= self.limits.prepared_plans.max(1) {
+            let Some(oldest) = prepared.iter().min_by_key(|(_, p)| p.at).map(|(h, _)| *h) else {
+                break;
+            };
+            prepared.remove(&oldest);
+        }
+        prepared.insert(
+            handle,
+            Prepared {
+                tenant,
+                ctx,
+                plan,
+                warnings,
+                at: now,
+            },
+        );
+        Ok((handle, schema))
+    }
+
+    /// Executes the plan prepared under `handle` for `tenant`, consuming
+    /// it, or `None` when it is gone: expired, dropped for room, executed
+    /// already, prepared by another querier, or prepared for another
+    /// tenant, which is never served across tenants.
+    ///
+    /// # Errors
+    /// Physical planning or execution failure.
+    pub async fn execute_prepared(
+        &self,
+        tenant: TenantId,
+        handle: PreparedHandle,
+    ) -> Result<Option<(SendableRecordBatchStream, Arc<QueryWarnings>)>, QueryError> {
+        let taken = {
+            let mut prepared = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
+            match prepared.get(&handle) {
+                Some(p) if p.tenant == tenant && p.at.elapsed() < self.limits.prepared_ttl => {
+                    prepared.remove(&handle)
+                }
+                _ => None,
+            }
+        };
+        let Some(Prepared {
+            ctx,
+            plan,
+            warnings,
+            ..
+        }) = taken
+        else {
+            self.stats
+                .prepared_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        };
+        self.stats
+            .prepared_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let frame = ctx.execute_logical_plan(plan).await?;
+        let stream = frame.execute_stream().await?;
+        Ok(Some((stream, warnings)))
+    }
+
+    /// Prepared plans waiting for their `DoGet`.
+    pub fn prepared_count(&self) -> usize {
+        self.prepared.lock().map_or(0, |p| p.len())
     }
 
     /// Executes `sql` for `tenant` as a stream of batches. The stream enforces

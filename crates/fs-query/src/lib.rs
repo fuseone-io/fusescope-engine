@@ -52,6 +52,9 @@ pub enum QueryError {
     /// Unknown tenant.
     #[error("unknown tenant")]
     UnknownTenant,
+    /// A lock around the prepared plans was poisoned by a panic.
+    #[error("prepared plans unavailable")]
+    Poisoned,
     /// Listening socket could not be bound.
     #[error("bind {addr}: {source}")]
     Bind {
