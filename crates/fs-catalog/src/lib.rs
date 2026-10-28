@@ -19,6 +19,7 @@ mod watch;
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
 pub use compaction::CompactionInputs;
 pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
+pub use orphans::Doom;
 pub use token::{
     TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token, looks_like_token,
 };

@@ -16,7 +16,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{Duration, TimeZone, Utc};
 use fs_catalog::{
-    Catalog, CatalogError, FileId, FileState, LeaseFence, Level, NewFile, NewTenant, Signal,
+    Catalog, CatalogError, Doom, FileId, FileState, LeaseFence, Level, NewFile, NewTenant, Signal,
     TenantId, TimeRange, TokenScope, hash_token,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -709,7 +709,8 @@ async fn wait_for_lock_waiter(catalog: &Catalog) {
                and exists (
                    select 1 from pg_locks l
                    where l.pid = a.pid
-                     and l.relation in ('engine_lease'::regclass, 'engine_orphan'::regclass)
+                     and (l.relation in ('engine_lease'::regclass, 'engine_orphan'::regclass)
+                          or l.locktype = 'advisory')
                )",
         )
         .fetch_one(catalog.pool())
@@ -919,7 +920,8 @@ async fn orphans_keep_their_first_sighting() {
 }
 
 /// The mark and a registration serialise: whichever commits first wins,
-/// and a sidecar's mark is refused by a row for the file it belongs to.
+/// a sidecar's mark is refused by a row for the file it belongs to, and a
+/// mark already made is reported as such, never undone.
 #[tokio::test]
 async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_mark() {
     let Some(db) = TestDb::new().await else {
@@ -933,17 +935,29 @@ async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_
         .id;
     let pending = file(t, Signal::Traces, 0, 0, &[]);
     let sidecar = fs_index::sidecar_path(&pending.path).unwrap();
+    let doom = |path: String, owners: Vec<String>| {
+        let catalog = db.catalog.clone();
+        async move { catalog.orphan_doom(&path, &owners).await.unwrap() }
+    };
 
-    // Marked first: the registration is refused, for the file and for its sidecar.
+    assert_eq!(
+        doom("nobody".into(), vec!["nobody".into()]).await,
+        Doom::Missing
+    );
+
+    // Marked first: the registration is refused, for the file and for its
+    // sidecar; a second mark finds the first and leaves it.
     db.catalog
         .orphans_seen(std::slice::from_ref(&pending.path))
         .await
         .unwrap();
-    assert!(
-        db.catalog
-            .orphan_doom(&pending.path, std::slice::from_ref(&pending.path))
-            .await
-            .unwrap()
+    assert_eq!(
+        doom(pending.path.clone(), vec![pending.path.clone()]).await,
+        Doom::Marked
+    );
+    assert_eq!(
+        doom(pending.path.clone(), vec![pending.path.clone()]).await,
+        Doom::AlreadyMarked
     );
     let err = db.catalog.register_file(&pending).await.unwrap_err();
     assert!(
@@ -962,11 +976,9 @@ async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_
         .orphans_seen(std::slice::from_ref(&sidecar))
         .await
         .unwrap();
-    assert!(
-        db.catalog
-            .orphan_doom(&sidecar, &fs_index::owners_of_sidecar(&sidecar))
-            .await
-            .unwrap()
+    assert_eq!(
+        doom(sidecar.clone(), fs_index::owners_of_sidecar(&sidecar)).await,
+        Doom::Marked
     );
     let err = db.catalog.register_file(&pending).await.unwrap_err();
     assert!(
@@ -984,54 +996,35 @@ async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_
         .orphans_seen(&[pending.path.clone(), sidecar.clone()])
         .await
         .unwrap();
-    assert!(
-        !db.catalog
-            .orphan_doom(&pending.path, std::slice::from_ref(&pending.path))
-            .await
-            .unwrap()
+    assert_eq!(
+        doom(pending.path.clone(), vec![pending.path.clone()]).await,
+        Doom::Owned
     );
-    assert!(
-        !db.catalog
-            .orphan_doom(&sidecar, &fs_index::owners_of_sidecar(&sidecar))
-            .await
-            .unwrap()
+    assert_eq!(
+        doom(sidecar.clone(), fs_index::owners_of_sidecar(&sidecar)).await,
+        Doom::Owned
     );
     assert_eq!(
         db.catalog.orphans_doomed(10).await.unwrap(),
         Vec::<String>::new()
     );
-    assert!(
-        !db.catalog
-            .orphan_doom("nobody", &["nobody".into()])
-            .await
-            .unwrap(),
-        "not remembered"
-    );
 
-    // A registration holds the orphan row until it commits, so a mark
-    // started meanwhile waits and is then refused. The registration is
-    // played by hand in one transaction: the lock first, then the row.
+    // A registration holds the path's lock until it commits, before any
+    // orphan row exists for it, so a mark started meanwhile waits and is
+    // then refused. The registration is played by hand in one
+    // transaction: the lock, then the sighting arriving, then the row.
     let late = file(t, Signal::Traces, 1, 1, &[]);
-    db.catalog
-        .orphans_seen(std::slice::from_ref(&late.path))
-        .await
-        .unwrap();
     let mut registering = db.catalog.pool().begin().await.unwrap();
-    sqlx::query("select path from engine_orphan where path = $1 for update")
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&late.path)
         .execute(&mut *registering)
         .await
         .unwrap();
-    let mark = tokio::spawn({
-        let catalog = db.catalog.clone();
-        let path = late.path.clone();
-        async move {
-            catalog
-                .orphan_doom(&path, std::slice::from_ref(&path))
-                .await
-                .unwrap()
-        }
-    });
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&late.path))
+        .await
+        .unwrap();
+    let mark = tokio::spawn(doom(late.path.clone(), vec![late.path.clone()]));
     wait_for_lock_waiter(&db.catalog).await;
     assert!(!mark.is_finished());
     sqlx::query(
@@ -1046,8 +1039,9 @@ async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_
     .await
     .unwrap();
     registering.commit().await.unwrap();
-    assert!(
-        !mark.await.unwrap(),
+    assert_eq!(
+        mark.await.unwrap(),
+        Doom::Owned,
         "the row the registration committed stops the mark"
     );
     db.finish().await;

@@ -90,17 +90,33 @@ fn is_uuid(s: &str) -> bool {
     parts.next().is_none()
 }
 
-/// `dt=YYYY-MM-DD`.
+/// `dt=YYYY-MM-DD`, a date that exists.
 fn is_date(s: &str) -> bool {
     let Some(d) = s.strip_prefix("dt=") else {
         return false;
     };
     let b = d.as_bytes();
-    b.len() == 10
+    let shaped = b.len() == 10
         && b.iter().enumerate().all(|(i, c)| match i {
             4 | 7 => *c == b'-',
             _ => c.is_ascii_digit(),
-        })
+        });
+    if !shaped {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> { d.get(range)?.parse().ok() };
+    let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
+        return false;
+    };
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 /// `hr=HH`.
@@ -126,6 +142,11 @@ mod tests {
         assert!(!file.sidecar);
         assert_eq!(file.partition, "dt=2026-10-24/hr=14");
         assert_eq!(file.id, F);
+        assert!(
+            SpanObject::parse(&format!("t/{T}/traces/l0/dt=2024-02-29/hr=23/{F}.parquet"))
+                .is_some(),
+            "leap day"
+        );
         let tix = SpanObject::parse(&format!(
             "t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/{F}.tix"
         ))
@@ -144,6 +165,10 @@ mod tests {
             &format!("t/{T}/traces/l3/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=24/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-1-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/l0/dt=2026-99-99/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/l0/dt=2026-02-29/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/l0/dt=2026-04-31/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/l0/dt=2026-00-10/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=14/notes.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet/extra"),

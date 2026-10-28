@@ -1,14 +1,18 @@
 //! Objects in the bucket without a file row, remembered between sweeps so
 //! one is deleted only after it has been an orphan for the whole TTL, and
-//! marked before deletion so a registration cannot race the delete.
+//! marked before deletion under a lock every registration takes too.
 //!
-//! The protocol is a row per path in `engine_orphan`. The sweep records a
-//! sighting, and once the sighting is older than the TTL it marks the row
-//! `deleting` with an update that is refused when a file row for the path,
-//! or for any file the path could belong to, exists; the update takes the
-//! row lock. A registration locks the orphan rows of the paths it writes
-//! and is refused when one is marked. The two serialise on the lock: the
-//! one that commits first decides.
+//! The protocol is a row per path in `engine_orphan` and a transaction
+//! advisory lock per path. The sweep records a sighting, and once the
+//! sighting is older than the TTL it marks the row `deleting` in a
+//! transaction that takes the path's lock first and reads the file rows
+//! after, so a registration that held the lock has committed and its row
+//! is seen. A registration takes the locks of the path and its sidecar in
+//! its own transaction and is refused when either row is marked. The lock
+//! is not the row's, so it serialises the two even before any orphan row
+//! exists. A mark is never undone by another sweeper: one that finds the
+//! row already marked leaves it for whoever marked it, or deletes it
+//! itself, both of which end the same way.
 
 use std::collections::HashSet;
 
@@ -16,6 +20,19 @@ use crate::{Catalog, CatalogError};
 
 /// Paths per membership query.
 const CHUNK: usize = 1000;
+
+/// What marking a path for deletion found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Doom {
+    /// Marked now: the object may be deleted, no registration will commit.
+    Marked,
+    /// Marked by an earlier pass or another sweeper; still to be deleted.
+    AlreadyMarked,
+    /// A file row owns the object: not an orphan, forget it.
+    Owned,
+    /// The path is not remembered.
+    Missing,
+}
 
 impl Catalog {
     /// Which of `paths` are the path of a file row, in any state.
@@ -80,44 +97,45 @@ impl Catalog {
     }
 
     /// Marks `path` for deletion unless a file row exists for any of
-    /// `owners`, the paths a file owning the object would have. True when
-    /// marked: the object may be deleted and no registration of it will
-    /// commit; false when a row exists, or the path is not remembered.
+    /// `owners`, the paths a file owning the object would have.
     ///
-    /// The orphan row is locked first, then the file rows are read by a
+    /// The path's lock is taken first, then the file rows are read by a
     /// statement of its own, so a registration that held the lock has
     /// committed and its row is seen; a `where not exists` on the update
     /// alone would keep the snapshot from before the wait.
     ///
     /// # Errors
     /// Database failure.
-    pub async fn orphan_doom(&self, path: &str, owners: &[String]) -> Result<bool, CatalogError> {
+    pub async fn orphan_doom(&self, path: &str, owners: &[String]) -> Result<Doom, CatalogError> {
         let mut tx = self.pool().begin().await?;
-        let remembered: Option<(String,)> = sqlx::query_as(
-            "select path from engine_orphan where path = $1 and not deleting for update",
-        )
-        .bind(path)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if remembered.is_none() {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        let owned: Option<(String,)> =
-            sqlx::query_as("select path from engine_file where path = any($1) limit 1")
-                .bind(owners)
+        lock_path(&mut tx, path).await?;
+        let remembered: Option<(bool,)> =
+            sqlx::query_as("select deleting from engine_orphan where path = $1 for update")
+                .bind(path)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if owned.is_some() {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        sqlx::query("update engine_orphan set deleting = true where path = $1")
-            .bind(path)
-            .execute(&mut *tx)
-            .await?;
+        let outcome = match remembered {
+            None => Doom::Missing,
+            Some((true,)) => Doom::AlreadyMarked,
+            Some((false,)) => {
+                let owned: Option<(String,)> =
+                    sqlx::query_as("select path from engine_file where path = any($1) limit 1")
+                        .bind(owners)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if owned.is_some() {
+                    Doom::Owned
+                } else {
+                    sqlx::query("update engine_orphan set deleting = true where path = $1")
+                        .bind(path)
+                        .execute(&mut *tx)
+                        .await?;
+                    Doom::Marked
+                }
+            }
+        };
         tx.commit().await?;
-        Ok(true)
+        Ok(outcome)
     }
 
     /// Up to `limit` paths marked for deletion: a sweep that stopped
@@ -149,22 +167,36 @@ impl Catalog {
     }
 }
 
+/// Takes the transaction advisory lock of `path`, held until `tx` ends.
+async fn lock_path(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    path: &str,
+) -> Result<(), CatalogError> {
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(path)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Refuses, inside `tx`, to register a file whose path or sidecar path is
-/// marked for deletion, and locks those orphan rows until `tx` ends so
-/// the sweep cannot mark them meanwhile. One statement: a row locked by
-/// the sweep is read as the sweep left it once the wait is over.
+/// marked for deletion. Takes the locks of both paths, in that order, and
+/// holds them until `tx` ends, so the sweep cannot mark either meanwhile.
 pub(crate) async fn refuse_doomed(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     path: &str,
 ) -> Result<(), CatalogError> {
     let mut paths = vec![path.to_owned()];
     paths.extend(fs_index::sidecar_path(path));
-    let rows: Vec<(String, bool)> =
-        sqlx::query_as("select path, deleting from engine_orphan where path = any($1) for update")
+    for p in &paths {
+        lock_path(tx, p).await?;
+    }
+    let doomed: Option<(String,)> =
+        sqlx::query_as("select path from engine_orphan where path = any($1) and deleting limit 1")
             .bind(&paths)
-            .fetch_all(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
-    if let Some((doomed, _)) = rows.into_iter().find(|(_, deleting)| *deleting) {
+    if let Some((doomed,)) = doomed {
         return Err(CatalogError::ObjectDoomed { path: doomed });
     }
     Ok(())
