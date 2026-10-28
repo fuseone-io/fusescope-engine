@@ -17,7 +17,7 @@
 //! download that cannot fit is not read; its file is scanned.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use fs_catalog::{FileId, FileRecord};
 use fs_index::TraceIndex;
@@ -70,7 +70,8 @@ struct Slot {
 pub struct Held {
     index: TraceIndex,
     bytes: usize,
-    shared: Arc<Shared>,
+    /// Weak, so entries never keep the cache alive.
+    shared: Weak<Shared>,
 }
 
 impl std::ops::Deref for Held {
@@ -83,7 +84,9 @@ impl std::ops::Deref for Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.shared.lock().bytes -= self.bytes;
+        if let Some(shared) = self.shared.upgrade() {
+            shared.lock().bytes -= self.bytes;
+        }
     }
 }
 
@@ -222,20 +225,21 @@ impl TraceIndexCache {
             Ok(bytes) => bytes,
             Err(e) => return self.unavailable(file, &e),
         };
-        let heap = match TraceIndex::heap_bytes_of(&bytes) {
-            Ok(heap) => heap,
+        let cost = match TraceIndex::decode_cost(&bytes) {
+            Ok(cost) => cost,
             Err(e) => return self.unreadable(file, &e),
         };
-        match lease.reserve(heap) {
+        let decoding = cost.retained + cost.scratch;
+        match lease.reserve(decoding) {
             Reserve::Fits => {}
             Reserve::TooLarge => {
-                warn!(file = %file.id.0, heap, budget = self.shared.max_bytes, "trace index decodes beyond the budget; the file is scanned");
+                warn!(file = %file.id.0, decoding, budget = self.shared.max_bytes, "trace index decodes beyond the budget; the file is scanned");
                 return self.miss();
             }
-            Reserve::Busy => return self.busy(file, heap),
+            Reserve::Busy => return self.busy(file, decoding),
         }
         match TraceIndex::decode(&bytes) {
-            Ok(index) if index.covers(&file.path) => Fetched::Index(index, heap),
+            Ok(index) if index.covers(&file.path) => Fetched::Index(index, cost.retained),
             Ok(_) => {
                 warn!(file = %file.id.0, "trace index names other files; the file is scanned");
                 self.miss()
@@ -380,7 +384,7 @@ impl Lease {
             Arc::new(Held {
                 index,
                 bytes: charged,
-                shared: Arc::clone(&self.shared),
+                shared: Arc::downgrade(&self.shared),
             })
         });
         let slot_charge = if held.is_some() { 0 } else { charged };
@@ -494,9 +498,14 @@ mod tests {
         .unwrap();
         let path = fs_index::sidecar_path(&at.path).unwrap();
         let encoded = index.encode();
-        let size = encoded.len();
-        store.put(&Path::from(path), encoded.into()).await.unwrap();
-        (index.heap_bytes(), size)
+        let cost = TraceIndex::decode_cost(&encoded).unwrap();
+        store
+            .put(&Path::from(path), encoded.clone().into())
+            .await
+            .unwrap();
+        // Bytes a download of it needs at its peak: the object, the
+        // retained heap and the decoder's scratch.
+        (cost.retained, encoded.len() + cost.scratch)
     }
 
     fn stats(cache: &TraceIndexCache) -> (u64, u64, u64) {
@@ -690,7 +699,13 @@ mod tests {
     async fn a_cancelled_download_leaves_nothing_behind() {
         let memory = InMemory::new();
         let file = record(1);
-        let (_, size) = put_sidecar(&memory, &file, &file, &[[1u8; 16]]).await;
+        let (_, peak) = put_sidecar(&memory, &file, &file, &[[1u8; 16]]).await;
+        let object = memory
+            .head(&Path::from(fs_index::sidecar_path(&file.path).unwrap()))
+            .await
+            .unwrap()
+            .size;
+        let object = usize::try_from(object).unwrap();
         let slow = ThrottledStore::new(
             memory,
             ThrottleConfig {
@@ -698,7 +713,7 @@ mod tests {
                 ..ThrottleConfig::default()
             },
         );
-        let cache = Arc::new(cache(Arc::new(slow), size * 4));
+        let cache = Arc::new(cache(Arc::new(slow), peak * 4));
 
         let query = tokio::spawn({
             let cache = Arc::clone(&cache);
@@ -712,7 +727,7 @@ mod tests {
         }
         assert_eq!(
             cache.committed_bytes(),
-            size,
+            object,
             "the object size is reserved mid-download"
         );
         query.abort();
@@ -727,6 +742,22 @@ mod tests {
         assert_eq!(kept.len(), 1, "a fresh download works and finds the trace");
         assert_eq!(stats(&cache).0, 2);
         assert_eq!(cache.bytes(), cache.committed_bytes());
+    }
+
+    #[tokio::test]
+    async fn entries_do_not_keep_the_cache_alive() {
+        let store = Arc::new(InMemory::new());
+        let file = record(1);
+        put_sidecar(store.as_ref(), &file, &file, &[[1u8; 16]]).await;
+        let cache = cache(store, 1 << 20);
+        let held = cache.lookup(&file).await.unwrap();
+        let shared = Arc::downgrade(&cache.shared);
+        drop(cache);
+        assert!(
+            shared.upgrade().is_none(),
+            "an entry in use does not hold the cache"
+        );
+        drop(held);
     }
 
     #[tokio::test]
