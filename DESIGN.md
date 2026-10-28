@@ -486,7 +486,13 @@ and late data is no longer arriving. The ingester confirms a registration
 in a second statement once the rows are retained in memory for it, so the
 delay never counts from a row stamp taken before a commit that came later;
 a file whose writer died before confirming keeps its hour open until the
-replay confirms it. Hours are UTC bins of `ts_min`
+replay confirms it. A confirmation that fails is retried off the flusher,
+`ingest.confirm_batch` per interval and `ingest.max_confirms` at a time
+with the flush backoff, so a catalog that is down never holds a flush; the
+pending count is the `fusescope_flush_unconfirmed` gauge. A confirmation
+changes nothing a querier reads, so the catalog does not announce it: the
+change notification fires for the columns queriers read, and a column
+added for them is added to the trigger. Hours are UTC bins of `ts_min`
 whatever the session time zone, and hour and files are read in one
 repeatable-read snapshot, so a file registered meanwhile is neither counted
 nor taken. It merges the hour's oldest files up to
@@ -588,8 +594,11 @@ under their own ids, so an hour closes only after the hot window could
 have let go of every L0 in it: the server refuses an hour close delay under
 the persisted retention plus a query timeout plus the file cache TTL. When
 rolling the engine out, queriers go first, so every planner excludes by
-origin before any ingester announces one; a server of the previous version
-registering files meanwhile gets the id as origin from the catalog.
+origin before any ingester announces one, then compactors, so no leader of
+the previous version, which closes an hour by the registration stamp
+alone, meets an unconfirmed file of a new ingester, and ingesters last; a
+server of the previous version registering files meanwhile gets the id as
+origin and the registration stamp as confirmation from the catalog.
 A mark is never undone: a sweeper that finds a row already marked, by an
 earlier pass or by another instance during a handover, deletes the object
 itself; only a path a file row owns, or one that is not the engine's, is
