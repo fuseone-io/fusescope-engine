@@ -73,6 +73,26 @@ impl FileId {
         name.extend_from_slice(&offset.to_le_bytes());
         Self(Uuid::new_v5(&FILE_NAMESPACE, &name))
     }
+
+    /// [`derived`](Self::derived) for one of the files a flushed buffer is
+    /// cut into when its rows span calendar hours: the part holding the
+    /// rows of `hour`. Distinct from the id of the whole buffer and from
+    /// every other hour's.
+    pub fn derived_at(
+        instance: Uuid,
+        tenant: TenantId,
+        segment: u64,
+        offset: u64,
+        hour: DateTime<Utc>,
+    ) -> Self {
+        let mut name = Vec::with_capacity(56);
+        name.extend_from_slice(instance.as_bytes());
+        name.extend_from_slice(tenant.0.as_bytes());
+        name.extend_from_slice(&segment.to_le_bytes());
+        name.extend_from_slice(&offset.to_le_bytes());
+        name.extend_from_slice(&hour.timestamp().to_le_bytes());
+        Self(Uuid::new_v5(&FILE_NAMESPACE, &name))
+    }
 }
 
 /// Namespace for derived file ids. Fixed forever; changing it changes every id.
@@ -507,6 +527,12 @@ mod tests {
             FileId::derived(Uuid::new_v4(), tenant, 3, 4096),
             "another ingester, another id"
         );
+        let h14 = DateTime::from_timestamp(1_792_677_600, 0).unwrap();
+        let h15 = DateTime::from_timestamp(1_792_681_200, 0).unwrap();
+        let at14 = FileId::derived_at(wal, tenant, 3, 4096, h14);
+        assert_eq!(at14, FileId::derived_at(wal, tenant, 3, 4096, h14));
+        assert_ne!(at14, a, "a part of the buffer is not the whole buffer");
+        assert_ne!(at14, FileId::derived_at(wal, tenant, 3, 4096, h15));
     }
 
     #[test]
