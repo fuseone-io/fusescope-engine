@@ -1630,6 +1630,7 @@ version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "fs-index",
  "futures-util",
  "getrandom 0.3.4",
  "serde",
