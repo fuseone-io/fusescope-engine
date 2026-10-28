@@ -416,6 +416,87 @@ async fn ingester_heartbeats_expire() {
     db.finish().await;
 }
 
+/// One holder at a time: a second taker fails until the lease expires or
+/// is released; the holder renews without losing its acquisition time.
+#[tokio::test]
+async fn leases_are_exclusive_until_they_expire_or_are_released() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let ttl = StdDuration::from_secs(30);
+    assert!(
+        db.catalog
+            .acquire_lease("compactor", "a", ttl)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.catalog
+            .acquire_lease("compactor", "b", ttl)
+            .await
+            .unwrap(),
+        "held by a"
+    );
+    let first = db.catalog.lease("compactor").await.unwrap().unwrap();
+    assert_eq!(first.holder, "a");
+
+    assert!(
+        db.catalog
+            .acquire_lease("compactor", "a", ttl)
+            .await
+            .unwrap(),
+        "renewal"
+    );
+    let renewed = db.catalog.lease("compactor").await.unwrap().unwrap();
+    assert_eq!(
+        renewed.acquired_at, first.acquired_at,
+        "a renewal keeps the acquisition time"
+    );
+    assert!(renewed.expires_at >= first.expires_at);
+
+    assert!(
+        !db.catalog.release_lease("compactor", "b").await.unwrap(),
+        "not b's to release"
+    );
+    assert!(db.catalog.release_lease("compactor", "a").await.unwrap());
+    assert!(
+        db.catalog
+            .acquire_lease("compactor", "b", ttl)
+            .await
+            .unwrap(),
+        "free after release"
+    );
+
+    // b stops renewing: once its short lease lapses, a takes over.
+    assert!(
+        db.catalog
+            .acquire_lease("compactor", "b", StdDuration::from_millis(200))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.catalog
+            .acquire_lease("compactor", "a", ttl)
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(StdDuration::from_millis(400)).await;
+    assert!(
+        db.catalog
+            .acquire_lease("compactor", "a", ttl)
+            .await
+            .unwrap(),
+        "expired"
+    );
+    let taken = db.catalog.lease("compactor").await.unwrap().unwrap();
+    assert_eq!(taken.holder, "a");
+    assert!(taken.acquired_at > first.acquired_at, "a new acquisition");
+
+    // Other names are independent.
+    assert!(db.catalog.acquire_lease("other", "b", ttl).await.unwrap());
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn watcher_sees_file_changes() {
     let Some(db) = TestDb::new().await else {
