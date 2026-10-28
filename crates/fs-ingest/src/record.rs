@@ -104,7 +104,47 @@ impl FlushIntent {
         }
     }
 
-    /// The hour the file holds, when the buffer was cut by hour.
+    /// Reads an intent from its record, refusing what the record's version
+    /// does not allow: an intent of the first version names no hour, and
+    /// an intent of the hour version names the start of a representable
+    /// hour. Anything else was not written by this engine's cut.
+    ///
+    /// # Errors
+    /// Not an intent record, a malformed payload, or an hour the version
+    /// does not allow.
+    pub fn from_record(record: &WalRecord) -> Result<Self, IngestError> {
+        if record.signal != RecordSignal::FlushIntent {
+            return Err(IngestError::Record("not a flush intent".into()));
+        }
+        let intent = Self::from_payload(&record.payload)?;
+        match (record.version, intent.hour) {
+            (VERSION, None) => Ok(intent),
+            (VERSION, Some(_)) => Err(IngestError::Record(
+                "an intent of the first version carries an hour".into(),
+            )),
+            (VERSION_HOUR_INTENT, Some(secs)) => {
+                let representable = chrono::DateTime::from_timestamp(secs, 0)
+                    .and_then(|hour| hour.timestamp_nanos_opt())
+                    .is_some();
+                if secs.rem_euclid(3600) == 0 && representable {
+                    Ok(intent)
+                } else {
+                    Err(IngestError::Record(format!(
+                        "intent hour {secs} is not the start of an hour"
+                    )))
+                }
+            }
+            (VERSION_HOUR_INTENT, None) => Err(IngestError::Record(
+                "an intent of the hour version names no hour".into(),
+            )),
+            (version, _) => Err(IngestError::Record(format!(
+                "unsupported version {version}"
+            ))),
+        }
+    }
+
+    /// The hour the file holds, when the buffer was cut by hour. Always
+    /// representable for an intent read through [`Self::from_record`].
     pub fn hour_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.hour
             .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
@@ -168,6 +208,11 @@ impl WalRecord {
         }
         let signal = RecordSignal::from_byte(header.get(1).copied().unwrap_or(0))
             .ok_or_else(|| IngestError::Record("unknown signal".into()))?;
+        if version == VERSION_HOUR_INTENT && signal != RecordSignal::FlushIntent {
+            return Err(IngestError::Record(
+                "the hour version is for flush intents only".into(),
+            ));
+        }
         let uuid = header
             .get(2..18)
             .and_then(|b| uuid::Uuid::from_slice(b).ok())
@@ -312,6 +357,53 @@ mod tests {
                 .unwrap()
                 .hour,
             None
+        );
+
+        // Reading fails closed: a version and an hour that do not match
+        // were not written by this engine's cut.
+        assert!(FlushIntent::from_record(&whole.to_record()).is_ok());
+        assert!(FlushIntent::from_record(&one_hour.to_record()).is_ok());
+        let as_version = |intent: &FlushIntent, version: u8| WalRecord {
+            version,
+            ..intent.to_record()
+        };
+        assert!(FlushIntent::from_record(&as_version(&one_hour, VERSION)).is_err());
+        assert!(FlushIntent::from_record(&as_version(&whole, VERSION_HOUR_INTENT)).is_err());
+        // 2300-01-01T00:00:00Z is a date but not a nanosecond timestamp.
+        for bad in [
+            1_792_677_601,
+            10_413_792_000,
+            i64::MAX,
+            -3600 * 400_000_000_000,
+        ] {
+            let intent = FlushIntent {
+                hour: Some(bad),
+                ..whole.clone()
+            };
+            assert!(
+                FlushIntent::from_record(&intent.to_record()).is_err(),
+                "{bad} is not the start of a representable hour"
+            );
+        }
+        let rows_v2 = WalRecord {
+            version: VERSION_HOUR_INTENT,
+            tenant,
+            signal: RecordSignal::Traces,
+            payload: Bytes::from_static(b"otlp"),
+        }
+        .encode();
+        assert!(
+            WalRecord::decode(&rows_v2).is_err(),
+            "the hour version is for intents"
+        );
+        assert!(
+            FlushIntent::from_record(&WalRecord {
+                version: VERSION,
+                tenant,
+                signal: RecordSignal::Traces,
+                payload: Bytes::from_static(b"otlp"),
+            })
+            .is_err()
         );
     }
 
