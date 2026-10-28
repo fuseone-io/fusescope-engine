@@ -129,14 +129,26 @@ arriving meanwhile:
   there first. Replay groups records
   under their intents, so a retry produces the same object and the same
   catalog row even if later rows arrived during the original flush. A cut
-  makes one file per calendar hour its rows fall in, each under the id
-  derived from the range's first position and that hour; rows spanning
-  hours get one intent per hour over the same range, each naming its hour,
-  written under WAL record version 2 so an ingester of the previous version
-  fails on it instead of reading the intent as the whole range, and replay
-  filters each record by the intent's hour. The hot window announces, for
-  the live rows, the id of every hour they fall in, so a querier excludes
-  the files whichever way the cut goes.
+  makes one file per calendar hour its rows fall in, at most
+  `ingest.max_hours_per_cut` of them (8, never above 64), oldest first,
+  each under the id derived from the range's first position and that hour
+  and under an intent naming that hour: an intent claims the rows of its
+  hour and no other, so rows left live, by the bound or by an intent that
+  could not be logged, are cut later under their own hour over a range that
+  may overlap, and a replay still gives every row to one file; a stop cuts
+  until nothing is left live or a pass cuts nothing. The hours of a batch
+  are taken once, when it is made, and kept with it: a cut and a hot scan
+  read them, a batch of one hour moves whole, and only a batch spanning the
+  hours cut and others is partitioned, in one pass. A request whose spans
+  fall in more than `ingest.max_hours_per_batch` hours (48) is refused, and
+  a tenant whose live rows would fall in more than `ingest.max_live_hours`
+  (64) is refused until the cuts drain them, so no cut, scan or
+  announcement grows past that. An intent naming an hour is written
+  under WAL record version 2, so an ingester of the previous version fails
+  on it instead of reading the intent as the whole range; the reader fails
+  closed on a version and an hour that do not match. The hot window
+  announces, for the live rows, the id of every hour they fall in, so a
+  querier excludes the files whichever way the cut goes.
 - Uploads never overwrite (conditional create), and registering an existing
   id verifies the immutable fields; a mismatch is an error, never a silent
   accept.
