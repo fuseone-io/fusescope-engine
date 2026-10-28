@@ -476,21 +476,27 @@ At every level the compactor:
 
 ### 7.1 L0 to L1
 
-A pass takes the oldest hour, across tenants, whose visible L0 files all
-ended more than `compactor.hour_close_delay_secs` ago (so the hot window
-has let go of them) and number at least two, and merges its oldest files up
-to `compactor.max_inputs_per_pass` and `compactor.max_input_bytes`. A large
-hour closes over several passes; an hour left with a single L0 file keeps
-it. Every input is already sorted by `(service_name, timestamp)`, so the
+A pass takes the oldest cold hour, across tenants: one whose visible L0
+files number at least two and all ended and were registered more than
+`compactor.hour_close_delay_secs` ago, so the hot window has let go of them
+and late data is no longer arriving; candidate and files come from one
+statement, so a file registered meanwhile is neither counted nor taken. It
+merges the hour's oldest files up to `compactor.max_inputs_per_pass` and
+`compactor.max_input_bytes`, a ceiling: an hour whose two oldest files do
+not fit is skipped and counted, and the server refuses a cap under twice
+the ingest buffer so two L0 files always fit. A large hour closes over
+several passes; an hour left with a single L0 file keeps it. A pass runs
+only under the lease fence; without one it does nothing. Every input is already sorted by `(service_name, timestamp)`, so the
 merge is a k-way heap over one row group per input, ties in registration
 order, producing row groups of the ingester's size through the same writer
-settings as the flush (`fs-schema::parquet`); an L1 file closes once it
-reaches `compactor.l1_target_bytes` and the next one starts. Memory holds
-one decoded row group per input, the row group being gathered and the
-compressed bytes of the file being written. Outputs go to
-`traces/l1/dt=…/hr=…/{id}.parquet`, each with its own `trace_id` sidecar,
-and are uploaded under the create-once rule before one fenced swap
-quarantines the inputs and publishes the outputs. A crash before the swap
+settings as the flush (`fs-schema::parquet`), a null service before every
+name as the inputs sorted it; an L1 file closes once it reaches
+`compactor.l1_target_bytes` and is uploaded, under the create-once rule,
+before the next one starts, so memory holds one decoded row group per
+input, the row group being gathered and the compressed bytes of the one
+file being written. Outputs go to `traces/l1/dt=…/hr=…/{id}.parquet`, each
+with its own `trace_id` sidecar; once all are in the bucket, one fenced
+swap quarantines the inputs and publishes the outputs. A crash before the swap
 leaves the inputs visible and the outputs as objects without rows for the
 orphan sweep; a swap refused for a conflict or a lost lease leaves them the
 same way; a crash after the swap leaves the inputs quarantined for the

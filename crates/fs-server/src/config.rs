@@ -783,6 +783,13 @@ impl Config {
                 "compactor.max_inputs_per_pass must be at least 2, l1_target_bytes at least 1 MiB and max_input_bytes at least l1_target_bytes",
             );
         }
+        // Two L0 files must always fit a pass, or an hour could never close;
+        // an L0 file is at most one flushed buffer.
+        if self.compactor.max_input_bytes < 2 * self.ingest.max_buffer_bytes as u64 {
+            return invalid(
+                "compactor.max_input_bytes must be at least twice ingest.max_buffer_bytes so two L0 files always fit a pass",
+            );
+        }
         // A querier may read a file for its cache TTL plus one query after
         // the swap that quarantined it.
         let readers_may_hold = fs_query::files::STALE_AFTER.as_secs() + self.query.timeout_secs;

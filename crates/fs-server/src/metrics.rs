@@ -403,9 +403,9 @@ impl Metrics {
                 load(&c.failures),
             ),
             (
-                "fusescope_compaction_orphaned_total",
-                "Outputs uploaded by passes that did not publish them",
-                load(&c.orphaned),
+                "fusescope_compaction_skipped_total",
+                "Hours skipped because their two oldest files exceed the input cap",
+                load(&c.skipped),
             ),
         ] {
             counter(out, name, help, value);

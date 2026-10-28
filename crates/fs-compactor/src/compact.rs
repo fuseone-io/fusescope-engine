@@ -1,6 +1,6 @@
-//! One compaction pass: the oldest closed hour with enough L0 files is
-//! merged into L1 files, which are uploaded and swapped in under the
-//! leader's fence.
+//! One compaction pass: the oldest cold hour with enough L0 files is
+//! merged into L1 files, each uploaded as it closes, then swapped in under
+//! the leader's fence. Without a fence there is no pass.
 //!
 //! A crash before the swap leaves the inputs visible and the outputs as
 //! objects without rows, which the orphan sweep removes; a crash after it
@@ -19,7 +19,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tracing::{info, warn};
 
 use crate::CompactError;
-use crate::merge::{MergeConfig, Output, merge_to_l1};
+use crate::merge::{L1Merger, MergeConfig};
 
 /// What one pass is allowed to take on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,8 @@ pub struct CompactionConfig {
     pub l1_target_bytes: usize,
     /// Most L0 files one pass merges; memory holds one row group of each.
     pub max_inputs_per_pass: usize,
-    /// Most input bytes one pass merges.
+    /// Most input bytes one pass merges, a ceiling: an hour whose two
+    /// oldest files do not fit is skipped and reported.
     pub max_input_bytes: u64,
     /// Rows per output row group.
     pub row_group_rows: usize,
@@ -63,6 +64,8 @@ pub struct CompactorStats {
     pub failures: AtomicU64,
     /// Outputs uploaded by passes that did not publish them.
     pub orphaned: AtomicU64,
+    /// Hours skipped because their two oldest files exceed the input cap.
+    pub skipped: AtomicU64,
 }
 
 /// The compaction side of the compactor.
@@ -100,30 +103,35 @@ impl Compactor {
         Arc::clone(&self.stats)
     }
 
-    /// Compacts the oldest closed hour with at least two L0 files, up to
-    /// the configured inputs, and swaps the outputs in under `fence`.
-    /// `None` when nothing qualifies.
+    /// Compacts the oldest cold hour with at least two L0 files, up to the
+    /// configured inputs, and swaps the outputs in under `fence`. `None`
+    /// when nothing qualifies or the hour's two oldest files exceed the
+    /// input cap.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
     /// catalog failure. The counters record which.
     pub async fn compact_once(
         &self,
-        fence: Option<&LeaseFence>,
+        fence: &LeaseFence,
     ) -> Result<Option<Compaction>, CompactError> {
         let Some(candidate) = self
             .catalog
-            .compaction_candidate(Signal::Traces, self.config.hour_close_delay, 2)
+            .compaction_inputs(Signal::Traces, self.config.hour_close_delay, 2)
             .await?
         else {
             return Ok(None);
         };
-        let all = self
-            .catalog
-            .l0_files_in_hour(candidate.tenant_id, Signal::Traces, candidate.hour)
-            .await?;
-        let inputs = self.take_inputs(&all);
+        let inputs = self.take_inputs(&candidate.files);
         if inputs.len() < 2 {
+            self.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                role = "compactor",
+                tenant = %candidate.tenant_id.0,
+                hour = %candidate.hour,
+                cap = self.config.max_input_bytes,
+                "the hour's two oldest files exceed the input cap; skipped"
+            );
             return Ok(None);
         }
         let result = self
@@ -144,18 +152,20 @@ impl Compactor {
         result.map(Some)
     }
 
-    /// The oldest files of the hour that fit one pass: at least two.
+    /// The oldest files of the hour that fit one pass under both caps;
+    /// fewer than two when the two oldest do not fit the byte cap.
     fn take_inputs<'a>(&self, all: &'a [FileRecord]) -> Vec<&'a FileRecord> {
         let mut inputs = Vec::new();
         let mut bytes = 0u64;
         for file in all {
-            let size = u64::try_from(file.size_bytes).unwrap_or(0);
-            if inputs.len() >= self.config.max_inputs_per_pass.max(2)
-                || (inputs.len() >= 2 && bytes + size > self.config.max_input_bytes)
-            {
+            if inputs.len() >= self.config.max_inputs_per_pass.max(2) {
                 break;
             }
-            bytes += size;
+            let size = u64::try_from(file.size_bytes).unwrap_or(u64::MAX);
+            match bytes.checked_add(size) {
+                Some(total) if total <= self.config.max_input_bytes => bytes = total,
+                _ => break,
+            }
             inputs.push(file);
         }
         inputs
@@ -166,10 +176,10 @@ impl Compactor {
         tenant: fs_catalog::TenantId,
         hour: chrono::DateTime<chrono::Utc>,
         inputs: &[&FileRecord],
-        fence: Option<&LeaseFence>,
+        fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         let owned: Vec<FileRecord> = inputs.iter().map(|f| (*f).clone()).collect();
-        let outputs = merge_to_l1(
+        let mut merger = L1Merger::open(
             Arc::clone(&self.store),
             &self.root,
             tenant,
@@ -181,12 +191,19 @@ impl Compactor {
             },
         )
         .await?;
-        for output in &outputs {
+        // Each output is uploaded as it closes; only its row stays.
+        let mut outputs: Vec<Published> = Vec::new();
+        while let Some(output) = merger.next_output().await? {
             self.put_once(&output.file.path, output.bytes.clone())
                 .await?;
             self.put_once(&output.index_path, output.index.clone())
                 .await?;
+            outputs.push(Published {
+                bytes: output.bytes.len() as u64,
+                file: output.file,
+            });
         }
+        drop(merger);
         let swap = self.swap(tenant, &owned, &outputs, fence).await;
         if swap.is_err() {
             self.stats
@@ -217,8 +234,8 @@ impl Compactor {
         &self,
         tenant: fs_catalog::TenantId,
         inputs: &[FileRecord],
-        outputs: &[Output],
-        fence: Option<&LeaseFence>,
+        outputs: &[Published],
+        fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         if take_injected(&self.inject_swap_failures) {
             return Err(CompactError::Injected("swap"));
@@ -227,7 +244,7 @@ impl Compactor {
         let files: Vec<NewFile> = outputs.iter().map(|o| o.file.clone()).collect();
         Ok(self
             .catalog
-            .swap_files_fenced(tenant, Signal::Traces, &ids, &files, fence)
+            .swap_files_fenced(tenant, Signal::Traces, &ids, &files, Some(fence))
             .await?)
     }
 
@@ -249,7 +266,7 @@ impl Compactor {
         }
     }
 
-    fn count(&self, inputs: &[FileRecord], outputs: &[Output]) {
+    fn count(&self, inputs: &[FileRecord], outputs: &[Published]) {
         let s = &self.stats;
         s.passes.fetch_add(1, Ordering::Relaxed);
         s.inputs.fetch_add(inputs.len() as u64, Ordering::Relaxed);
@@ -268,11 +285,15 @@ impl Compactor {
                 .sum(),
             Ordering::Relaxed,
         );
-        s.output_bytes.fetch_add(
-            outputs.iter().map(|o| o.bytes.len() as u64).sum(),
-            Ordering::Relaxed,
-        );
+        s.output_bytes
+            .fetch_add(outputs.iter().map(|o| o.bytes).sum(), Ordering::Relaxed);
     }
+}
+
+/// An output already in the bucket, waiting for the swap.
+struct Published {
+    file: NewFile,
+    bytes: u64,
 }
 
 /// Takes one injected failure when any is left.

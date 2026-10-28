@@ -14,7 +14,7 @@ use std::time::Duration;
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Int64Type, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
-use chrono::{TimeZone, Utc};
+use chrono::{TimeZone, Timelike, Utc};
 use fs_catalog::{
     COMPACTOR_LEASE, Catalog, CatalogError, FileRecord, LeaseFence, Level, NewTenant, Signal,
     TenantId,
@@ -194,6 +194,32 @@ fn config(row_group_rows: usize) -> CompactionConfig {
     }
 }
 
+/// The fence of a lease taken for this test's holder.
+async fn fence(f: &Fixture) -> LeaseFence {
+    let generation =
+        f.db.catalog
+            .acquire_lease(COMPACTOR_LEASE, "me", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+    LeaseFence {
+        name: COMPACTOR_LEASE.into(),
+        holder: "me".into(),
+        generation,
+    }
+}
+
+/// Backdates the registration of `files` by an hour: cold, as files
+/// flushed long ago would be.
+async fn registered_an_hour_ago(f: &Fixture, files: &[FileRecord]) {
+    let ids: Vec<_> = files.iter().map(|x| x.id).collect();
+    sqlx::query("update engine_file set created_at = now() - interval '1 hour' where id = any($1)")
+        .bind(&ids)
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
+}
+
 fn compactor(f: &Fixture, config: CompactionConfig) -> Compactor {
     Compactor::new(
         f.db.catalog.clone(),
@@ -214,7 +240,14 @@ async fn three_closed_l0(f: &Fixture, row_group_rows: usize) -> Vec<FileRecord> 
         let req = request(service, trace, h + offset * minute, 6);
         files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], row_group_rows).await);
     }
+    registered_an_hour_ago(f, &files).await;
     files
+}
+
+fn request_without_service(trace: u8, start: u64, spans: u8) -> ExportTraceServiceRequest {
+    let mut req = request("x", trace, start, spans);
+    req.resource_spans[0].resource = Some(Resource::default());
+    req
 }
 
 async fn visible(f: &Fixture) -> Vec<FileRecord> {
@@ -224,8 +257,9 @@ async fn visible(f: &Fixture) -> Vec<FileRecord> {
         .unwrap()
 }
 
-/// Rows of a local Parquet file as `(service, timestamp)` in file order.
-fn rows_of(path: &std::path::Path) -> Vec<(String, i64)> {
+/// Rows of a local Parquet file as `(service, timestamp)` in file order;
+/// a null service is `None`.
+fn rows_of(path: &std::path::Path) -> Vec<(Option<String>, i64)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap())
         .unwrap()
@@ -246,7 +280,7 @@ fn rows_of(path: &std::path::Path) -> Vec<(String, i64)> {
             .values()
             .to_vec();
         for (s, t) in service.as_string::<i32>().iter().zip(ts) {
-            out.push((s.unwrap().to_owned(), t));
+            out.push((s.map(str::to_owned), t));
         }
     }
     out
@@ -295,7 +329,7 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     let before_trace = q.collect(f.tenant, &trace_sql).await.unwrap();
 
     let c = compactor(&f, config(4));
-    let done = c.compact_once(None).await.unwrap().unwrap();
+    let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert_eq!(done.inputs.len(), 3);
     assert_eq!(done.outputs.len(), 1);
 
@@ -358,7 +392,7 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     assert_eq!(stats.outputs.load(Ordering::Relaxed), 1);
     assert_eq!(stats.rows.load(Ordering::Relaxed), 18);
     assert!(
-        c.compact_once(None).await.unwrap().is_none(),
+        c.compact_once(&fence(&f).await).await.unwrap().is_none(),
         "nothing left to compact"
     );
     f.db.finish().await;
@@ -375,7 +409,7 @@ async fn outputs_close_at_the_target_size() {
             ..config(4)
         },
     );
-    let done = c.compact_once(None).await.unwrap().unwrap();
+    let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert!(
         done.outputs.len() >= 2,
         "every row group closes an output: {}",
@@ -414,7 +448,7 @@ async fn a_pass_takes_the_oldest_inputs_up_to_its_limit() {
             ..config(4)
         },
     );
-    let done = c.compact_once(None).await.unwrap().unwrap();
+    let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert_eq!(done.inputs, [inputs[0].id, inputs[1].id], "the two oldest");
     let now = visible(&f).await;
     assert!(
@@ -422,7 +456,7 @@ async fn a_pass_takes_the_oldest_inputs_up_to_its_limit() {
         "the newest stays as L0"
     );
     assert!(
-        c.compact_once(None).await.unwrap().is_none(),
+        c.compact_once(&fence(&f).await).await.unwrap().is_none(),
         "one L0 left: not enough to compact"
     );
     f.db.finish().await;
@@ -442,7 +476,7 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
             ..config(4)
         },
     );
-    let err = c.compact_once(None).await.unwrap_err();
+    let err = c.compact_once(&fence(&f).await).await.unwrap_err();
     assert!(matches!(err, CompactError::Injected("swap")), "{err}");
     let now = visible(&f).await;
     let mut still: Vec<_> = now.iter().map(|x| x.id).collect();
@@ -463,7 +497,7 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 1);
     assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
 
-    let done = c.compact_once(None).await.unwrap().unwrap();
+    let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert_eq!(done.inputs.len(), 3);
     let now = visible(&f).await;
     assert_eq!(now.len(), 1);
@@ -488,7 +522,7 @@ async fn a_stale_fence_publishes_nothing() {
         generation,
     };
     let c = compactor(&f, config(4));
-    let err = c.compact_once(Some(&stale)).await.unwrap_err();
+    let err = c.compact_once(&stale).await.unwrap_err();
     assert!(
         matches!(err, CompactError::Catalog(CatalogError::LeaseLost { .. })),
         "{err}"
@@ -500,11 +534,161 @@ async fn a_stale_fence_publishes_nothing() {
     assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 1);
 
     // The real holder's fence works.
-    let fence = LeaseFence {
+    let real = LeaseFence {
         holder: "other".into(),
         ..stale
     };
-    assert!(c.compact_once(Some(&fence)).await.unwrap().is_some());
+    assert!(c.compact_once(&real).await.unwrap().is_some());
+    f.db.finish().await;
+}
+
+/// Two cold L0 files do not make an hour compactable while a third file
+/// in it ended recently or was registered recently: the hot window may
+/// still serve it and late data may still arrive.
+#[tokio::test]
+async fn an_hour_with_a_recent_or_late_file_is_not_cold() {
+    let Some(f) = fixture().await else { return };
+    let cold = three_closed_l0(&f, 4).await;
+    let hour = nanos(closed_hour());
+    // Late data: old timestamps, registered just now, not backdated.
+    let late = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request("web", 7, hour + 1, 2)],
+        4,
+    )
+    .await;
+    let compactor = compactor(&f, config(4));
+    let me = fence(&f).await;
+    assert!(
+        compactor.compact_once(&me).await.unwrap().is_none(),
+        "late data keeps the hour open"
+    );
+
+    // Once it is cold too, the whole hour compacts, the late file included.
+    registered_an_hour_ago(&f, std::slice::from_ref(&late)).await;
+    let done = compactor.compact_once(&me).await.unwrap().unwrap();
+    assert_eq!(done.inputs.len(), cold.len() + 1);
+
+    // A file whose rows end recently keeps its hour open however old its registration.
+    let recent_hour = Utc::now() - chrono::Duration::minutes(30);
+    let recent_hour = recent_hour
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let first = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request("web", 11, nanos(recent_hour), 2)],
+        4,
+    )
+    .await;
+    let second = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request("api", 12, nanos(recent_hour) + 1, 2)],
+        4,
+    )
+    .await;
+    let ending_now = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request("api", 13, nanos(Utc::now()) - 1, 2)],
+        4,
+    )
+    .await;
+    registered_an_hour_ago(&f, &[first, second, ending_now]).await;
+    assert!(
+        compactor.compact_once(&me).await.unwrap().is_none(),
+        "one file still ends now"
+    );
+    f.db.finish().await;
+}
+
+/// A null service sorts before every name, the empty one included, across
+/// inputs as it does inside each of them.
+#[tokio::test]
+async fn a_null_service_sorts_before_an_empty_one_across_inputs() {
+    let Some(f) = fixture().await else { return };
+    let h = nanos(closed_hour());
+    // The empty name has the earlier timestamps; the null the later ones.
+    let empty = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request("", 1, h, 3)],
+        4,
+    )
+    .await;
+    let null = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request_without_service(2, h + 60_000_000_000, 3)],
+        4,
+    )
+    .await;
+    registered_an_hour_ago(&f, &[empty, null]).await;
+    let c = compactor(&f, config(4));
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let l1 = visible(&f)
+        .await
+        .into_iter()
+        .find(|x| x.level == Level::L1)
+        .unwrap();
+    let rows = rows_of(&f.dir.path().join(&l1.path));
+    assert_eq!(rows.len(), 6);
+    assert!(
+        rows[..3].iter().all(|(s, _)| s.is_none()),
+        "nulls first: {rows:?}"
+    );
+    assert!(
+        rows[3..].iter().all(|(s, _)| s.as_deref() == Some("")),
+        "{rows:?}"
+    );
+    f.db.finish().await;
+}
+
+/// The input byte cap is a ceiling: an hour whose two oldest files do not
+/// fit is skipped and counted, not compacted over the cap.
+#[tokio::test]
+async fn the_input_cap_is_a_ceiling() {
+    let Some(f) = fixture().await else { return };
+    let inputs = three_closed_l0(&f, 4).await;
+    let smallest_pair: u64 = inputs
+        .iter()
+        .take(2)
+        .map(|x| u64::try_from(x.size_bytes).unwrap())
+        .sum();
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            max_input_bytes: smallest_pair - 1,
+            ..config(4)
+        },
+    );
+    let me = fence(&f).await;
+    assert!(c.compact_once(&me).await.unwrap().is_none());
+    assert_eq!(c.stats().skipped.load(Ordering::Relaxed), 1);
+    assert_eq!(visible(&f).await.len(), 3, "nothing compacted");
+
+    // Exactly the pair fits: two go, the third stays.
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            max_input_bytes: smallest_pair,
+            ..config(4)
+        },
+    );
+    let done = c.compact_once(&me).await.unwrap().unwrap();
+    assert_eq!(done.inputs.len(), 2);
     f.db.finish().await;
 }
 

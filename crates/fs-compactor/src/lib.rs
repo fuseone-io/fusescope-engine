@@ -146,7 +146,7 @@ const PASSES_PER_TICK: usize = 64;
 
 /// The work of the leader: purge and compaction passes at their intervals
 /// until the lease is lost. Every swap carries the fence of the lease as
-/// it is at that moment.
+/// it is at that moment; no fence, no pass.
 async fn work_loop(
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
@@ -166,10 +166,10 @@ async fn work_loop(
             }
             _ = compact.tick() => {
                 for _ in 0..PASSES_PER_TICK {
-                    if !*leader.borrow() {
+                    let Some(fence) = leadership.fence() else {
                         break;
-                    }
-                    match compactor.compact_once(leadership.fence().as_ref()).await {
+                    };
+                    match compactor.compact_once(&fence).await {
                         Ok(Some(_)) => {}
                         Ok(None) => break,
                         Err(e) => {

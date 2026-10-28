@@ -5,9 +5,11 @@
 //! that order: the heads of the inputs are kept in a heap keyed by
 //! `(service, timestamp, input, row)`, the smallest goes to the output,
 //! and an input whose row group is spent loads its next one. An output
-//! file closes when it reaches the target size and the next one starts, so
-//! memory holds one decoded row group per input, the output row group
-//! being gathered and the compressed bytes of the file being written.
+//! file closes when it reaches the target size and is handed over before
+//! the next one starts, so memory holds one decoded row group per input,
+//! the output row group being gathered and the compressed bytes of the one
+//! file being written. A null service sorts before every name, as the
+//! inputs sorted it.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
@@ -56,35 +58,73 @@ pub struct MergeConfig {
     pub target_bytes: usize,
 }
 
-/// Merges `inputs`, all L0 files of `tenant` in the hour starting at
-/// `hour`, into L1 outputs under `root`.
-///
-/// # Errors
-/// Store, Parquet or Arrow failures, or an input whose columns are not
-/// the span schema.
-pub async fn merge_to_l1(
-    store: Arc<dyn ObjectStore>,
-    root: &Path,
+/// Merges L0 files of one tenant and hour into L1 outputs, one at a time.
+pub struct L1Merger {
+    schema: SchemaRef,
+    merge: Merge,
+    root: Path,
     tenant: TenantId,
     hour: DateTime<Utc>,
-    inputs: &[FileRecord],
     config: MergeConfig,
-) -> Result<Vec<Output>, CompactError> {
-    let schema = span_schema_v1();
-    let mut merge = Merge::open(store, inputs, &schema, config.row_group_rows).await?;
-    let mut outputs = Vec::new();
-    let mut current = OutputBuilder::new(&schema, config.row_group_rows)?;
-    while let Some(group) = merge.next_group(&schema, config.row_group_rows).await? {
-        current.write(&group)?;
-        if current.bytes_written() >= config.target_bytes {
-            outputs.push(current.finish(root, tenant, hour)?);
-            current = OutputBuilder::new(&schema, config.row_group_rows)?;
+    /// Set once the inputs are spent.
+    done: bool,
+}
+
+impl L1Merger {
+    /// Opens `inputs`, all L0 files of `tenant` in the hour starting at
+    /// `hour`; outputs go under `root`.
+    ///
+    /// # Errors
+    /// Store or Parquet failures opening an input.
+    pub async fn open(
+        store: Arc<dyn ObjectStore>,
+        root: &Path,
+        tenant: TenantId,
+        hour: DateTime<Utc>,
+        inputs: &[FileRecord],
+        config: MergeConfig,
+    ) -> Result<Self, CompactError> {
+        let schema = span_schema_v1();
+        let merge = Merge::open(store, inputs, &schema, config.row_group_rows).await?;
+        Ok(Self {
+            schema,
+            merge,
+            root: root.clone(),
+            tenant,
+            hour,
+            config,
+            done: false,
+        })
+    }
+
+    /// The next output, closed at the target size or at the end of the
+    /// inputs; `None` once the inputs are spent. Only this output's bytes
+    /// are held.
+    ///
+    /// # Errors
+    /// Store, Parquet or Arrow failures, or an input whose columns are not
+    /// the span schema.
+    pub async fn next_output(&mut self) -> Result<Option<Output>, CompactError> {
+        if self.done {
+            return Ok(None);
         }
+        let mut current = OutputBuilder::new(&self.schema, self.config.row_group_rows)?;
+        while let Some(group) = self
+            .merge
+            .next_group(&self.schema, self.config.row_group_rows)
+            .await?
+        {
+            current.write(&group)?;
+            if current.bytes_written() >= self.config.target_bytes {
+                return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
+            }
+        }
+        self.done = true;
+        if current.rows == 0 {
+            return Ok(None);
+        }
+        Ok(Some(current.finish(&self.root, self.tenant, self.hour)?))
     }
-    if current.rows > 0 {
-        outputs.push(current.finish(root, tenant, hour)?);
-    }
-    Ok(outputs)
 }
 
 /// `{root}/t/{tenant}/traces/l1/dt=YYYY-MM-DD/hr=HH/{id}.parquet`
@@ -103,10 +143,13 @@ pub fn l1_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -
     }
 }
 
+/// A service name as a sort key: `None` is a null, before every name.
+type Service = Option<Arc<str>>;
+
 /// A loaded row group of one input with its sort keys.
 struct Slot {
     batch: RecordBatch,
-    services: Vec<Arc<str>>,
+    services: Vec<Service>,
     timestamps: Vec<i64>,
 }
 
@@ -120,15 +163,14 @@ impl Slot {
         let mut services = Vec::with_capacity(batch.num_rows());
         let mut last: Option<Arc<str>> = None;
         for value in service.as_string::<i32>() {
-            let value = value.unwrap_or("");
-            let shared = match &last {
+            let shared = value.map(|value| match &last {
                 Some(l) if l.as_ref() == value => Arc::clone(l),
                 _ => {
                     let s: Arc<str> = Arc::from(value);
                     last = Some(Arc::clone(&s));
                     s
                 }
-            };
+            });
             services.push(shared);
         }
         let timestamps = batch
@@ -215,7 +257,7 @@ impl AsyncFileReader for ObjectReader {
 }
 
 /// The head of one input in the heap: its sort key and where the row is.
-type Head = Reverse<(Arc<str>, i64, usize, usize, usize)>;
+type Head = Reverse<(Service, i64, usize, usize, usize)>;
 
 struct Input {
     stream: ParquetRecordBatchStream<ObjectReader>,
@@ -275,7 +317,7 @@ impl Merge {
                         (loaded.services.get(row), loaded.timestamps.get(row))
                     {
                         self.heap
-                            .push(Reverse((Arc::clone(service), *ts, input, row, slot)));
+                            .push(Reverse((service.clone(), *ts, input, row, slot)));
                         return Ok(());
                     }
                 }
