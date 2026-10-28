@@ -573,10 +573,6 @@ pub struct CompactorConfig {
     /// try, times the number of failures so far, up to six times.
     #[serde(default = "default_sweep_delete_backoff")]
     pub sweep_delete_backoff_secs: u64,
-    /// How long a deleted path stays refused to registration; longer than
-    /// any delete request could stay in flight.
-    #[serde(default = "default_sweep_tombstone_ttl")]
-    pub sweep_tombstone_ttl_secs: u64,
 }
 
 impl Default for CompactorConfig {
@@ -596,7 +592,6 @@ impl Default for CompactorConfig {
             sweep_objects_per_pass: default_sweep_objects(),
             sweep_deletes_per_pass: default_sweep_deletes(),
             sweep_delete_backoff_secs: default_sweep_delete_backoff(),
-            sweep_tombstone_ttl_secs: default_sweep_tombstone_ttl(),
         }
     }
 }
@@ -627,7 +622,6 @@ impl CompactorConfig {
                 objects_per_pass: self.sweep_objects_per_pass,
                 deletes_per_pass: self.sweep_deletes_per_pass,
                 delete_backoff: std::time::Duration::from_secs(self.sweep_delete_backoff_secs),
-                tombstone_ttl: std::time::Duration::from_secs(self.sweep_tombstone_ttl_secs),
                 inject_delete_failure: None,
             },
         }
@@ -652,10 +646,6 @@ fn default_sweep_deletes() -> usize {
 
 fn default_sweep_delete_backoff() -> u64 {
     600
-}
-
-fn default_sweep_tombstone_ttl() -> u64 {
-    7 * 24 * 3600
 }
 
 fn default_lease_ttl() -> u64 {
@@ -858,11 +848,7 @@ impl Config {
                 "compactor.orphan_ttl_secs must be at least 60 and orphan_interval_secs, sweep_objects_per_pass, sweep_deletes_per_pass and sweep_delete_backoff_secs positive",
             );
         }
-        // A tombstone must outlive any delete request to the bucket, which
-        // gives up long before an hour.
-        if self.compactor.sweep_tombstone_ttl_secs < 3600 {
-            return invalid("compactor.sweep_tombstone_ttl_secs must be at least 3600");
-        }
+
         // Two L0 files must always fit a pass, or an hour could never close;
         // an L0 file is at most one flushed buffer.
         if self.compactor.max_input_bytes < 2 * self.ingest.max_buffer_bytes as u64 {
@@ -1103,17 +1089,14 @@ mod tests {
                 .contains("quarantine_ttl_secs"),
             "a querier may still read a quarantined file for its cache TTL plus one query"
         );
-        for bad in [
+        let err = Config::parse(
             "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\nsweep_delete_backoff_secs = 0\n",
-            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\nsweep_tombstone_ttl_secs = 60\n",
-        ] {
-            let err = Config::parse(bad)
-                .unwrap()
-                .validate(&secrets)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("sweep_"), "{err}");
-        }
+        )
+        .unwrap()
+        .validate(&secrets)
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sweep_"), "{err}");
         let long_enough = Config::parse(
             "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\ntimeout_secs = 60\n[compactor]\nquarantine_ttl_secs = 65\n",
         )

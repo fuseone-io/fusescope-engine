@@ -862,7 +862,6 @@ fn sweeper(f: &Fixture, objects_per_pass: usize) -> fs_compactor::Sweeper {
             objects_per_pass,
             deletes_per_pass: 100,
             delete_backoff: Duration::from_secs(600),
-            tombstone_ttl: Duration::from_secs(7 * 24 * 3600),
             inject_delete_failure: None,
         },
         Arc::new(fs_compactor::OrphanStats::default()),
@@ -949,8 +948,10 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     );
 
     // The stray gets a row before its TTL; the rest wait it out.
+    let adopted_id = fs_catalog::FileId::new();
     let row = fs_catalog::NewFile {
-        id: fs_catalog::FileId::new(),
+        id: adopted_id,
+        origin: adopted_id,
         tenant_id: f.tenant,
         signal: Signal::Traces,
         level: Level::L0,
@@ -1159,7 +1160,6 @@ async fn a_failing_delete_waits_its_backoff_behind_the_others() {
             objects_per_pass: 1000,
             deletes_per_pass: 1,
             delete_backoff: Duration::from_secs(600),
-            tombstone_ttl: Duration::from_secs(7 * 24 * 3600),
             inject_delete_failure: Some(stuck_id.to_string()),
         },
         Arc::new(fs_compactor::OrphanStats::default()),
@@ -1207,11 +1207,67 @@ fn sweeper_with(f: &Fixture, inject_delete_failure: Option<String>) -> fs_compac
             objects_per_pass: 1000,
             deletes_per_pass: 100,
             delete_backoff: Duration::from_secs(600),
-            tombstone_ttl: Duration::from_secs(7 * 24 * 3600),
             inject_delete_failure,
         },
         Arc::new(fs_compactor::OrphanStats::default()),
     )
+}
+
+/// An object written behind a tombstone, by a writer that checked just
+/// before the delete, is seen by the next sweep, which turns the
+/// tombstone back into a mark and deletes the object again; the tombstone
+/// stays.
+#[tokio::test]
+async fn an_object_written_behind_a_tombstone_is_deleted_again() {
+    let Some(f) = fixture().await else { return };
+    let path = format!(
+        "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
+        f.tenant.0,
+        uuid::Uuid::new_v4()
+    );
+    f.db.catalog
+        .orphans_seen(std::slice::from_ref(&path))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.db.catalog
+            .orphan_doom(&path, std::slice::from_ref(&path))
+            .await
+            .unwrap(),
+        fs_catalog::Doom::Marked
+    );
+    f.db.catalog
+        .orphan_claim(&path)
+        .await
+        .unwrap()
+        .unwrap()
+        .deleted()
+        .await
+        .unwrap();
+    // The writer slipped its upload in after the delete.
+    f.store
+        .put(&Path::from(path.as_str()), b"late".to_vec().into())
+        .await
+        .unwrap();
+
+    let mut sweeper = sweeper(&f, 1000);
+    let first = sweeper.sweep_once().await.unwrap();
+    assert_eq!(first.seen, 1, "seen again behind its tombstone");
+    let second = sweeper.sweep_once().await.unwrap();
+    assert_eq!(
+        second.deleted, 1,
+        "the mark the sighting restored is finished"
+    );
+    assert!(!present(&f, &path).await);
+    assert_eq!(
+        f.db.catalog.orphans_doomed(10).await.unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(
+        f.db.catalog.object_refused(&path).await.unwrap().is_some(),
+        "still a tombstone"
+    );
+    f.db.finish().await;
 }
 
 /// L1 objects under the bucket, by path relative to it.

@@ -484,6 +484,7 @@ impl OutputBuilder {
         )?;
         let file = NewFile {
             id,
+            origin: id,
             tenant_id: tenant,
             signal: Signal::Traces,
             level: Level::L1,

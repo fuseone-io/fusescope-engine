@@ -12,7 +12,10 @@
 //! and uploads again once the object is gone. A mark is never undone by
 //! another sweeper, and the delete itself runs under a claim that holds
 //! the path's lock, so two sweepers never delete the same path and a
-//! registration re-uploading it waits for the claim to end.
+//! registration re-uploading it waits for the claim to end. A deleted
+//! path stays a tombstone for good; one seen with an object again, from
+//! a writer that checked just before the delete, goes back to marked and
+//! is deleted again.
 //!
 //! Only paths the engine lays out are considered
 //! ([`fs_index::SpanObject`]), checked again just before an object is
@@ -64,9 +67,6 @@ pub struct SweepConfig {
     /// How long a marked object whose delete failed waits before the next
     /// try, times the number of failures so far, up to six times.
     pub delete_backoff: Duration,
-    /// How long a deleted path stays refused to registration; longer than
-    /// any delete request could stay in flight.
-    pub tombstone_ttl: Duration,
     /// Make the delete of every object whose path contains this fail
     /// artificially. `None` in production; tests use it for the backoff.
     pub inject_delete_failure: Option<String>,
@@ -88,8 +88,6 @@ pub struct OrphanStats {
     pub forgotten: AtomicU64,
     /// Deletes that failed and wait their backoff.
     pub delete_failures: AtomicU64,
-    /// Tombstones pruned after their TTL.
-    pub tombstones_pruned: AtomicU64,
 }
 
 /// What one pass did.
@@ -165,16 +163,6 @@ impl Sweeper {
     /// Catalog or bucket failure; the next pass redoes what this one left.
     pub async fn sweep_once(&mut self) -> Result<Swept, CompactError> {
         let mut swept = Swept::default();
-        let pruned = self
-            .catalog
-            .orphans_prune_tombstones(
-                self.config.tombstone_ttl,
-                i64::try_from(self.config.deletes_per_pass).unwrap_or(i64::MAX),
-            )
-            .await?;
-        self.stats
-            .tombstones_pruned
-            .fetch_add(pruned as u64, Ordering::Relaxed);
         self.finish_marked(&mut swept).await?;
         self.walk(&mut swept).await?;
         self.reap(&mut swept).await?;

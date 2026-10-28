@@ -562,17 +562,24 @@ fresh id, logged as a second intent for the same records so a restart
 retries under it too, and writes the same bytes under the new path. A path
 once marked is never written again, since a delete still in flight when a
 sweeper lost its lease could remove an object re-uploaded under it: a
-deleted path stays in the catalog as a tombstone, refused to registration,
-for `compactor.sweep_tombstone_ttl_secs`, so a writer that was down while
-its object was deleted is refused on its first retry and takes a fresh id
-too; a writer also asks before uploading, so a refused path is not written
-again even as an orphan, the registration's own check being the one that
-decides. The id changes while the failed attempt still holds the flush, so
-no concurrent retry takes the old id meanwhile.
+deleted path stays in the catalog as a tombstone, refused to registration
+for good, so a writer that was down while its object was deleted is refused
+on its first retry, however late, and takes a fresh id too; a writer also
+asks before uploading, so a refused path is not written again even as an
+orphan, the registration's own check being the one that decides, and an
+object that slips in between the two is seen by the sweep, which turns its
+tombstone back into a mark and deletes it again. The id changes while the
+failed attempt still holds the flush, so no concurrent retry takes the old
+id meanwhile. The file keeps the id its rows were first assigned as its
+`origin`, which the hot window announces: a querier excludes a file by its
+id or its origin, so a flush that changed id between the hot scan and the
+catalog read is still left out and its rows are never read twice.
 A mark is never undone: a sweeper that finds a row already marked, by an
 earlier pass or by another instance during a handover, deletes the object
 itself; only a path a file row owns, or one that is not the engine's, is
-forgotten. The delete and the forgetting run under a claim that holds the
+forgotten. A deleted path stays as a tombstone for good, one row per
+deleted orphan, the record that the path is spent; there is no bound on how
+long a cancelled delete request may take to land, so none on the tombstone. The delete and the forgetting run under a claim that holds the
 path's lock in an open transaction, so two sweepers never delete the same
 path, a registration re-uploading it waits for the claim to end, and a
 sweeper whose claim finds the mark gone does nothing. A pass that stops
