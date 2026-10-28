@@ -750,7 +750,7 @@ async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
         .unwrap()
         .id;
     let closed = StdDuration::from_secs(60);
-    let inputs = |min: i64| db.catalog.compaction_inputs(Signal::Traces, closed, min);
+    let inputs = |min: i64| db.catalog.compaction_inputs(Signal::Traces, closed, min, 0);
     assert!(inputs(2).await.unwrap().is_none());
 
     // Hour 1 has two files, hour 0 one, hour 2 three; all ended long ago.
@@ -792,6 +792,21 @@ async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
         found.hour,
         hour(1),
         "hour 0 has one file; hour 1 is the oldest with two"
+    );
+    let second = db
+        .catalog
+        .compaction_inputs(Signal::Traces, closed, 2, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.hour, hour(2), "skipping one lands on the next hour");
+    assert_eq!(second.files.len(), 3);
+    assert!(
+        db.catalog
+            .compaction_inputs(Signal::Traces, closed, 2, 2)
+            .await
+            .unwrap()
+            .is_none()
     );
     assert_eq!(
         found.files.iter().map(|f| f.id).collect::<Vec<_>>(),

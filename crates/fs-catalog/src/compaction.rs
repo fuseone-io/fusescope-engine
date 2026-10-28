@@ -1,7 +1,7 @@
 //! What the compactor asks the catalog: the next hour to compact and the
-//! files that make it up, in one statement so both come from one snapshot.
+//! files that make it up, read in one snapshot.
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::types::{FileRecord, FileRow, FileState, Level, Signal, TenantId};
 use crate::{Catalog, CatalogError};
@@ -11,19 +11,24 @@ use crate::{Catalog, CatalogError};
 pub struct CompactionInputs {
     /// Owner.
     pub tenant_id: TenantId,
-    /// Start of the hour, by the files' `ts_min`.
+    /// Start of the hour in UTC, by the files' `ts_min`.
     pub hour: DateTime<Utc>,
     /// Every visible L0 file of the hour, oldest registration first.
     pub files: Vec<FileRecord>,
 }
 
+/// Hours are UTC, whatever the session's time zone.
+const HOUR_BIN: &str = "date_bin('1 hour', ts_min, timestamptz '1970-01-01 00:00:00+00')";
+
 impl Catalog {
-    /// The oldest hour, across tenants, whose visible L0 files of `signal`
-    /// number at least `min_files` and are all cold: every one ended and
-    /// was registered more than `closed_for` ago on the database clock, so
-    /// nothing in the hour is still served by a hot window or about to be
-    /// joined by late data. Candidate and files come from one statement,
-    /// so a file registered meanwhile is neither counted nor returned.
+    /// The `skip`-th oldest hour, across tenants, whose visible L0 files of
+    /// `signal` number at least `min_files` and are all cold: every one
+    /// ended and was registered more than `closed_for` ago on the database
+    /// clock, so nothing in the hour is still served by a hot window or
+    /// about to be joined by late data. Hour and files are read in one
+    /// repeatable-read snapshot, so a file registered meanwhile is neither
+    /// counted nor returned. `skip` lets a caller pass over hours it cannot
+    /// take on.
     ///
     /// # Errors
     /// Database failure.
@@ -32,50 +37,58 @@ impl Catalog {
         signal: Signal,
         closed_for: std::time::Duration,
         min_files: i64,
+        skip: i64,
     ) -> Result<Option<CompactionInputs>, CatalogError> {
-        let rows = sqlx::query_as::<_, FileRow>(
-            "with hours as (
-                 select tenant_id, date_trunc('hour', ts_min) as hour
-                 from engine_file
-                 where signal = $1 and level = $2 and state = $3
-                 group by tenant_id, hour
-                 having count(*) >= $4
-                    and max(ts_max) < now() - make_interval(secs => $5)
-                    and max(created_at) < now() - make_interval(secs => $5)
-                 order by hour, tenant_id
-                 limit 1
-             )
-             select f.id, f.tenant_id, f.signal, f.level, f.path, f.size_bytes, f.row_count,
-                    f.ts_min, f.ts_max, f.services, f.summary, f.state, f.created_at,
-                    f.quarantined_at
-             from engine_file f
-             join hours h on f.tenant_id = h.tenant_id and date_trunc('hour', f.ts_min) = h.hour
-             where f.signal = $1 and f.level = $2 and f.state = $3
-             order by f.created_at, f.id",
-        )
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await?;
+        let hour: Option<(TenantId, DateTime<Utc>)> = sqlx::query_as(&format!(
+            "select tenant_id, {HOUR_BIN} as hour
+             from engine_file
+             where signal = $1 and level = $2 and state = $3
+             group by tenant_id, hour
+             having count(*) >= $4
+                and max(ts_max) < now() - make_interval(secs => $5)
+                and max(created_at) < now() - make_interval(secs => $5)
+             order by hour, tenant_id
+             offset $6
+             limit 1"
+        ))
         .bind(signal.code())
         .bind(Level::L0.code())
         .bind(FileState::Visible.code())
         .bind(min_files)
         .bind(closed_for.as_secs_f64())
-        .fetch_all(self.pool())
+        .bind(skip)
+        .fetch_optional(&mut *tx)
         .await?;
-        let files: Vec<FileRecord> = rows
+        let Some((tenant_id, hour)) = hour else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let rows = sqlx::query_as::<_, FileRow>(&format!(
+            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+                    services, summary, state, created_at, quarantined_at
+             from engine_file
+             where tenant_id = $1 and signal = $2 and level = $3 and state = $4
+               and {HOUR_BIN} = $5
+             order by created_at, id"
+        ))
+        .bind(tenant_id)
+        .bind(signal.code())
+        .bind(Level::L0.code())
+        .bind(FileState::Visible.code())
+        .bind(hour)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let files = rows
             .into_iter()
             .map(FileRecord::try_from)
             .collect::<Result<_, _>>()?;
-        let Some(first) = files.first() else {
-            return Ok(None);
-        };
-        let hour = first
-            .range
-            .start
-            .with_minute(0)
-            .and_then(|t| t.with_second(0))
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(first.range.start);
         Ok(Some(CompactionInputs {
-            tenant_id: first.tenant_id,
+            tenant_id,
             hour,
             files,
         }))
