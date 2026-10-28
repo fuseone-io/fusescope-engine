@@ -72,6 +72,14 @@ pub enum CatalogError {
         /// First differing field.
         field: &'static str,
     },
+    /// The object at `path`, or its sidecar, is marked for deletion by the
+    /// orphan sweep: the file is not registered, the writer uploads again
+    /// once the sweep is done with it.
+    #[error("object {path} is being deleted as an orphan; upload it again")]
+    ObjectDoomed {
+        /// Object path.
+        path: String,
+    },
     /// The operating system could not provide randomness for a token.
     #[error("randomness unavailable: {0}")]
     Randomness(#[from] getrandom::Error),

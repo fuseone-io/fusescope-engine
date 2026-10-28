@@ -476,7 +476,7 @@ async fn leases_are_exclusive_until_they_expire_or_are_released() {
     // b stops renewing: once its short lease lapses, a takes over at the next generation.
     assert_eq!(
         db.catalog
-            .acquire_lease("compactor", "b", StdDuration::from_millis(200))
+            .acquire_lease("compactor", "b", StdDuration::from_secs(2))
             .await
             .unwrap(),
         Some(2),
@@ -489,7 +489,7 @@ async fn leases_are_exclusive_until_they_expire_or_are_released() {
             .unwrap(),
         None
     );
-    tokio::time::sleep(StdDuration::from_millis(400)).await;
+    tokio::time::sleep(StdDuration::from_millis(2500)).await;
     assert_eq!(
         db.catalog
             .acquire_lease("compactor", "a", ttl)
@@ -697,7 +697,7 @@ async fn a_fenced_swap_is_serialised_with_takeovers() {
 }
 
 /// Waits until some backend is blocked on a lock while holding a lock on
-/// this schema's `engine_lease`, so the test knows the task reached the
+/// this schema's `engine_lease` or `engine_orphan`, so the test knows the task reached the
 /// row rather than assuming it from a sleep. Panics after five seconds:
 /// nothing waited, so nothing was serialised.
 async fn wait_for_lock_waiter(catalog: &Catalog) {
@@ -708,7 +708,8 @@ async fn wait_for_lock_waiter(catalog: &Catalog) {
              where a.wait_event_type = 'Lock'
                and exists (
                    select 1 from pg_locks l
-                   where l.pid = a.pid and l.relation = 'engine_lease'::regclass
+                   where l.pid = a.pid
+                     and l.relation in ('engine_lease'::regclass, 'engine_orphan'::regclass)
                )",
         )
         .fetch_one(catalog.pool())
@@ -873,13 +874,16 @@ async fn orphans_keep_their_first_sighting() {
         .unwrap();
     assert_eq!(
         db.catalog
-            .orphans_due(StdDuration::from_secs(60))
+            .orphans_due(StdDuration::from_secs(60), 100)
             .await
             .unwrap(),
         Vec::<String>::new()
     );
     assert_eq!(
-        db.catalog.orphans_due(StdDuration::ZERO).await.unwrap(),
+        db.catalog
+            .orphans_due(StdDuration::ZERO, 100)
+            .await
+            .unwrap(),
         ["a", "b"]
     );
     sqlx::query(
@@ -894,7 +898,7 @@ async fn orphans_keep_their_first_sighting() {
         .unwrap();
     assert_eq!(
         db.catalog
-            .orphans_due(StdDuration::from_secs(3600))
+            .orphans_due(StdDuration::from_secs(3600), 100)
             .await
             .unwrap(),
         ["a"],
@@ -905,8 +909,146 @@ async fn orphans_keep_their_first_sighting() {
         .await
         .unwrap();
     assert_eq!(
-        db.catalog.orphans_due(StdDuration::ZERO).await.unwrap(),
+        db.catalog
+            .orphans_due(StdDuration::ZERO, 100)
+            .await
+            .unwrap(),
         ["b", "c"]
+    );
+    db.finish().await;
+}
+
+/// The mark and a registration serialise: whichever commits first wins,
+/// and a sidecar's mark is refused by a row for the file it belongs to.
+#[tokio::test]
+async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_mark() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let pending = file(t, Signal::Traces, 0, 0, &[]);
+    let sidecar = fs_index::sidecar_path(&pending.path).unwrap();
+
+    // Marked first: the registration is refused, for the file and for its sidecar.
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&pending.path))
+        .await
+        .unwrap();
+    assert!(
+        db.catalog
+            .orphan_doom(&pending.path, std::slice::from_ref(&pending.path))
+            .await
+            .unwrap()
+    );
+    let err = db.catalog.register_file(&pending).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { ref path } if *path == pending.path),
+        "{err}"
+    );
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        std::slice::from_ref(&pending.path)
+    );
+    db.catalog
+        .orphans_forget(std::slice::from_ref(&pending.path))
+        .await
+        .unwrap();
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&sidecar))
+        .await
+        .unwrap();
+    assert!(
+        db.catalog
+            .orphan_doom(&sidecar, &fs_index::owners_of_sidecar(&sidecar))
+            .await
+            .unwrap()
+    );
+    let err = db.catalog.register_file(&pending).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { ref path } if *path == sidecar),
+        "{err}"
+    );
+    db.catalog
+        .orphans_forget(std::slice::from_ref(&sidecar))
+        .await
+        .unwrap();
+
+    // Registered first: the mark is refused, for the file and for its sidecar.
+    db.catalog.register_file(&pending).await.unwrap();
+    db.catalog
+        .orphans_seen(&[pending.path.clone(), sidecar.clone()])
+        .await
+        .unwrap();
+    assert!(
+        !db.catalog
+            .orphan_doom(&pending.path, std::slice::from_ref(&pending.path))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.catalog
+            .orphan_doom(&sidecar, &fs_index::owners_of_sidecar(&sidecar))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(
+        !db.catalog
+            .orphan_doom("nobody", &["nobody".into()])
+            .await
+            .unwrap(),
+        "not remembered"
+    );
+
+    // A registration holds the orphan row until it commits, so a mark
+    // started meanwhile waits and is then refused. The registration is
+    // played by hand in one transaction: the lock first, then the row.
+    let late = file(t, Signal::Traces, 1, 1, &[]);
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&late.path))
+        .await
+        .unwrap();
+    let mut registering = db.catalog.pool().begin().await.unwrap();
+    sqlx::query("select path from engine_orphan where path = $1 for update")
+        .bind(&late.path)
+        .execute(&mut *registering)
+        .await
+        .unwrap();
+    let mark = tokio::spawn({
+        let catalog = db.catalog.clone();
+        let path = late.path.clone();
+        async move {
+            catalog
+                .orphan_doom(&path, std::slice::from_ref(&path))
+                .await
+                .unwrap()
+        }
+    });
+    wait_for_lock_waiter(&db.catalog).await;
+    assert!(!mark.is_finished());
+    sqlx::query(
+        "insert into engine_file
+             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, state)
+         values ($1, $2, 1, 0, $3, 1, 1, now(), now(), '{}', 1)",
+    )
+    .bind(late.id)
+    .bind(t)
+    .bind(&late.path)
+    .execute(&mut *registering)
+    .await
+    .unwrap();
+    registering.commit().await.unwrap();
+    assert!(
+        !mark.await.unwrap(),
+        "the row the registration committed stops the mark"
     );
     db.finish().await;
 }

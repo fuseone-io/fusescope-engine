@@ -427,6 +427,7 @@ async fn insert_file(
     tx: &mut Transaction<'_, Postgres>,
     file: &NewFile,
 ) -> Result<FileRecord, CatalogError> {
+    crate::orphans::refuse_doomed(tx, &file.path).await?;
     let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
              (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state)
