@@ -12,7 +12,10 @@
 //! is not the row's, so it serialises the two even before any orphan row
 //! exists. A mark is never undone by another sweeper: one that finds the
 //! row already marked leaves it for whoever marked it, or deletes it
-//! itself, both of which end the same way.
+//! itself, both of which end the same way. Deleting the object and
+//! forgetting the row happen under a claim that holds the path's lock in
+//! an open transaction, so two sweepers never delete the same path and a
+//! registration that re-uploads it waits for the claim to end.
 
 use std::collections::HashSet;
 
@@ -20,6 +23,35 @@ use crate::{Catalog, CatalogError};
 
 /// Paths per membership query.
 const CHUNK: usize = 1000;
+
+/// Exclusive possession of a marked path while its object is deleted:
+/// the path's lock is held in an open transaction until the claim is
+/// finished or dropped. Dropped, the mark stays for a later pass.
+pub struct OrphanClaim {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    path: String,
+}
+
+impl OrphanClaim {
+    /// The claimed path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Forgets the row and releases the lock: the object is gone, or is
+    /// not the engine's to delete.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn finish(mut self) -> Result<(), CatalogError> {
+        sqlx::query("delete from engine_orphan where path = $1")
+            .bind(&self.path)
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        Ok(())
+    }
+}
 
 /// What marking a path for deletion found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +168,31 @@ impl Catalog {
         };
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// Claims `path` for deletion: takes its lock and holds it, in an open
+    /// transaction, while the caller deletes the object. `None` when the
+    /// path is not marked once the lock is held: another sweeper finished
+    /// it, or a registration owns it now.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn orphan_claim(&self, path: &str) -> Result<Option<OrphanClaim>, CatalogError> {
+        let mut tx = self.pool().begin().await?;
+        lock_path(&mut tx, path).await?;
+        let marked: Option<(bool,)> =
+            sqlx::query_as("select deleting from engine_orphan where path = $1 for update")
+                .bind(path)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if marked != Some((true,)) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        Ok(Some(OrphanClaim {
+            tx,
+            path: path.to_owned(),
+        }))
     }
 
     /// Up to `limit` paths marked for deletion: a sweep that stopped

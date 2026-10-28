@@ -1047,6 +1047,116 @@ async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_
     db.finish().await;
 }
 
+/// A claim holds the path while its object is deleted: a second sweeper
+/// claiming the same path waits and gets nothing once the first finished,
+/// and a registration re-uploading the path waits for the claim to end.
+#[tokio::test]
+async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let pending = file(t, Signal::Traces, 0, 0, &[]);
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&pending.path))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog
+            .orphan_doom(&pending.path, std::slice::from_ref(&pending.path))
+            .await
+            .unwrap(),
+        Doom::Marked
+    );
+
+    // Sweeper A holds the claim; sweeper B's claim waits.
+    let claim = db
+        .catalog
+        .orphan_claim(&pending.path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.path(), pending.path);
+    let second = tokio::spawn({
+        let catalog = db.catalog.clone();
+        let path = pending.path.clone();
+        async move { catalog.orphan_claim(&path).await.unwrap().is_some() }
+    });
+    wait_for_lock_waiter(&db.catalog).await;
+    assert!(!second.is_finished(), "B waits for A");
+    claim.finish().await.unwrap();
+    assert!(
+        !second.await.unwrap(),
+        "B finds nothing to delete once A finished"
+    );
+
+    // The writer re-uploads and registers: a claim in flight makes the
+    // registration wait, and it goes through once the claim is finished.
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&pending.path))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog
+            .orphan_doom(&pending.path, std::slice::from_ref(&pending.path))
+            .await
+            .unwrap(),
+        Doom::Marked
+    );
+    let claim = db
+        .catalog
+        .orphan_claim(&pending.path)
+        .await
+        .unwrap()
+        .unwrap();
+    let registration = tokio::spawn({
+        let catalog = db.catalog.clone();
+        let pending = pending.clone();
+        async move { catalog.register_file(&pending).await }
+    });
+    wait_for_lock_waiter(&db.catalog).await;
+    assert!(
+        !registration.is_finished(),
+        "the registration waits for the claim"
+    );
+    claim.finish().await.unwrap();
+    registration.await.unwrap().unwrap();
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        Vec::<String>::new()
+    );
+
+    // A dropped claim keeps the mark for a later pass.
+    let other = file(t, Signal::Traces, 2, 2, &[]);
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&other.path))
+        .await
+        .unwrap();
+    db.catalog
+        .orphan_doom(&other.path, std::slice::from_ref(&other.path))
+        .await
+        .unwrap();
+    drop(db.catalog.orphan_claim(&other.path).await.unwrap());
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        std::slice::from_ref(&other.path)
+    );
+    assert!(
+        db.catalog
+            .orphan_claim("t/never.parquet")
+            .await
+            .unwrap()
+            .is_none(),
+        "not marked"
+    );
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn watcher_sees_file_changes() {
     let Some(db) = TestDb::new().await else {
