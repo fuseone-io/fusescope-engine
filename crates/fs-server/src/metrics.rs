@@ -349,6 +349,12 @@ impl Metrics {
             "Flushes given a fresh id because the orphan sweep marked their path",
             ns(&f.superseded),
         );
+        counter(
+            out,
+            "fusescope_flush_confirm_failures_total",
+            "Registration confirmations that failed and wait for a retry",
+            ns(&f.confirm_failures),
+        );
         histogram(
             out,
             "fusescope_coalesce_seconds",

@@ -494,6 +494,10 @@ pub struct Buffers {
     tenants: HashMap<TenantId, TenantBuffer>,
     flushing: HashMap<TenantId, Vec<Flushing>>,
     persisted: HashMap<TenantId, Vec<Persisted>>,
+    /// Registered files whose confirmation has not landed, with the first
+    /// record of their intent: the checkpoint never passes it, so a restart
+    /// replays the flush and confirms.
+    unconfirmed: HashMap<FileId, (TenantId, Position)>,
     reserved: HashMap<TenantId, Arc<AtomicUsize>>,
     reserved_total: Arc<AtomicUsize>,
     scratch_total: Arc<AtomicU64>,
@@ -911,6 +915,7 @@ impl Buffers {
         now: Instant,
     ) {
         if let Some(entry) = self.remove_flushing(tenant, file) {
+            self.unconfirmed.insert(file, (tenant, entry.range.0));
             let budget = entry.buffer.bytes;
             let written = hot_batches_bytes(&rows);
             let (batches, bytes) = if written <= budget {
@@ -946,6 +951,20 @@ impl Buffers {
             self.flushing.remove(&tenant);
         }
         Some(entry)
+    }
+
+    /// The registration of `file` is confirmed: the checkpoint may pass its
+    /// intent.
+    pub fn confirmed(&mut self, file: FileId) {
+        self.unconfirmed.remove(&file);
+    }
+
+    /// Registered files whose confirmation is still pending.
+    pub fn unconfirmed(&self) -> Vec<(TenantId, FileId)> {
+        self.unconfirmed
+            .iter()
+            .map(|(file, (tenant, _))| (*tenant, *file))
+            .collect()
     }
 
     /// Drops persisted rows older than `retain`.
@@ -1000,8 +1019,9 @@ impl Buffers {
             .collect()
     }
 
-    /// Earliest WAL position still live or flushing for any tenant. Everything
-    /// before it is materialised and safe to checkpoint.
+    /// Earliest WAL position still live, flushing or registered without a
+    /// confirmation, for any tenant. Everything before it is materialised
+    /// and confirmed: safe to checkpoint.
     pub fn earliest_wal(&self) -> Option<Position> {
         let live = self.tenants.values().filter_map(|b| b.first_wal);
         let flushing = self
@@ -1009,7 +1029,8 @@ impl Buffers {
             .values()
             .flatten()
             .filter_map(|f| f.buffer.first_wal);
-        live.chain(flushing).min()
+        let unconfirmed = self.unconfirmed.values().map(|(_, first)| *first);
+        live.chain(flushing).chain(unconfirmed).min()
     }
 
     /// Bytes held in each state across tenants: `(live, flushing, persisted)`.

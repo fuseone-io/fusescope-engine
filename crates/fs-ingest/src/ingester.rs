@@ -11,11 +11,15 @@
 //!    are exactly the tenant's records in `[first, end)`.
 //! 2. Append a [`FlushIntent`] naming the file id and that range, and sync.
 //! 3. Encode, upload without overwriting, register idempotently.
-//! 4. Move the rows to the persisted state and checkpoint the WAL.
+//! 4. Move the rows to the persisted state, confirm the registration, so
+//!    the compactor's delay counts from after the retention began, and
+//!    checkpoint the WAL.
 //!
 //! Replay groups records under the intents found in the log, so a crash
 //! anywhere after step 2 reproduces the same file and the same catalog row;
 //! a crash before step 2 simply flushes the rows again under a new intent.
+//! The checkpoint stays behind the intent of a file not yet confirmed, so a
+//! crash before the confirmation replays the flush and confirms it.
 //! After step 2 a failure of any later step keeps the rows bound to the same
 //! id and retries them unchanged: an id has exactly one possible content.
 
@@ -128,6 +132,8 @@ pub struct FlushStats {
     pub trace_index_bytes: AtomicU64,
     /// Flushes given a fresh id because the orphan sweep marked their path.
     pub superseded: AtomicU64,
+    /// Registration confirmations that failed and wait for a retry.
+    pub confirm_failures: AtomicU64,
 }
 
 /// Permits of the flush semaphore for a configured `max_flushes`.
@@ -205,6 +211,7 @@ pub struct Shared {
     coalesces: Arc<tokio::sync::Semaphore>,
     flushes: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
+    inject_confirm_failures: std::sync::atomic::AtomicU32,
     inject_index_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
     retry_delay_pending: std::sync::atomic::AtomicBool,
@@ -433,6 +440,7 @@ impl Shared {
                     buffers.finish_flush(tenant, file_id, rows, Instant::now());
                     drop(held);
                 }
+                self.confirm(tenant, file_id).await;
                 if self.config.checkpoint_after_flush {
                     self.checkpoint_wal().await;
                 }
@@ -625,6 +633,37 @@ impl Shared {
         }
         self.catalog.register_file(file).await?;
         Ok(())
+    }
+
+    /// Confirms the registration of `file` now that its rows are retained
+    /// in the persisted state. A failure leaves the checkpoint behind the
+    /// file's intent; the confirmation is retried every flusher tick and by
+    /// the replay after a restart.
+    async fn confirm(&self, tenant: TenantId, file: FileId) {
+        let outcome = if take_injected(&self.inject_confirm_failures) {
+            Err(IngestError::Injected("catalog confirmation"))
+        } else {
+            self.catalog
+                .confirm_file(file)
+                .await
+                .map_err(IngestError::from)
+        };
+        match outcome {
+            Ok(()) => self.buffers.lock().await.confirmed(file),
+            Err(e) => {
+                self.flush_stats
+                    .confirm_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(tenant = %tenant.0, file = %file.0, error = %e, "registration not confirmed; will retry");
+            }
+        }
+    }
+
+    async fn confirm_pending(&self) {
+        let pending = self.buffers.lock().await.unconfirmed();
+        for (tenant, file) in pending {
+            self.confirm(tenant, file).await;
+        }
     }
 
     /// Retries flushes whose earlier attempt failed after the intent, or
@@ -856,6 +895,7 @@ impl Shared {
     /// `everything` the call returns only once every flush, including those
     /// started earlier, has finished.
     async fn flush_due(self: &Arc<Self>, everything: bool) {
+        self.confirm_pending().await;
         let now = Instant::now();
         let tenants = {
             let mut buffers = self.buffers.lock().await;
@@ -1073,6 +1113,7 @@ impl Ingester {
         );
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
+        let config_confirm_injected = config.inject_confirm_failures;
         let config_index_injected = config.inject_index_failures;
         let config_conversions = config.max_conversions;
         let config_coalesces = config.max_coalesces;
@@ -1102,6 +1143,7 @@ impl Ingester {
             )),
             flushes: Arc::new(tokio::sync::Semaphore::new(flush_permits(config_flushes))),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
+            inject_confirm_failures: std::sync::atomic::AtomicU32::new(config_confirm_injected),
             inject_index_failures: std::sync::atomic::AtomicU32::new(config_index_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
             retry_delay_pending: std::sync::atomic::AtomicBool::new(retry_delay_pending),

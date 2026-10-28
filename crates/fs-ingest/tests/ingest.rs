@@ -769,6 +769,119 @@ async fn crash_after_register_keeps_flush_boundaries() {
     db.finish().await;
 }
 
+/// Whether each registered file is confirmed, oldest registration first.
+async fn confirmations(db: &TestDb) -> Vec<bool> {
+    sqlx::query_scalar("select confirmed_at is not null from engine_file order by created_at")
+        .fetch_all(db.catalog.pool())
+        .await
+        .unwrap()
+}
+
+/// A registration is confirmed only once its rows are retained in the
+/// persisted state; a confirmation that fails is retried by the flusher.
+#[tokio::test]
+async fn a_failed_confirmation_is_retried_by_the_flusher() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_confirm_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    h.client()
+        .await
+        .export(authed(request("api", 7, 10), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    assert_eq!(
+        h.ingester
+            .flush_stats()
+            .confirm_failures
+            .load(Ordering::Relaxed),
+        1
+    );
+    h.ingester.flush_all().await;
+    assert_eq!(confirmations(&db).await, [true], "a later tick confirmed");
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Crash after the registration, before its confirmation: the checkpoint
+/// stayed behind the intent, so the restart replays the flush, meets the
+/// same row and confirms it.
+#[tokio::test]
+async fn crash_before_the_confirmation_is_replayed_and_confirmed() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let never_confirms = IngestConfig {
+        inject_confirm_failures: u32::MAX,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), never_confirms).await;
+    h.client()
+        .await
+        .export(authed(request("api", 7, 10), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await; // registered, checkpointed, never confirmed
+    assert_eq!(confirmations(&db).await, [false]);
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    assert!(
+        h.ingester.stats().flushes_recovered.load(Ordering::Relaxed) >= 1,
+        "the checkpoint stayed behind the unconfirmed intent"
+    );
+    h.ingester.flush_all().await;
+    assert_eq!(confirmations(&db).await, [true]);
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
+    let registered = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registered.iter().map(|f| f.row_count).collect::<Vec<_>>(),
+        [10]
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
 /// Crash after the intent but before the upload succeeded: the retry after
 /// restart writes exactly the intended file, once.
 #[tokio::test]
