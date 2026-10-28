@@ -1131,6 +1131,60 @@ async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
         Vec::<String>::new()
     );
 
+    // A delete that failed waits its backoff behind the others, and longer
+    // each time.
+    let slow = file(t, Signal::Traces, 3, 3, &[]);
+    let fast = file(t, Signal::Traces, 4, 4, &[]);
+    for f in [&slow, &fast] {
+        db.catalog
+            .orphans_seen(std::slice::from_ref(&f.path))
+            .await
+            .unwrap();
+        db.catalog
+            .orphan_doom(&f.path, std::slice::from_ref(&f.path))
+            .await
+            .unwrap();
+    }
+    let claim = db.catalog.orphan_claim(&slow.path).await.unwrap().unwrap();
+    claim
+        .retry_later(StdDuration::from_secs(600))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        std::slice::from_ref(&fast.path),
+        "the failed one waits; the other is tried"
+    );
+    sqlx::query(
+        "update engine_orphan set retry_after = now() - interval '1 second' where path = $1",
+    )
+    .bind(&slow.path)
+    .execute(db.catalog.pool())
+    .await
+    .unwrap();
+    assert_eq!(db.catalog.orphans_doomed(10).await.unwrap().len(), 2);
+    let claim = db.catalog.orphan_claim(&slow.path).await.unwrap().unwrap();
+    claim
+        .retry_later(StdDuration::from_secs(600))
+        .await
+        .unwrap();
+    let (attempts, wait): (i32, f64) = sqlx::query_as(
+        "select attempts, extract(epoch from retry_after - now())::float8 from engine_orphan where path = $1",
+    )
+    .bind(&slow.path)
+    .fetch_one(db.catalog.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert!(
+        wait > 1100.0 && wait <= 1200.0,
+        "twice the backoff on the second failure: {wait}"
+    );
+    db.catalog
+        .orphans_forget(&[slow.path.clone(), fast.path.clone()])
+        .await
+        .unwrap();
+
     // A dropped claim keeps the mark for a later pass.
     let other = file(t, Signal::Traces, 2, 2, &[]);
     db.catalog

@@ -51,6 +51,27 @@ impl OrphanClaim {
         self.tx.commit().await?;
         Ok(())
     }
+
+    /// Keeps the mark but holds the path back from the next tries: the
+    /// delete failed, and it is tried again after `backoff` times the
+    /// number of failures so far, up to six times `backoff`.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn retry_later(mut self, backoff: std::time::Duration) -> Result<(), CatalogError> {
+        sqlx::query(
+            "update engine_orphan
+             set attempts = attempts + 1,
+                 retry_after = now() + make_interval(secs => $2 * least(attempts + 1, 6))
+             where path = $1",
+        )
+        .bind(&self.path)
+        .bind(backoff.as_secs_f64())
+        .execute(&mut *self.tx)
+        .await?;
+        self.tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// What marking a path for deletion found.
@@ -195,17 +216,23 @@ impl Catalog {
         }))
     }
 
-    /// Up to `limit` paths marked for deletion: a sweep that stopped
-    /// between marking and deleting finishes them first.
+    /// Up to `limit` paths marked for deletion whose turn has come, the
+    /// longest waiting first: a sweep that stopped between marking and
+    /// deleting finishes them first, and one whose delete failed waits
+    /// its backoff behind the others.
     ///
     /// # Errors
     /// Database failure.
     pub async fn orphans_doomed(&self, limit: i64) -> Result<Vec<String>, CatalogError> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("select path from engine_orphan where deleting order by path limit $1")
-                .bind(limit)
-                .fetch_all(self.pool())
-                .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "select path from engine_orphan
+             where deleting and retry_after <= now()
+             order by retry_after, path
+             limit $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
