@@ -573,7 +573,16 @@ failed attempt still holds the flush, so no concurrent retry takes the old
 id meanwhile. The file keeps the id its rows were first assigned as its
 `origin`, which the hot window announces: a querier excludes a file by its
 id or its origin, so a flush that changed id between the hot scan and the
-catalog read is still left out and its rows are never read twice.
+catalog read is still left out and its rows are never read twice. On
+replay the origin is the id of the first intent logged for the records,
+taken from the log rather than derived again, and the catalog refuses to
+register an id again with another origin. Compaction publishes L1 files
+under their own ids, so an hour closes only after the hot window could
+have let go of every L0 in it: the server refuses an hour close delay under
+the persisted retention plus a query timeout plus the file cache TTL. When
+rolling the engine out, queriers go first, so every planner excludes by
+origin before any ingester announces one; a server of the previous version
+registering files meanwhile gets the id as origin from the catalog.
 A mark is never undone: a sweeper that finds a row already marked, by an
 earlier pass or by another instance during a handover, deletes the object
 itself; only a path a file row owns, or one that is not the engine's, is

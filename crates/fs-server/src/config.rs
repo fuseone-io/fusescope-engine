@@ -849,6 +849,18 @@ impl Config {
             );
         }
 
+        // A compaction publishes L1 files under their own ids, so it must
+        // never cover rows the hot window still serves under the L0's: an
+        // hour closes only after the retention, a query and a file cache
+        // refresh could all have ended.
+        let hot_may_serve = self.ingest.persisted_retain_secs
+            + self.query.timeout_secs
+            + fs_query::files::STALE_AFTER.as_secs();
+        if self.compactor.hour_close_delay_secs < hot_may_serve {
+            return invalid(
+                "compactor.hour_close_delay_secs must cover ingest.persisted_retain_secs plus query.timeout_secs plus the querier's file cache TTL",
+            );
+        }
         // Two L0 files must always fit a pass, or an hour could never close;
         // an L0 file is at most one flushed buffer.
         if self.compactor.max_input_bytes < 2 * self.ingest.max_buffer_bytes as u64 {
@@ -1089,14 +1101,19 @@ mod tests {
                 .contains("quarantine_ttl_secs"),
             "a querier may still read a quarantined file for its cache TTL plus one query"
         );
-        let err = Config::parse(
-            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\nsweep_delete_backoff_secs = 0\n",
-        )
-        .unwrap()
-        .validate(&secrets)
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("sweep_"), "{err}");
+        for (bad, key) in [
+            ("sweep_delete_backoff_secs = 0", "sweep_"),
+            ("hour_close_delay_secs = 10", "hour_close_delay_secs"),
+        ] {
+            let err = Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"
+            ))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(key), "{err}");
+        }
         let long_enough = Config::parse(
             "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\ntimeout_secs = 60\n[compactor]\nquarantine_ttl_secs = 65\n",
         )
