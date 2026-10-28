@@ -1449,23 +1449,45 @@ async fn watcher_sees_file_changes() {
         .unwrap()
         .id;
     let mut watcher = db.catalog.watch().await.unwrap();
-    db.catalog
+    let registered = db
+        .catalog
         .register_file(&file(t, Signal::MetricSamples, 0, 1, &[]))
         .await
         .unwrap();
 
     // The channel is shared by every schema on the server, so wait for our tenant.
-    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
-    loop {
-        let change = tokio::time::timeout_at(deadline, watcher.next())
-            .await
-            .expect("notification")
-            .unwrap();
-        if change.tenant_id == t {
-            assert_eq!(change.signal, Signal::MetricSamples);
-            break;
+    let wait_for_ours = async |watcher: &mut fs_catalog::Watcher| {
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
+        loop {
+            let change = tokio::time::timeout_at(deadline, watcher.next())
+                .await
+                .expect("notification")
+                .unwrap();
+            if change.tenant_id == t {
+                assert_eq!(change.signal, Signal::MetricSamples);
+                break;
+            }
         }
+    };
+    wait_for_ours(&mut watcher).await;
+
+    // A confirmation changes nothing a querier reads: it is not announced.
+    db.catalog.confirm_file(registered.id).await.unwrap();
+    let quiet = tokio::time::Instant::now() + StdDuration::from_millis(500);
+    while let Ok(change) = tokio::time::timeout_at(quiet, watcher.next()).await {
+        assert_ne!(
+            change.unwrap().tenant_id,
+            t,
+            "a confirmation must not notify"
+        );
     }
+
+    // Quarantining it is.
+    db.catalog
+        .swap_files(t, Signal::MetricSamples, &[registered.id], &[])
+        .await
+        .unwrap();
+    wait_for_ours(&mut watcher).await;
     // The watcher holds a pooled connection; closing the pool would wait for it.
     drop(watcher);
     db.finish().await;
