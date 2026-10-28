@@ -16,8 +16,8 @@ use std::time::Duration as StdDuration;
 
 use chrono::{Duration, TimeZone, Utc};
 use fs_catalog::{
-    Catalog, CatalogError, FileId, FileState, Level, NewFile, NewTenant, Signal, TenantId,
-    TimeRange, TokenScope, hash_token,
+    Catalog, CatalogError, FileId, FileState, LeaseFence, Level, NewFile, NewTenant, Signal,
+    TenantId, TimeRange, TokenScope, hash_token,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
@@ -347,14 +347,14 @@ async fn purge_returns_paths_of_old_quarantined_files_only() {
 
     let not_yet = db
         .catalog
-        .purge_quarantined(Duration::hours(1), 100)
+        .purge_quarantined(StdDuration::from_secs(3600), 100)
         .await
         .unwrap();
     assert_eq!(not_yet.len(), 0, "quarantined just now, inside the TTL");
 
     let purged = db
         .catalog
-        .purge_quarantined(Duration::zero(), 100)
+        .purge_quarantined(StdDuration::ZERO, 100)
         .await
         .unwrap();
     assert_eq!(purged.len(), 1);
@@ -363,7 +363,7 @@ async fn purge_returns_paths_of_old_quarantined_files_only() {
 
     let again = db
         .catalog
-        .purge_quarantined(Duration::zero(), 100)
+        .purge_quarantined(StdDuration::ZERO, 100)
         .await
         .unwrap();
     assert_eq!(again.len(), 0);
@@ -417,34 +417,39 @@ async fn ingester_heartbeats_expire() {
 }
 
 /// One holder at a time: a second taker fails until the lease expires or
-/// is released; the holder renews without losing its acquisition time.
+/// is released; the holder renews without losing its acquisition time or
+/// generation, and every change of hands bumps the generation.
 #[tokio::test]
 async fn leases_are_exclusive_until_they_expire_or_are_released() {
     let Some(db) = TestDb::new().await else {
         return;
     };
     let ttl = StdDuration::from_secs(30);
-    assert!(
+    assert_eq!(
         db.catalog
             .acquire_lease("compactor", "a", ttl)
             .await
-            .unwrap()
+            .unwrap(),
+        Some(1)
     );
-    assert!(
-        !db.catalog
+    assert_eq!(
+        db.catalog
             .acquire_lease("compactor", "b", ttl)
             .await
             .unwrap(),
+        None,
         "held by a"
     );
     let first = db.catalog.lease("compactor").await.unwrap().unwrap();
     assert_eq!(first.holder, "a");
+    assert_eq!(first.generation, 1);
 
-    assert!(
+    assert_eq!(
         db.catalog
             .acquire_lease("compactor", "a", ttl)
             .await
             .unwrap(),
+        Some(1),
         "renewal"
     );
     let renewed = db.catalog.lease("compactor").await.unwrap().unwrap();
@@ -459,33 +464,38 @@ async fn leases_are_exclusive_until_they_expire_or_are_released() {
         "not b's to release"
     );
     assert!(db.catalog.release_lease("compactor", "a").await.unwrap());
-    assert!(
+    assert_eq!(
         db.catalog
             .acquire_lease("compactor", "b", ttl)
             .await
             .unwrap(),
-        "free after release"
+        Some(2),
+        "a released lease changes hands at the next generation"
     );
 
-    // b stops renewing: once its short lease lapses, a takes over.
-    assert!(
+    // b stops renewing: once its short lease lapses, a takes over at the next generation.
+    assert_eq!(
         db.catalog
             .acquire_lease("compactor", "b", StdDuration::from_millis(200))
             .await
-            .unwrap()
+            .unwrap(),
+        Some(2),
+        "b renews its own lease with a shorter TTL"
     );
-    assert!(
-        !db.catalog
-            .acquire_lease("compactor", "a", ttl)
-            .await
-            .unwrap()
-    );
-    tokio::time::sleep(StdDuration::from_millis(400)).await;
-    assert!(
+    assert_eq!(
         db.catalog
             .acquire_lease("compactor", "a", ttl)
             .await
             .unwrap(),
+        None
+    );
+    tokio::time::sleep(StdDuration::from_millis(400)).await;
+    assert_eq!(
+        db.catalog
+            .acquire_lease("compactor", "a", ttl)
+            .await
+            .unwrap(),
+        Some(3),
         "expired"
     );
     let taken = db.catalog.lease("compactor").await.unwrap().unwrap();
@@ -493,7 +503,100 @@ async fn leases_are_exclusive_until_they_expire_or_are_released() {
     assert!(taken.acquired_at > first.acquired_at, "a new acquisition");
 
     // Other names are independent.
-    assert!(db.catalog.acquire_lease("other", "b", ttl).await.unwrap());
+    assert_eq!(
+        db.catalog.acquire_lease("other", "b", ttl).await.unwrap(),
+        Some(1)
+    );
+    db.finish().await;
+}
+
+/// A swap fenced by a lease the holder lost changes nothing.
+#[tokio::test]
+async fn a_fenced_swap_is_refused_once_the_lease_changed_hands() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let input = db
+        .catalog
+        .register_file(&file(t, Signal::Logs, 0, 1, &[]))
+        .await
+        .unwrap();
+    let generation = db
+        .catalog
+        .acquire_lease("compactor", "a", StdDuration::from_millis(200))
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = LeaseFence {
+        name: "compactor".into(),
+        holder: "a".into(),
+        generation,
+    };
+    tokio::time::sleep(StdDuration::from_millis(400)).await;
+    assert_eq!(
+        db.catalog
+            .acquire_lease("compactor", "b", StdDuration::from_secs(30))
+            .await
+            .unwrap(),
+        Some(generation + 1)
+    );
+
+    let err = db
+        .catalog
+        .swap_files_fenced(
+            t,
+            Signal::Logs,
+            &[input.id],
+            &[file(t, Signal::Logs, 0, 1, &[])],
+            Some(&fence),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::LeaseLost { ref holder, .. } if holder == "a"),
+        "{err}"
+    );
+    let visible = db
+        .catalog
+        .visible_files(
+            t,
+            Signal::Logs,
+            TimeRange {
+                start: hour(0),
+                end: hour(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        visible.len(),
+        1,
+        "the input is still visible, no output registered"
+    );
+    assert_eq!(visible[0].id, input.id);
+
+    // The holder of the current generation may swap.
+    let fence = LeaseFence {
+        holder: "b".into(),
+        generation: generation + 1,
+        ..fence
+    };
+    db.catalog
+        .swap_files_fenced(
+            t,
+            Signal::Logs,
+            &[input.id],
+            &[file(t, Signal::Logs, 0, 1, &[])],
+            Some(&fence),
+        )
+        .await
+        .unwrap();
     db.finish().await;
 }
 

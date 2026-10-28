@@ -196,7 +196,36 @@ impl Catalog {
         inputs: &[FileId],
         outputs: &[NewFile],
     ) -> Result<Compaction, CatalogError> {
+        self.swap_files_fenced(tenant, signal, inputs, outputs, None)
+            .await
+    }
+
+    /// [`swap_files`](Self::swap_files) that first checks, in the same
+    /// transaction, that `fence` still names the unexpired holder and
+    /// generation of its lease; otherwise nothing changes and
+    /// [`CatalogError::LeaseLost`] is returned.
+    ///
+    /// # Errors
+    /// Lease lost, conflict, or database failure.
+    pub async fn swap_files_fenced(
+        &self,
+        tenant: TenantId,
+        signal: Signal,
+        inputs: &[FileId],
+        outputs: &[NewFile],
+        fence: Option<&crate::LeaseFence>,
+    ) -> Result<Compaction, CatalogError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(fence) = fence {
+            if !crate::lease::fence_holds(&mut tx, fence).await? {
+                tx.rollback().await?;
+                return Err(CatalogError::LeaseLost {
+                    name: fence.name.clone(),
+                    holder: fence.holder.clone(),
+                    generation: fence.generation,
+                });
+            }
+        }
         let quarantined: Vec<(FileId,)> = sqlx::query_as(
             "update engine_file set state = $4, quarantined_at = now()
              where id = any($1) and tenant_id = $2 and signal = $3 and state = $5
@@ -247,22 +276,23 @@ impl Catalog {
     /// Database failure.
     pub async fn purge_quarantined(
         &self,
-        older_than: Duration,
+        older_than: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<PurgedFile>, CatalogError> {
-        let cutoff = Utc::now() - older_than;
+        // The cutoff is the database's clock, as the quarantine time was,
+        // so a compactor with a skewed clock cannot purge early.
         let rows = sqlx::query_as::<_, PurgedFile>(
             "delete from engine_file
              where id in (
                  select id from engine_file
-                 where state = $1 and quarantined_at <= $2
+                 where state = $1 and quarantined_at <= now() - make_interval(secs => $2)
                  order by quarantined_at
                  limit $3
              )
              returning id, path",
         )
         .bind(FileState::Quarantined.code())
-        .bind(cutoff)
+        .bind(older_than.as_secs_f64())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

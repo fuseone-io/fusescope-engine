@@ -15,7 +15,7 @@ mod types;
 mod watch;
 
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
-pub use lease::{COMPACTOR_LEASE, Lease};
+pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
 pub use token::{
     TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token, looks_like_token,
 };
@@ -39,6 +39,17 @@ pub enum CatalogError {
     /// Migration failure.
     #[error("migration: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// The lease a write was fenced by is no longer this holder's at this
+    /// generation: nothing was written.
+    #[error("lease {name} is no longer held by {holder} at generation {generation}")]
+    LeaseLost {
+        /// Lease name.
+        name: String,
+        /// Holder that lost it.
+        holder: String,
+        /// Generation it quoted.
+        generation: i64,
+    },
     /// A compaction swap found inputs that are not visible any more. Another
     /// compactor won; the caller discards its outputs.
     #[error("compaction conflict: {expected} inputs expected, {found} visible")]
