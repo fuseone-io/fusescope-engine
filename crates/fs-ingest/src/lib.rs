@@ -84,6 +84,15 @@ pub enum IngestError {
     /// The WAL on disk is over its cap; the caller answers UNAVAILABLE.
     #[error("write-ahead log full")]
     WalFull,
+    /// A request's spans fall in more calendar hours than allowed; the
+    /// caller answers INVALID_ARGUMENT.
+    #[error("spans fall in {hours} calendar hours, more than the {limit} allowed")]
+    TooManyHours {
+        /// Hours the spans fall in.
+        hours: usize,
+        /// The configured limit.
+        limit: usize,
+    },
     /// A failure injected by test configuration.
     #[error("injected failure: {0}")]
     Injected(&'static str),

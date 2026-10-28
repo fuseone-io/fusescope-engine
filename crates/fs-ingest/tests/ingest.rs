@@ -1212,6 +1212,225 @@ async fn crash_between_the_files_of_a_split_flush_is_resumed() {
     db.finish().await;
 }
 
+/// The second hour's intent cannot be logged, so its rows go back live
+/// and are cut later under an intent of their own hour over a range that
+/// also holds the first hour's rows. That intent claims only its hour, so
+/// a crash and replay reproduce both files, byte for byte, and the first
+/// hour is never written twice.
+#[tokio::test]
+async fn a_part_left_live_by_a_failed_intent_keeps_its_hour_through_a_replay() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_intent_failures: 1,
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request_at("api", 1, 2, T0), &token))
+        .await
+        .unwrap();
+    // 14:59:59.999: one span of 14h and two of 15h in one record.
+    client
+        .export(authed(
+            request_at("api", 2, 3, T0 + (42 * 60 + 57) * 1_000_000_000 - 1_000_000),
+            &token,
+        ))
+        .await
+        .unwrap();
+    // The first pass logs one intent and fails the other; the rows left
+    // live are cut by the next pass of the same call.
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let bucket = h.dir.path().join("bucket");
+    let files = parquet_files(&bucket);
+    assert_eq!(files.len(), 2, "the rows left live made their own file");
+    let digests: Vec<_> = files.iter().map(|f| (f.clone(), sha256_of(f))).collect();
+    let counts = |registered: Vec<(String, i64, TimeRange)>| {
+        registered
+            .into_iter()
+            .map(|(hour, rows, _)| (hour, rows))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        counts(registered_by_hour(&db, tenant).await),
+        [("hr=14".to_owned(), 3), ("hr=15".to_owned(), 2)]
+    );
+
+    h.task.abort();
+    let _ = h.task.await;
+    let h = start(&db.catalog, h.dir, test_config()).await;
+    assert!(h.ingester.stats().flushes_recovered.load(Ordering::Relaxed) >= 2);
+    h.ingester.flush_all().await;
+    assert_eq!(
+        h.ingester.stats().flush_failures.load(Ordering::Relaxed),
+        0,
+        "the replay met the objects it expected"
+    );
+    assert_eq!(parquet_files(&bucket).len(), 2);
+    for (file, digest) in digests {
+        assert_eq!(sha256_of(&file), digest, "the replay reproduced {file:?}");
+    }
+    assert_eq!(
+        counts(registered_by_hour(&db, tenant).await),
+        [("hr=14".to_owned(), 3), ("hr=15".to_owned(), 2)]
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A cut flushes at most `max_hours_per_cut` hours, oldest first, and the
+/// rows of later hours stay live; one stop still flushes every hour, cut
+/// after cut, and a replay reproduces every file.
+#[tokio::test]
+async fn a_stop_flushes_every_hour_however_many_a_cut_takes() {
+    const HOUR: u64 = 3_600_000_000_000;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_hours_per_cut: 2,
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for (trace, hours_later) in [(1, 2), (2, 0), (3, 1)] {
+        client
+            .export(authed(
+                request_at("api", trace, 1, T0 + hours_later * HOUR),
+                &token,
+            ))
+            .await
+            .unwrap();
+    }
+    let bucket = h.dir.path().join("bucket");
+    let dir = h.stop().await;
+    let hours = |registered: Vec<(String, i64, TimeRange)>| {
+        registered
+            .into_iter()
+            .map(|(hour, _, _)| hour)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        hours(registered_by_hour(&db, tenant).await),
+        ["hr=14", "hr=15", "hr=16"],
+        "the stop cut twice"
+    );
+    let files = parquet_files(&bucket);
+    assert_eq!(files.len(), 3);
+    let digests: Vec<_> = files.iter().map(|f| (f.clone(), sha256_of(f))).collect();
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&bucket).len(), 3);
+    for (file, digest) in digests {
+        assert_eq!(sha256_of(&file), digest, "the replay reproduced {file:?}");
+    }
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A request whose spans fall in more hours than allowed is refused before
+/// the log; a tenant whose live rows would span more hours than allowed is
+/// refused until a flush drains them.
+#[tokio::test]
+async fn requests_are_bounded_by_the_hours_they_span_and_the_hours_live() {
+    const HOUR: u64 = 3_600_000_000_000;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_hours_per_batch: 2,
+        max_live_hours: 3,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    let mut three_hours = request_at("api", 9, 3, T0);
+    for (i, span) in three_hours.resource_spans[0].scope_spans[0]
+        .spans
+        .iter_mut()
+        .enumerate()
+    {
+        span.start_time_unix_nano = T0 + u64::try_from(i).unwrap() * HOUR;
+        span.end_time_unix_nano = span.start_time_unix_nano + 1;
+    }
+    let status = client
+        .export(authed(three_hours, &token))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("3 calendar hours"), "{status:?}");
+
+    for hours_later in 0..3 {
+        client
+            .export(authed(
+                request_at("api", 1, 1, T0 + hours_later * HOUR),
+                &token,
+            ))
+            .await
+            .unwrap();
+    }
+    let status = client
+        .export(authed(request_at("api", 2, 1, T0 + 3 * HOUR), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(status.message().contains("too many hours"), "{status:?}");
+    assert!(h.ingester.stats().over_capacity.load(Ordering::Relaxed) >= 1);
+    client
+        .export(authed(request_at("api", 3, 1, T0 + HOUR), &token))
+        .await
+        .expect("an hour already live costs nothing");
+
+    h.ingester.flush_all().await;
+    client
+        .export(authed(request_at("api", 2, 1, T0 + 3 * HOUR), &token))
+        .await
+        .expect("flushed hours no longer count");
+    h.stop().await;
+    db.finish().await;
+}
+
 /// Crash after the intent but before the upload succeeded: the retry after
 /// restart writes exactly the intended file, once.
 #[tokio::test]

@@ -82,6 +82,7 @@ impl TraceService for TraceReceiver {
             }
             IngestError::Capacity(what) => Status::resource_exhausted(what),
             IngestError::WalFull => Status::unavailable("write-ahead log full"),
+            IngestError::TooManyHours { .. } => Status::invalid_argument(e.to_string()),
             IngestError::Wal(_) | IngestError::Join(_) => {
                 warn!(error = %e, "wal append failed");
                 Status::unavailable("write-ahead log unavailable")

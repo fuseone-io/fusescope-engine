@@ -6,6 +6,9 @@ use std::time::Duration;
 use fs_catalog::TenantId;
 use fs_schema::limits::Limits;
 
+/// Ceiling of `max_hours_per_cut`: a cut never takes more hours than this.
+pub const MAX_HOURS_PER_CUT: usize = 64;
+
 /// Tunables of the ingest path. Defaults follow DESIGN.md.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestConfig {
@@ -69,6 +72,17 @@ pub struct IngestConfig {
     /// cover the querier's file cache TTL plus one hot scan: the querier
     /// scans the hot window first and lists files after.
     pub persisted_retain: Duration,
+    /// Most calendar hours one cut flushes, oldest first, at most
+    /// [`MAX_HOURS_PER_CUT`]; rows of later hours stay live for the next
+    /// cut. Bounds the work a cut does under the gate and the files one
+    /// cut makes.
+    pub max_hours_per_cut: usize,
+    /// Refuse a request whose spans fall in more calendar hours than this.
+    pub max_hours_per_batch: usize,
+    /// Refuse a tenant's request when its live rows would fall in more
+    /// calendar hours than this; the cuts drain them. Bounds the hours a
+    /// cut or a hot scan enumerates.
+    pub max_live_hours: usize,
     /// Confirmations attempted at the same time, off the flusher.
     pub max_confirms: usize,
     /// How long one confirmation call may take before it counts as failed.
@@ -86,6 +100,9 @@ pub struct IngestConfig {
     /// the file is registered. Zero in production; tests use it to crash or
     /// retry between the registration and its confirmation.
     pub inject_confirm_failures: u32,
+    /// Make this many flush intents fail to log artificially, part by
+    /// part. Zero in production; tests use it to leave part of a cut live.
+    pub inject_intent_failures: u32,
     /// Hold each injected confirmation failure this long before failing.
     /// `None` in production; tests use it to act while an attempt is held.
     pub inject_confirm_delay: Option<Duration>,
@@ -134,6 +151,9 @@ impl Default for IngestConfig {
             token_cache_ttl: Duration::from_secs(60),
             hot_listen: None,
             persisted_retain: Duration::from_secs(8),
+            max_hours_per_cut: 8,
+            max_hours_per_batch: 48,
+            max_live_hours: 64,
             max_confirms: 4,
             confirm_timeout: Duration::from_secs(10),
             confirm_interval: Duration::from_secs(1),
@@ -141,6 +161,7 @@ impl Default for IngestConfig {
             inject_register_failures: 0,
             inject_confirm_failures: 0,
             inject_confirm_delay: None,
+            inject_intent_failures: 0,
             inject_index_failures: 0,
             inject_register_delay: None,
             inject_push_delay: None,

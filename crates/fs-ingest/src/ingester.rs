@@ -230,6 +230,7 @@ pub struct Shared {
     flushes: Arc<tokio::sync::Semaphore>,
     confirms: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
+    inject_intent_failures: std::sync::atomic::AtomicU32,
     inject_confirm_failures: std::sync::atomic::AtomicU32,
     inject_index_failures: std::sync::atomic::AtomicU32,
     push_delay_pending: std::sync::atomic::AtomicBool,
@@ -249,8 +250,16 @@ impl Shared {
         tenant: TenantId,
         bytes: usize,
         rows: usize,
+        hours: &[DateTime<Utc>],
     ) -> Result<Reservation, IngestError> {
         let mut buffers = self.buffers.lock().await;
+        if buffers.live_hours_with(tenant, hours) > self.config.max_live_hours {
+            self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
+            self.flush_now.notify_one();
+            return Err(IngestError::Capacity(
+                "tenant rows span too many hours, flush pending",
+            ));
+        }
         let reserved = buffers.reserved_of(tenant);
         // Every cap sees the batch with the bound of the trace set it will
         // get, which its bytes carry from the push until a chunk replaces it.
@@ -322,9 +331,23 @@ impl Shared {
         let batch = builder.finish()?;
         let accepted = batch.num_rows();
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
+        let hours: Vec<_> = crate::hours::hours_in(std::slice::from_ref(&batch))?
+            .into_iter()
+            .collect();
+        if hours.len() > self.config.max_hours_per_batch {
+            return Err(IngestError::TooManyHours {
+                hours: hours.len(),
+                limit: self.config.max_hours_per_batch,
+            });
+        }
 
         let reservation = self
-            .admit(tenant, batch.get_array_memory_size(), batch.num_rows())
+            .admit(
+                tenant,
+                batch.get_array_memory_size(),
+                batch.num_rows(),
+                &hours,
+            )
             .await?;
         drop(slot);
         let _shared = self.gate.read().await;
@@ -338,7 +361,9 @@ impl Shared {
         let (due, coalesce) = {
             let mut buffers = self.buffers.lock().await;
             let was_due = self.flush_is_due(buffers.get_mut(tenant));
-            buffers.get_mut(tenant).push(batch, tracked.position, now);
+            buffers
+                .get_mut(tenant)
+                .push_with_hours(batch, hours, tracked.position, now);
             // Both released under the lock: no admission runs between the push
             // and the release, and no coalesce takes a run the position
             // belongs in before the batch is there.
@@ -374,12 +399,15 @@ impl Shared {
     }
 
     /// Steps 1 and 2 of the flush protocol: cut the live rows under the gate
-    /// and log the intents: one flush per hour the rows fall in, each under
-    /// the id derived from the rows' first position and its hour, so no
-    /// file ever holds two hours and the hot window can announce every id
-    /// beforehand. Returns the flushes whose intent is durable, or `None`
-    /// when nothing was live; a part whose intent could not be logged goes
-    /// back to the live rows.
+    /// and log the intents: one flush per hour the rows fall in, at most
+    /// `max_hours_per_cut` of them, oldest first, each under the id derived
+    /// from the rows' first position and its hour and under an intent
+    /// naming that hour, so no file ever holds two hours, the hot window
+    /// can announce every id beforehand, and rows left live, by the bound
+    /// or by an intent that could not be logged, are cut later under an
+    /// intent of their own hour that never claims the rows of another.
+    /// Returns the flushes whose intent is durable, or `None` when nothing
+    /// was live.
     async fn cut_tenant(&self, tenant: TenantId) -> Result<Option<Vec<Cut>>, IngestError> {
         let (intents, parts) = {
             let _exclusive = self.gate.write().await;
@@ -393,7 +421,16 @@ impl Shared {
                 return Ok(None);
             };
             let layout = FileLayout::current(self.config.row_group_rows);
-            let hours = buffers.live_hours(tenant)?;
+            let all_hours = buffers.live_hours(tenant);
+            let hours: Vec<_> = all_hours
+                .iter()
+                .copied()
+                .take(
+                    self.config
+                        .max_hours_per_cut
+                        .clamp(1, crate::config::MAX_HOURS_PER_CUT),
+                )
+                .collect();
             let intent = |file, hour: Option<DateTime<Utc>>| FlushIntent {
                 tenant,
                 file,
@@ -408,13 +445,15 @@ impl Shared {
                 }
                 None => FileId::derived(self.instance, tenant, first.segment, first.offset),
             };
-            if hours.len() <= 1 {
-                let file = file_at(hours.first().copied());
-                let Some((batches, held)) = buffers.begin_flush(tenant, file, layout, (first, end))
+            if all_hours.len() <= 1 {
+                let hour = hours.first().copied();
+                let file = file_at(hour);
+                let Some((batches, held)) =
+                    buffers.begin_flush(tenant, file, layout, (first, end), hour)
                 else {
                     return Ok(None);
                 };
-                (vec![intent(file, None)], vec![(file, batches, held)])
+                (vec![intent(file, hour)], vec![(file, batches, held)])
             } else {
                 let parts: Vec<_> = hours.iter().map(|h| (file_at(Some(*h)), *h)).collect();
                 let Some(cut) = buffers.begin_flush_split(tenant, layout, (first, end), &parts)?
@@ -433,7 +472,12 @@ impl Shared {
         let mut logged = Vec::with_capacity(parts.len());
         let mut first_error = None;
         for (intent, part) in intents.into_iter().zip(parts) {
-            match self.append_wal(tenant, intent.to_record().encode()).await {
+            let logged_intent = if take_injected(&self.inject_intent_failures) {
+                Err(IngestError::Injected("flush intent"))
+            } else {
+                self.append_wal(tenant, intent.to_record().encode()).await
+            };
+            match logged_intent {
                 Ok(tracked) => {
                     drop(tracked);
                     logged.push(part);
@@ -1016,13 +1060,7 @@ impl Shared {
     /// them. Taken under the exclusive gate: no request is between its
     /// append and its push, so the smallest live position, and with it the
     /// announced ids, is the one the next flush derives from.
-    ///
-    /// # Errors
-    /// Live rows without the span timestamp column.
-    pub(crate) async fn snapshot(
-        &self,
-        tenant: TenantId,
-    ) -> Result<(Snapshot, Vec<FileId>), IngestError> {
+    pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Vec<FileId>) {
         let started = Instant::now();
         let snapshot = {
             let _exclusive = self.gate.write().await;
@@ -1031,18 +1069,16 @@ impl Shared {
         self.stats.hot_scan.observe(started.elapsed());
         let mut live_files = Vec::new();
         if let Some(p) = snapshot.live_first_wal {
-            let batches: Vec<RecordBatch> = snapshot.live.iter().map(|b| b.batch.clone()).collect();
-            let hours = crate::hours::hours_in(&batches)?;
-            if hours.is_empty() {
+            if snapshot.live_hours.is_empty() {
                 live_files.push(FileId::derived(self.instance, tenant, p.segment, p.offset));
             }
             live_files.extend(
-                hours.into_iter().map(|hour| {
-                    FileId::derived_at(self.instance, tenant, p.segment, p.offset, hour)
+                snapshot.live_hours.iter().map(|hour| {
+                    FileId::derived_at(self.instance, tenant, p.segment, p.offset, *hour)
                 }),
             );
         }
-        Ok((snapshot, live_files))
+        (snapshot, live_files)
     }
 
     /// Cuts every due tenant (every tenant with live rows when `everything`)
@@ -1050,8 +1086,9 @@ impl Shared {
     /// time, so the flusher keeps coalescing while files are written. A
     /// tenant left without a permit stays due for the next round. With
     /// `everything` the call returns only once every flush, including those
-    /// started earlier, has finished.
-    async fn flush_due(self: &Arc<Self>, everything: bool) {
+    /// started earlier, has finished. Returns how many flushes were cut.
+    async fn flush_due(self: &Arc<Self>, everything: bool) -> usize {
+        let mut cuts = 0;
         let now = Instant::now();
         let tenants = {
             let mut buffers = self.buffers.lock().await;
@@ -1080,10 +1117,11 @@ impl Shared {
         self.retry_flushing(everything).await;
         for tenant in tenants {
             let Some(permit) = self.flush_permit(everything).await else {
-                return;
+                return cuts;
             };
             match self.cut_tenant(tenant).await {
                 Ok(Some(parts)) => {
+                    cuts += parts.len();
                     let attempts = parts
                         .into_iter()
                         .map(|(file, batches, held)| Attempt {
@@ -1108,6 +1146,12 @@ impl Shared {
                 .acquire_many_owned(u32::try_from(all).unwrap_or(u32::MAX))
                 .await;
         }
+        cuts
+    }
+
+    /// True while some tenant has live rows.
+    async fn has_live(&self) -> bool {
+        !self.buffers.lock().await.all().is_empty()
     }
 }
 
@@ -1158,7 +1202,7 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                     // one. Skipping it would send its rows back to live and
                     // write them as other bytes under an id already taken, so
                     // the replay stops here: the log needs an engine that reads it.
-                    RecordSignal::FlushIntent => match FlushIntent::from_payload(&record.payload) {
+                    RecordSignal::FlushIntent => match FlushIntent::from_record(&record) {
                         Ok(intent) => out.intents.push(intent),
                         Err(e) => {
                             return Err(IngestError::Record(format!(
@@ -1231,23 +1275,26 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
             }
             continue;
         }
-        let mut hours = Vec::with_capacity(covering.len());
-        for i in covering {
-            let Some((intent, _, buffer)) = groups.get_mut(i) else {
-                continue;
-            };
-            let Some(hour) = intent.hour_start() else {
-                continue;
-            };
-            buffer.push(crate::hours::rows_in_hour(&batch, hour)?, position, now);
-            hours.push(hour);
+        let (targets, hours): (Vec<usize>, Vec<DateTime<Utc>>) = covering
+            .into_iter()
+            .filter_map(|i| {
+                groups
+                    .get(i)
+                    .and_then(|(intent, _, _)| intent.hour_start())
+                    .map(|hour| (i, hour))
+            })
+            .unzip();
+        if hours.is_empty() {
+            buffers.get_mut(tenant).push(batch, position, now);
+            continue;
         }
-        let rest = if hours.is_empty() {
-            batch
-        } else {
-            crate::hours::rows_outside(&batch, &hours)?
-        };
-        buffers.get_mut(tenant).push(rest, position, now);
+        let split = crate::hours::partition(&batch, &hours)?;
+        for (i, piece) in targets.into_iter().zip(split.by_hour) {
+            if let Some((_, _, buffer)) = groups.get_mut(i) {
+                buffer.push(piece, position, now);
+            }
+        }
+        buffers.get_mut(tenant).push(split.rest, position, now);
     }
     for (intent, origin, buffer) in groups {
         let bound = Bound {
@@ -1306,6 +1353,7 @@ impl Ingester {
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
         let config_confirm_injected = config.inject_confirm_failures;
+        let config_intent_injected = config.inject_intent_failures;
         let config_confirms = config.max_confirms;
         let config_index_injected = config.inject_index_failures;
         let config_conversions = config.max_conversions;
@@ -1340,6 +1388,7 @@ impl Ingester {
                 config_confirms,
             ))),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
+            inject_intent_failures: std::sync::atomic::AtomicU32::new(config_intent_injected),
             inject_confirm_failures: std::sync::atomic::AtomicU32::new(config_confirm_injected),
             inject_index_failures: std::sync::atomic::AtomicU32::new(config_index_injected),
             push_delay_pending: std::sync::atomic::AtomicBool::new(push_delay_pending),
@@ -1381,7 +1430,10 @@ impl Ingester {
     /// Retries or resumes every pending flush, then flushes every tenant.
     /// Used by tests and at shutdown.
     pub async fn flush_all(&self) {
-        self.shared.flush_due(true).await;
+        // A cut takes at most `max_hours_per_cut` hours, so a pass can leave
+        // rows live; passes repeat while they make progress, and stop on a
+        // pass that cut nothing rather than spin on a failing intent.
+        while self.shared.flush_due(true).await > 0 && self.shared.has_live().await {}
     }
 
     /// Advances the WAL checkpoint to the earliest row still in memory. Runs
@@ -1456,10 +1508,12 @@ impl Ingester {
                 tokio::select! {
                     _ = tick.tick() => {
                         shared.coalesce_due().await;
-                        shared.flush_due(false).await;
+                        let _ = shared.flush_due(false).await;
                     }
                     () = shared.coalesce_now.notified() => shared.coalesce_due().await,
-                    () = shared.flush_now.notified() => shared.flush_due(false).await,
+                    () = shared.flush_now.notified() => {
+                        let _ = shared.flush_due(false).await;
+                    }
                     _ = flusher_shutdown.changed() => break,
                 }
             }

@@ -275,11 +275,7 @@ impl FlightService for HotService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let scan = HotScanRequest::from_ticket(request.get_ref())?;
-        let (snapshot, live_files) = self
-            .shared
-            .snapshot(scan.tenant)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let (snapshot, live_files) = self.shared.snapshot(scan.tenant).await;
         let sources = snapshot
             .live
             .iter()

@@ -1,9 +1,9 @@
 //! Calendar hours of span rows: an L0 file never holds rows of two.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
-use arrow::array::{AsArray, BooleanArray, PrimitiveArray};
-use arrow::compute::filter_record_batch;
+use arrow::array::{AsArray, PrimitiveArray, UInt32Array};
+use arrow::compute::take_record_batch;
 use arrow::datatypes::TimestampNanosecondType;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, TimeZone, Utc};
@@ -15,7 +15,7 @@ const HOUR_NANOS: i64 = 3_600_000_000_000;
 
 /// Start of the UTC hour holding a timestamp in nanoseconds since the epoch.
 pub fn hour_of(nanos: i64) -> DateTime<Utc> {
-    Utc.timestamp_nanos(nanos.div_euclid(HOUR_NANOS) * HOUR_NANOS)
+    Utc.timestamp_nanos(hour_floor(nanos))
 }
 
 /// Every UTC hour with a row in `batches`, in order.
@@ -23,60 +23,67 @@ pub fn hour_of(nanos: i64) -> DateTime<Utc> {
 /// # Errors
 /// A batch without the span timestamp column.
 pub fn hours_in(batches: &[RecordBatch]) -> Result<BTreeSet<DateTime<Utc>>, IngestError> {
-    let mut hours = BTreeSet::new();
+    let mut starts = BTreeSet::new();
     for batch in batches {
         let ts = timestamps(batch)?;
         let (Some(min), Some(max)) = (arrow::compute::min(ts), arrow::compute::max(ts)) else {
             continue;
         };
-        if hour_of(min) == hour_of(max) {
-            hours.insert(hour_of(min));
+        if hour_floor(min) == hour_floor(max) {
+            starts.insert(hour_floor(min));
         } else {
-            hours.extend(ts.values().iter().map(|t| hour_of(*t)));
+            starts.extend(ts.values().iter().map(|t| hour_floor(*t)));
         }
     }
-    Ok(hours)
+    Ok(starts.into_iter().map(|s| Utc.timestamp_nanos(s)).collect())
 }
 
-/// The rows of `batch` whose timestamp falls in `hour`.
-///
-/// # Errors
-/// A batch without the span timestamp column, or an Arrow failure.
-pub fn rows_in_hour(batch: &RecordBatch, hour: DateTime<Utc>) -> Result<RecordBatch, IngestError> {
-    let start = hour_nanos(hour)?;
-    let end = start.saturating_add(HOUR_NANOS);
-    let ts = timestamps(batch)?;
-    let mask: BooleanArray = ts
-        .iter()
-        .map(|t| t.map(|t| t >= start && t < end))
-        .collect();
-    Ok(filter_record_batch(batch, &mask)?)
+/// The rows of one batch split by hour.
+#[derive(Debug)]
+pub struct Partition {
+    /// One batch per hour asked for, in the same order, empty when none.
+    pub by_hour: Vec<RecordBatch>,
+    /// The rows of every other hour, and rows without a timestamp.
+    pub rest: RecordBatch,
 }
 
-/// The rows of `batch` whose timestamp falls in none of `hours`.
+/// Splits `batch` by hour in one pass over its timestamps: the rows of each
+/// of `hours` and the rest. A row is placed by the hour its timestamp
+/// starts in, so the last representable timestamp has an hour too.
 ///
 /// # Errors
-/// A batch without the span timestamp column, or an Arrow failure.
-pub fn rows_outside(
-    batch: &RecordBatch,
-    hours: &[DateTime<Utc>],
-) -> Result<RecordBatch, IngestError> {
-    let starts = hours
+/// A batch without the span timestamp column, more rows than can be
+/// indexed, or an Arrow failure.
+pub fn partition(batch: &RecordBatch, hours: &[DateTime<Utc>]) -> Result<Partition, IngestError> {
+    let wanted: HashMap<i64, usize> = hours
         .iter()
-        .map(|h| hour_nanos(*h))
-        .collect::<Result<Vec<_>, _>>()?;
+        .enumerate()
+        .map(|(i, hour)| hour_nanos(*hour).map(|start| (start, i)))
+        .collect::<Result<_, _>>()?;
     let ts = timestamps(batch)?;
-    let mask: BooleanArray = ts
-        .iter()
-        .map(|t| {
-            t.map(|t| {
-                !starts
-                    .iter()
-                    .any(|s| t >= *s && t < s.saturating_add(HOUR_NANOS))
-            })
-        })
-        .collect();
-    Ok(filter_record_batch(batch, &mask)?)
+    let mut by_hour: Vec<Vec<u32>> = hours.iter().map(|_| Vec::new()).collect();
+    let mut rest = Vec::new();
+    for (row, t) in ts.iter().enumerate() {
+        let row = u32::try_from(row)
+            .map_err(|_| IngestError::Encode("too many rows in one batch to partition".into()))?;
+        match t.and_then(|t| wanted.get(&hour_floor(t))) {
+            Some(i) => {
+                if let Some(rows) = by_hour.get_mut(*i) {
+                    rows.push(row);
+                }
+            }
+            None => rest.push(row),
+        }
+    }
+    let take = |rows: Vec<u32>| take_record_batch(batch, &UInt32Array::from(rows));
+    Ok(Partition {
+        by_hour: by_hour.into_iter().map(take).collect::<Result<_, _>>()?,
+        rest: take(rest)?,
+    })
+}
+
+fn hour_floor(nanos: i64) -> i64 {
+    nanos.div_euclid(HOUR_NANOS) * HOUR_NANOS
 }
 
 fn hour_nanos(hour: DateTime<Utc>) -> Result<i64, IngestError> {
@@ -128,9 +135,18 @@ mod tests {
         );
     }
 
+    /// Rows go to the hour they start in, the rest apart; the last
+    /// representable timestamp, which the converter clamps to, has an hour
+    /// like any other instead of falling off an open range.
     #[test]
-    fn rows_are_split_by_their_hour_and_the_rest_kept_apart() {
-        let rows = batch(&[H14 + 5, H14 + HOUR_NANOS + 5, H14 + 7, H14 + 3 * HOUR_NANOS]);
+    fn rows_are_partitioned_by_their_hour_in_one_pass() {
+        let rows = batch(&[
+            H14 + 5,
+            H14 + HOUR_NANOS + 5,
+            H14 + 7,
+            H14 + 3 * HOUR_NANOS,
+            i64::MAX,
+        ]);
         let hours: Vec<_> = hours_in(std::slice::from_ref(&rows))
             .unwrap()
             .into_iter()
@@ -140,29 +156,25 @@ mod tests {
             [
                 hour_of(H14),
                 hour_of(H14 + HOUR_NANOS),
-                hour_of(H14 + 3 * HOUR_NANOS)
+                hour_of(H14 + 3 * HOUR_NANOS),
+                hour_of(i64::MAX)
             ]
         );
-        assert_eq!(rows_in_hour(&rows, hour_of(H14)).unwrap().num_rows(), 2);
-        assert_eq!(
-            rows_in_hour(&rows, hour_of(H14 + HOUR_NANOS))
-                .unwrap()
-                .num_rows(),
-            1
-        );
-        assert_eq!(
-            rows_in_hour(&rows, hour_of(H14 + 2 * HOUR_NANOS))
-                .unwrap()
-                .num_rows(),
-            0
-        );
-        let outside = rows_outside(&rows, &[hour_of(H14), hour_of(H14 + HOUR_NANOS)]).unwrap();
-        assert_eq!(outside.num_rows(), 1);
+        let split = partition(&rows, &[hour_of(H14), hour_of(H14 + HOUR_NANOS)]).unwrap();
+        let counts: Vec<_> = split.by_hour.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(counts, [2, 1]);
+        assert_eq!(split.rest.num_rows(), 2);
+        let last = partition(&rows, &[hour_of(i64::MAX)]).unwrap();
+        assert_eq!(last.by_hour.first().map(RecordBatch::num_rows), Some(1));
+        assert_eq!(last.rest.num_rows(), 4);
+        let none = partition(&rows, &[]).unwrap();
+        assert_eq!(none.by_hour.len(), 0);
+        assert_eq!(none.rest.num_rows(), 5);
         assert_eq!(
             hours_in(&[batch(&[H14, H14 + 1])]).unwrap().len(),
             1,
             "one hour needs no scan"
         );
-        assert!(hours_in(&[batch(&[])]).unwrap().is_empty());
+        assert_eq!(hours_in(&[batch(&[])]).unwrap().len(), 0);
     }
 }
