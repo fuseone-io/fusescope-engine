@@ -466,6 +466,7 @@ mod tests {
         let now = Utc::now();
         FileRecord {
             id: FileId(uuid::Uuid::from_u128(n)),
+            origin: FileId(uuid::Uuid::from_u128(n)),
             tenant_id: TenantId(uuid::Uuid::nil()),
             signal: Signal::Traces,
             level: Level::L0,

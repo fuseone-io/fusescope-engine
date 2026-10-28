@@ -156,6 +156,8 @@ fn flush_permits(max_flushes: usize) -> usize {
 struct Attempt {
     tenant: TenantId,
     file: FileId,
+    /// The id the rows were first assigned; see `Flushing::origin`.
+    origin: FileId,
     batches: Vec<RecordBatch>,
     held: crate::buffer::Scratch,
     /// The intent's layout; `None` for an intent logged before layouts were
@@ -397,6 +399,7 @@ impl Shared {
         &self,
         tenant: TenantId,
         file_id: FileId,
+        origin: FileId,
         batches: Vec<RecordBatch>,
         held: crate::buffer::Scratch,
         layout: Option<FileLayout>,
@@ -407,7 +410,7 @@ impl Shared {
         let started = Instant::now();
         let mut timing = StageTiming::default();
         let result = self
-            .write_and_register(tenant, file_id, batches, layout, &mut timing)
+            .write_and_register(tenant, file_id, origin, batches, layout, &mut timing)
             .await;
         // The lease and the margin trade places under the buffer lock, in
         // both outcomes, so no admission ever sees the room without the
@@ -528,6 +531,7 @@ impl Shared {
         &self,
         tenant: TenantId,
         file_id: FileId,
+        origin: FileId,
         batches: Vec<RecordBatch>,
         layout: Option<FileLayout>,
         timing: &mut StageTiming,
@@ -567,6 +571,7 @@ impl Shared {
             writer_peak,
             ..
         } = prepared;
+        file.origin = origin;
         // The object is in the bucket: its bytes go now; the lease waits for
         // the outcome.
         drop(bytes);
@@ -638,7 +643,7 @@ impl Shared {
                 return;
             };
             let taken = self.buffers.lock().await.take_flushing(tenant, file);
-            let Some((batches, held, layout)) = taken else {
+            let Some((batches, held, layout, origin)) = taken else {
                 continue;
             };
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
@@ -650,6 +655,7 @@ impl Shared {
             let attempt = Attempt {
                 tenant,
                 file,
+                origin,
                 batches,
                 held,
                 layout,
@@ -683,12 +689,13 @@ impl Shared {
             let Attempt {
                 tenant,
                 file,
+                origin,
                 batches,
                 held,
                 layout,
             } = attempt;
             if let Err(e) = shared
-                .materialize(tenant, file, batches, held, layout)
+                .materialize(tenant, file, origin, batches, held, layout)
                 .await
             {
                 error!(tenant = %tenant.0, error = %e, "flush error");
@@ -884,6 +891,7 @@ impl Shared {
                     let attempt = Attempt {
                         tenant,
                         file: file_id,
+                        origin: file_id,
                         batches,
                         held,
                         layout: Some(FileLayout::current(self.config.row_group_rows)),
@@ -974,7 +982,7 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
 
 /// Rebuilds buffers: rows covered by an intent go back to the flushing state
 /// under that file id, everything else is live.
-fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
+fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>, instance: uuid::Uuid) -> Buffers {
     let now = Instant::now();
     let mut buffers = Buffers::with_scratch_counter(scratch);
     // Several intents for the same records are one flush under the id of
@@ -1002,12 +1010,21 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
         }
     }
     for (intent, buffer) in groups {
+        // The id the rows were first assigned is the one derived from their
+        // first record, whatever id the last intent gave them.
+        let origin = FileId::derived(
+            instance,
+            intent.tenant,
+            intent.first.segment,
+            intent.first.offset,
+        );
         buffers.insert_flushing(
             intent.tenant,
             intent.file,
             buffer,
             intent.layout,
             (intent.first, intent.end),
+            origin,
         );
     }
     buffers
@@ -1047,7 +1064,11 @@ impl Ingester {
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
         let flush_stats = Arc::new(FlushStats::default());
-        let buffers = rebuild(replayed, Arc::clone(&flush_stats.scratch_bytes));
+        let buffers = rebuild(
+            replayed,
+            Arc::clone(&flush_stats.scratch_bytes),
+            wal.instance_id(),
+        );
         info!(
             records,
             damaged,

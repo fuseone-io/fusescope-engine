@@ -271,6 +271,7 @@ mod tests {
     fn file(start: i64, end: i64, services: &[&str]) -> FileRecord {
         FileRecord {
             id: FileId::new(),
+            origin: FileId::new(),
             tenant_id: TenantId::new(),
             signal: Signal::Traces,
             level: Level::L0,

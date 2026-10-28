@@ -151,6 +151,7 @@ pub fn prepare(
     let index = Bytes::from(trace_index(path.as_ref(), &rows)?.encode());
     let file = NewFile {
         id,
+        origin: id,
         tenant_id: tenant,
         signal: Signal::Traces,
         level: Level::L0,

@@ -380,6 +380,10 @@ pub struct Flushing {
     /// The records the intent covers, `[first, end)`, so an intent for
     /// another id can be logged for the same rows.
     pub range: (Position, Position),
+    /// The id the rows were first assigned, kept when the flush changes
+    /// id: what the hot window announces, so a querier excludes the file
+    /// however it is registered.
+    pub origin: FileId,
 }
 
 impl Flushing {
@@ -477,7 +481,8 @@ pub struct Snapshot {
     /// its file id from; final when the snapshot was taken with no request
     /// between its append and its push.
     pub live_first_wal: Option<Position>,
-    /// Rows being flushed, with the id their file will have.
+    /// Rows being flushed, with the id they were first assigned, which
+    /// their file keeps as its origin whatever id it registers under.
     pub flushing: Vec<(FileId, Vec<HotBatch>)>,
     /// Rows flushed recently and still served; the querier skips these files.
     pub persisted: Vec<Persisted>,
@@ -759,6 +764,7 @@ impl Buffers {
             detached: 0,
             layout: Some(layout),
             range,
+            origin: file,
         });
         Some((batches, lease))
     }
@@ -772,6 +778,7 @@ impl Buffers {
         buffer: TenantBuffer,
         layout: Option<FileLayout>,
         range: (Position, Position),
+        origin: FileId,
     ) {
         if !buffer.is_empty() {
             self.flushing.entry(tenant).or_default().push(Flushing {
@@ -783,6 +790,7 @@ impl Buffers {
                 detached: 0,
                 layout,
                 range,
+                origin,
             });
         }
     }
@@ -841,8 +849,8 @@ impl Buffers {
         &mut self,
         tenant: TenantId,
         file: FileId,
-    ) -> Option<(Vec<RecordBatch>, Scratch, Option<FileLayout>)> {
-        let (lease_bytes, layout) = {
+    ) -> Option<(Vec<RecordBatch>, Scratch, Option<FileLayout>, FileId)> {
+        let (lease_bytes, layout, origin) = {
             let entry = self
                 .flushing
                 .get_mut(&tenant)?
@@ -852,6 +860,7 @@ impl Buffers {
             (
                 entry.buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR),
                 entry.layout,
+                entry.origin,
             )
         };
         let lease = self.hold_scratch(lease_bytes);
@@ -862,7 +871,7 @@ impl Buffers {
             .find(|f| f.file == file)?
             .buffer
             .batches();
-        Some((batches, lease, layout))
+        Some((batches, lease, layout, origin))
     }
 
     /// Flushes bound by an intent and not being worked on right now.
@@ -959,7 +968,7 @@ impl Buffers {
                 .get(&tenant)
                 .map(|list| {
                     list.iter()
-                        .map(|f| (f.file, f.buffer.hot_batches()))
+                        .map(|f| (f.origin, f.buffer.hot_batches()))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1212,7 +1221,7 @@ mod tests {
             "waiting rows keep their margin"
         );
         assert_eq!(buffers.headroom(live * 5), live);
-        let (_, lease, _) = buffers.take_flushing(tenant, file).unwrap();
+        let (_, lease, _, _) = buffers.take_flushing(tenant, file).unwrap();
         assert_eq!(
             buffers.scratch_total(),
             live * FLUSH_SCRATCH_FACTOR,
@@ -1659,7 +1668,7 @@ mod tests {
         );
         let due = buffers.due_flushes(now, true);
         assert_eq!(due, vec![(tenant, file)]);
-        let (retried, _lease, layout) = buffers.take_flushing(tenant, file).unwrap();
+        let (retried, _lease, layout, _) = buffers.take_flushing(tenant, file).unwrap();
         assert_eq!(
             layout,
             Some(FileLayout::current(8)),

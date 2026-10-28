@@ -85,7 +85,15 @@ impl SpansTable {
             .await
     }
 
-    async fn plan_files_excluding(
+    /// Files the scan would open after catalog-level pruning, leaving out
+    /// the ones the hot window still serves: `excluded` holds the ids the
+    /// ingesters announced, matched against a file's id and its origin, the
+    /// id its rows were first assigned, so a flush that changed id between
+    /// the hot scan and the catalog read is still left out.
+    ///
+    /// # Errors
+    /// Catalog failure.
+    pub async fn plan_files_excluding(
         &self,
         filters: &[Expr],
         excluded: &std::collections::HashSet<fs_catalog::FileId>,
@@ -94,7 +102,9 @@ impl SpansTable {
         let all = self.cache.files(self.tenant, Signal::Traces).await?;
         let candidates: Vec<&fs_catalog::FileRecord> = all
             .iter()
-            .filter(|f| pruning.keeps(f) && !excluded.contains(&f.id))
+            .filter(|f| {
+                pruning.keeps(f) && !excluded.contains(&f.id) && !excluded.contains(&f.origin)
+            })
             .collect();
         let after_catalog = candidates.len();
         let candidates = match (&self.trace_index, pinned_traces(&pruning)) {

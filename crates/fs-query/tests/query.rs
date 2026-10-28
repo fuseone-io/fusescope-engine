@@ -465,6 +465,59 @@ async fn missing_or_damaged_sidecars_degrade_to_a_scan() {
     f.db.finish().await;
 }
 
+/// The hot window announces the id a flush was first given; a file that
+/// registered under another id after changing it keeps that id as its
+/// origin, and the planner leaves it out by either.
+#[tokio::test]
+async fn files_are_excluded_by_their_origin_as_well_as_their_id() {
+    let Some(f) = fixture().await else { return };
+    let mut builder = SpanBatchBuilder::new(Limits::default());
+    builder
+        .append_request(&request("api", 5, T0 + 3 * HOUR, 4))
+        .unwrap();
+    let batch = builder.finish().unwrap();
+    let announced = fs_catalog::FileId::new();
+    let registered = fs_catalog::FileId::new();
+    let store = LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap();
+    let mut prepared = flush::prepare(
+        f.tenant,
+        &Path::from(""),
+        registered,
+        &[batch],
+        flush::DEFAULT_ROW_GROUP_ROWS,
+    )
+    .unwrap();
+    prepared.file.origin = announced;
+    flush::upload(&store, &prepared).await.unwrap();
+    flush::upload_index(&store, &prepared).await.unwrap();
+    let row = f.db.catalog.register_file(&prepared.file).await.unwrap();
+    assert_eq!(row.origin, announced);
+
+    let table = fs_query::spans_table::SpansTable::new(
+        f.tenant,
+        f.querier.cache(),
+        datafusion::execution::object_store::ObjectStoreUrl::parse(fs_query::STORE_URL).unwrap(),
+        u64::MAX,
+    );
+    let (all, _) = table
+        .plan_files_excluding(&[], &std::collections::HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 4);
+    for excluded in [announced, registered] {
+        let (kept, _) = table
+            .plan_files_excluding(&[], &std::collections::HashSet::from([excluded]))
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 3, "left out by {excluded:?}");
+        assert!(
+            kept.iter()
+                .all(|p| p.path().as_ref() != prepared.file.path.as_str())
+        );
+    }
+    f.db.finish().await;
+}
+
 #[tokio::test]
 async fn trace_lookup_by_hex_id() {
     let Some(f) = fixture().await else { return };

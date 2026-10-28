@@ -2571,6 +2571,30 @@ async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
     };
     assert_eq!(visible(db.catalog.clone()).await.len(), 0);
 
+    // The hot window keeps announcing the id the rows were first given,
+    // which the file registers as its origin, so a querier that scanned
+    // the hot window before the change still leaves the file out.
+    let old_id = fs_catalog::FileId(
+        uuid::Uuid::parse_str(old.file_stem().unwrap().to_str().unwrap()).unwrap(),
+    );
+    let everything = fs_ingest::hot::HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: None,
+        span_ids: None,
+    };
+    let scanned =
+        fs_ingest::hot::scan(&h.hot_addr.to_string(), &everything, Duration::from_secs(5))
+            .await
+            .unwrap();
+    assert!(
+        scanned.persisted_files.contains(&old_id),
+        "announced by its first id after the change"
+    );
+
     // The next attempt writes the same bytes under the new path and
     // registers them; the marked object is left as it is.
     h.ingester.flush_all().await;
@@ -2584,6 +2608,11 @@ async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
     assert_eq!(registered.len(), 1);
     assert_eq!(bucket.join(&registered[0].path), new);
     assert_ne!(registered[0].path, old_relative);
+    assert_eq!(
+        registered[0].origin, old_id,
+        "registered with its first id as origin"
+    );
+    assert_ne!(registered[0].id, old_id);
 
     // Crash before the checkpoint: replay sees both intents for these
     // records and keeps the last id, so the retry finds its row and
