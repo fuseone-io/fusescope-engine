@@ -474,6 +474,9 @@ impl Shared {
         let mut first_error = None;
         for (intent, part) in intents.into_iter().zip(parts) {
             let logged_intent = if take_injected(&self.inject_intent_failures) {
+                if let Some(delay) = self.config.inject_intent_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 Err(IngestError::Injected("flush intent"))
             } else {
                 self.append_wal(tenant, intent.to_record().encode()).await
@@ -490,6 +493,11 @@ impl Shared {
                     first_error.get_or_insert(e);
                 }
             }
+        }
+        // The pressure of a refusal outlives a cut whose intent failed: the
+        // rows are live again and the next pass cuts them.
+        if first_error.is_none() {
+            self.buffers.lock().await.unpress(tenant);
         }
         match (logged.is_empty(), first_error) {
             (true, Some(e)) => Err(e),

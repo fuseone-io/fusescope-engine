@@ -142,10 +142,13 @@ arriving meanwhile:
   hours cut and others is partitioned, in one pass. A request whose spans
   fall in more than `ingest.max_hours_per_batch` hours (48) is refused, and
   a tenant whose rows would fall in more than `ingest.max_live_hours`
-  (64), the hours of requests admitted but not yet pushed counted, is
-  refused and marked due, so the next flusher pass cuts it whatever its
-  rows, bytes and age and the request is admitted again as soon as the
-  cuts drain the hours; no cut, scan or announcement grows past that. An
+  (64) is refused and marked due, so the next flusher pass cuts it
+  whatever its rows, bytes and age and the request is admitted again once
+  the files are registered. The count takes the live rows, the rows being
+  flushed, whose intent may still be on its way to the log and whose rows
+  come back if it fails, and the requests admitted but not yet pushed, so
+  nothing slips in between a cut and its log, and the mark outlives a cut
+  whose intent failed; no cut, scan or announcement grows past that. An
   intent naming an hour is written
   under WAL record version 2, so an ingester of the previous version fails
   on it instead of reading the intent as the whole range; the reader fails

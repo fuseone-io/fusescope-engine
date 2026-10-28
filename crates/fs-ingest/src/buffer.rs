@@ -962,6 +962,11 @@ impl Buffers {
         self.pressed.insert(tenant);
     }
 
+    /// The cut of `tenant` is durable: it is no longer due for that.
+    pub fn unpress(&mut self, tenant: TenantId) {
+        self.pressed.remove(&tenant);
+    }
+
     /// Smallest WAL position among the live rows of `tenant`, if any.
     pub fn live_first_wal(&self, tenant: TenantId) -> Option<Position> {
         self.tenants
@@ -984,7 +989,6 @@ impl Buffers {
         hour: Option<DateTime<Utc>>,
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
-        self.pressed.remove(&tenant);
         let batches = buffer.batches();
         let lease = self.hold_scratch(buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
         self.flushing.entry(tenant).or_default().push(Flushing {
@@ -1019,7 +1023,6 @@ impl Buffers {
         let Some(buffer) = self.tenants.remove(&tenant).filter(|b| !b.is_empty()) else {
             return Ok(None);
         };
-        self.pressed.remove(&tenant);
         let hours: Vec<_> = parts.iter().map(|(_, hour)| *hour).collect();
         let (split, rest) = match buffer.split_by_hours(&hours) {
             Ok(split) => split,
@@ -1073,14 +1076,19 @@ impl Buffers {
     }
 
     /// How many hours the rows of `tenant` would fall in with rows of
-    /// `hours` added: the live rows and the requests admitted but not yet
-    /// pushed, so two requests admitted together cannot both fit.
+    /// `hours` added: the live rows, the rows being flushed, whose intent
+    /// may still be on its way to the log and whose rows may come back,
+    /// and the requests admitted but not yet pushed, so two requests
+    /// admitted together cannot both fit.
     pub fn live_hours_with(&self, tenant: TenantId, hours: &[DateTime<Utc>]) -> usize {
         let mut all = self
             .tenants
             .get(&tenant)
             .map(TenantBuffer::hours)
             .unwrap_or_default();
+        for flushing in self.flushing.get(&tenant).into_iter().flatten() {
+            all.extend(flushing.buffer.hours());
+        }
         if let Ok(reserved) = self.reserved_hours.lock() {
             if let Some(travelling) = reserved.get(&tenant) {
                 all.extend(travelling.keys().copied());

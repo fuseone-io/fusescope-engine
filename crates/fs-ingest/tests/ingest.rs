@@ -1554,6 +1554,79 @@ async fn a_tenant_refused_for_its_hours_is_cut_without_waiting_for_the_interval(
     db.finish().await;
 }
 
+/// The hours of a cut count until its intent is durable and while its
+/// rows are flushed: a new hour cannot slip in between the cut and the
+/// log, so an intent that fails brings the rows back under the cap, and
+/// the tenant stays due until a cut of them holds.
+#[tokio::test]
+async fn hours_being_cut_still_count_until_their_intent_holds() {
+    const HOUR: u64 = 3_600_000_000_000;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_hours_per_batch: 1,
+        max_live_hours: 2,
+        inject_intent_failures: 1,
+        inject_intent_delay: Some(Duration::from_secs(2)),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for hours_later in 0..2 {
+        client
+            .export(authed(
+                request_at("api", 1, 1, T0 + hours_later * HOUR),
+                &token,
+            ))
+            .await
+            .unwrap();
+    }
+    // The cut takes both hours out of the live rows at once; its first
+    // intent is held for two seconds and then fails.
+    let ingester = h.ingester.clone();
+    let flushing = tokio::spawn(async move { ingester.flush_all().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let status = client
+        .export(authed(request_at("api", 2, 1, T0 + 2 * HOUR), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::ResourceExhausted,
+        "the hours being cut still count: {status:?}"
+    );
+    flushing.await.unwrap();
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        registered_by_hour(&db, tenant)
+            .await
+            .iter()
+            .map(|(hour, _, _)| hour.as_str())
+            .collect::<Vec<_>>(),
+        ["hr=14", "hr=15"],
+        "the failed intent's rows were cut again by the same call"
+    );
+    client
+        .export(authed(request_at("api", 2, 1, T0 + 2 * HOUR), &token))
+        .await
+        .expect("flushed hours no longer count");
+    h.stop().await;
+    db.finish().await;
+}
+
 /// Crash after the intent but before the upload succeeded: the retry after
 /// restart writes exactly the intended file, once.
 #[tokio::test]

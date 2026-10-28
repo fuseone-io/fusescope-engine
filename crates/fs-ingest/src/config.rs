@@ -103,6 +103,9 @@ pub struct IngestConfig {
     /// Make this many flush intents fail to log artificially, part by
     /// part. Zero in production; tests use it to leave part of a cut live.
     pub inject_intent_failures: u32,
+    /// Hold each injected intent failure this long before failing. `None`
+    /// in production; tests use it to act while a cut is not yet durable.
+    pub inject_intent_delay: Option<Duration>,
     /// Hold each injected confirmation failure this long before failing.
     /// `None` in production; tests use it to act while an attempt is held.
     pub inject_confirm_delay: Option<Duration>,
@@ -162,6 +165,7 @@ impl Default for IngestConfig {
             inject_confirm_failures: 0,
             inject_confirm_delay: None,
             inject_intent_failures: 0,
+            inject_intent_delay: None,
             inject_index_failures: 0,
             inject_register_delay: None,
             inject_push_delay: None,
