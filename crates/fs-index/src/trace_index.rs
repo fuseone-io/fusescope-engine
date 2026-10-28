@@ -308,30 +308,34 @@ const STRING_OVERHEAD: usize = 24;
 pub struct DecodeCost {
     /// Heap the decoded index keeps: its entries and file paths.
     pub retained: usize,
-    /// Scratch the decoder uses and frees: the set that checks paths for
-    /// duplicates.
+    /// Scratch the decoder uses and frees: the slice of path references
+    /// sorted to check for duplicates.
     pub scratch: usize,
 }
 
-/// Bytes of the set `has_duplicates` builds for `files` paths: a hash
-/// table of string slices sized for them, buckets rounded up to a power of
-/// two with one control byte each.
+/// Bytes `has_duplicates` allocates for `files` paths: one reference per
+/// path, exactly, and nothing for fewer than two.
 fn duplicate_check_bytes(files: usize) -> usize {
-    if files == 0 {
+    if files < 2 {
         return 0;
     }
-    let buckets = (files * 8).div_ceil(7).next_power_of_two();
-    buckets * (std::mem::size_of::<&str>() + 1) + 16
+    files * std::mem::size_of::<&str>()
 }
 
 fn heap_bytes(path_lens: impl Iterator<Item = usize>, entries: usize) -> usize {
     entries * ENTRY_LEN + path_lens.map(|len| len + STRING_OVERHEAD).sum::<usize>()
 }
 
+/// Sorts references to the paths and looks for equal neighbours, so the
+/// scratch is exactly one reference per path.
 fn has_duplicates(files: &[String]) -> bool {
-    let mut seen: std::collections::HashSet<&str> =
-        std::collections::HashSet::with_capacity(files.len());
-    files.iter().any(|f| !seen.insert(f.as_str()))
+    if files.len() < 2 {
+        return false;
+    }
+    let mut refs: Vec<&str> = Vec::with_capacity(files.len());
+    refs.extend(files.iter().map(String::as_str));
+    refs.sort_unstable();
+    refs.windows(2).any(|pair| pair.first() == pair.last())
 }
 
 fn checksum(body: &[u8]) -> u64 {
@@ -482,9 +486,10 @@ mod tests {
         let bytes = index.encode();
         let cost = TraceIndex::decode_cost(&bytes).unwrap();
         assert_eq!(cost.retained, index.heap_bytes());
-        assert!(
-            cost.scratch >= 2 * (std::mem::size_of::<&str>() + 1),
-            "room for two paths"
+        assert_eq!(
+            cost.scratch,
+            2 * std::mem::size_of::<&str>(),
+            "one reference per path"
         );
         let decoded = TraceIndex::decode(&bytes).unwrap();
         assert_eq!(
@@ -500,6 +505,17 @@ mod tests {
         .unwrap();
         let bytes = many.encode();
         let cost = TraceIndex::decode_cost(&bytes).unwrap();
+        assert_eq!(
+            TraceIndex::decode(&bytes).unwrap().allocated_bytes(),
+            cost.retained
+        );
+        assert_eq!(cost.scratch, 300 * std::mem::size_of::<&str>());
+
+        // The L0 shape: one path, no scratch at all.
+        let one = TraceIndex::new(vec!["f".into()], [(trace(1), 0)]).unwrap();
+        let bytes = one.encode();
+        let cost = TraceIndex::decode_cost(&bytes).unwrap();
+        assert_eq!(cost.scratch, 0);
         assert_eq!(
             TraceIndex::decode(&bytes).unwrap().allocated_bytes(),
             cost.retained
