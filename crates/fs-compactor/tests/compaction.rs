@@ -215,11 +215,15 @@ async fn fence(f: &Fixture) -> LeaseFence {
 /// flushed long ago would be.
 async fn registered_an_hour_ago(f: &Fixture, files: &[FileRecord]) {
     let ids: Vec<_> = files.iter().map(|x| x.id).collect();
-    sqlx::query("update engine_file set created_at = now() - interval '1 hour' where id = any($1)")
-        .bind(&ids)
-        .execute(f.db.catalog.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "update engine_file set created_at = now() - interval '1 hour',
+                                confirmed_at = now() - interval '1 hour'
+         where id = any($1)",
+    )
+    .bind(&ids)
+    .execute(f.db.catalog.pool())
+    .await
+    .unwrap();
 }
 
 fn compactor(f: &Fixture, config: CompactionConfig) -> Compactor {

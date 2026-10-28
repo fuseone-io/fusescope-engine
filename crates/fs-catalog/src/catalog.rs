@@ -98,13 +98,35 @@ impl Catalog {
     /// existing row untouched, so a flush retried after a crash between upload
     /// and registration does not create a second file.
     ///
+    /// The file is not eligible for compaction until the caller
+    /// [confirms](Self::confirm_file) it, once the rows it serves from memory
+    /// are retained for the registration: the compactor's delay then counts
+    /// from after that retention began, however long the commit took.
+    ///
     /// # Errors
     /// Duplicate path under a different id, unknown tenant, or database failure.
     pub async fn register_file(&self, file: &NewFile) -> Result<FileRecord, CatalogError> {
         let mut tx = self.pool.begin().await?;
-        let record = insert_file(&mut tx, file).await?;
+        let record = insert_file(&mut tx, file, Confirm::ByWriter).await?;
         tx.commit().await?;
         Ok(record)
+    }
+
+    /// Makes a registered file eligible for compaction once the compactor's
+    /// delay has passed, stamped on the database clock now. Idempotent: a
+    /// file already confirmed keeps its stamp.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn confirm_file(&self, id: FileId) -> Result<(), CatalogError> {
+        sqlx::query(
+            "update engine_file set confirmed_at = clock_timestamp()
+             where id = $1 and confirmed_at is null",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Visible files of one tenant and signal whose time span overlaps `range`,
@@ -247,7 +269,7 @@ impl Catalog {
         }
         let mut output_ids = Vec::with_capacity(outputs.len());
         for file in outputs {
-            output_ids.push(insert_file(&mut tx, file).await?.id);
+            output_ids.push(insert_file(&mut tx, file, Confirm::OnInsert).await?.id);
         }
         let id = Uuid::now_v7();
         sqlx::query(
@@ -423,15 +445,27 @@ impl Catalog {
     }
 }
 
+/// When a registration becomes eligible for compaction.
+#[derive(Clone, Copy)]
+enum Confirm {
+    /// With the row: nothing serves the file before it is visible.
+    OnInsert,
+    /// After the commit, by the writer, once its hot retention has begun.
+    ByWriter,
+}
+
 async fn insert_file(
     tx: &mut Transaction<'_, Postgres>,
     file: &NewFile,
+    confirm: Confirm,
 ) -> Result<FileRecord, CatalogError> {
     crate::orphans::refuse_doomed(tx, &file.path).await?;
     let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
-             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state, origin)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state, origin,
+              confirmed_at)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                 case when $14 then clock_timestamp() end)
          on conflict (id) do nothing
          returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                    services, summary, state, created_at, quarantined_at",
@@ -449,6 +483,7 @@ async fn insert_file(
     .bind(&file.summary)
     .bind(FileState::Visible.code())
     .bind(file.origin)
+    .bind(matches!(confirm, Confirm::OnInsert))
     .fetch_optional(&mut **tx)
     .await?;
     let row = if let Some(row) = inserted {

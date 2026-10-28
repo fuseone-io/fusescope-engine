@@ -731,11 +731,15 @@ async fn wait_for_lock_waiter(catalog: &Catalog) {
 /// Backdates the registration of `ids` by an hour, as files flushed long
 /// ago would show.
 async fn registered_an_hour_ago(db: &TestDb, ids: &[FileId]) {
-    sqlx::query("update engine_file set created_at = now() - interval '1 hour' where id = any($1)")
-        .bind(ids)
-        .execute(db.catalog.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "update engine_file set created_at = now() - interval '1 hour',
+                                confirmed_at = now() - interval '1 hour'
+         where id = any($1)",
+    )
+    .bind(ids)
+    .execute(db.catalog.pool())
+    .await
+    .unwrap();
 }
 
 /// The oldest cold hour with enough L0 files comes first, with every L0
@@ -1307,6 +1311,16 @@ async fn origin_is_part_of_the_idempotent_check_and_defaults_to_the_id() {
         .unwrap();
     let row = rows.iter().find(|r| r.id == legacy.id).unwrap();
     assert_eq!(row.origin, legacy.id, "defaulted by the trigger");
+    let (legacy_confirmed,): (bool,) =
+        sqlx::query_as("select confirmed_at is not null from engine_file where id = $1")
+            .bind(legacy.id)
+            .fetch_one(db.catalog.pool())
+            .await
+            .unwrap();
+    assert!(
+        legacy_confirmed,
+        "a writer that does not confirm keeps the registration stamp"
+    );
 
     // An origin names one flush: a second file cannot carry it.
     let mut twin = file(t, Signal::Traces, 2, 2, &[]);
@@ -1342,6 +1356,83 @@ async fn origin_is_part_of_the_idempotent_check_and_defaults_to_the_id() {
         registered.created_at >= released_at,
         "stamped after the wait: {} < {released_at}",
         registered.created_at
+    );
+    db.finish().await;
+}
+
+/// A registration that stalled between its row and its commit is not cold
+/// when it commits, however long the stall: the hour closes only after the
+/// writer confirmed the registration, which it does once its hot retention
+/// has begun. A writer that died before confirming confirms when it
+/// replays the registration; until then the file keeps its hour open.
+#[tokio::test]
+async fn an_hour_closes_only_after_its_registrations_were_confirmed() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let closed = StdDuration::from_secs(1);
+    let inputs = || db.catalog.compaction_inputs(Signal::Traces, closed, 2, 0);
+
+    // Every row written from here on waits in its transaction for longer
+    // than `closed` before it commits.
+    db.catalog
+        .pool()
+        .execute(
+            "create function stall() returns trigger language plpgsql as $$
+             begin perform pg_sleep(1.5); return new; end $$;
+             create trigger zz_stall before insert on engine_file
+                 for each row execute function stall()",
+        )
+        .await
+        .unwrap();
+    let a = file(t, Signal::Traces, 0, 0, &[]);
+    let b = file(t, Signal::Traces, 0, 0, &[]);
+    db.catalog.register_file(&a).await.unwrap();
+    db.catalog.register_file(&b).await.unwrap();
+    db.catalog
+        .pool()
+        .execute("drop trigger zz_stall on engine_file; drop function stall()")
+        .await
+        .unwrap();
+    assert!(
+        inputs().await.unwrap().is_none(),
+        "registered, not confirmed: the hour stays open"
+    );
+    db.catalog.confirm_file(a.id).await.unwrap();
+    db.catalog.confirm_file(b.id).await.unwrap();
+    assert!(
+        inputs().await.unwrap().is_none(),
+        "the rows are older than the delay, the writers' hot retention is not"
+    );
+    registered_an_hour_ago(&db, &[a.id, b.id]).await;
+    assert_eq!(inputs().await.unwrap().unwrap().files.len(), 2);
+
+    // The writer of `b` died after the commit, before confirming; the
+    // replay registers the same row again and confirms it.
+    sqlx::query("update engine_file set confirmed_at = null where id = $1")
+        .bind(b.id)
+        .execute(db.catalog.pool())
+        .await
+        .unwrap();
+    assert!(inputs().await.unwrap().is_none());
+    db.catalog.register_file(&b).await.unwrap();
+    assert!(
+        inputs().await.unwrap().is_none(),
+        "registering again does not confirm"
+    );
+    db.catalog.confirm_file(b.id).await.unwrap();
+    assert!(inputs().await.unwrap().is_none(), "confirmed just now");
+    registered_an_hour_ago(&db, &[b.id]).await;
+    let found = inputs().await.unwrap().unwrap();
+    assert_eq!(
+        found.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [a.id, b.id]
     );
     db.finish().await;
 }

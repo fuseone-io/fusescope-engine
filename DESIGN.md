@@ -103,7 +103,9 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
          2. write Parquet L0 to the bucket under a temporary path
          3. write index sidecars (section 5)
          4. INSERT into the catalog with state "visible"
-         5. checkpoint the WAL at the first still-buffered record
+         5. retain the rows in memory, then confirm the registration: the
+            compactor's delay counts from the confirmation
+         6. checkpoint the WAL at the first still-buffered or unconfirmed record
 ```
 
 A file exists for the querier only after the catalog INSERT. Three things
@@ -265,7 +267,8 @@ create table engine_file (
   services       text[] not null default '{}', -- coarse pruning summary
   summary        bytea,                        -- binary summary: small filters, min/max of promoted columns
   state          smallint not null,           -- 0 writing, 1 visible, 2 quarantined
-  created_at     timestamptz not null default now(),
+  created_at     timestamptz not null default clock_timestamp(),
+  confirmed_at   timestamptz,                 -- set by the writer once it retains the rows; null keeps the file out of compaction
   quarantined_at timestamptz
 );
 create index on engine_file (tenant_id, signal, ts_min, ts_max) where state = 1;
@@ -477,11 +480,13 @@ At every level the compactor:
 ### 7.1 L0 to L1
 
 A pass takes the oldest cold hour, across tenants: one whose visible L0
-files number at least two and all ended and were registered more than
+files number at least two and all ended, and were confirmed, more than
 `compactor.hour_close_delay_secs` ago, so the hot window has let go of them
-and late data is no longer arriving; a file's registration time is the
-moment its row was written, not the start of a transaction that may have
-waited on a lock. Hours are UTC bins of `ts_min`
+and late data is no longer arriving. The ingester confirms a registration
+in a second statement once the rows are retained in memory for it, so the
+delay never counts from a row stamp taken before a commit that came later;
+a file whose writer died before confirming keeps its hour open until the
+replay confirms it. Hours are UTC bins of `ts_min`
 whatever the session time zone, and hour and files are read in one
 repeatable-read snapshot, so a file registered meanwhile is neither counted
 nor taken. It merges the hour's oldest files up to

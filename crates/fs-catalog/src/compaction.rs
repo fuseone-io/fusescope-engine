@@ -23,9 +23,10 @@ const HOUR_BIN: &str = "date_bin('1 hour', ts_min, timestamptz '1970-01-01 00:00
 impl Catalog {
     /// The `skip`-th oldest hour, across tenants, whose visible L0 files of
     /// `signal` number at least `min_files` and are all cold: every one
-    /// ended and was registered more than `closed_for` ago on the database
-    /// clock, so nothing in the hour is still served by a hot window or
-    /// about to be joined by late data. Hour and files are read in one
+    /// ended, and was confirmed by its writer, more than `closed_for` ago on
+    /// the database clock, so nothing in the hour is still served by a hot
+    /// window or about to be joined by late data. A file not yet confirmed
+    /// keeps its hour open. Hour and files are read in one
     /// repeatable-read snapshot, so a file registered meanwhile is neither
     /// counted nor returned. `skip` lets a caller pass over hours it cannot
     /// take on.
@@ -50,7 +51,8 @@ impl Catalog {
              group by tenant_id, hour
              having count(*) >= $4
                 and max(ts_max) < now() - make_interval(secs => $5)
-                and max(created_at) < now() - make_interval(secs => $5)
+                and count(confirmed_at) = count(*)
+                and max(confirmed_at) < now() - make_interval(secs => $5)
              order by hour, tenant_id
              offset $6
              limit 1"
