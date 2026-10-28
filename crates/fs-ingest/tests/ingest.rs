@@ -827,6 +827,70 @@ async fn a_failed_confirmation_is_retried_after_its_backoff() {
     db.finish().await;
 }
 
+/// A confirmation the catalog holds takes no flush permit and does not
+/// hold the stop: the flush returns once its rows are retained, the next
+/// flush gets the only permit, and the stop cancels the held attempt,
+/// gives it back and confirms it in its last pass.
+#[tokio::test]
+async fn a_held_confirmation_holds_neither_a_flush_permit_nor_the_stop() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_flushes: 1,
+        inject_confirm_failures: 1,
+        inject_confirm_delay: Some(Duration::from_secs(30)),
+        confirm_timeout: Duration::from_secs(60),
+        confirm_interval: Duration::from_millis(50),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 7, 10), &token))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h.ingester.flush_all())
+        .await
+        .expect("a flush does not wait for its confirmation");
+    client
+        .export(authed(request("api", 8, 3), &token))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h.ingester.flush_all())
+        .await
+        .expect("a held confirmation takes no flush permit");
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 2);
+    assert_eq!(
+        h.ingester
+            .flush_stats()
+            .confirm_failures
+            .load(Ordering::Relaxed),
+        0,
+        "still held, not failed"
+    );
+    tokio::time::timeout(Duration::from_secs(5), h.stop())
+        .await
+        .expect("a held confirmation does not hold the stop");
+    assert_eq!(
+        confirmations(&db).await,
+        [true, true],
+        "the stop gave the attempt back and its last pass confirmed it"
+    );
+    db.finish().await;
+}
+
 /// Crash after the registration, before its confirmation: the checkpoint
 /// stayed behind the intent, so the restart replays the flush, meets the
 /// same row and confirms it.
@@ -1157,11 +1221,21 @@ async fn wal_full_recovers_after_checkpoint() {
     }
     assert!(refused, "the cap must be reached");
 
-    h.ingester.flush_all().await; // registers files, checkpoints, removes segments
-    client
-        .export(authed(request("api", 1, 1), &token))
-        .await
-        .expect("writes resume after the checkpoint");
+    h.ingester.flush_all().await; // registers files; the confirmations land off the flusher
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.export(authed(request("api", 1, 1), &token)).await {
+            Ok(_) => break,
+            Err(status) => {
+                assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "writes resume once the confirmations checkpointed the old segments away"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
     assert!(h.ingester.wal_bytes() < 256 * 1024);
     h.stop().await;
     db.finish().await;

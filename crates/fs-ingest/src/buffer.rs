@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
@@ -402,8 +402,21 @@ struct Unconfirmed {
     first: Position,
     attempts: u32,
     next_attempt: Instant,
-    /// An attempt is running right now; a pass must not start another.
-    in_progress: bool,
+    /// An attempt holds it true through its [`ConfirmAttempt`].
+    in_progress: Arc<AtomicBool>,
+}
+
+/// An attempt at one confirmation, taken through
+/// [`Buffers::take_confirmation`]: the entry is not taken again while this
+/// is held, and dropping it on any path, cancellation included, gives the
+/// entry back.
+#[derive(Debug)]
+pub struct ConfirmAttempt(Arc<AtomicBool>);
+
+impl Drop for ConfirmAttempt {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Copies of its inputs a flush holds while the file is prepared: the
@@ -938,7 +951,7 @@ impl Buffers {
                     first: entry.range.0,
                     attempts: 0,
                     next_attempt: now,
-                    in_progress: true,
+                    in_progress: Arc::new(AtomicBool::new(false)),
                 },
             );
             let budget = entry.buffer.bytes;
@@ -990,22 +1003,26 @@ impl Buffers {
         if let Some(entry) = self.unconfirmed.get_mut(&file) {
             entry.attempts = entry.attempts.saturating_add(1);
             entry.next_attempt = now + retry_backoff(entry.attempts);
-            entry.in_progress = false;
         }
     }
 
-    /// Up to `limit` confirmations due at `now` and not being attempted,
-    /// marked in progress until they are confirmed or fail.
-    pub fn take_confirmations(&mut self, now: Instant, limit: usize) -> Vec<(TenantId, FileId)> {
-        self.unconfirmed
-            .iter_mut()
-            .filter(|(_, e)| !e.in_progress && e.next_attempt <= now)
-            .take(limit)
-            .map(|(file, e)| {
-                e.in_progress = true;
-                (e.tenant, *file)
-            })
-            .collect()
+    /// One confirmation due at `now` and not being attempted, with the
+    /// attempt that keeps it so. Callers hold a confirmation permit before
+    /// taking, so an attempt in progress always has its call running.
+    pub fn take_confirmation(
+        &mut self,
+        now: Instant,
+    ) -> Option<(TenantId, FileId, ConfirmAttempt)> {
+        let (file, entry) = self
+            .unconfirmed
+            .iter()
+            .find(|(_, e)| !e.in_progress.load(Ordering::Acquire) && e.next_attempt <= now)?;
+        entry.in_progress.store(true, Ordering::Release);
+        Some((
+            entry.tenant,
+            *file,
+            ConfirmAttempt(entry.in_progress.clone()),
+        ))
     }
 
     /// Registered files whose confirmation has not landed.
@@ -1161,31 +1178,31 @@ mod tests {
         assert_eq!(buffers.earliest_wal(), Some(at(15)));
     }
 
-    /// A registered file waits for its confirmation with the inline attempt
-    /// in progress; a failed attempt is retried after its backoff, taken in
-    /// bounded batches, and the intent holds the checkpoint until confirmed.
+    /// A registered file is due for confirmation at once; an attempt taken
+    /// is not taken again until it is given back, which dropping it does on
+    /// any path; a failed attempt waits for its backoff; and the intent
+    /// holds the checkpoint until confirmed.
     #[test]
-    fn confirmations_are_taken_in_bounded_batches_after_their_backoff() {
+    fn confirmations_are_taken_one_at_a_time_and_given_back_when_dropped() {
         let tenant = TenantId(uuid::Uuid::from_u128(7));
         let now = Instant::now();
         let mut buffers = Buffers::default();
-        let a = FileId(uuid::Uuid::from_u128(1));
-        let b = FileId(uuid::Uuid::from_u128(2));
-        let c = FileId(uuid::Uuid::from_u128(3));
-        let files = [a, b, c];
-        for (i, file) in files.iter().enumerate() {
-            let first = 10 * (u64::try_from(i).unwrap() + 1);
-            buffers.get_mut(tenant).push(batch(1), at(first), now);
+        let files = [1, 2, 3].map(|i| FileId(uuid::Uuid::from_u128(i)));
+        let first_record = |file: FileId| at(10 * u64::try_from(file.0.as_u128()).unwrap());
+        for file in files {
+            buffers
+                .get_mut(tenant)
+                .push(batch(1), first_record(file), now);
             let (_, lease) = buffers
                 .begin_flush(
                     tenant,
-                    *file,
+                    file,
                     FileLayout::current(8),
-                    (at(first), at(first + 1)),
+                    (first_record(file), at(first_record(file).offset + 1)),
                 )
                 .unwrap();
             drop(lease);
-            buffers.finish_flush(tenant, *file, Vec::new(), now);
+            buffers.finish_flush(tenant, file, Vec::new(), now);
         }
         assert_eq!(buffers.unconfirmed_count(), 3);
         assert_eq!(
@@ -1193,27 +1210,29 @@ mod tests {
             Some(at(10)),
             "the intent holds the checkpoint"
         );
-        assert!(
-            buffers.take_confirmations(now, 8).is_empty(),
-            "the inline attempt is in progress"
-        );
-        for file in &files {
-            buffers.confirm_failed(*file, now);
-        }
-        assert!(buffers.take_confirmations(now, 8).is_empty(), "backoff");
+        let (_, f1, attempt1) = buffers.take_confirmation(now).unwrap();
+        let (_, f2, attempt2) = buffers.take_confirmation(now).unwrap();
+        let (_, f3, attempt3) = buffers.take_confirmation(now).unwrap();
+        assert!(buffers.take_confirmation(now).is_none(), "all in progress");
+        drop(attempt3);
+        let (_, again, attempt3) = buffers.take_confirmation(now).unwrap();
+        assert_eq!(again, f3, "given back when dropped");
+        buffers.confirm_failed(f3, now);
+        drop(attempt3);
+        assert!(buffers.take_confirmation(now).is_none(), "backoff");
         let later = now + Duration::from_secs(3);
-        assert_eq!(buffers.take_confirmations(later, 2).len(), 2, "bounded");
+        let (_, due, attempt3) = buffers.take_confirmation(later).unwrap();
+        assert_eq!(due, f3);
+        buffers.confirmed(f1);
+        drop(attempt1);
         assert_eq!(
-            buffers.take_confirmations(later, 2).len(),
-            1,
-            "taken entries are in progress"
+            buffers.earliest_wal(),
+            Some(first_record(f2).min(first_record(f3))),
+            "the checkpoint moves past the confirmed intent"
         );
-        assert_eq!(buffers.take_confirmations(later, 2).len(), 0);
-        buffers.confirmed(a);
-        assert_eq!(buffers.earliest_wal(), Some(at(20)));
-        buffers.confirm_failed(b, later);
-        buffers.confirmed(b);
-        buffers.confirmed(c);
+        buffers.confirmed(f2);
+        buffers.confirmed(f3);
+        drop((attempt2, attempt3));
         assert_eq!(buffers.unconfirmed_count(), 0);
         assert_eq!(buffers.earliest_wal(), None);
     }

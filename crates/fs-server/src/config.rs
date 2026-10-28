@@ -242,12 +242,13 @@ pub struct IngestSection {
     /// Files written at the same time.
     #[serde(default = "default_max_flushes")]
     pub max_flushes: usize,
-    /// Registration confirmations retried at the same time, off the flusher.
+    /// Registration confirmations attempted at the same time, off the flusher.
     #[serde(default = "default_max_confirms")]
     pub max_confirms: usize,
-    /// Most confirmations one retry pass takes.
-    #[serde(default = "default_confirm_batch")]
-    pub confirm_batch: usize,
+    /// Seconds one confirmation call may take before it counts as failed;
+    /// also bounds what a stop waits for the confirmations due.
+    #[serde(default = "default_confirm_timeout")]
+    pub confirm_timeout_secs: u64,
     /// Rows per Parquet row group; the writer holds one at a time.
     #[serde(default = "default_row_group_rows")]
     pub row_group_rows: usize,
@@ -317,7 +318,7 @@ impl Default for IngestSection {
             max_coalesces: fs_ingest::config::default_coalesces(),
             max_flushes: default_max_flushes(),
             max_confirms: default_max_confirms(),
-            confirm_batch: default_confirm_batch(),
+            confirm_timeout_secs: default_confirm_timeout(),
             row_group_rows: default_row_group_rows(),
             max_buffer_bytes: default_max_buffer_bytes(),
             max_tenant_bytes: default_max_tenant_bytes(),
@@ -391,7 +392,7 @@ impl IngestSection {
             max_coalesces: self.max_coalesces,
             max_flushes: self.max_flushes,
             max_confirms: self.max_confirms,
-            confirm_batch: self.confirm_batch,
+            confirm_timeout: std::time::Duration::from_secs(self.confirm_timeout_secs),
             row_group_rows: self.row_group_rows,
             max_buffer_bytes: self.max_buffer_bytes,
             max_tenant_bytes: self.max_tenant_bytes,
@@ -444,8 +445,8 @@ fn default_max_confirms() -> usize {
     fs_ingest::IngestConfig::default().max_confirms
 }
 
-fn default_confirm_batch() -> usize {
-    fs_ingest::IngestConfig::default().confirm_batch
+fn default_confirm_timeout() -> u64 {
+    fs_ingest::IngestConfig::default().confirm_timeout.as_secs()
 }
 
 fn default_max_flushes() -> usize {
@@ -962,10 +963,10 @@ impl Config {
             || self.ingest.max_coalesces == 0
             || self.ingest.max_flushes == 0
             || self.ingest.max_confirms == 0
-            || self.ingest.confirm_batch == 0
+            || self.ingest.confirm_timeout_secs == 0
         {
             return invalid(
-                "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces, ingest.max_flushes, ingest.max_confirms and ingest.confirm_batch must be positive",
+                "ingest.coalesce_bytes, ingest.max_conversions, ingest.max_coalesces, ingest.max_flushes, ingest.max_confirms and ingest.confirm_timeout_secs must be positive",
             );
         }
         if self.ingest.row_group_rows < 1024

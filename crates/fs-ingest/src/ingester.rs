@@ -13,14 +13,17 @@
 //! 3. Encode, upload without overwriting, register idempotently.
 //! 4. Move the rows to the persisted state, confirm the registration, so
 //!    the compactor's delay counts from after the retention began, and
-//!    checkpoint the WAL.
+//!    checkpoint the WAL: after the flush and again once the confirmation
+//!    lands, which is what lets the checkpoint pass the intent.
 //!
 //! Replay groups records under the intents found in the log, so a crash
 //! anywhere after step 2 reproduces the same file and the same catalog row;
 //! a crash before step 2 simply flushes the rows again under a new intent.
 //! The checkpoint stays behind the intent of a file not yet confirmed, so a
-//! crash before the confirmation replays the flush and confirms it; a failed
-//! confirmation is retried off the flusher, in bounded batches with backoff.
+//! crash before the confirmation replays the flush and confirms it. The
+//! confirmation runs off the flusher: a flush returns once its rows are
+//! retained, and the confirmer attempts each confirmation on its own permit,
+//! with a timeout and backoff, giving an attempt back when it is cancelled.
 //! After step 2 a failure of any later step keeps the rows bound to the same
 //! id and retries them unchanged: an id has exactly one possible content.
 
@@ -38,11 +41,12 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use prost::Message;
 use tokio::sync::{Mutex, Notify, RwLock, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::buffer::{Buffers, Reservation, Snapshot, TenantBuffer};
+use crate::buffer::{Buffers, ConfirmAttempt, Reservation, Snapshot, TenantBuffer};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
 use crate::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
@@ -210,9 +214,11 @@ pub struct Shared {
     gate: RwLock<()>,
     flush_now: Notify,
     coalesce_now: Notify,
+    confirm_now: Notify,
     conversions: tokio::sync::Semaphore,
     coalesces: Arc<tokio::sync::Semaphore>,
     flushes: Arc<tokio::sync::Semaphore>,
+    confirms: Arc<tokio::sync::Semaphore>,
     inject_register_failures: std::sync::atomic::AtomicU32,
     inject_confirm_failures: std::sync::atomic::AtomicU32,
     inject_index_failures: std::sync::atomic::AtomicU32,
@@ -444,7 +450,7 @@ impl Shared {
                     self.publish_unconfirmed(&buffers);
                     drop(held);
                 }
-                self.confirm(tenant, file_id).await;
+                self.confirm_now.notify_one();
                 if self.config.checkpoint_after_flush {
                     self.checkpoint_wal().await;
                 }
@@ -639,47 +645,104 @@ impl Shared {
         Ok(())
     }
 
-    /// Confirms the registration of `file` now that its rows are retained
-    /// in the persisted state. A failure leaves the checkpoint behind the
-    /// file's intent and schedules a retry with backoff; the replay after a
-    /// restart confirms what was left.
-    async fn confirm(&self, tenant: TenantId, file: FileId) {
-        let outcome = if take_injected(&self.inject_confirm_failures) {
-            Err(IngestError::Injected("catalog confirmation"))
-        } else {
+    /// One attempt at confirming the registration of `file`, whose rows
+    /// are retained in the persisted state, within `confirm_timeout`. A
+    /// failure leaves the checkpoint behind the file's intent and schedules
+    /// a retry with backoff; `shutdown` cancels the attempt, which gives the
+    /// entry back untouched.
+    async fn confirm(
+        &self,
+        tenant: TenantId,
+        file: FileId,
+        attempt: ConfirmAttempt,
+        mut shutdown: Option<watch::Receiver<bool>>,
+    ) {
+        let call = async {
+            if take_injected(&self.inject_confirm_failures) {
+                if let Some(delay) = self.config.inject_confirm_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                return Err(IngestError::Injected("catalog confirmation"));
+            }
             self.catalog
                 .confirm_file(file)
                 .await
                 .map_err(IngestError::from)
         };
+        let cancelled = async {
+            match shutdown.as_mut() {
+                Some(shutdown) => {
+                    let _ = shutdown.changed().await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+        let outcome = tokio::select! {
+            outcome = tokio::time::timeout(self.config.confirm_timeout, call) => outcome,
+            () = cancelled => return,
+        };
         let mut buffers = self.buffers.lock().await;
+        let confirmed = matches!(outcome, Ok(Ok(())));
         match outcome {
-            Ok(()) => buffers.confirmed(file),
-            Err(e) => {
+            Ok(Ok(())) => buffers.confirmed(file),
+            Ok(Err(e)) => {
                 buffers.confirm_failed(file, Instant::now());
                 self.flush_stats
                     .confirm_failures
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(tenant = %tenant.0, file = %file.0, error = %e, "registration not confirmed; will retry");
             }
+            Err(_) => {
+                buffers.confirm_failed(file, Instant::now());
+                self.flush_stats
+                    .confirm_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(tenant = %tenant.0, file = %file.0, "confirmation timed out; will retry");
+            }
         }
         self.publish_unconfirmed(&buffers);
+        drop(buffers);
+        drop(attempt);
+        if confirmed && self.config.checkpoint_after_flush {
+            self.checkpoint_wal().await;
+        }
     }
 
-    /// Retries the confirmations due, at most `confirm_batch` of them and
-    /// `max_confirms` at a time, so a catalog that is down costs one bounded
-    /// pass per interval and never holds a flush.
-    async fn confirm_due(&self) {
-        let due = self
-            .buffers
-            .lock()
-            .await
-            .take_confirmations(Instant::now(), self.config.confirm_batch);
-        futures_util::StreamExt::for_each_concurrent(
-            futures_util::stream::iter(due),
-            self.config.max_confirms,
-            |(tenant, file)| self.confirm(tenant, file),
-        )
+    /// Starts an attempt for every confirmation due while a permit is free,
+    /// each on its own task in `attempts`: a permit is taken before an
+    /// entry, so an entry in progress always has its call running, and the
+    /// pass itself never waits on the catalog.
+    async fn confirm_due(
+        self: &Arc<Self>,
+        shutdown: Option<&watch::Receiver<bool>>,
+        attempts: &mut JoinSet<()>,
+    ) {
+        loop {
+            let Ok(permit) = self.confirms.clone().try_acquire_owned() else {
+                break;
+            };
+            let taken = self.buffers.lock().await.take_confirmation(Instant::now());
+            let Some((tenant, file, attempt)) = taken else {
+                break;
+            };
+            let shared = self.clone();
+            let shutdown = shutdown.cloned();
+            attempts.spawn(async move {
+                shared.confirm(tenant, file, attempt, shutdown).await;
+                drop(permit);
+            });
+        }
+    }
+
+    /// One pass over the confirmations due, waited for up to
+    /// `confirm_timeout`: a stop leaves nothing to the replay that a
+    /// reachable catalog could take now.
+    async fn confirm_remaining(self: &Arc<Self>) {
+        let mut attempts = JoinSet::new();
+        self.confirm_due(None, &mut attempts).await;
+        let _ = tokio::time::timeout(self.config.confirm_timeout, async {
+            while attempts.join_next().await.is_some() {}
+        })
         .await;
     }
 
@@ -1136,6 +1199,7 @@ impl Ingester {
         let instance = wal.instance_id();
         let config_injected = config.inject_register_failures;
         let config_confirm_injected = config.inject_confirm_failures;
+        let config_confirms = config.max_confirms;
         let config_index_injected = config.inject_index_failures;
         let config_conversions = config.max_conversions;
         let config_coalesces = config.max_coalesces;
@@ -1156,6 +1220,7 @@ impl Ingester {
             buffers: Mutex::new(buffers),
             gate: RwLock::new(()),
             flush_now: Notify::new(),
+            confirm_now: Notify::new(),
             coalesce_now: Notify::new(),
             conversions: tokio::sync::Semaphore::new(
                 config_conversions.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
@@ -1164,6 +1229,7 @@ impl Ingester {
                 config_coalesces.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             )),
             flushes: Arc::new(tokio::sync::Semaphore::new(flush_permits(config_flushes))),
+            confirms: Arc::new(tokio::sync::Semaphore::new(config_confirms)),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             inject_confirm_failures: std::sync::atomic::AtomicU32::new(config_confirm_injected),
             inject_index_failures: std::sync::atomic::AtomicU32::new(config_index_injected),
@@ -1290,12 +1356,19 @@ impl Ingester {
             }
         };
 
+        // Dropping `attempts` at the end cancels the calls still running;
+        // each gives its entry back.
         let shared = self.shared.clone();
         let confirmer = async move {
             let mut tick = tokio::time::interval(shared.config.confirm_interval);
+            let mut attempts = JoinSet::new();
             loop {
                 tokio::select! {
-                    _ = tick.tick() => shared.confirm_due().await,
+                    _ = tick.tick() => shared.confirm_due(Some(&shutdown), &mut attempts).await,
+                    () = shared.confirm_now.notified() => {
+                        shared.confirm_due(Some(&shutdown), &mut attempts).await;
+                    }
+                    Some(_) = attempts.join_next(), if !attempts.is_empty() => {}
                     _ = shutdown.changed() => break,
                 }
             }
@@ -1306,6 +1379,7 @@ impl Ingester {
         hot_result?;
         info!("otlp server stopped, flushing buffers");
         self.flush_all().await;
+        self.shared.confirm_remaining().await;
         let wal = self.shared.wal.clone();
         tokio::task::spawn_blocking(move || {
             wal.lock()

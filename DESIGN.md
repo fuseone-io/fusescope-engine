@@ -105,7 +105,8 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
          4. INSERT into the catalog with state "visible"
          5. retain the rows in memory, then confirm the registration: the
             compactor's delay counts from the confirmation
-         6. checkpoint the WAL at the first still-buffered or unconfirmed record
+         6. checkpoint the WAL at the first still-buffered or unconfirmed
+            record, after the flush and again once the confirmation lands
 ```
 
 A file exists for the querier only after the catalog INSERT. Three things
@@ -486,10 +487,13 @@ and late data is no longer arriving. The ingester confirms a registration
 in a second statement once the rows are retained in memory for it, so the
 delay never counts from a row stamp taken before a commit that came later;
 a file whose writer died before confirming keeps its hour open until the
-replay confirms it. A confirmation that fails is retried off the flusher,
-`ingest.confirm_batch` per interval and `ingest.max_confirms` at a time
-with the flush backoff, so a catalog that is down never holds a flush; the
-pending count is the `fusescope_flush_unconfirmed` gauge. A confirmation
+replay confirms it. The confirmation runs off the flusher: a flush returns
+once its rows are retained, and the confirmer attempts each confirmation
+on one of `ingest.max_confirms` permits, within `ingest.confirm_timeout_secs`,
+with the flush backoff after a failure, so a catalog that is down never
+holds a flush or a stop; an attempt cancelled by the stop gives its entry
+back, and the stop makes one last pass, waited for the timeout at most.
+The pending count is the `fusescope_flush_unconfirmed` gauge. A confirmation
 changes nothing a querier reads, so the catalog does not announce it: the
 change notification fires for the columns queriers read, and a column
 added for them is added to the trigger. Hours are UTC bins of `ts_min`

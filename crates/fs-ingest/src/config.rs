@@ -69,10 +69,10 @@ pub struct IngestConfig {
     /// cover the querier's file cache TTL plus one hot scan: the querier
     /// scans the hot window first and lists files after.
     pub persisted_retain: Duration,
-    /// Confirmations retried at the same time, off the flusher.
+    /// Confirmations attempted at the same time, off the flusher.
     pub max_confirms: usize,
-    /// Most confirmations one retry pass takes.
-    pub confirm_batch: usize,
+    /// How long one confirmation call may take before it counts as failed.
+    pub confirm_timeout: Duration,
     /// How often confirmations due for a retry are looked for.
     pub confirm_interval: Duration,
     /// Advance the WAL checkpoint after a successful flush. Always true in
@@ -86,6 +86,9 @@ pub struct IngestConfig {
     /// the file is registered. Zero in production; tests use it to crash or
     /// retry between the registration and its confirmation.
     pub inject_confirm_failures: u32,
+    /// Hold each injected confirmation failure this long before failing.
+    /// `None` in production; tests use it to act while an attempt is held.
+    pub inject_confirm_delay: Option<Duration>,
     /// Make this many trace index uploads fail artificially, after the
     /// Parquet object is in the bucket. Zero in production; tests use it to
     /// crash between the two uploads.
@@ -132,11 +135,12 @@ impl Default for IngestConfig {
             hot_listen: None,
             persisted_retain: Duration::from_secs(8),
             max_confirms: 4,
-            confirm_batch: 64,
+            confirm_timeout: Duration::from_secs(10),
             confirm_interval: Duration::from_secs(1),
             checkpoint_after_flush: true,
             inject_register_failures: 0,
             inject_confirm_failures: 0,
+            inject_confirm_delay: None,
             inject_index_failures: 0,
             inject_register_delay: None,
             inject_push_delay: None,
