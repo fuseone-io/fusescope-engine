@@ -646,7 +646,7 @@ async fn a_fenced_swap_is_serialised_with_takeovers() {
                 .unwrap()
         }
     });
-    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    wait_for_lock_waiter(&db.catalog).await;
     assert!(!takeover.is_finished(), "the takeover waits for the swap");
     holding.commit().await.unwrap();
     assert_eq!(
@@ -674,7 +674,7 @@ async fn a_fenced_swap_is_serialised_with_takeovers() {
                 .await
         }
     });
-    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    wait_for_lock_waiter(&db.catalog).await;
     assert!(!swap.is_finished(), "the swap waits for the takeover");
     taking.commit().await.unwrap();
     let err = swap.await.unwrap().unwrap_err();
@@ -694,6 +694,35 @@ async fn a_fenced_swap_is_serialised_with_takeovers() {
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id, input.id, "nothing published");
     db.finish().await;
+}
+
+/// Waits until some backend is blocked on a lock while holding a lock on
+/// this schema's `engine_lease`, so the test knows the task reached the
+/// row rather than assuming it from a sleep. Panics after five seconds:
+/// nothing waited, so nothing was serialised.
+async fn wait_for_lock_waiter(catalog: &Catalog) {
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
+    loop {
+        let (waiting,): (i64,) = sqlx::query_as(
+            "select count(*) from pg_stat_activity a
+             where a.wait_event_type = 'Lock'
+               and exists (
+                   select 1 from pg_locks l
+                   where l.pid = a.pid and l.relation = 'engine_lease'::regclass
+               )",
+        )
+        .fetch_one(catalog.pool())
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no backend ever waited on the lease row"
+        );
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
