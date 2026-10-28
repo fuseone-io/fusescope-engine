@@ -853,10 +853,12 @@ impl Config {
         // never cover rows the hot window still serves under the L0's: an
         // hour closes only after the retention, a query and a file cache
         // refresh could all have ended.
-        let hot_may_serve = self.ingest.persisted_retain_secs
-            + self.query.timeout_secs
-            + fs_query::files::STALE_AFTER.as_secs();
-        if self.compactor.hour_close_delay_secs < hot_may_serve {
+        let hot_may_serve = self
+            .ingest
+            .persisted_retain_secs
+            .checked_add(self.query.timeout_secs)
+            .and_then(|s| s.checked_add(fs_query::files::STALE_AFTER.as_secs()));
+        if hot_may_serve.is_none_or(|floor| self.compactor.hour_close_delay_secs < floor) {
             return invalid(
                 "compactor.hour_close_delay_secs must cover ingest.persisted_retain_secs plus query.timeout_secs plus the querier's file cache TTL",
             );
@@ -1104,6 +1106,10 @@ mod tests {
         for (bad, key) in [
             ("sweep_delete_backoff_secs = 0", "sweep_"),
             ("hour_close_delay_secs = 10", "hour_close_delay_secs"),
+            (
+                "hour_close_delay_secs = 18446744073709551615\n[query]\ntimeout_secs = 18446744073709551615",
+                "hour_close_delay_secs",
+            ),
         ] {
             let err = Config::parse(&format!(
                 "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"

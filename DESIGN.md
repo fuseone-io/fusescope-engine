@@ -479,7 +479,9 @@ At every level the compactor:
 A pass takes the oldest cold hour, across tenants: one whose visible L0
 files number at least two and all ended and were registered more than
 `compactor.hour_close_delay_secs` ago, so the hot window has let go of them
-and late data is no longer arriving. Hours are UTC bins of `ts_min`
+and late data is no longer arriving; a file's registration time is the
+moment its row was written, not the start of a transaction that may have
+waited on a lock. Hours are UTC bins of `ts_min`
 whatever the session time zone, and hour and files are read in one
 repeatable-read snapshot, so a file registered meanwhile is neither counted
 nor taken. It merges the hour's oldest files up to
