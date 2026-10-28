@@ -991,6 +991,9 @@ impl Config {
         if self.ingest.wal_queue_records > tokio::sync::Semaphore::MAX_PERMITS {
             return invalid("ingest.wal_queue_records is larger than the runtime can track");
         }
+        if self.ingest.max_confirms > tokio::sync::Semaphore::MAX_PERMITS {
+            return invalid("ingest.max_confirms is larger than the runtime can track");
+        }
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
             || self.query.memory_bytes < 64 * 1024 * 1024
@@ -1280,6 +1283,29 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("wal_queue")
+        );
+    }
+
+    #[test]
+    fn max_confirms_is_bounded_by_what_the_runtime_can_track() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let with = |max_confirms: usize| {
+            Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[ingest]\nmax_confirms = {max_confirms}\n"
+            ))
+            .unwrap()
+        };
+        let most = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(with(most).validate(&secrets).is_ok());
+        assert!(
+            with(most + 1)
+                .validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("max_confirms")
         );
     }
 

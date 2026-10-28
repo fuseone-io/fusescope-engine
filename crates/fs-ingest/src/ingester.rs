@@ -164,6 +164,12 @@ fn flush_permits(max_flushes: usize) -> usize {
     max_flushes.clamp(1, u32::MAX as usize / 4)
 }
 
+/// Permits of the confirmation semaphore for a configured `max_confirms`,
+/// within what the runtime can track.
+fn confirm_permits(max_confirms: usize) -> usize {
+    max_confirms.clamp(1, tokio::sync::Semaphore::MAX_PERMITS)
+}
+
 /// One flush attempt handed to its task: the rows as cut, the scratch lease
 /// held for them and the layout the intent recorded.
 struct Attempt {
@@ -1234,7 +1240,9 @@ impl Ingester {
                 config_coalesces.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
             )),
             flushes: Arc::new(tokio::sync::Semaphore::new(flush_permits(config_flushes))),
-            confirms: Arc::new(tokio::sync::Semaphore::new(config_confirms)),
+            confirms: Arc::new(tokio::sync::Semaphore::new(confirm_permits(
+                config_confirms,
+            ))),
             inject_register_failures: std::sync::atomic::AtomicU32::new(config_injected),
             inject_confirm_failures: std::sync::atomic::AtomicU32::new(config_confirm_injected),
             inject_index_failures: std::sync::atomic::AtomicU32::new(config_index_injected),
@@ -1408,8 +1416,19 @@ mod tests {
     use fs_catalog::{FileId, TenantId};
     use fs_wal::Position;
 
-    use super::{Replayed, rebuild};
+    use super::{Replayed, confirm_permits, rebuild};
     use crate::record::FlushIntent;
+
+    #[test]
+    fn confirm_permits_stay_within_what_the_runtime_can_track() {
+        let most = tokio::sync::Semaphore::MAX_PERMITS;
+        assert_eq!(confirm_permits(0), 1);
+        assert_eq!(confirm_permits(4), 4);
+        assert_eq!(confirm_permits(most), most);
+        assert_eq!(confirm_permits(most + 1), most);
+        assert_eq!(confirm_permits(usize::MAX), most);
+        let _ = tokio::sync::Semaphore::new(confirm_permits(usize::MAX));
+    }
 
     fn batch(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
