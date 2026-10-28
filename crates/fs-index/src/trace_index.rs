@@ -59,6 +59,9 @@ impl TraceIndex {
         if files.iter().any(|f| u16::try_from(f.len()).is_err()) {
             return Err(IndexError::TooLarge("file path"));
         }
+        if has_duplicates(&files) {
+            return Err(IndexError::BadBody("duplicate file path"));
+        }
         let mut entries: Vec<Entry> = pairs
             .into_iter()
             .map(|(trace, file)| {
@@ -92,7 +95,36 @@ impl TraceIndex {
 
     /// Heap bytes the decoded index holds, for a cache budget.
     pub fn heap_bytes(&self) -> usize {
-        self.entries.len() * ENTRY_LEN + self.files.iter().map(|f| f.len() + 24).sum::<usize>()
+        heap_bytes(self.files.iter().map(String::len), self.entries.len())
+    }
+
+    /// Heap bytes [`decode`](Self::decode) would allocate for `bytes`,
+    /// found by walking the frame without allocating, so a reader can
+    /// reserve them first. Checks everything `decode` checks except the
+    /// entries' order and file indexes.
+    ///
+    /// # Errors
+    /// Any header or framing check that fails.
+    pub fn heap_bytes_of(bytes: &[u8]) -> Result<usize, IndexError> {
+        let body = frame(bytes)?;
+        let mut cursor = Cursor { bytes: body, at: 0 };
+        let file_count = cursor.u32()? as usize;
+        let mut paths = 0usize;
+        for _ in 0..file_count {
+            let len = cursor.u16()? as usize;
+            cursor.take(len)?;
+            paths += len;
+        }
+        let entry_count = cursor.u32()? as usize;
+        cursor.take(
+            entry_count
+                .checked_mul(ENTRY_LEN)
+                .ok_or(IndexError::BadBody("count past the end"))?,
+        )?;
+        if cursor.at != body.len() {
+            return Err(IndexError::BadBody("trailing bytes"));
+        }
+        Ok(entry_count * ENTRY_LEN + paths + file_count * STRING_OVERHEAD)
     }
 
     /// Files holding `trace`, in index order.
@@ -173,25 +205,7 @@ impl TraceIndex {
     /// # Errors
     /// Any header or body check that fails; see [`IndexError`].
     pub fn decode(bytes: &[u8]) -> Result<Self, IndexError> {
-        let (header, body) = bytes
-            .split_at_checked(HEADER_LEN)
-            .ok_or(IndexError::BadMagic)?;
-        if header.get(..6) != Some(MAGIC.as_slice()) {
-            return Err(IndexError::BadMagic);
-        }
-        let version = *header.get(6).ok_or(IndexError::BadMagic)?;
-        if version != VERSION {
-            return Err(IndexError::UnknownVersion(version));
-        }
-        let declared = u64::from(read_u32(header, 8).ok_or(IndexError::BadMagic)?);
-        let present = body.len() as u64;
-        if declared != present {
-            return Err(IndexError::BadLength { declared, present });
-        }
-        let expected = read_u64(header, 12).ok_or(IndexError::BadMagic)?;
-        if checksum(body) != expected {
-            return Err(IndexError::ChecksumMismatch);
-        }
+        let body = frame(bytes)?;
         let mut cursor = Cursor { bytes: body, at: 0 };
         let file_count = cursor.u32()? as usize;
         let mut files = Vec::with_capacity(file_count.min(1 << 16));
@@ -200,6 +214,9 @@ impl TraceIndex {
             let raw = cursor.take(len)?;
             let path = std::str::from_utf8(raw).map_err(|_| IndexError::BadBody("path"))?;
             files.push(path.to_owned());
+        }
+        if has_duplicates(&files) {
+            return Err(IndexError::BadBody("duplicate file path"));
         }
         let entry_count = cursor.u32()? as usize;
         let mut entries = Vec::with_capacity(entry_count.min(1 << 20));
@@ -236,6 +253,42 @@ pub fn sidecar_path(parquet: &str) -> Option<String> {
         return None;
     }
     Some(format!("{prefix}/traces/index/trace_id/{partition}.tix"))
+}
+
+/// The body of a framed sidecar, after every header check.
+fn frame(bytes: &[u8]) -> Result<&[u8], IndexError> {
+    let (header, body) = bytes
+        .split_at_checked(HEADER_LEN)
+        .ok_or(IndexError::BadMagic)?;
+    if header.get(..6) != Some(MAGIC.as_slice()) {
+        return Err(IndexError::BadMagic);
+    }
+    let version = *header.get(6).ok_or(IndexError::BadMagic)?;
+    if version != VERSION {
+        return Err(IndexError::UnknownVersion(version));
+    }
+    let declared = u64::from(read_u32(header, 8).ok_or(IndexError::BadMagic)?);
+    let present = body.len() as u64;
+    if declared != present {
+        return Err(IndexError::BadLength { declared, present });
+    }
+    let expected = read_u64(header, 12).ok_or(IndexError::BadMagic)?;
+    if checksum(body) != expected {
+        return Err(IndexError::ChecksumMismatch);
+    }
+    Ok(body)
+}
+
+/// Bytes of one `String` beyond its characters.
+const STRING_OVERHEAD: usize = 24;
+
+fn heap_bytes(path_lens: impl Iterator<Item = usize>, entries: usize) -> usize {
+    entries * ENTRY_LEN + path_lens.map(|len| len + STRING_OVERHEAD).sum::<usize>()
+}
+
+fn has_duplicates(files: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(files.len());
+    files.iter().any(|f| !seen.insert(f.as_str()))
 }
 
 fn checksum(body: &[u8]) -> u64 {
@@ -346,6 +399,51 @@ mod tests {
     fn a_file_index_without_a_file_is_refused() {
         let err = TraceIndex::new(vec!["f".into()], [(trace(1), 1)]).unwrap_err();
         assert_eq!(err, IndexError::BadBody("file index without a file"));
+    }
+
+    #[test]
+    fn duplicate_paths_are_refused_by_the_builder_and_the_decoder() {
+        let err = TraceIndex::new(vec!["f".into(), "f".into()], [(trace(1), 1)]).unwrap_err();
+        assert_eq!(err, IndexError::BadBody("duplicate file path"));
+
+        // Hand-framed: two files named alike, one entry pointing at the second.
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.push(b'f');
+        }
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&trace(1));
+        body.extend_from_slice(&1u32.to_le_bytes());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(VERSION);
+        bytes.push(0);
+        bytes.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&checksum(&body).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        assert_eq!(
+            TraceIndex::decode(&bytes).unwrap_err(),
+            IndexError::BadBody("duplicate file path")
+        );
+    }
+
+    #[test]
+    fn the_heap_of_a_frame_is_known_before_decoding_it() {
+        let index = sample();
+        let bytes = index.encode();
+        assert_eq!(
+            TraceIndex::heap_bytes_of(&bytes).unwrap(),
+            index.heap_bytes()
+        );
+        let mut flipped = bytes.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xff;
+        assert_eq!(
+            TraceIndex::heap_bytes_of(&flipped).unwrap_err(),
+            IndexError::ChecksumMismatch
+        );
     }
 
     #[test]
