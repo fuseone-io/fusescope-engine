@@ -18,9 +18,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, Utc};
 use fs_catalog::{FileId, TenantId};
 use fs_wal::Position;
 
+use crate::IngestError;
 use crate::record::FileLayout;
 
 /// Why an entry is in the buffer.
@@ -155,6 +157,52 @@ impl TenantBuffer {
         self.entries.is_empty()
     }
 
+    /// The rows of `hour`, entry by entry at the same positions. A chunk's
+    /// trace set is kept as it is, a bound for the part. Entries taken by a
+    /// coalesce are plain requests in the part: the chunk, if it finishes,
+    /// finds no rows to replace and is dropped.
+    ///
+    /// # Errors
+    /// Rows without the span timestamp column.
+    pub fn part_in_hour(&self, hour: DateTime<Utc>) -> Result<TenantBuffer, IngestError> {
+        let mut part = TenantBuffer {
+            oldest: self.oldest,
+            ..TenantBuffer::default()
+        };
+        for entry in &self.entries {
+            let batch = crate::hours::rows_in_hour(&entry.batch, hour)?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let kind = match entry.kind {
+                Kind::Chunk => Kind::Chunk,
+                Kind::Request | Kind::Coalescing(_) => Kind::Request,
+            };
+            let bytes = batch.get_array_memory_size()
+                + match &entry.traces {
+                    Some(_) => trace_set_bytes(&entry.traces),
+                    None => trace_set_bound(batch.num_rows()),
+                };
+            part.rows += batch.num_rows();
+            part.bytes += bytes;
+            part.first_wal = Some(
+                part.first_wal
+                    .map_or(entry.position, |f| f.min(entry.position)),
+            );
+            if kind == Kind::Request {
+                part.requests += 1;
+            }
+            part.entries.push(Entry {
+                position: entry.position,
+                bytes,
+                kind,
+                batch,
+                traces: entry.traces.clone(),
+            });
+        }
+        Ok(part)
+    }
+
     /// The batches in position order. Shared, not copied.
     pub fn batches(&self) -> Vec<RecordBatch> {
         self.entries.iter().map(|e| e.batch.clone()).collect()
@@ -198,6 +246,7 @@ impl TenantBuffer {
         }
         earlier.entries.append(&mut self.entries);
         self.entries = earlier.entries;
+        self.entries.sort_by_key(|e| e.position);
         self.requests += earlier.requests;
         self.rows += earlier.rows;
         self.bytes += earlier.bytes;
@@ -384,6 +433,9 @@ pub struct Flushing {
     /// id: what the hot window announces, so a querier excludes the file
     /// however it is registered.
     pub origin: FileId,
+    /// The hour the rows were cut into, when the buffer spanned hours; a
+    /// superseding intent carries it on.
+    pub hour: Option<DateTime<Utc>>,
 }
 
 impl Flushing {
@@ -417,6 +469,34 @@ impl Drop for ConfirmAttempt {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+/// What a durable intent binds its rows to: the id, the record range, the
+/// layout and, for a buffer cut by hour, the hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bound {
+    /// Id the file will have.
+    pub file: FileId,
+    /// The records the intent covers, `[first, end)`.
+    pub range: (Position, Position),
+    /// Layout the intent recorded; `None` for intents logged before layouts
+    /// were recorded.
+    pub layout: Option<FileLayout>,
+    /// The hour the rows were cut into, when the buffer spanned hours.
+    pub hour: Option<DateTime<Utc>>,
+}
+
+/// One of the flushes a buffer spanning hours is cut into.
+#[derive(Debug)]
+pub struct FlushPart {
+    /// Id the file will have.
+    pub file: FileId,
+    /// The hour its rows fall in.
+    pub hour: DateTime<Utc>,
+    /// The rows, in position order.
+    pub batches: Vec<RecordBatch>,
+    /// Scratch held for the attempt.
+    pub held: Scratch,
 }
 
 /// Copies of its inputs a flush holds while the file is prepared: the
@@ -799,8 +879,87 @@ impl Buffers {
             layout: Some(layout),
             range,
             origin: file,
+            hour: None,
         });
         Some((batches, lease))
+    }
+
+    /// [`begin_flush`](Self::begin_flush) for a buffer whose rows span
+    /// hours: one flush per `(file, hour)` in `parts`, each holding the
+    /// rows of its hour at their positions, with its own scratch. Every
+    /// row must fall in one of the hours; otherwise nothing is cut.
+    ///
+    /// # Errors
+    /// Rows without the span timestamp column, or outside every hour.
+    pub fn begin_flush_split(
+        &mut self,
+        tenant: TenantId,
+        layout: FileLayout,
+        range: (Position, Position),
+        parts: &[(FileId, DateTime<Utc>)],
+    ) -> Result<Option<Vec<FlushPart>>, IngestError> {
+        let Some(buffer) = self.tenants.remove(&tenant).filter(|b| !b.is_empty()) else {
+            return Ok(None);
+        };
+        let split = parts
+            .iter()
+            .map(|(file, hour)| buffer.part_in_hour(*hour).map(|part| (*file, *hour, part)))
+            .collect::<Result<Vec<_>, _>>();
+        let split = match split {
+            Ok(split) if split.iter().map(|(_, _, p)| p.rows).sum::<usize>() == buffer.rows => {
+                split
+            }
+            Ok(_) => {
+                self.get_mut(tenant).restore(buffer);
+                return Err(IngestError::Encode(
+                    "rows outside every hour of the cut".into(),
+                ));
+            }
+            Err(e) => {
+                self.get_mut(tenant).restore(buffer);
+                return Err(e);
+            }
+        };
+        let mut cut = Vec::with_capacity(split.len());
+        for (file, hour, part) in split {
+            if part.is_empty() {
+                continue;
+            }
+            let batches = part.batches();
+            let held = self.hold_scratch(part.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
+            self.flushing.entry(tenant).or_default().push(Flushing {
+                file,
+                buffer: part,
+                attempts: 0,
+                next_attempt: Instant::now(),
+                in_progress: true,
+                detached: 0,
+                layout: Some(layout),
+                range,
+                origin: file,
+                hour: Some(hour),
+            });
+            cut.push(FlushPart {
+                file,
+                hour,
+                batches,
+                held,
+            });
+        }
+        Ok(Some(cut))
+    }
+
+    /// The hours the live rows of `tenant` fall in.
+    ///
+    /// # Errors
+    /// Rows without the span timestamp column.
+    pub fn live_hours(&self, tenant: TenantId) -> Result<Vec<DateTime<Utc>>, IngestError> {
+        let batches = self
+            .tenants
+            .get(&tenant)
+            .map(TenantBuffer::batches)
+            .unwrap_or_default();
+        Ok(crate::hours::hours_in(&batches)?.into_iter().collect())
     }
 
     /// Registers rows recovered from the WAL that an intent had already
@@ -808,39 +967,39 @@ impl Buffers {
     pub fn insert_flushing(
         &mut self,
         tenant: TenantId,
-        file: FileId,
+        bound: Bound,
         buffer: TenantBuffer,
-        layout: Option<FileLayout>,
-        range: (Position, Position),
         origin: FileId,
     ) {
         if !buffer.is_empty() {
             self.flushing.entry(tenant).or_default().push(Flushing {
-                file,
+                file: bound.file,
                 buffer,
                 attempts: 0,
                 next_attempt: Instant::now(),
                 in_progress: false,
                 detached: 0,
-                layout,
-                range,
+                layout: bound.layout,
+                range: bound.range,
                 origin,
+                hour: bound.hour,
             });
         }
     }
 
     /// The records and layout the pending flush of `file` covers, for an
     /// intent that gives the same rows another id.
-    pub fn flushing_range(
-        &self,
-        tenant: TenantId,
-        file: FileId,
-    ) -> Option<((Position, Position), Option<FileLayout>)> {
+    pub fn flushing_range(&self, tenant: TenantId, file: FileId) -> Option<Bound> {
         self.flushing
             .get(&tenant)?
             .iter()
             .find(|f| f.file == file)
-            .map(|f| (f.range, f.layout))
+            .map(|f| Bound {
+                file: f.file,
+                range: f.range,
+                layout: f.layout,
+                hour: f.hour,
+            })
     }
 
     /// Gives the pending flush of `old` the id `new`, keeping its rows,
@@ -1140,6 +1299,119 @@ mod tests {
         Position { segment: 1, offset }
     }
 
+    /// 2026-10-22T14:00:00Z.
+    const H14: u64 = 1_792_677_600_000_000_000;
+    const HOUR: u64 = 3_600_000_000_000;
+
+    fn span_batch(timestamps: &[u64]) -> RecordBatch {
+        use fs_schema::limits::Limits;
+        use fs_schema::spans::SpanBatchBuilder;
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let spans = timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| Span {
+                trace_id: vec![1; 16],
+                span_id: vec![u8::try_from(i).unwrap() + 1; 8],
+                name: format!("op-{i}"),
+                kind: 2,
+                start_time_unix_nano: *ts,
+                end_time_unix_nano: *ts + 1_000,
+                ..Span::default()
+            })
+            .collect();
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue("api".into())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut builder = SpanBatchBuilder::new(Limits::default());
+        builder.append_request(&request).unwrap();
+        builder.finish().unwrap()
+    }
+
+    /// A buffer spanning hours is cut into one flush per hour, each with
+    /// the rows of its hour at their positions and its own scratch; an
+    /// aborted part goes back to the live rows in position order.
+    #[test]
+    fn a_buffer_spanning_hours_is_cut_into_one_flush_per_hour() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let f14 = FileId(uuid::Uuid::from_u128(0x14));
+        let f15 = FileId(uuid::Uuid::from_u128(0x15));
+        let hour = |nanos: u64| crate::hours::hour_of(i64::try_from(nanos).unwrap());
+        let mut buffers = Buffers::default();
+        buffers
+            .get_mut(tenant)
+            .push(span_batch(&[H14 + 1, H14 + HOUR + 1]), at(10), now);
+        buffers
+            .get_mut(tenant)
+            .push(span_batch(&[H14 + 2]), at(20), now);
+        buffers
+            .get_mut(tenant)
+            .push(span_batch(&[H14 + HOUR + 2]), at(30), now);
+        assert_eq!(
+            buffers.live_hours(tenant).unwrap(),
+            [hour(H14), hour(H14 + HOUR)]
+        );
+        let scratch_before = buffers.scratch_total();
+
+        let parts = [(f14, hour(H14)), (f15, hour(H14 + HOUR))];
+        let cut = buffers
+            .begin_flush_split(tenant, FileLayout::current(8), (at(10), at(40)), &parts)
+            .unwrap()
+            .unwrap();
+        let rows =
+            |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let [part14, part15]: [FlushPart; 2] = cut.try_into().unwrap();
+        assert_eq!(rows(&part14.batches), 2);
+        assert_eq!(rows(&part15.batches), 2);
+        assert_eq!(part14.file, f14);
+        assert!(
+            buffers.scratch_total() > scratch_before,
+            "scratch held per part"
+        );
+        assert_eq!(buffers.live_first_wal(tenant), None);
+        let bound = buffers.flushing_range(tenant, f15).unwrap();
+        assert_eq!(bound.range, (at(10), at(40)));
+        assert_eq!(bound.hour, Some(hour(H14 + HOUR)));
+        assert_eq!(
+            buffers.earliest_wal(),
+            Some(at(10)),
+            "both parts start at the first record"
+        );
+
+        // The second part's intent could not be logged: its rows are live
+        // again, before and between the first part's positions.
+        buffers.abort_flush(tenant, f15);
+        drop((part14, part15));
+        assert_eq!(buffers.live_first_wal(tenant), Some(at(10)));
+        let live = buffers.snapshot(tenant).live;
+        assert_eq!(live.iter().map(|b| b.batch.num_rows()).sum::<usize>(), 2);
+        assert_eq!(buffers.live_hours(tenant).unwrap(), [hour(H14 + HOUR)]);
+        assert!(buffers.flushing_range(tenant, f14).is_some());
+    }
+
     #[test]
     fn first_wal_is_the_minimum_whatever_the_arrival_order() {
         let now = Instant::now();
@@ -1254,7 +1526,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             buffers.flushing_range(tenant, old),
-            Some(((at(20), at(21)), Some(FileLayout::current(8))))
+            Some(Bound {
+                file: old,
+                range: (at(20), at(21)),
+                layout: Some(FileLayout::current(8)),
+                hour: None,
+            })
         );
         assert!(buffers.rename_flushing(tenant, old, new));
         assert!(

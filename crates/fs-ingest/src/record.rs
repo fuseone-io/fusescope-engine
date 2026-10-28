@@ -8,8 +8,13 @@ use fs_catalog::TenantId;
 
 use crate::IngestError;
 
-/// Record format version.
-const VERSION: u8 = 1;
+/// Record format version: rows, and intents covering every row of their
+/// range.
+pub const VERSION: u8 = 1;
+/// Record format version of an intent holding one hour of its range. A
+/// reader of the previous version meets it and fails, rather than reading
+/// the intent as the whole range.
+pub const VERSION_HOUR_INTENT: u8 = 2;
 
 /// Signal carried by a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +55,11 @@ pub struct FlushIntent {
     /// current layout and trust the object they find.
     #[serde(default)]
     pub layout: Option<FileLayout>,
+    /// Start of the UTC hour, in seconds since the epoch, whose rows of the
+    /// range the file holds, when the buffer was cut by hour. Absent, the
+    /// file holds every row of the range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hour: Option<i64>,
 }
 
 /// The encoder and its parameters that turn a set of rows into one exact
@@ -79,13 +89,25 @@ impl FileLayout {
 }
 
 impl FlushIntent {
-    /// Serialises the intent as a WAL record payload.
+    /// Serialises the intent as a WAL record payload, under the record
+    /// version that an intent of one hour needs.
     pub fn to_record(&self) -> WalRecord {
         WalRecord {
+            version: if self.hour.is_some() {
+                VERSION_HOUR_INTENT
+            } else {
+                VERSION
+            },
             tenant: self.tenant,
             signal: RecordSignal::FlushIntent,
             payload: Bytes::from(serde_json::to_vec(self).unwrap_or_default()),
         }
+    }
+
+    /// The hour the file holds, when the buffer was cut by hour.
+    pub fn hour_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.hour
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
     }
 
     /// Parses an intent payload.
@@ -106,6 +128,8 @@ impl FlushIntent {
 /// Header plus payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
+    /// Format version of the record.
+    pub version: u8,
     /// Owner.
     pub tenant: TenantId,
     /// Payload type.
@@ -121,7 +145,7 @@ impl WalRecord {
     /// Serialises header and payload into one buffer.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
-        out.push(VERSION);
+        out.push(self.version);
         out.push(self.signal as u8);
         out.extend_from_slice(self.tenant.0.as_bytes());
         out.extend_from_slice(&self.payload);
@@ -137,7 +161,7 @@ impl WalRecord {
             .split_at_checked(HEADER_LEN)
             .ok_or_else(|| IngestError::Record(format!("short record: {} bytes", bytes.len())))?;
         let version = header.first().copied().unwrap_or(0);
-        if version != VERSION {
+        if version != VERSION && version != VERSION_HOUR_INTENT {
             return Err(IngestError::Record(format!(
                 "unsupported version {version}"
             )));
@@ -149,6 +173,7 @@ impl WalRecord {
             .and_then(|b| uuid::Uuid::from_slice(b).ok())
             .ok_or_else(|| IngestError::Record("bad tenant id".into()))?;
         Ok(Self {
+            version,
             tenant: TenantId(uuid),
             signal,
             payload: Bytes::copy_from_slice(payload),
@@ -163,6 +188,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let record = WalRecord {
+            version: VERSION,
             tenant: TenantId::new(),
             signal: RecordSignal::Traces,
             payload: Bytes::from_static(b"otlp"),
@@ -187,6 +213,7 @@ mod tests {
                 offset: 4096,
             },
             layout: Some(FileLayout::current(4096)),
+            hour: None,
         };
         let record = intent.to_record();
         assert_eq!(record.signal, RecordSignal::FlushIntent);
@@ -235,10 +262,64 @@ mod tests {
         assert_eq!(decoded.file, intent.file);
     }
 
+    /// An intent of one hour is written under the record version that a
+    /// reader of the previous version refuses, so it is never read as the
+    /// whole range; an intent of the whole range keeps the first version,
+    /// and an intent logged before hours were recorded has none.
+    #[test]
+    fn an_intent_of_one_hour_takes_the_record_version_older_readers_refuse() {
+        let tenant = TenantId::new();
+        let whole = FlushIntent {
+            tenant,
+            file: fs_catalog::FileId::new(),
+            first: fs_wal::Position {
+                segment: 1,
+                offset: 16,
+            },
+            end: fs_wal::Position {
+                segment: 1,
+                offset: 4096,
+            },
+            layout: Some(FileLayout::current(4096)),
+            hour: None,
+        };
+        let one_hour = FlushIntent {
+            hour: Some(1_792_677_600),
+            ..whole.clone()
+        };
+        assert_eq!(whole.to_record().version, VERSION);
+        assert_eq!(one_hour.to_record().version, VERSION_HOUR_INTENT);
+        let bytes = one_hour.to_record().encode();
+        assert_eq!(bytes.first().copied(), Some(VERSION_HOUR_INTENT));
+        let decoded = WalRecord::decode(&bytes).unwrap();
+        assert_eq!(decoded.version, VERSION_HOUR_INTENT);
+        let intent = FlushIntent::from_payload(&decoded.payload).unwrap();
+        assert_eq!(intent, one_hour);
+        assert_eq!(
+            intent.hour_start().unwrap().to_rfc3339(),
+            "2026-10-22T14:00:00+00:00"
+        );
+        assert!(
+            !String::from_utf8_lossy(&whole.to_record().payload).contains("hour"),
+            "the whole range is written as before"
+        );
+        let before_hours = format!(
+            r#"{{"tenant":"{}","file":"{}","first":{{"segment":1,"offset":16}},"end":{{"segment":1,"offset":4096}}}}"#,
+            tenant.0, whole.file.0
+        );
+        assert_eq!(
+            FlushIntent::from_payload(before_hours.as_bytes())
+                .unwrap()
+                .hour,
+            None
+        );
+    }
+
     #[test]
     fn rejects_garbage() {
         assert!(WalRecord::decode(b"short").is_err());
         let mut bad_version = WalRecord {
+            version: VERSION,
             tenant: TenantId::new(),
             signal: RecordSignal::Traces,
             payload: Bytes::new(),
@@ -247,6 +328,7 @@ mod tests {
         *bad_version.first_mut().unwrap() = 9;
         assert!(WalRecord::decode(&bad_version).is_err());
         let mut bad_signal = WalRecord {
+            version: VERSION,
             tenant: TenantId::new(),
             signal: RecordSignal::Traces,
             payload: Bytes::new(),

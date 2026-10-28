@@ -80,14 +80,19 @@ impl TestDb {
 }
 
 fn request(service: &str, trace: u8, spans: u8) -> ExportTraceServiceRequest {
+    request_at(service, trace, spans, T0)
+}
+
+/// `spans` spans of one trace, a millisecond apart from `start`.
+fn request_at(service: &str, trace: u8, spans: u8, start: u64) -> ExportTraceServiceRequest {
     let spans = (0..spans)
         .map(|i| Span {
             trace_id: vec![trace; 16],
             span_id: vec![i + 1; 8],
             name: format!("op-{i}"),
             kind: 2,
-            start_time_unix_nano: T0 + u64::from(i) * 1_000_000,
-            end_time_unix_nano: T0 + u64::from(i) * 1_000_000 + 500_000,
+            start_time_unix_nano: start + u64::from(i) * 1_000_000,
+            end_time_unix_nano: start + u64::from(i) * 1_000_000 + 500_000,
             ..Span::default()
         })
         .collect();
@@ -996,6 +1001,212 @@ async fn crash_before_the_confirmation_is_replayed_and_confirmed() {
     assert_eq!(
         registered.iter().map(|f| f.row_count).collect::<Vec<_>>(),
         [10]
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Registered files of `tenant`, oldest range first: `(hour directory, rows, range)`.
+async fn registered_by_hour(db: &TestDb, tenant: TenantId) -> Vec<(String, i64, TimeRange)> {
+    let mut files = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    files.sort_by_key(|f| f.range.start);
+    files
+        .into_iter()
+        .map(|f| {
+            let hour = f
+                .path
+                .split('/')
+                .find(|part| part.starts_with("hr="))
+                .unwrap()
+                .to_owned();
+            (hour, f.row_count, f.range)
+        })
+        .collect()
+}
+
+/// Spans of two hours in one buffer are cut into one file per hour, each
+/// within its hour and under its own id, both announced by the hot window
+/// before the flush; a crash before the checkpoint replays both intents
+/// to the same two files, byte for byte, without a duplicate.
+#[tokio::test]
+async fn a_flush_with_spans_across_an_hour_boundary_writes_one_file_per_hour() {
+    use fs_ingest::hot::{HotScanRequest, scan};
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let no_checkpoint = IngestConfig {
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), no_checkpoint).await;
+    let mut client = h.client().await;
+    // T0 is 14:17:03Z: the second request starts at 14:59:59.999 and
+    // straddles 15:00 with its three spans a millisecond apart.
+    client
+        .export(authed(request_at("api", 1, 4, T0), &token))
+        .await
+        .unwrap();
+    client
+        .export(authed(
+            request_at("api", 2, 3, T0 + (42 * 60 + 57) * 1_000_000_000 - 1_000_000),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let all = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: None,
+        span_ids: None,
+    };
+    let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .persisted_files;
+
+    h.ingester.flush_all().await;
+    let bucket = h.dir.path().join("bucket");
+    let files = parquet_files(&bucket);
+    assert_eq!(files.len(), 2, "one file per hour");
+    let digests: Vec<_> = files.iter().map(|f| (f.clone(), sha256_of(f))).collect();
+    let registered = registered_by_hour(&db, tenant).await;
+    assert_eq!(
+        registered
+            .iter()
+            .map(|(hour, rows, _)| (hour.as_str(), *rows))
+            .collect::<Vec<_>>(),
+        [("hr=14", 5), ("hr=15", 2)]
+    );
+    for (_, _, range) in &registered {
+        assert_eq!(
+            range.start.format("%Y-%m-%dT%H").to_string(),
+            range.end.format("%Y-%m-%dT%H").to_string(),
+            "a file stays within its hour"
+        );
+    }
+    assert_eq!(sidecar_files(&bucket).len(), 2, "a sidecar per file");
+    let ids: Vec<_> = db
+        .catalog
+        .visible_files(
+            tenant,
+            Signal::Traces,
+            TimeRange {
+                start: chrono::DateTime::UNIX_EPOCH,
+                end: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
+    assert!(
+        ids.iter().all(|id| announced.contains(id)),
+        "both ids were announced before the flush: {announced:?} vs {ids:?}"
+    );
+
+    h.task.abort();
+    let _ = h.task.await;
+    let h = start(&db.catalog, h.dir, test_config()).await;
+    assert!(
+        h.ingester.stats().flushes_recovered.load(Ordering::Relaxed) >= 2,
+        "both intents were resumed"
+    );
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&bucket).len(), 2, "no third file");
+    for (file, digest) in digests {
+        assert_eq!(sha256_of(&file), digest, "the replay reproduced {file:?}");
+    }
+    assert_eq!(registered_by_hour(&db, tenant).await.len(), 2);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The registration of the first hour's file fails after its upload and
+/// the ingester dies: the restart registers it from the object it finds
+/// and leaves the second hour's file as it was.
+#[tokio::test]
+async fn crash_between_the_files_of_a_split_flush_is_resumed() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_register_failures: 1,
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request_at("api", 1, 2, T0), &token))
+        .await
+        .unwrap();
+    client
+        .export(authed(
+            request_at("api", 2, 2, T0 + 60 * 60 * 1_000_000_000),
+            &token,
+        ))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let bucket = h.dir.path().join("bucket");
+    assert_eq!(
+        parquet_files(&bucket).len(),
+        2,
+        "both objects were uploaded"
+    );
+    assert_eq!(registered_by_hour(&db, tenant).await.len(), 1);
+    h.task.abort();
+    let _ = h.task.await;
+
+    let h = start(&db.catalog, h.dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(parquet_files(&bucket).len(), 2);
+    assert_eq!(
+        registered_by_hour(&db, tenant)
+            .await
+            .iter()
+            .map(|(hour, rows, _)| (hour.as_str(), *rows))
+            .collect::<Vec<_>>(),
+        [("hr=14", 2), ("hr=15", 2)]
     );
     h.stop().await;
     db.finish().await;
@@ -3004,6 +3215,7 @@ async fn future_layout_version_fails_closed() {
     {
         let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
         let record = WalRecord {
+            version: fs_ingest::record::VERSION,
             tenant,
             signal: RecordSignal::Traces,
             payload: bytes::Bytes::from(request("api", 1, 5).encode_to_vec()),
@@ -3019,6 +3231,7 @@ async fn future_layout_version_fails_closed() {
                 version: FileLayout::CURRENT_VERSION + 1,
                 row_group_rows: 7,
             }),
+            hour: None,
         };
         wal.append(&intent.to_record().encode()).unwrap();
         wal.sync().unwrap();
@@ -3146,6 +3359,7 @@ async fn unreadable_intent_refuses_to_start() {
     {
         let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
         let record = WalRecord {
+            version: fs_ingest::record::VERSION,
             tenant,
             signal: RecordSignal::Traces,
             payload: bytes::Bytes::from(request("api", 1, 5).encode_to_vec()),
@@ -3158,6 +3372,7 @@ async fn unreadable_intent_refuses_to_start() {
             tenant.0, file.0, first.segment, first.offset, end.segment, end.offset
         );
         let intent = WalRecord {
+            version: fs_ingest::record::VERSION,
             tenant,
             signal: RecordSignal::FlushIntent,
             payload: bytes::Bytes::from(payload),
@@ -3203,6 +3418,7 @@ async fn future_record_version_refuses_to_start() {
         use fs_ingest::record::{RecordSignal, WalRecord};
         let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
         let record = WalRecord {
+            version: fs_ingest::record::VERSION,
             tenant,
             signal: RecordSignal::Traces,
             payload: bytes::Bytes::from(request("api", 1, 5).encode_to_vec()),
@@ -3258,6 +3474,7 @@ async fn damage_in_a_sealed_segment_refuses_to_start() {
         let mut wal = Wal::open(small.clone()).unwrap();
         for i in 0..40u8 {
             let record = WalRecord {
+                version: fs_ingest::record::VERSION,
                 tenant,
                 signal: RecordSignal::Traces,
                 payload: bytes::Bytes::from(request("api", i, 5).encode_to_vec()),
@@ -3321,6 +3538,7 @@ async fn corruption_in_the_active_segment_refuses_to_open() {
         let mut wal = Wal::open(WalConfig::new(wal_dir.clone())).unwrap();
         for i in 0..10u8 {
             let record = WalRecord {
+                version: fs_ingest::record::VERSION,
                 tenant,
                 signal: RecordSignal::Traces,
                 payload: bytes::Bytes::from(request("api", i, 5).encode_to_vec()),

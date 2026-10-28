@@ -275,7 +275,11 @@ impl FlightService for HotService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let scan = HotScanRequest::from_ticket(request.get_ref())?;
-        let (snapshot, live_file) = self.shared.snapshot(scan.tenant).await;
+        let (snapshot, live_files) = self
+            .shared
+            .snapshot(scan.tenant)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         let sources = snapshot
             .live
             .iter()
@@ -311,7 +315,7 @@ impl FlightService for HotService {
         // Every file id whose rows are (or will be) in this answer. Excluding
         // an id that is not in the catalog yet is harmless and closes the race
         // where it appears while the querier plans.
-        let persisted: Vec<String> = live_file
+        let persisted: Vec<String> = live_files
             .into_iter()
             .chain(snapshot.flushing.iter().map(|(id, _)| *id))
             .chain(snapshot.persisted.iter().map(|p| p.file))

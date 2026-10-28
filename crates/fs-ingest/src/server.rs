@@ -53,6 +53,7 @@ impl TraceService for TraceReceiver {
             }
         }
         let record = WalRecord {
+            version: crate::record::VERSION,
             tenant,
             signal: RecordSignal::Traces,
             payload,

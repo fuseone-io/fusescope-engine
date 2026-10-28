@@ -133,6 +133,7 @@ pub async fn run(
     let start = std::time::Instant::now();
     for payload in &encoded {
         let record = WalRecord {
+            version: fs_ingest::record::VERSION,
             tenant,
             signal: RecordSignal::Traces,
             payload: bytes::Bytes::copy_from_slice(payload),
@@ -165,6 +166,7 @@ pub async fn run(
         .iter()
         .map(|payload| {
             WalRecord {
+                version: fs_ingest::record::VERSION,
                 tenant,
                 signal: RecordSignal::Traces,
                 payload: bytes::Bytes::copy_from_slice(payload),

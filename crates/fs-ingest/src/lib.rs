@@ -19,6 +19,7 @@ pub mod config;
 pub mod flush;
 pub mod histogram;
 pub mod hot;
+pub mod hours;
 pub mod ingester;
 pub mod ratelimit;
 pub mod record;
