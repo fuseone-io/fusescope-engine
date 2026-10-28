@@ -191,6 +191,7 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         max_input_bytes: 2 << 30,
         row_group_rows,
         inject_swap_failures: 0,
+        inject_put_failure_at: None,
     }
 }
 
@@ -689,6 +690,104 @@ async fn the_input_cap_is_a_ceiling() {
     );
     let done = c.compact_once(&me).await.unwrap().unwrap();
     assert_eq!(done.inputs.len(), 2);
+    f.db.finish().await;
+}
+
+/// An hour over the input cap is passed over and the next cold hour
+/// compacts; the stuck hour is reported once.
+#[tokio::test]
+async fn an_hour_over_the_cap_does_not_block_later_hours() {
+    let Some(f) = fixture().await else { return };
+    let stuck = three_closed_l0(&f, 4).await;
+    let later_hour = nanos(closed_hour() + chrono::Duration::hours(1));
+    let mut later = Vec::new();
+    for (service, trace) in [("api", 21u8), ("api", 22)] {
+        later.push(
+            write_l0(
+                &f.db.catalog,
+                &f.store,
+                f.tenant,
+                &[request(service, trace, later_hour, 2)],
+                4,
+            )
+            .await,
+        );
+    }
+    registered_an_hour_ago(&f, &later).await;
+    let pair: u64 = stuck
+        .iter()
+        .take(2)
+        .map(|x| u64::try_from(x.size_bytes).unwrap())
+        .sum();
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            max_input_bytes: pair - 1,
+            ..config(4)
+        },
+    );
+    let me = fence(&f).await;
+    let done = c.compact_once(&me).await.unwrap().unwrap();
+    assert_eq!(
+        done.inputs,
+        later.iter().map(|x| x.id).collect::<Vec<_>>(),
+        "the later hour"
+    );
+    assert_eq!(c.stats().skipped.load(Ordering::Relaxed), 1);
+    assert!(c.compact_once(&me).await.unwrap().is_none());
+    assert_eq!(
+        c.stats().skipped.load(Ordering::Relaxed),
+        1,
+        "reported once"
+    );
+    assert_eq!(
+        visible(&f)
+            .await
+            .iter()
+            .filter(|x| x.level == Level::L0)
+            .count(),
+        3,
+        "the stuck hour is untouched"
+    );
+    f.db.finish().await;
+}
+
+/// A failure between outputs counts every object created so far as an
+/// orphan, sidecar put included.
+#[tokio::test]
+async fn a_failure_between_outputs_counts_the_orphans_created_so_far() {
+    let Some(f) = fixture().await else { return };
+    three_closed_l0(&f, 4).await;
+    let me = fence(&f).await;
+    // Puts go parquet, sidecar, parquet, sidecar, ...; the second
+    // sidecar fails: two Parquet objects exist.
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            l1_target_bytes: 1,
+            inject_put_failure_at: Some(3),
+            ..config(4)
+        },
+    );
+    let err = c.compact_once(&me).await.unwrap_err();
+    assert!(matches!(err, CompactError::Injected("object put")), "{err}");
+    assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 2);
+    assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
+    assert_eq!(l1_objects(&f).await.len(), 2);
+    assert_eq!(visible(&f).await.len(), 3, "nothing published");
+
+    // The second Parquet put fails: one object exists.
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            l1_target_bytes: 1,
+            inject_put_failure_at: Some(2),
+            ..config(4)
+        },
+    );
+    assert!(c.compact_once(&me).await.is_err());
+    assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 1);
+    assert_eq!(l1_objects(&f).await.len(), 3);
     f.db.finish().await;
 }
 

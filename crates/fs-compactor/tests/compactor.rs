@@ -347,6 +347,7 @@ fn no_compaction() -> fs_compactor::CompactionConfig {
         max_input_bytes: 2 << 30,
         row_group_rows: 1024,
         inject_swap_failures: 0,
+        inject_put_failure_at: None,
     }
 }
 

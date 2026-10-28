@@ -588,6 +588,7 @@ impl CompactorConfig {
                 max_input_bytes: self.max_input_bytes,
                 row_group_rows,
                 inject_swap_failures: 0,
+                inject_put_failure_at: None,
             },
         }
     }

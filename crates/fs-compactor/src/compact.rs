@@ -39,6 +39,10 @@ pub struct CompactionConfig {
     /// Make this many swaps fail artificially after the outputs are
     /// uploaded. Zero in production; tests use it to crash before the swap.
     pub inject_swap_failures: u32,
+    /// Make the n-th object put of a pass fail artificially, counting
+    /// Parquet and sidecar puts from zero. `None` in production; tests use
+    /// it to crash between outputs.
+    pub inject_put_failure_at: Option<usize>,
 }
 
 /// Counters of the compactor.
@@ -76,6 +80,10 @@ pub struct Compactor {
     config: CompactionConfig,
     stats: Arc<CompactorStats>,
     inject_swap_failures: AtomicU32,
+    /// Hours already reported as exceeding the input cap.
+    reported: std::sync::Mutex<
+        std::collections::HashSet<(fs_catalog::TenantId, chrono::DateTime<chrono::Utc>)>,
+    >,
 }
 
 impl Compactor {
@@ -95,6 +103,7 @@ impl Compactor {
             config,
             stats,
             inject_swap_failures: AtomicU32::new(inject),
+            reported: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -104,9 +113,9 @@ impl Compactor {
     }
 
     /// Compacts the oldest cold hour with at least two L0 files, up to the
-    /// configured inputs, and swaps the outputs in under `fence`. `None`
-    /// when nothing qualifies or the hour's two oldest files exceed the
-    /// input cap.
+    /// configured inputs, and swaps the outputs in under `fence`. An hour
+    /// whose two oldest files exceed the input cap is passed over, reported
+    /// once, and the next hour is tried. `None` when nothing qualifies.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
@@ -115,27 +124,25 @@ impl Compactor {
         &self,
         fence: &LeaseFence,
     ) -> Result<Option<Compaction>, CompactError> {
-        let Some(candidate) = self
-            .catalog
-            .compaction_inputs(Signal::Traces, self.config.hour_close_delay, 2)
-            .await?
-        else {
-            return Ok(None);
+        let mut skip = 0;
+        let (candidate, inputs) = loop {
+            let Some(candidate) = self
+                .catalog
+                .compaction_inputs(Signal::Traces, self.config.hour_close_delay, 2, skip)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let taken = self.taken(&candidate.files);
+            if taken >= 2 {
+                break (candidate, taken);
+            }
+            self.report_over_cap(candidate.tenant_id, candidate.hour);
+            skip += 1;
         };
-        let inputs = self.take_inputs(&candidate.files);
-        if inputs.len() < 2 {
-            self.stats.skipped.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                role = "compactor",
-                tenant = %candidate.tenant_id.0,
-                hour = %candidate.hour,
-                cap = self.config.max_input_bytes,
-                "the hour's two oldest files exceed the input cap; skipped"
-            );
-            return Ok(None);
-        }
+        let inputs = candidate.files.get(..inputs).unwrap_or(&[]);
         let result = self
-            .compact_inputs(candidate.tenant_id, candidate.hour, &inputs, fence)
+            .compact_inputs(candidate.tenant_id, candidate.hour, inputs, fence)
             .await;
         match &result {
             Ok(_) => {}
@@ -152,13 +159,32 @@ impl Compactor {
         result.map(Some)
     }
 
-    /// The oldest files of the hour that fit one pass under both caps;
+    /// Counts and warns once per hour whose two oldest files exceed the cap.
+    fn report_over_cap(&self, tenant: fs_catalog::TenantId, hour: chrono::DateTime<chrono::Utc>) {
+        let first_time = self
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((tenant, hour));
+        if first_time {
+            self.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                role = "compactor",
+                tenant = %tenant.0,
+                hour = %hour,
+                cap = self.config.max_input_bytes,
+                "the hour's two oldest files exceed the input cap; passed over"
+            );
+        }
+    }
+
+    /// How many of the hour's oldest files fit one pass under both caps;
     /// fewer than two when the two oldest do not fit the byte cap.
-    fn take_inputs<'a>(&self, all: &'a [FileRecord]) -> Vec<&'a FileRecord> {
-        let mut inputs = Vec::new();
+    fn taken(&self, all: &[FileRecord]) -> usize {
+        let mut taken = 0;
         let mut bytes = 0u64;
         for file in all {
-            if inputs.len() >= self.config.max_inputs_per_pass.max(2) {
+            if taken >= self.config.max_inputs_per_pass.max(2) {
                 break;
             }
             let size = u64::try_from(file.size_bytes).unwrap_or(u64::MAX);
@@ -166,19 +192,19 @@ impl Compactor {
                 Some(total) if total <= self.config.max_input_bytes => bytes = total,
                 _ => break,
             }
-            inputs.push(file);
+            taken += 1;
         }
-        inputs
+        taken
     }
 
     async fn compact_inputs(
         &self,
         tenant: fs_catalog::TenantId,
         hour: chrono::DateTime<chrono::Utc>,
-        inputs: &[&FileRecord],
+        inputs: &[FileRecord],
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
-        let owned: Vec<FileRecord> = inputs.iter().map(|f| (*f).clone()).collect();
+        let owned: Vec<FileRecord> = inputs.to_vec();
         let mut merger = L1Merger::open(
             Arc::clone(&self.store),
             &self.root,
@@ -191,33 +217,39 @@ impl Compactor {
             },
         )
         .await?;
-        // Each output is uploaded as it closes; only its row stays.
+        // Each output is uploaded as it closes; only its row stays. Any
+        // exit before the swap commits leaves the objects created so far
+        // as orphans, counted whatever the failure.
         let mut outputs: Vec<Published> = Vec::new();
-        while let Some(output) = merger.next_output().await? {
-            self.put_once(&output.file.path, output.bytes.clone())
-                .await?;
-            self.put_once(&output.index_path, output.index.clone())
-                .await?;
-            outputs.push(Published {
-                bytes: output.bytes.len() as u64,
-                file: output.file,
-            });
+        let mut created = 0u64;
+        let mut puts = 0usize;
+        let published = async {
+            while let Some(output) = merger.next_output().await? {
+                self.put_once(&output.file.path, output.bytes.clone(), &mut puts)
+                    .await?;
+                created += 1;
+                self.put_once(&output.index_path, output.index.clone(), &mut puts)
+                    .await?;
+                outputs.push(Published {
+                    bytes: output.bytes.len() as u64,
+                    file: output.file,
+                });
+            }
+            drop(merger);
+            self.swap(tenant, &owned, &outputs, fence).await
         }
-        drop(merger);
-        let swap = self.swap(tenant, &owned, &outputs, fence).await;
-        if swap.is_err() {
-            self.stats
-                .orphaned
-                .fetch_add(outputs.len() as u64, Ordering::Relaxed);
+        .await;
+        if published.is_err() {
+            self.stats.orphaned.fetch_add(created, Ordering::Relaxed);
             warn!(
                 role = "compactor",
                 tenant = %tenant.0,
                 hour = %hour,
-                outputs = outputs.len(),
-                "compaction not published; its outputs are orphans"
+                orphans = created,
+                "compaction not published; the objects it created are orphans"
             );
         }
-        let compaction = swap?;
+        let compaction = published?;
         self.count(&owned, &outputs);
         info!(
             role = "compactor",
@@ -248,7 +280,17 @@ impl Compactor {
             .await?)
     }
 
-    async fn put_once(&self, path: &str, bytes: Bytes) -> Result<(), CompactError> {
+    async fn put_once(
+        &self,
+        path: &str,
+        bytes: Bytes,
+        puts: &mut usize,
+    ) -> Result<(), CompactError> {
+        let this = *puts;
+        *puts += 1;
+        if self.config.inject_put_failure_at == Some(this) {
+            return Err(CompactError::Injected("object put"));
+        }
         let create = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()

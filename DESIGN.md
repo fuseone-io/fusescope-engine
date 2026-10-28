@@ -479,12 +479,15 @@ At every level the compactor:
 A pass takes the oldest cold hour, across tenants: one whose visible L0
 files number at least two and all ended and were registered more than
 `compactor.hour_close_delay_secs` ago, so the hot window has let go of them
-and late data is no longer arriving; candidate and files come from one
-statement, so a file registered meanwhile is neither counted nor taken. It
-merges the hour's oldest files up to `compactor.max_inputs_per_pass` and
-`compactor.max_input_bytes`, a ceiling: an hour whose two oldest files do
-not fit is skipped and counted, and the server refuses a cap under twice
-the ingest buffer so two L0 files always fit. A large hour closes over
+and late data is no longer arriving. Hours are UTC bins of `ts_min`
+whatever the session time zone, and hour and files are read in one
+repeatable-read snapshot, so a file registered meanwhile is neither counted
+nor taken. It merges the hour's oldest files up to
+`compactor.max_inputs_per_pass` and `compactor.max_input_bytes`, a ceiling:
+an hour whose two oldest files do not fit is passed over, reported once, and
+the next cold hour is tried, so one oversized hour never blocks the queue;
+the server refuses a cap under twice the ingest buffer so two L0 files
+normally fit. A large hour closes over
 several passes; an hour left with a single L0 file keeps it. A pass runs
 only under the lease fence; without one it does nothing. Every input is already sorted by `(service_name, timestamp)`, so the
 merge is a k-way heap over one row group per input, ties in registration
@@ -496,11 +499,11 @@ before the next one starts, so memory holds one decoded row group per
 input, the row group being gathered and the compressed bytes of the one
 file being written. Outputs go to `traces/l1/dt=…/hr=…/{id}.parquet`, each
 with its own `trace_id` sidecar; once all are in the bucket, one fenced
-swap quarantines the inputs and publishes the outputs. A crash before the swap
-leaves the inputs visible and the outputs as objects without rows for the
-orphan sweep; a swap refused for a conflict or a lost lease leaves them the
-same way; a crash after the swap leaves the inputs quarantined for the
-purge. An L0 file that crosses the hour boundary belongs to the hour of its
+swap quarantines the inputs and publishes the outputs. A crash or failure
+before the swap commits leaves the inputs visible and every object created
+so far as an orphan for the orphan sweep, counted whatever the failure; a
+swap refused for a conflict or a lost lease leaves them the same way; a
+crash after the swap leaves the inputs quarantined for the purge. An L0 file that crosses the hour boundary belongs to the hour of its
 `ts_min` until the ingester cuts flushes at the hour; the output carries the
 real range of its rows, so pruning stays correct. The merged per-hour
 `trace_id` index waits until an hour's file set is final.
