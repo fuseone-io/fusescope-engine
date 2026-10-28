@@ -984,7 +984,15 @@ async fn crash_before_the_confirmation_is_replayed_and_confirmed() {
         "the checkpoint stayed behind the unconfirmed intent"
     );
     h.ingester.flush_all().await;
-    assert_eq!(confirmations(&db).await, [true]);
+    // The replayed flush confirms off the flusher: wait for it to land.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while confirmations(&db).await != [true] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replay never confirmed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 1);
     let registered = db
         .catalog
