@@ -192,6 +192,7 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         row_group_rows,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
+        inject_put_hold: None,
     }
 }
 
@@ -788,6 +789,56 @@ async fn a_failure_between_outputs_counts_the_orphans_created_so_far() {
     assert!(c.compact_once(&me).await.is_err());
     assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 1);
     assert_eq!(l1_objects(&f).await.len(), 3);
+    f.db.finish().await;
+}
+
+/// A pass cancelled between outputs, as losing the lease or shutting down
+/// cancels it, counts the objects it created as orphans.
+#[tokio::test]
+async fn a_cancelled_pass_counts_the_orphans_it_created() {
+    let Some(f) = fixture().await else { return };
+    three_closed_l0(&f, 4).await;
+    let me = fence(&f).await;
+    // The first Parquet goes up; its sidecar put is held, as a slow store
+    // would, long enough for the lease to go.
+    let c = Arc::new(compactor(
+        &f,
+        CompactionConfig {
+            l1_target_bytes: 1,
+            inject_put_hold: Some((1, Duration::from_secs(30))),
+            ..config(4)
+        },
+    ));
+    let stats = c.stats();
+    let pass = tokio::spawn({
+        let c = Arc::clone(&c);
+        async move { c.compact_once(&me).await.map(|_| ()) }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while l1_objects(&f).await.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        l1_objects(&f).await.len(),
+        1,
+        "the first output is in the bucket"
+    );
+    assert_eq!(
+        stats.orphaned.load(Ordering::Relaxed),
+        0,
+        "not an orphan while the pass runs"
+    );
+
+    // The lease goes: the leader loop drops the work task.
+    pass.abort();
+    assert!(pass.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        stats.orphaned.load(Ordering::Relaxed),
+        1,
+        "counted when the task was dropped"
+    );
+    assert_eq!(l1_objects(&f).await.len(), 1);
+    assert_eq!(visible(&f).await.len(), 3, "nothing published");
     f.db.finish().await;
 }
 

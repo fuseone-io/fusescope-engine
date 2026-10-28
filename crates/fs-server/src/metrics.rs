@@ -403,6 +403,11 @@ impl Metrics {
                 load(&c.failures),
             ),
             (
+                "fusescope_compaction_orphaned_total",
+                "Outputs uploaded by passes that did not publish them",
+                load(&c.orphaned),
+            ),
+            (
                 "fusescope_compaction_skipped_total",
                 "Hours skipped because their two oldest files exceed the input cap",
                 load(&c.skipped),
@@ -605,6 +610,24 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("fusescope_buffer_live_bytes 77\n"), "{page}");
+        let compactor = Arc::new(fs_compactor::CompactorStats::default());
+        compactor.passes.fetch_add(4, Ordering::Relaxed);
+        compactor.orphaned.fetch_add(3, Ordering::Relaxed);
+        compactor.skipped.fetch_add(1, Ordering::Relaxed);
+        metrics.register_compactor(compactor);
+        let page = metrics.render();
+        assert!(
+            page.contains("fusescope_compaction_passes_total 4\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_compaction_orphaned_total 3\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_compaction_skipped_total 1\n"),
+            "{page}"
+        );
         assert!(page.lines().all(|l| {
             l.starts_with('#')
                 || l.split_once(' ')

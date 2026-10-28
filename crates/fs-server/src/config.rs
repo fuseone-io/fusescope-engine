@@ -589,6 +589,7 @@ impl CompactorConfig {
                 row_group_rows,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
+                inject_put_hold: None,
             },
         }
     }

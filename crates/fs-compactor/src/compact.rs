@@ -43,6 +43,9 @@ pub struct CompactionConfig {
     /// Parquet and sidecar puts from zero. `None` in production; tests use
     /// it to crash between outputs.
     pub inject_put_failure_at: Option<usize>,
+    /// Hold the n-th object put of a pass this long before it starts.
+    /// `None` in production; tests use it to cancel a pass between outputs.
+    pub inject_put_hold: Option<(usize, Duration)>,
 }
 
 /// Counters of the compactor.
@@ -218,38 +221,32 @@ impl Compactor {
         )
         .await?;
         // Each output is uploaded as it closes; only its row stays. Any
-        // exit before the swap commits leaves the objects created so far
-        // as orphans, counted whatever the failure.
+        // exit before the swap commits, an error or the task being dropped,
+        // leaves the objects created so far as orphans: the guard counts
+        // them unless the swap disarms it.
         let mut outputs: Vec<Published> = Vec::new();
-        let mut created = 0u64;
+        let mut guard = OrphanGuard {
+            stats: Arc::clone(&self.stats),
+            tenant,
+            hour,
+            created: 0,
+            armed: true,
+        };
         let mut puts = 0usize;
-        let published = async {
-            while let Some(output) = merger.next_output().await? {
-                self.put_once(&output.file.path, output.bytes.clone(), &mut puts)
-                    .await?;
-                created += 1;
-                self.put_once(&output.index_path, output.index.clone(), &mut puts)
-                    .await?;
-                outputs.push(Published {
-                    bytes: output.bytes.len() as u64,
-                    file: output.file,
-                });
-            }
-            drop(merger);
-            self.swap(tenant, &owned, &outputs, fence).await
+        while let Some(output) = merger.next_output().await? {
+            self.put_once(&output.file.path, output.bytes.clone(), &mut puts)
+                .await?;
+            guard.created += 1;
+            self.put_once(&output.index_path, output.index.clone(), &mut puts)
+                .await?;
+            outputs.push(Published {
+                bytes: output.bytes.len() as u64,
+                file: output.file,
+            });
         }
-        .await;
-        if published.is_err() {
-            self.stats.orphaned.fetch_add(created, Ordering::Relaxed);
-            warn!(
-                role = "compactor",
-                tenant = %tenant.0,
-                hour = %hour,
-                orphans = created,
-                "compaction not published; the objects it created are orphans"
-            );
-        }
-        let compaction = published?;
+        drop(merger);
+        let compaction = self.swap(tenant, &owned, &outputs, fence).await?;
+        guard.armed = false;
         self.count(&owned, &outputs);
         info!(
             role = "compactor",
@@ -290,6 +287,11 @@ impl Compactor {
         *puts += 1;
         if self.config.inject_put_failure_at == Some(this) {
             return Err(CompactError::Injected("object put"));
+        }
+        if let Some((at, hold)) = self.config.inject_put_hold {
+            if at == this {
+                tokio::time::sleep(hold).await;
+            }
         }
         let create = PutOptions {
             mode: PutMode::Create,
@@ -336,6 +338,37 @@ impl Compactor {
 struct Published {
     file: NewFile,
     bytes: u64,
+}
+
+/// Counts the objects a pass created as orphans when it ends without a
+/// committed swap, whether by error or by the task being dropped.
+struct OrphanGuard {
+    stats: Arc<CompactorStats>,
+    tenant: fs_catalog::TenantId,
+    hour: chrono::DateTime<chrono::Utc>,
+    /// Parquet objects created so far; their sidecars may or may not be.
+    created: u64,
+    armed: bool,
+}
+
+impl Drop for OrphanGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.stats
+            .orphaned
+            .fetch_add(self.created, Ordering::Relaxed);
+        if self.created > 0 {
+            warn!(
+                role = "compactor",
+                tenant = %self.tenant.0,
+                hour = %self.hour,
+                orphans = self.created,
+                "compaction not published; the objects it created are orphans"
+            );
+        }
+    }
 }
 
 /// Takes one injected failure when any is left.
