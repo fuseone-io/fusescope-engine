@@ -16,10 +16,11 @@
 //! forgetting the row happen under a claim that holds the path's lock in
 //! an open transaction, so two sweepers never delete the same path and a
 //! registration that re-uploads it waits for the claim to end. A path
-//! whose object was deleted stays as a tombstone, still refused to
-//! registration, for the tombstone TTL: a writer that never saw the
-//! refusal before the delete is refused on its next try and gives the
-//! rows a fresh id, so no delete still in flight can find the new object.
+//! whose object was deleted stays as a tombstone, refused to registration
+//! for good: a writer that never saw the refusal before the delete is
+//! refused on its next try, however late, and gives the rows a fresh id,
+//! so no delete still in flight can find the new object. A tombstone is
+//! one row per deleted orphan, and the record that the path is spent.
 
 use std::collections::HashSet;
 
@@ -43,7 +44,7 @@ impl OrphanClaim {
     }
 
     /// The object is gone: the row stays as a tombstone, refused to
-    /// registration until pruned, and the lock is released.
+    /// registration for good, and the lock is released.
     ///
     /// # Errors
     /// Database failure.
@@ -127,7 +128,9 @@ impl Catalog {
     }
 
     /// Remembers `paths` as seen without a row; a path already remembered
-    /// keeps its first sighting.
+    /// keeps its first sighting. A tombstone whose object is seen again,
+    /// written by a writer that checked just before the delete, goes back
+    /// to marked so the object is deleted again.
     ///
     /// # Errors
     /// Database failure.
@@ -135,7 +138,9 @@ impl Catalog {
         for chunk in paths.chunks(CHUNK) {
             sqlx::query(
                 "insert into engine_orphan (path) select unnest($1::text[])
-                 on conflict (path) do nothing",
+                 on conflict (path) do update
+                 set deleted_at = null, attempts = 0, retry_after = now()
+                 where engine_orphan.deleted_at is not null",
             )
             .bind(chunk)
             .execute(self.pool())
@@ -273,31 +278,6 @@ impl Catalog {
         .fetch_optional(self.pool())
         .await?;
         Ok(doomed.map(|(p,)| p))
-    }
-
-    /// Prunes up to `limit` tombstones older than `ttl`: long past any
-    /// delete that could still be in flight.
-    ///
-    /// # Errors
-    /// Database failure.
-    pub async fn orphans_prune_tombstones(
-        &self,
-        ttl: std::time::Duration,
-        limit: i64,
-    ) -> Result<usize, CatalogError> {
-        let pruned = sqlx::query(
-            "delete from engine_orphan where path in (
-                 select path from engine_orphan
-                 where deleted_at < now() - make_interval(secs => $1)
-                 order by deleted_at limit $2
-             )",
-        )
-        .bind(ttl.as_secs_f64())
-        .bind(limit)
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-        Ok(usize::try_from(pruned).unwrap_or(usize::MAX))
     }
 
     /// Forgets `paths`: seen with a row after all, or never the engine's.

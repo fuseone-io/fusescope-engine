@@ -119,7 +119,7 @@ impl Catalog {
         range: TimeRange,
     ) -> Result<Vec<FileRecord>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
-            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                     services, summary, state, created_at, quarantined_at
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3 and ts_min <= $5 and ts_max >= $4
@@ -146,7 +146,7 @@ impl Catalog {
         signal: Signal,
     ) -> Result<Vec<FileRecord>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
-            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                     services, summary, state, created_at, quarantined_at
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3
@@ -430,10 +430,10 @@ async fn insert_file(
     crate::orphans::refuse_doomed(tx, &file.path).await?;
     let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
-             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state, origin)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          on conflict (id) do nothing
-         returning id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+         returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                    services, summary, state, created_at, quarantined_at",
     )
     .bind(file.id)
@@ -448,13 +448,14 @@ async fn insert_file(
     .bind(&file.services)
     .bind(&file.summary)
     .bind(FileState::Visible.code())
+    .bind(file.origin)
     .fetch_optional(&mut **tx)
     .await?;
     let row = if let Some(row) = inserted {
         row
     } else {
         let existing = sqlx::query_as::<_, FileRow>(
-            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                     services, summary, state, created_at, quarantined_at
              from engine_file where id = $1",
         )

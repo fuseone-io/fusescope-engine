@@ -319,6 +319,10 @@ pub struct Tenant {
 pub struct NewFile {
     /// Id chosen by the writer so the bucket path can embed it.
     pub id: FileId,
+    /// The id the rows were first assigned, equal to `id` unless the
+    /// flush changed id before registering. The hot window announces it,
+    /// so a querier excludes the file however it was registered.
+    pub origin: FileId,
     /// Owner.
     pub tenant_id: TenantId,
     /// Content.
@@ -344,6 +348,8 @@ pub struct NewFile {
 pub struct FileRecord {
     /// Id.
     pub id: FileId,
+    /// The id the rows were first assigned; see [`NewFile::origin`].
+    pub origin: FileId,
     /// Owner.
     pub tenant_id: TenantId,
     /// Content.
@@ -374,6 +380,7 @@ pub struct FileRecord {
 #[derive(sqlx::FromRow)]
 pub(crate) struct FileRow {
     pub(crate) id: FileId,
+    pub(crate) origin: FileId,
     pub(crate) tenant_id: TenantId,
     pub(crate) signal: i16,
     pub(crate) level: i16,
@@ -395,6 +402,7 @@ impl TryFrom<FileRow> for FileRecord {
     fn try_from(row: FileRow) -> Result<Self, CatalogError> {
         Ok(FileRecord {
             id: row.id,
+            origin: row.origin,
             tenant_id: row.tenant_id,
             signal: Signal::from_code(row.signal)?,
             level: Level::from_code(row.level)?,

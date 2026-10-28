@@ -86,6 +86,7 @@ fn file(
     let id = FileId::new();
     NewFile {
         id,
+        origin: id,
         tenant_id: tenant,
         signal,
         level: Level::L0,
@@ -1029,8 +1030,8 @@ async fn a_marked_orphan_refuses_registration_and_a_registered_path_refuses_the_
     assert!(!mark.is_finished());
     sqlx::query(
         "insert into engine_file
-             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, state)
-         values ($1, $2, 1, 0, $3, 1, 1, now(), now(), '{}', 1)",
+             (id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, state)
+         values ($1, $1, $2, 1, 0, $3, 1, 1, now(), now(), '{}', 1)",
     )
     .bind(late.id)
     .bind(t)
@@ -1109,36 +1110,33 @@ async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
     );
 
     // The writer that never saw the refusal retries the path: the
-    // tombstone refuses it until pruned, long after any delete could
-    // still be in flight.
+    // tombstone refuses it, however late, and a tombstone seen with its
+    // object again goes back to marked.
     let err = db.catalog.register_file(&pending).await.unwrap_err();
     assert!(
         matches!(err, CatalogError::ObjectDoomed { ref path } if *path == pending.path),
         "{err}"
     );
-    assert_eq!(
-        db.catalog
-            .orphans_prune_tombstones(StdDuration::from_secs(3600), 10)
-            .await
-            .unwrap(),
-        0,
-        "too young to prune"
-    );
-    assert_eq!(
-        db.catalog
-            .orphans_prune_tombstones(StdDuration::ZERO, 10)
-            .await
-            .unwrap(),
-        1
-    );
-    db.catalog.register_file(&pending).await.unwrap();
     db.catalog
-        .swap_files(t, Signal::Traces, &[pending.id], &[])
+        .orphans_seen(std::slice::from_ref(&pending.path))
         .await
         .unwrap();
-    sqlx::query("delete from engine_file where id = $1")
-        .bind(pending.id)
-        .execute(db.catalog.pool())
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        std::slice::from_ref(&pending.path),
+        "reactivated: to be deleted again"
+    );
+    let claim = db
+        .catalog
+        .orphan_claim(&pending.path)
+        .await
+        .unwrap()
+        .unwrap();
+    claim.deleted().await.unwrap();
+    let err = db.catalog.register_file(&pending).await.unwrap_err();
+    assert!(matches!(err, CatalogError::ObjectDoomed { .. }), "{err}");
+    db.catalog
+        .orphans_forget(std::slice::from_ref(&pending.path))
         .await
         .unwrap();
 
@@ -1177,13 +1175,6 @@ async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
     assert_eq!(
         db.catalog.orphans_doomed(10).await.unwrap(),
         Vec::<String>::new()
-    );
-    assert_eq!(
-        db.catalog
-            .orphans_prune_tombstones(StdDuration::ZERO, 10)
-            .await
-            .unwrap(),
-        1
     );
 
     // A delete that failed waits its backoff behind the others, and longer
