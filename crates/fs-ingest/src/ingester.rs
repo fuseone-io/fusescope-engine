@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use fs_catalog::{Catalog, FileId, TenantId};
+use fs_catalog::{Catalog, CatalogError, FileId, TenantId};
 use fs_schema::spans::SpanBatchBuilder;
 use fs_wal::{Event, Position, Wal};
 use object_store::ObjectStore;
@@ -126,6 +126,8 @@ pub struct FlushStats {
     pub row_groups: AtomicU64,
     /// Bytes of `trace_id` sidecars created.
     pub trace_index_bytes: AtomicU64,
+    /// Flushes given a fresh id because the orphan sweep marked their path.
+    pub superseded: AtomicU64,
 }
 
 /// Permits of the flush semaphore for a configured `max_flushes`.
@@ -363,7 +365,8 @@ impl Shared {
             };
             let file_id = FileId::derived(self.instance, tenant, first.segment, first.offset);
             let layout = FileLayout::current(self.config.row_group_rows);
-            let Some((batches, held)) = buffers.begin_flush(tenant, file_id, layout) else {
+            let Some((batches, held)) = buffers.begin_flush(tenant, file_id, layout, (first, end))
+            else {
                 return Ok(None);
             };
             (
@@ -461,14 +464,49 @@ impl Shared {
                 // retried as they are. Returning them to the live buffer would let
                 // later rows join a file whose object may already exist.
                 self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
-                warn!(tenant = %tenant.0, file = %file_id.0, error = %e, rows, "flush failed; will retry with the same id");
+                warn!(tenant = %tenant.0, file = %file_id.0, error = %e, rows, "flush failed; will retry");
                 {
                     let mut buffers = self.buffers.lock().await;
                     buffers.flush_failed(tenant, file_id, Instant::now());
                     drop(held);
                 }
+                if let IngestError::Catalog(CatalogError::ObjectDoomed { .. }) = &e {
+                    self.supersede(tenant, file_id).await;
+                }
                 Err(e)
             }
+        }
+    }
+
+    /// Gives the rows of a flush the orphan sweep is deleting a fresh id:
+    /// a path once marked is never written again, since a delete still in
+    /// flight when the sweep lost its lease could remove the new object.
+    /// The new intent for the same records goes to the log before the
+    /// rows take the id, so a restart retries under the new id too; a log
+    /// failure keeps the old id, whose next attempt is refused again.
+    async fn supersede(&self, tenant: TenantId, old: FileId) {
+        let range = {
+            let buffers = self.buffers.lock().await;
+            buffers.flushing_range(tenant, old)
+        };
+        let Some((range, layout)) = range else {
+            return;
+        };
+        let new = FileId::new();
+        let intent = FlushIntent {
+            tenant,
+            file: new,
+            first: range.0,
+            end: range.1,
+            layout,
+        };
+        if let Err(e) = self.append_wal(tenant, intent.to_record().encode()).await {
+            warn!(tenant = %tenant.0, file = %old.0, error = %e, "superseding intent could not be logged; keeping the id");
+            return;
+        }
+        if self.buffers.lock().await.rename_flushing(tenant, old, new) {
+            self.flush_stats.superseded.fetch_add(1, Ordering::Relaxed);
+            info!(tenant = %tenant.0, old = %old.0, new = %new.0, "flush takes a fresh id: its object was marked as an orphan");
         }
     }
 
@@ -923,8 +961,18 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
 fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
     let now = Instant::now();
     let mut buffers = Buffers::with_scratch_counter(scratch);
-    let mut groups: Vec<(FlushIntent, TenantBuffer)> = replayed
-        .intents
+    // Several intents for the same records are one flush under the id of
+    // the last logged: an earlier id was given up.
+    let mut latest: Vec<FlushIntent> = Vec::new();
+    for intent in replayed.intents {
+        latest.retain(|earlier| {
+            !(earlier.tenant == intent.tenant
+                && earlier.first == intent.first
+                && earlier.end == intent.end)
+        });
+        latest.push(intent);
+    }
+    let mut groups: Vec<(FlushIntent, TenantBuffer)> = latest
         .into_iter()
         .map(|i| (i, TenantBuffer::default()))
         .collect();
@@ -938,7 +986,13 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
         }
     }
     for (intent, buffer) in groups {
-        buffers.insert_flushing(intent.tenant, intent.file, buffer, intent.layout);
+        buffers.insert_flushing(
+            intent.tenant,
+            intent.file,
+            buffer,
+            intent.layout,
+            (intent.first, intent.end),
+        );
     }
     buffers
 }

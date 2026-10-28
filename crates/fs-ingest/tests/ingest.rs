@@ -2492,11 +2492,12 @@ async fn a_foreign_sidecar_under_the_files_path_blocks_registration() {
     db.finish().await;
 }
 
-/// A registration racing the orphan sweep: once the sweep has marked the
-/// object, the retry is refused and keeps its rows; once the sweep has
-/// deleted it, the retry uploads again and registers the same bytes.
+/// A registration refused because the orphan sweep marked the object: the
+/// rows take a fresh id through a second intent, the retry writes the same
+/// bytes under the new path and registers them, the marked path is never
+/// written again, and a restart before the checkpoint keeps the new id.
 #[tokio::test]
-async fn a_retry_refused_by_the_orphan_sweep_uploads_again_once_the_object_is_gone() {
+async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
     let Some(db) = TestDb::new().await else {
         return;
     };
@@ -2513,6 +2514,7 @@ async fn a_retry_refused_by_the_orphan_sweep_uploads_again_once_the_object_is_go
         .unwrap();
     let config = IngestConfig {
         inject_register_failures: 1,
+        checkpoint_after_flush: false,
         ..test_config()
     };
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
@@ -2526,28 +2528,34 @@ async fn a_retry_refused_by_the_orphan_sweep_uploads_again_once_the_object_is_go
     let bucket = h.dir.path().join("bucket");
     let written = parquet_files(&bucket);
     assert_eq!(written.len(), 1);
-    let before = sha256_of(&written[0]);
-    let relative = written[0]
+    let old = written[0].clone();
+    let bytes = sha256_of(&old);
+    let old_relative = old
         .strip_prefix(&bucket)
         .unwrap()
         .to_str()
         .unwrap()
         .to_owned();
 
-    // The sweep marks the object: the retry is refused and nothing registers.
+    // The sweep marks the object: the retry is refused and the rows get a
+    // fresh id, logged as a second intent.
     db.catalog
-        .orphans_seen(std::slice::from_ref(&relative))
+        .orphans_seen(std::slice::from_ref(&old_relative))
         .await
         .unwrap();
     assert_eq!(
         db.catalog
-            .orphan_doom(&relative, std::slice::from_ref(&relative))
+            .orphan_doom(&old_relative, std::slice::from_ref(&old_relative))
             .await
             .unwrap(),
         fs_catalog::Doom::Marked
     );
     h.ingester.flush_all().await;
     assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        h.ingester.flush_stats().superseded.load(Ordering::Relaxed),
+        1
+    );
     let visible = |catalog: Catalog| async move {
         catalog
             .visible_files(
@@ -2563,19 +2571,33 @@ async fn a_retry_refused_by_the_orphan_sweep_uploads_again_once_the_object_is_go
     };
     assert_eq!(visible(db.catalog.clone()).await.len(), 0);
 
-    // The sweep deletes the object and forgets it: the retry uploads the
-    // same bytes again and registers.
-    std::fs::remove_file(&written[0]).unwrap();
-    db.catalog
-        .orphans_forget(std::slice::from_ref(&relative))
-        .await
-        .unwrap();
+    // The next attempt writes the same bytes under the new path and
+    // registers them; the marked object is left as it is.
     h.ingester.flush_all().await;
     assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
-    let after = parquet_files(&bucket);
-    assert_eq!(after, written, "same path");
-    assert_eq!(sha256_of(&after[0]), before, "same bytes");
-    assert_eq!(visible(db.catalog.clone()).await.len(), 1);
+    let now = parquet_files(&bucket);
+    assert_eq!(now.len(), 2, "the marked object and the new one");
+    let new = now.iter().find(|p| **p != old).unwrap().clone();
+    assert_eq!(sha256_of(&new), bytes, "same bytes under the new id");
+    assert_eq!(sha256_of(&old), bytes, "the marked object untouched");
+    let registered = visible(db.catalog.clone()).await;
+    assert_eq!(registered.len(), 1);
+    assert_eq!(bucket.join(&registered[0].path), new);
+    assert_ne!(registered[0].path, old_relative);
+
+    // Crash before the checkpoint: replay sees both intents for these
+    // records and keeps the last id, so the retry finds its row and
+    // nothing is written or registered twice.
+    h.task.abort();
+    let _ = h.task.await;
+    let dir = h.dir;
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 0);
+    assert_eq!(parquet_files(&bucket).len(), 2);
+    let registered = visible(db.catalog.clone()).await;
+    assert_eq!(registered.len(), 1);
+    assert_eq!(bucket.join(&registered[0].path), new);
     h.stop().await;
     db.finish().await;
 }

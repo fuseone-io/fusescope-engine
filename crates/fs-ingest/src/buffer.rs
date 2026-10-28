@@ -377,6 +377,9 @@ pub struct Flushing {
     /// Layout the intent recorded, which every attempt reproduces; `None`
     /// for intents logged before layouts were recorded.
     pub layout: Option<FileLayout>,
+    /// The records the intent covers, `[first, end)`, so an intent for
+    /// another id can be logged for the same rows.
+    pub range: (Position, Position),
 }
 
 impl Flushing {
@@ -742,6 +745,7 @@ impl Buffers {
         tenant: TenantId,
         file: FileId,
         layout: FileLayout,
+        range: (Position, Position),
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
@@ -754,6 +758,7 @@ impl Buffers {
             in_progress: true,
             detached: 0,
             layout: Some(layout),
+            range,
         });
         Some((batches, lease))
     }
@@ -766,6 +771,7 @@ impl Buffers {
         file: FileId,
         buffer: TenantBuffer,
         layout: Option<FileLayout>,
+        range: (Position, Position),
     ) {
         if !buffer.is_empty() {
             self.flushing.entry(tenant).or_default().push(Flushing {
@@ -776,7 +782,38 @@ impl Buffers {
                 in_progress: false,
                 detached: 0,
                 layout,
+                range,
             });
+        }
+    }
+
+    /// The records and layout the pending flush of `file` covers, for an
+    /// intent that gives the same rows another id.
+    pub fn flushing_range(
+        &self,
+        tenant: TenantId,
+        file: FileId,
+    ) -> Option<((Position, Position), Option<FileLayout>)> {
+        self.flushing
+            .get(&tenant)?
+            .iter()
+            .find(|f| f.file == file)
+            .map(|f| (f.range, f.layout))
+    }
+
+    /// Gives the pending flush of `old` the id `new`, keeping its rows,
+    /// attempts and backoff; true when there was one.
+    pub fn rename_flushing(&mut self, tenant: TenantId, old: FileId, new: FileId) -> bool {
+        match self
+            .flushing
+            .get_mut(&tenant)
+            .and_then(|l| l.iter_mut().find(|f| f.file == old))
+        {
+            Some(entry) => {
+                entry.file = new;
+                true
+            }
+            None => false,
         }
     }
 
@@ -1039,7 +1076,7 @@ mod tests {
             .push(batch(1), at(15), Instant::now());
         assert_eq!(buffers.live_first_wal(tenant), Some(at(15)));
         let (_, lease) = buffers
-            .begin_flush(tenant, file, FileLayout::current(8))
+            .begin_flush(tenant, file, FileLayout::current(8), (at(0), at(u64::MAX)))
             .unwrap();
         drop(lease);
         assert_eq!(buffers.live_first_wal(tenant), None);
@@ -1110,7 +1147,7 @@ mod tests {
         drop(reservation);
         let file = FileId(uuid::Uuid::from_u128(1));
         let (_, lease) = buffers
-            .begin_flush(tenant, file, FileLayout::current(8))
+            .begin_flush(tenant, file, FileLayout::current(8), (at(0), at(u64::MAX)))
             .unwrap();
         assert_eq!(
             buffers.scratch_total(),
@@ -1233,7 +1270,7 @@ mod tests {
             .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
         let (flushed, _lease) = buffers
-            .begin_flush(tenant, file, FileLayout::current(8))
+            .begin_flush(tenant, file, FileLayout::current(8), (at(0), at(u64::MAX)))
             .unwrap();
         assert_eq!(
             values(&flushed),
@@ -1515,7 +1552,7 @@ mod tests {
             .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
         let (originals, lease) = buffers
-            .begin_flush(tenant, file, FileLayout::current(8))
+            .begin_flush(tenant, file, FileLayout::current(8), (at(0), at(u64::MAX)))
             .unwrap();
         drop(lease);
         let raw = buffers.memory().1;
@@ -1564,7 +1601,7 @@ mod tests {
             .take_for_coalesce(tenant, None, 2, usize::MAX, usize::MAX)
             .unwrap();
         let (originals, lease) = buffers
-            .begin_flush(tenant, file, FileLayout::current(8))
+            .begin_flush(tenant, file, FileLayout::current(8), (at(0), at(u64::MAX)))
             .unwrap();
         buffers.flush_failed(tenant, file, now);
         drop(originals);
@@ -1602,7 +1639,7 @@ mod tests {
         let mut buffers = Buffers::default();
         buffers.get_mut(tenant).push(tagged(4, 1), at(10), now);
         let (_, lease) = buffers
-            .begin_flush(tenant, file, FileLayout::current(8))
+            .begin_flush(tenant, file, FileLayout::current(8), (at(0), at(u64::MAX)))
             .unwrap();
         drop(lease);
         let budget = buffers.memory().1;
