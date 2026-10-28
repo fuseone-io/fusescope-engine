@@ -22,6 +22,8 @@ pub mod col {
     pub const TRACE_ID: &str = "trace_id";
     /// 8 byte span id.
     pub const SPAN_ID: &str = "span_id";
+    /// Resource service name, the leading sort key of every file.
+    pub const SERVICE_NAME: &str = "service_name";
     /// 8 byte parent span id, null for root spans.
     pub const PARENT_SPAN_ID: &str = "parent_span_id";
     /// W3C tracestate.

@@ -8,6 +8,7 @@ pub mod attrs;
 pub mod bucket;
 pub mod fingerprint;
 pub mod limits;
+pub mod parquet;
 pub mod spans;
 
 use thiserror::Error;
@@ -24,6 +25,12 @@ pub enum SchemaError {
     /// A nested builder did not have the layout the schema declares. Programming error.
     #[error("builder layout mismatch at {0}")]
     Layout(&'static str),
+    /// The Parquet writer refused its settings.
+    #[error("parquet: {0}")]
+    Parquet(#[from] ::parquet::errors::ParquetError),
+    /// A row group size outside `1..=MAX_ROW_GROUP_ROWS`.
+    #[error("row group of {0} rows is outside the supported range")]
+    RowGroupRows(usize),
 }
 
 #[cfg(test)]

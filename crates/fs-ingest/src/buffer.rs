@@ -17,10 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::array::AsArray;
 use arrow::record_batch::RecordBatch;
 use fs_catalog::{FileId, TenantId};
-use fs_schema::spans::col;
 use fs_wal::Position;
 
 use crate::record::FileLayout;
@@ -60,16 +58,7 @@ pub struct HotBatch {
 
 /// Trace ids of a span batch, or `None` when it has no `trace_id` column.
 pub fn trace_set(batch: &RecordBatch) -> Option<TraceSet> {
-    let index = batch.schema().index_of(col::TRACE_ID).ok()?;
-    let ids = batch.column(index).as_fixed_size_binary_opt()?;
-    let mut set: Vec<[u8; TRACE_ID_BYTES]> = ids
-        .iter()
-        .flatten()
-        .filter_map(|v| <[u8; TRACE_ID_BYTES]>::try_from(v).ok())
-        .collect();
-    set.sort_unstable();
-    set.dedup();
-    Some(Arc::from(set))
+    fs_schema::spans::trace_ids(batch).map(Arc::from)
 }
 
 /// Memory a trace set takes, counted with the batch it describes.

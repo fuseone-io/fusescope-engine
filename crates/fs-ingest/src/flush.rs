@@ -14,8 +14,8 @@
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, UInt32Array};
-use arrow::compute::{SortColumn, cast, interleave, lexsort_to_indices, take_record_batch};
+use arrow::array::AsArray;
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -26,39 +26,20 @@ use fs_schema::spans::{col, span_schema_v1};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
-use parquet::schema::types::ColumnPath;
+use parquet::file::properties::WriterProperties;
 
 use crate::IngestError;
 use crate::buffer::{HotBatch, trace_set};
 
-/// Rows per row group when the caller gives no size. Statistics still prune
-/// well at this size and a flush of a few hundred thousand rows makes a few
-/// groups, so the writer never holds the whole file.
-pub const DEFAULT_ROW_GROUP_ROWS: usize = 262_144;
-
-/// Most rows one row group may hold, from configuration or from an intent.
-/// The size feeds the bloom filters of three columns, each sized by it and
-/// held outside the flush lease, so it is bounded here and nowhere else.
-pub const MAX_ROW_GROUP_ROWS: usize = 1_048_576;
+pub use fs_schema::parquet::{DEFAULT_ROW_GROUP_ROWS, MAX_ROW_GROUP_ROWS};
 
 /// Refuses a row group size outside `1..=MAX_ROW_GROUP_ROWS`.
 ///
 /// # Errors
 /// Zero, or more than [`MAX_ROW_GROUP_ROWS`].
 pub fn check_row_group_rows(rows: usize) -> Result<(), IngestError> {
-    if (1..=MAX_ROW_GROUP_ROWS).contains(&rows) {
-        Ok(())
-    } else {
-        Err(IngestError::Encode(format!(
-            "row group of {rows} rows is outside 1..={MAX_ROW_GROUP_ROWS}"
-        )))
-    }
+    Ok(fs_schema::parquet::check_row_group_rows(rows)?)
 }
-
-/// zstd level for L0: fast, the compactor recompresses at L2.
-const ZSTD_LEVEL: i32 = 3;
 
 /// A Parquet file ready to upload plus its catalog entry.
 pub struct Prepared {
@@ -205,23 +186,8 @@ fn trace_index(path: &str, rows: &[HotBatch]) -> Result<TraceIndex, IngestError>
     Ok(TraceIndex::new(vec![path.to_owned()], pairs)?)
 }
 
-/// The engine's Parquet writer settings for L0 with row groups of
-/// `row_group_rows`. Row groups end on an explicit flush, never inside
-/// `write`: the writer's own limit sits one row above any group handed to
-/// it, so its memory can be read while it still holds the whole group. The
-/// bloom filters are sized to the group, not to that limit.
 fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, IngestError> {
-    Ok(WriterProperties::builder()
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
-        .set_max_row_group_row_count(Some(row_group_rows.saturating_add(1)))
-        .set_bloom_filter_max_ndv(u64::try_from(row_group_rows).unwrap_or(u64::MAX))
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::SPAN_ID), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("service_name"), true)
-        .set_bloom_filter_fpp(0.01)
-        .build())
+    Ok(fs_schema::parquet::writer_properties(row_group_rows)?)
 }
 
 /// Sort keys of every input, as integers: the rank of the service among all
@@ -321,42 +287,11 @@ fn gather(
     inputs: &[RecordBatch],
     indices: &[(usize, usize)],
 ) -> Result<RecordBatch, IngestError> {
-    let columns = (0..schema.fields().len())
-        .map(|c| {
-            let sources: Vec<&dyn Array> = inputs.iter().map(|b| b.column(c).as_ref()).collect();
-            interleave(&sources, indices)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+    Ok(fs_schema::parquet::gather(schema, inputs, indices)?)
 }
 
-/// Sorts one batch by `(service_name, timestamp, row)`: a total order, so
-/// the result does not depend on the sort algorithm.
 fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
-    let schema = batch.schema();
-    let service = batch.column(schema.index_of("service_name")?);
-    let timestamp = batch.column(schema.index_of(col::TIMESTAMP)?);
-    let rows = u32::try_from(batch.num_rows())
-        .map_err(|_| IngestError::Encode("batch too large to sort".into()))?;
-    let position: Arc<dyn Array> = Arc::new(UInt32Array::from_iter_values(0..rows));
-    let indices = lexsort_to_indices(
-        &[
-            SortColumn {
-                values: Arc::clone(service),
-                options: None,
-            },
-            SortColumn {
-                values: Arc::clone(timestamp),
-                options: None,
-            },
-            SortColumn {
-                values: position,
-                options: None,
-            },
-        ],
-        None,
-    )?;
-    Ok(take_record_batch(batch, &indices)?)
+    Ok(fs_schema::parquet::sort_batch(batch)?)
 }
 
 /// Refuses a layout this engine does not write: the rows wait, bound to
