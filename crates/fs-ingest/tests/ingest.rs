@@ -2621,12 +2621,21 @@ async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
     let _ = h.task.await;
     let dir = h.dir;
     let h = start(&db.catalog, dir, test_config()).await;
+    let scanned =
+        fs_ingest::hot::scan(&h.hot_addr.to_string(), &everything, Duration::from_secs(5))
+            .await
+            .unwrap();
+    assert!(
+        scanned.persisted_files.contains(&old_id),
+        "after the restart the hot window still announces the first id, taken from the log"
+    );
     h.ingester.flush_all().await;
     assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 0);
     assert_eq!(parquet_files(&bucket).len(), 2);
     let registered = visible(db.catalog.clone()).await;
     assert_eq!(registered.len(), 1);
     assert_eq!(bucket.join(&registered[0].path), new);
+    assert_eq!(registered[0].origin, old_id);
     h.stop().await;
     db.finish().await;
 }

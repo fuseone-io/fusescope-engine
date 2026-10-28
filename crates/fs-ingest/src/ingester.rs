@@ -982,42 +982,41 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
 
 /// Rebuilds buffers: rows covered by an intent go back to the flushing state
 /// under that file id, everything else is live.
-fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>, instance: uuid::Uuid) -> Buffers {
+fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Buffers {
     let now = Instant::now();
     let mut buffers = Buffers::with_scratch_counter(scratch);
     // Several intents for the same records are one flush under the id of
-    // the last logged: an earlier id was given up.
-    let mut latest: Vec<FlushIntent> = Vec::new();
+    // the last logged, an earlier id having been given up, and the id of
+    // the first logged is the origin: the one the hot window announced
+    // from the start, taken from the log rather than derived again.
+    let mut latest: Vec<(FlushIntent, FileId)> = Vec::new();
     for intent in replayed.intents {
-        latest.retain(|earlier| {
-            !(earlier.tenant == intent.tenant
+        let same_range = |earlier: &FlushIntent| {
+            earlier.tenant == intent.tenant
                 && earlier.first == intent.first
-                && earlier.end == intent.end)
-        });
-        latest.push(intent);
+                && earlier.end == intent.end
+        };
+        let origin = latest
+            .iter()
+            .find(|(earlier, _)| same_range(earlier))
+            .map_or(intent.file, |(_, origin)| *origin);
+        latest.retain(|(earlier, _)| !same_range(earlier));
+        latest.push((intent, origin));
     }
-    let mut groups: Vec<(FlushIntent, TenantBuffer)> = latest
+    let mut groups: Vec<(FlushIntent, FileId, TenantBuffer)> = latest
         .into_iter()
-        .map(|i| (i, TenantBuffer::default()))
+        .map(|(i, origin)| (i, origin, TenantBuffer::default()))
         .collect();
     for (tenant, position, batch) in replayed.rows {
         match groups
             .iter_mut()
-            .find(|(intent, _)| intent.covers(tenant, position))
+            .find(|(intent, _, _)| intent.covers(tenant, position))
         {
-            Some((_, buffer)) => buffer.push(batch, position, now),
+            Some((_, _, buffer)) => buffer.push(batch, position, now),
             None => buffers.get_mut(tenant).push(batch, position, now),
         }
     }
-    for (intent, buffer) in groups {
-        // The id the rows were first assigned is the one derived from their
-        // first record, whatever id the last intent gave them.
-        let origin = FileId::derived(
-            instance,
-            intent.tenant,
-            intent.first.segment,
-            intent.first.offset,
-        );
+    for (intent, origin, buffer) in groups {
         buffers.insert_flushing(
             intent.tenant,
             intent.file,
@@ -1064,11 +1063,7 @@ impl Ingester {
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
         let flush_stats = Arc::new(FlushStats::default());
-        let buffers = rebuild(
-            replayed,
-            Arc::clone(&flush_stats.scratch_bytes),
-            wal.instance_id(),
-        );
+        let buffers = rebuild(replayed, Arc::clone(&flush_stats.scratch_bytes));
         info!(
             records,
             damaged,
