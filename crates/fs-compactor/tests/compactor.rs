@@ -234,7 +234,11 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
         compaction_interval: Duration::from_secs(3600),
         compaction: no_compaction(),
         orphan_interval: Duration::from_secs(3600),
-        orphan_ttl: Duration::from_secs(3600),
+        sweep: fs_compactor::SweepConfig {
+            ttl: Duration::from_secs(3600),
+            prefixes_per_pass: 32,
+            deletes_per_pass: 100,
+        },
     };
     let task = tokio::spawn(fs_compactor::run(
         db.catalog.clone(),
@@ -395,7 +399,11 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
         compaction_interval: Duration::from_secs(3600),
         compaction: no_compaction(),
         orphan_interval: Duration::from_secs(3600),
-        orphan_ttl: Duration::from_secs(3600),
+        sweep: fs_compactor::SweepConfig {
+            ttl: Duration::from_secs(3600),
+            prefixes_per_pass: 32,
+            deletes_per_pass: 100,
+        },
     };
     let task = tokio::spawn(fs_compactor::run(
         db.catalog.clone(),

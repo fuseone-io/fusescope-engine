@@ -28,7 +28,7 @@ pub mod orphans;
 
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
 pub use lease::Leadership;
-pub use orphans::{OrphanStats, sweep_once};
+pub use orphans::{OrphanStats, SweepConfig, Sweeper};
 
 /// Why a compaction pass failed.
 #[derive(Debug, thiserror::Error)]
@@ -83,9 +83,8 @@ pub struct CompactorConfig {
     pub compaction: CompactionConfig,
     /// How often the bucket is swept for objects without a row.
     pub orphan_interval: Duration,
-    /// How long an object must have been seen without a row before it is
-    /// deleted; longer than any upload waits for its registration.
-    pub orphan_ttl: Duration,
+    /// Bounds of one sweep.
+    pub sweep: SweepConfig,
 }
 
 /// Counters of every kind of work the compactor does.
@@ -182,10 +181,17 @@ async fn work_loop(
     compact.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut orphans = tokio::time::interval(config.orphan_interval.max(Duration::from_secs(1)));
     orphans.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sweeper = Sweeper::new(
+        catalog.clone(),
+        Arc::clone(&store),
+        root,
+        config.sweep.clone(),
+        orphan_stats,
+    );
     loop {
         tokio::select! {
             _ = orphans.tick() => {
-                if let Err(e) = sweep_once(&catalog, store.as_ref(), &root, config.orphan_ttl, &orphan_stats).await {
+                if let Err(e) = sweeper.sweep_once().await {
                     warn!(role = "compactor", error = %e, "orphan sweep failed");
                 }
             }

@@ -2492,6 +2492,93 @@ async fn a_foreign_sidecar_under_the_files_path_blocks_registration() {
     db.finish().await;
 }
 
+/// A registration racing the orphan sweep: once the sweep has marked the
+/// object, the retry is refused and keeps its rows; once the sweep has
+/// deleted it, the retry uploads again and registers the same bytes.
+#[tokio::test]
+async fn a_retry_refused_by_the_orphan_sweep_uploads_again_once_the_object_is_gone() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_register_failures: 1,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 5), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let bucket = h.dir.path().join("bucket");
+    let written = parquet_files(&bucket);
+    assert_eq!(written.len(), 1);
+    let before = sha256_of(&written[0]);
+    let relative = written[0]
+        .strip_prefix(&bucket)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // The sweep marks the object: the retry is refused and nothing registers.
+    db.catalog
+        .orphans_seen(std::slice::from_ref(&relative))
+        .await
+        .unwrap();
+    assert!(
+        db.catalog
+            .orphan_doom(&relative, std::slice::from_ref(&relative))
+            .await
+            .unwrap()
+    );
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
+    let visible = |catalog: Catalog| async move {
+        catalog
+            .visible_files(
+                tenant,
+                Signal::Traces,
+                TimeRange {
+                    start: chrono::DateTime::UNIX_EPOCH,
+                    end: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(visible(db.catalog.clone()).await.len(), 0);
+
+    // The sweep deletes the object and forgets it: the retry uploads the
+    // same bytes again and registers.
+    std::fs::remove_file(&written[0]).unwrap();
+    db.catalog
+        .orphans_forget(std::slice::from_ref(&relative))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
+    let after = parquet_files(&bucket);
+    assert_eq!(after, written, "same path");
+    assert_eq!(sha256_of(&after[0]), before, "same bytes");
+    assert_eq!(visible(db.catalog.clone()).await.len(), 1);
+    h.stop().await;
+    db.finish().await;
+}
+
 /// An intent recorded by a newer engine names a layout this one does not
 /// write. The rows stay bound to their id and nothing reaches the bucket:
 /// writing other bytes under that id would break every later retry.

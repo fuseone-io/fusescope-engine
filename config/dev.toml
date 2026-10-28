@@ -57,6 +57,8 @@ max_input_bytes = 2147483648
 # Objects without a catalog row are deleted once seen that way for orphan_ttl_secs.
 orphan_interval_secs = 3600
 orphan_ttl_secs = 3600
+sweep_prefixes_per_pass = 32
+sweep_deletes_per_pass = 10000
 quarantine_ttl_secs = 3600
 
 [log]

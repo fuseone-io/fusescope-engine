@@ -528,17 +528,30 @@ must never point at files that do not exist.
 
 A crash between an upload and its registration, a compaction that did not
 publish, or a cancelled pass leaves objects no row points at. The leader
-sweeps the engine's prefix every `compactor.orphan_interval_secs`: it lists
-the span files and sidecars, asks the catalog which have a row (a sidecar
-has one when the span file of any level it could belong to has one),
-remembers the rest in `engine_orphan` with their first sighting, and
-deletes an object only when it is still without a row more than
-`compactor.orphan_ttl_secs` after that first sighting, so an upload still
-waiting for its registration is seen once and registered before the next
-look. An orphan that gets a row meanwhile, or that is gone, is forgotten.
-Objects the engine does not lay out are left alone. The sweep runs on the
-leader only and never alongside a compaction pass, so the outputs of the
-pass under way are never candidates.
+sweeps the engine's prefix every `compactor.orphan_interval_secs`, walking
+at most `compactor.sweep_objects_per_pass` objects per pass from where the
+last pass stopped and deleting at most `compactor.sweep_deletes_per_pass`,
+so memory, catalog queries and the time taken from purge and compaction are
+bounded. Only paths the engine lays out count, parsed strictly (tenant id,
+signal, level, partition, file id, extension); anything else under the
+prefix is left alone.
+
+Deletion is a protocol with registration, through one row per path in
+`engine_orphan`. The sweep records an object's first sighting without a row
+(a sidecar has a row when the span file of any level it could belong to
+has one). Once the sighting is older than `compactor.orphan_ttl_secs` the
+sweep marks the row `deleting` with an update that is refused when a row
+for the path, or for any file it could belong to, exists; the update takes
+the orphan's row lock. Every registration, a flush's or a compaction's,
+locks the orphan rows of the path and its sidecar in its own transaction
+and is refused with `ObjectDoomed` when one is marked. The two serialise on
+the lock, so the one that commits first decides: a registration that wins
+keeps its object, a mark that wins means the writer retries, is refused
+until the object is gone and forgotten, then uploads the same bytes again.
+Marked objects are deleted and forgotten; a pass that stops between marking
+and deleting is finished by the next. An orphan that gets a row before its
+TTL is forgotten. Objects deleted by a cancelled request to the bucket are
+the one case the sweep cannot see, and the TTL covers it.
 
 ## 8. Contract with the Go backend
 

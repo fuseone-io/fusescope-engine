@@ -852,10 +852,28 @@ async fn orphans_seen_two_hours_ago(f: &Fixture) {
         .unwrap();
 }
 
+fn sweeper(f: &Fixture, prefixes_per_pass: usize) -> fs_compactor::Sweeper {
+    fs_compactor::Sweeper::new(
+        f.db.catalog.clone(),
+        f.store.clone(),
+        Path::from(""),
+        fs_compactor::SweepConfig {
+            ttl: Duration::from_secs(3600),
+            prefixes_per_pass,
+            deletes_per_pass: 100,
+        },
+        Arc::new(fs_compactor::OrphanStats::default()),
+    )
+}
+
+async fn present(f: &Fixture, path: &str) -> bool {
+    f.store.head(&Path::from(path)).await.is_ok()
+}
+
 /// Objects without a row are remembered on first sight and deleted only
 /// when still without a row a TTL later; registered files, their
-/// sidecars and objects the engine does not lay out are left alone, and an
-/// orphan that gets a row meanwhile is forgotten, not deleted.
+/// sidecars and anything the engine does not lay out are left alone, and
+/// an orphan that gets a row meanwhile is forgotten, not deleted.
 #[tokio::test]
 async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let Some(f) = fixture().await else { return };
@@ -871,122 +889,155 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let me = fence(&f).await;
     assert!(c.compact_once(&me).await.is_err());
     let orphan_l1 = l1_objects(&f).await.remove(0);
-    // A stray span file nobody registered, and a note that is not ours.
+    // A stray span file nobody registered, and objects that are not ours.
     let stray = format!(
         "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
         f.tenant.0,
         uuid::Uuid::new_v4()
     );
-    f.store
-        .put(&Path::from(stray.as_str()), b"stray".to_vec().into())
-        .await
-        .unwrap();
-    f.store
-        .put(&Path::from("t/notes.txt"), b"keep".to_vec().into())
-        .await
-        .unwrap();
-    let stats = Arc::new(fs_compactor::OrphanStats::default());
-    let ttl = Duration::from_secs(3600);
+    let foreign = [
+        "t/notes.txt".to_owned(),
+        "t/notes.parquet".to_owned(),
+        format!(
+            "t/{}/traces/l7/dt=2026-10-24/hr=14/{}.parquet",
+            f.tenant.0,
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "t/{}/logs/l0/dt=2026-10-24/hr=14/{}.parquet",
+            f.tenant.0,
+            uuid::Uuid::new_v4()
+        ),
+        format!(
+            "t/{}/traces/index/other/dt=2026-10-24/hr=14/{}.tix",
+            f.tenant.0,
+            uuid::Uuid::new_v4()
+        ),
+    ];
+    for path in std::iter::once(&stray).chain(&foreign) {
+        f.store
+            .put(&Path::from(path.as_str()), b"x".to_vec().into())
+            .await
+            .unwrap();
+    }
+    let mut sweeper = sweeper(&f, 32);
+    let stats = sweeper.stats();
 
-    let first = fs_compactor::sweep_once(
-        &f.db.catalog,
-        f.store.as_ref(),
-        &Path::from(""),
-        ttl,
-        &stats,
-    )
-    .await
-    .unwrap();
+    let first = sweeper.sweep_once().await.unwrap();
+    assert_eq!(first.prefixes, 3, "the tenant's l0, l1 and sidecar days");
     assert_eq!(
         first.listed, 9,
-        "three files with sidecars, the L1 with its sidecar, the stray"
+        "the objects of those partitions, foreign levels and signals not walked"
     );
-    assert_eq!(first.seen, 3);
+    assert_eq!(
+        first.seen, 3,
+        "the L1, its sidecar and the stray; nothing foreign"
+    );
     assert_eq!(first.deleted, 0, "first sight: nothing deleted");
+    assert!(first.wrapped);
     for path in [&orphan_l1, &stray] {
-        assert!(
-            f.store.head(&Path::from(path.as_str())).await.is_ok(),
-            "{path} still there"
-        );
+        assert!(present(&f, path).await, "{path} still there");
     }
-    assert!(
-        fs_compactor::sweep_once(
-            &f.db.catalog,
-            f.store.as_ref(),
-            &Path::from(""),
-            ttl,
-            &stats
-        )
-        .await
-        .unwrap()
-        .deleted
-            == 0,
+    let again = sweeper.sweep_once().await.unwrap();
+    assert_eq!(
+        (again.seen, again.deleted),
+        (3, 0),
         "seen twice within the TTL: still nothing"
     );
 
     // The stray gets a row before its TTL; the rest wait it out.
-    let mut adopted = registered[0].clone();
     let row = fs_catalog::NewFile {
         id: fs_catalog::FileId::new(),
         tenant_id: f.tenant,
         signal: Signal::Traces,
         level: Level::L0,
         path: stray.clone(),
-        size_bytes: 5,
+        size_bytes: 1,
         row_count: 0,
-        range: adopted.range,
+        range: registered[0].range,
         services: vec![],
         summary: None,
     };
-    adopted.path = stray.clone();
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;
-    let second = fs_compactor::sweep_once(
-        &f.db.catalog,
-        f.store.as_ref(),
-        &Path::from(""),
-        ttl,
-        &stats,
-    )
-    .await
-    .unwrap();
+    let second = sweeper.sweep_once().await.unwrap();
     assert_eq!(second.seen, 2, "the stray has a row now");
     assert_eq!(second.deleted, 2, "the L1 and its sidecar");
     assert_eq!(second.forgotten, 1, "the stray");
-    assert!(f.store.head(&Path::from(orphan_l1.as_str())).await.is_err());
-    assert!(
-        f.store
-            .head(&Path::from(
-                fs_index::sidecar_path(&orphan_l1).unwrap().as_str()
-            ))
-            .await
-            .is_err()
-    );
-    assert!(f.store.head(&Path::from(stray.as_str())).await.is_ok());
-    assert!(f.store.head(&Path::from("t/notes.txt")).await.is_ok());
+    assert!(!present(&f, &orphan_l1).await);
+    assert!(!present(&f, &fs_index::sidecar_path(&orphan_l1).unwrap()).await);
+    assert!(present(&f, &stray).await);
+    for path in &foreign {
+        assert!(present(&f, path).await, "{path} is not ours to delete");
+    }
     for file in &registered {
-        assert!(f.store.head(&Path::from(file.path.as_str())).await.is_ok());
-        assert!(
-            f.store
-                .head(&Path::from(
-                    fs_index::sidecar_path(&file.path).unwrap().as_str()
-                ))
-                .await
-                .is_ok()
-        );
+        assert!(present(&f, &file.path).await);
+        assert!(present(&f, &fs_index::sidecar_path(&file.path).unwrap()).await);
     }
     assert_eq!(visible(&f).await.len(), 4, "catalog untouched by the sweep");
-    assert!(
-        f.db.catalog
-            .orphans_due(Duration::ZERO)
-            .await
-            .unwrap()
-            .is_empty(),
-        "nothing remembered"
+    assert_eq!(
+        f.db.catalog.orphans_due(Duration::ZERO, 10).await.unwrap(),
+        Vec::<String>::new()
     );
     assert_eq!(stats.sweeps.load(Ordering::Relaxed), 3);
     assert_eq!(stats.deleted.load(Ordering::Relaxed), 2);
     assert_eq!(stats.forgotten.load(Ordering::Relaxed), 1);
+    f.db.finish().await;
+}
+
+/// A pass walks a bounded stretch and the next one continues from there;
+/// a mark left by a pass that stopped is finished by the next.
+#[tokio::test]
+async fn a_sweep_walks_in_bounded_passes_and_finishes_what_it_marked() {
+    let Some(f) = fixture().await else { return };
+    three_closed_l0(&f, 4).await;
+    let strays: Vec<String> = (0..4)
+        .map(|_| {
+            format!(
+                "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
+                f.tenant.0,
+                uuid::Uuid::new_v4()
+            )
+        })
+        .collect();
+    for path in &strays {
+        f.store
+            .put(&Path::from(path.as_str()), b"x".to_vec().into())
+            .await
+            .unwrap();
+    }
+    // Two partitions, the L0 day and the sidecar day, one per pass: two
+    // passes to wrap.
+    let mut sweeper = sweeper(&f, 1);
+    let mut passes = 0;
+    let mut seen = 0;
+    loop {
+        let swept = sweeper.sweep_once().await.unwrap();
+        passes += 1;
+        seen += swept.seen;
+        assert_eq!(swept.prefixes, 1);
+        if swept.wrapped {
+            break;
+        }
+    }
+    assert_eq!(passes, 2);
+    assert_eq!(seen, 4, "every stray seen exactly once across the walk");
+
+    // A pass that marked but died before deleting: the next pass deletes.
+    orphans_seen_two_hours_ago(&f).await;
+    for path in &strays[..2] {
+        assert!(
+            f.db.catalog
+                .orphan_doom(path, std::slice::from_ref(path))
+                .await
+                .unwrap()
+        );
+    }
+    let swept = sweeper.sweep_once().await.unwrap();
+    assert_eq!(swept.deleted, 4, "two finished, two reaped");
+    for path in &strays {
+        assert!(!present(&f, path).await);
+    }
     f.db.finish().await;
 }
 
