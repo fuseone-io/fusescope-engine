@@ -343,6 +343,12 @@ impl Metrics {
             "Bytes of trace_id sidecars created",
             ns(&f.trace_index_bytes),
         );
+        counter(
+            out,
+            "fusescope_flush_superseded_total",
+            "Flushes given a fresh id because the orphan sweep marked their path",
+            ns(&f.superseded),
+        );
         histogram(
             out,
             "fusescope_coalesce_seconds",
@@ -438,6 +444,11 @@ impl Metrics {
                 "fusescope_orphan_forgotten_total",
                 "Remembered orphans found with a row, or gone, before their TTL",
                 load(&o.forgotten),
+            ),
+            (
+                "fusescope_orphan_delete_failures_total",
+                "Deletes that failed and wait their backoff",
+                load(&o.delete_failures),
             ),
         ] {
             counter(out, name, help, value);

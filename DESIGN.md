@@ -557,8 +557,11 @@ compaction's, takes the locks of its path and sidecar in its own
 transaction and is refused with `ObjectDoomed` when either row is marked.
 The lock is not the row's, so the two serialise even before any orphan row
 exists, and the one that commits first decides: a registration that wins
-keeps its object, a mark that wins means the writer retries, is refused
-until the object is gone and forgotten, then uploads the same bytes again.
+keeps its object; a mark that wins means the writer gives the same rows a
+fresh id, logged as a second intent for the same records so a restart
+retries under it too, and writes the same bytes under the new path. A path
+once marked is never written again, since a delete still in flight when a
+sweeper lost its lease could remove an object re-uploaded under it.
 A mark is never undone: a sweeper that finds a row already marked, by an
 earlier pass or by another instance during a handover, deletes the object
 itself; only a path a file row owns, or one that is not the engine's, is
@@ -566,7 +569,10 @@ forgotten. The delete and the forgetting run under a claim that holds the
 path's lock in an open transaction, so two sweepers never delete the same
 path, a registration re-uploading it waits for the claim to end, and a
 sweeper whose claim finds the mark gone does nothing. A pass that stops
-between marking and deleting is finished by the next. Objects deleted by a
+between marking and deleting is finished by the next. A delete that fails
+keeps its mark and waits `compactor.sweep_delete_backoff_secs`, times the
+failures so far, before its next try, behind the others, so the ones that
+always fail do not take every pass's budget. Objects deleted by a
 cancelled request to the bucket are the one case the sweep cannot see, and
 the TTL covers it.
 

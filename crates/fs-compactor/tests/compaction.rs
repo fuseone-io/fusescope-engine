@@ -861,6 +861,8 @@ fn sweeper(f: &Fixture, objects_per_pass: usize) -> fs_compactor::Sweeper {
             ttl: Duration::from_secs(3600),
             objects_per_pass,
             deletes_per_pass: 100,
+            delete_backoff: Duration::from_secs(600),
+            inject_delete_failure: None,
         },
         Arc::new(fs_compactor::OrphanStats::default()),
     )
@@ -1116,6 +1118,97 @@ async fn the_sweep_forgets_foreign_paths_and_finishes_another_sweepers_marks() {
         Vec::<String>::new()
     );
     f.db.finish().await;
+}
+
+/// A marked object whose delete keeps failing waits its backoff behind
+/// the others instead of taking the pass's whole budget every time.
+#[tokio::test]
+async fn a_failing_delete_waits_its_backoff_behind_the_others() {
+    let Some(f) = fixture().await else { return };
+    let stuck_id = uuid::Uuid::new_v4();
+    let stuck = format!(
+        "t/{}/traces/l0/dt=2026-10-24/hr=14/{stuck_id}.parquet",
+        f.tenant.0
+    );
+    let other = format!(
+        "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
+        f.tenant.0,
+        uuid::Uuid::new_v4()
+    );
+    for path in [&stuck, &other] {
+        f.store
+            .put(&Path::from(path.as_str()), b"x".to_vec().into())
+            .await
+            .unwrap();
+        f.db.catalog
+            .orphans_seen(std::slice::from_ref(path))
+            .await
+            .unwrap();
+        f.db.catalog
+            .orphan_doom(path, std::slice::from_ref(path))
+            .await
+            .unwrap();
+    }
+    let mut sweeper = fs_compactor::Sweeper::new(
+        f.db.catalog.clone(),
+        f.store.clone(),
+        Path::from(""),
+        fs_compactor::SweepConfig {
+            ttl: Duration::from_secs(3600),
+            objects_per_pass: 1000,
+            deletes_per_pass: 1,
+            delete_backoff: Duration::from_secs(600),
+            inject_delete_failure: Some(stuck_id.to_string()),
+        },
+        Arc::new(fs_compactor::OrphanStats::default()),
+    );
+    let stats = sweeper.stats();
+    // The stuck one is first by path or not; two passes of one delete each
+    // get the other one deleted and the stuck one waiting.
+    for _ in 0..2 {
+        sweeper.sweep_once().await.unwrap();
+    }
+    assert!(
+        !present(&f, &other).await,
+        "the other was not kept behind the stuck one"
+    );
+    assert!(present(&f, &stuck).await);
+    assert_eq!(stats.delete_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.deleted.load(Ordering::Relaxed), 1);
+    let third = sweeper.sweep_once().await.unwrap();
+    assert_eq!(
+        (third.deleted, stats.delete_failures.load(Ordering::Relaxed)),
+        (0, 1),
+        "waiting its backoff: not tried"
+    );
+
+    // Its turn comes back once the backoff is over, and a store that works
+    // again deletes it.
+    sqlx::query("update engine_orphan set retry_after = now() - interval '1 second'")
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
+    let mut recovered = sweeper_with(&f, None);
+    let swept = recovered.sweep_once().await.unwrap();
+    assert_eq!(swept.deleted, 1);
+    assert!(!present(&f, &stuck).await);
+    f.db.finish().await;
+}
+
+fn sweeper_with(f: &Fixture, inject_delete_failure: Option<String>) -> fs_compactor::Sweeper {
+    fs_compactor::Sweeper::new(
+        f.db.catalog.clone(),
+        f.store.clone(),
+        Path::from(""),
+        fs_compactor::SweepConfig {
+            ttl: Duration::from_secs(3600),
+            objects_per_pass: 1000,
+            deletes_per_pass: 100,
+            delete_backoff: Duration::from_secs(600),
+            inject_delete_failure,
+        },
+        Arc::new(fs_compactor::OrphanStats::default()),
+    )
 }
 
 /// L1 objects under the bucket, by path relative to it.

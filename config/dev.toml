@@ -59,6 +59,7 @@ orphan_interval_secs = 3600
 orphan_ttl_secs = 3600
 sweep_objects_per_pass = 100000
 sweep_deletes_per_pass = 10000
+sweep_delete_backoff_secs = 600
 quarantine_ttl_secs = 3600
 
 [log]

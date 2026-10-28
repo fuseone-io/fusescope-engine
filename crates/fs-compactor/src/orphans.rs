@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fs_catalog::{Catalog, Doom, OrphanClaim};
+use fs_catalog::{Catalog, Doom};
 use fs_index::SpanObject;
 use futures_util::StreamExt;
 use object_store::path::Path;
@@ -61,6 +61,12 @@ pub struct SweepConfig {
     pub objects_per_pass: usize,
     /// Most objects one pass deletes.
     pub deletes_per_pass: usize,
+    /// How long a marked object whose delete failed waits before the next
+    /// try, times the number of failures so far, up to six times.
+    pub delete_backoff: Duration,
+    /// Make the delete of every object whose path contains this fail
+    /// artificially. `None` in production; tests use it for the backoff.
+    pub inject_delete_failure: Option<String>,
 }
 
 /// Counters of the orphan sweep.
@@ -77,6 +83,8 @@ pub struct OrphanStats {
     /// Remembered paths forgotten: owned by a row after all, or not the
     /// engine's.
     pub forgotten: AtomicU64,
+    /// Deletes that failed and wait their backoff.
+    pub delete_failures: AtomicU64,
 }
 
 /// What one pass did.
@@ -361,14 +369,28 @@ impl Sweeper {
                 swept.forgotten += 1;
                 continue;
             }
-            match self.store.delete(&Path::from(path.as_str())).await {
+            let outcome = if self
+                .config
+                .inject_delete_failure
+                .as_ref()
+                .is_some_and(|needle| path.contains(needle.as_str()))
+            {
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "injected delete failure".into(),
+                })
+            } else {
+                self.store.delete(&Path::from(path.as_str())).await
+            };
+            match outcome {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     claim.finish().await?;
                     swept.deleted += 1;
                 }
                 Err(e) => {
-                    warn!(role = "compactor", path = %path, error = %e, "orphan delete failed; the next sweep retries");
-                    drop::<OrphanClaim>(claim);
+                    warn!(role = "compactor", path = %path, error = %e, backoff = ?self.config.delete_backoff, "orphan delete failed; tried again after its backoff");
+                    self.stats.delete_failures.fetch_add(1, Ordering::Relaxed);
+                    claim.retry_later(self.config.delete_backoff).await?;
                 }
             }
         }

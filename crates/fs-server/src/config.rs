@@ -569,6 +569,10 @@ pub struct CompactorConfig {
     /// Most objects one sweep deletes.
     #[serde(default = "default_sweep_deletes")]
     pub sweep_deletes_per_pass: usize,
+    /// How long a marked object whose delete failed waits before the next
+    /// try, times the number of failures so far, up to six times.
+    #[serde(default = "default_sweep_delete_backoff")]
+    pub sweep_delete_backoff_secs: u64,
 }
 
 impl Default for CompactorConfig {
@@ -587,6 +591,7 @@ impl Default for CompactorConfig {
             orphan_ttl_secs: default_orphan_ttl(),
             sweep_objects_per_pass: default_sweep_objects(),
             sweep_deletes_per_pass: default_sweep_deletes(),
+            sweep_delete_backoff_secs: default_sweep_delete_backoff(),
         }
     }
 }
@@ -616,6 +621,8 @@ impl CompactorConfig {
                 ttl: std::time::Duration::from_secs(self.orphan_ttl_secs),
                 objects_per_pass: self.sweep_objects_per_pass,
                 deletes_per_pass: self.sweep_deletes_per_pass,
+                delete_backoff: std::time::Duration::from_secs(self.sweep_delete_backoff_secs),
+                inject_delete_failure: None,
             },
         }
     }
@@ -635,6 +642,10 @@ fn default_sweep_objects() -> usize {
 
 fn default_sweep_deletes() -> usize {
     10_000
+}
+
+fn default_sweep_delete_backoff() -> u64 {
+    600
 }
 
 fn default_lease_ttl() -> u64 {

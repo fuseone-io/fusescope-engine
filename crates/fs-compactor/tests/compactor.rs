@@ -238,6 +238,8 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
             ttl: Duration::from_secs(3600),
             objects_per_pass: 100_000,
             deletes_per_pass: 100,
+            delete_backoff: Duration::from_secs(600),
+            inject_delete_failure: None,
         },
     };
     let task = tokio::spawn(fs_compactor::run(
@@ -403,6 +405,8 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
             ttl: Duration::from_secs(3600),
             objects_per_pass: 100_000,
             deletes_per_pass: 100,
+            delete_backoff: Duration::from_secs(600),
+            inject_delete_failure: None,
         },
     };
     let task = tokio::spawn(fs_compactor::run(
