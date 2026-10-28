@@ -37,7 +37,7 @@ must_use_candidate = "allow"
 [workspace.dependencies]
 # format and engine
 arrow = "59"
-parquet = "59"
+parquet = { version = "59", features = ["async", "object_store"] }
 # No `compression` feature: it pulls bzip2/xz for CSV and JSON, which we never read,
 # and libbz2-rs-sys carries the bzip2-1.0.6 license that is outside the allow-list.
 datafusion = { version = "55", default-features = false, features = [

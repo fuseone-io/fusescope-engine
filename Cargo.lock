@@ -1644,12 +1644,21 @@ dependencies = [
 name = "fs-compactor"
 version = "0.0.1"
 dependencies = [
+ "arrow",
+ "bytes",
  "chrono",
  "fs-catalog",
  "fs-index",
+ "fs-ingest",
+ "fs-query",
+ "fs-schema",
+ "futures-util",
  "object_store",
+ "opentelemetry-proto",
+ "parquet",
  "sqlx",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "uuid",

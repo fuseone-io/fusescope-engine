@@ -9,12 +9,14 @@
 //! stream ([`Catalog::watch`]) that keeps such a cache fresh.
 
 mod catalog;
+mod compaction;
 mod lease;
 mod token;
 mod types;
 mod watch;
 
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
+pub use compaction::CompactionCandidate;
 pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
 pub use token::{
     TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token, looks_like_token,

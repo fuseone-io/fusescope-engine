@@ -725,6 +725,126 @@ async fn wait_for_lock_waiter(catalog: &Catalog) {
     }
 }
 
+/// The oldest closed hour with enough L0 files comes first; open hours,
+/// other levels and quarantined files do not count.
+#[tokio::test]
+async fn compaction_candidates_are_closed_hours_with_enough_l0_files() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let closed = StdDuration::from_secs(60);
+    assert!(
+        db.catalog
+            .compaction_candidate(Signal::Traces, closed, 2)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Hour 1 has two files, hour 0 one, hour 2 three; all long closed.
+    let h0 = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 0, 0, &[]))
+        .await
+        .unwrap();
+    let h1a = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 1, 1, &[]))
+        .await
+        .unwrap();
+    let h1b = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 1, 1, &[]))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        db.catalog
+            .register_file(&file(t, Signal::Traces, 2, 2, &[]))
+            .await
+            .unwrap();
+    }
+    let candidate = db
+        .catalog
+        .compaction_candidate(Signal::Traces, closed, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.tenant_id, t);
+    assert_eq!(
+        candidate.hour,
+        hour(1),
+        "hour 0 has one file; hour 1 is the oldest with two"
+    );
+    assert_eq!(candidate.files, 2);
+    let in_hour = db
+        .catalog
+        .l0_files_in_hour(t, Signal::Traces, hour(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        in_hour.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [h1a.id, h1b.id],
+        "registration order"
+    );
+    assert!(
+        db.catalog
+            .l0_files_in_hour(t, Signal::Traces, hour(0))
+            .await
+            .unwrap()
+            .iter()
+            .all(|f| f.id == h0.id)
+    );
+
+    // Once hour 1 is swapped for an L1 file, hour 2 is next; the L1 does not count.
+    let mut l1 = file(t, Signal::Traces, 1, 1, &[]);
+    l1.level = Level::L1;
+    db.catalog
+        .swap_files(t, Signal::Traces, &[h1a.id, h1b.id], &[l1])
+        .await
+        .unwrap();
+    let next = db
+        .catalog
+        .compaction_candidate(Signal::Traces, closed, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.hour, hour(2));
+    assert_eq!(next.files, 3);
+
+    // A file that ended recently keeps its hour open.
+    let mut open = file(t, Signal::Traces, 3, 3, &[]);
+    open.range.end = Utc::now();
+    db.catalog.register_file(&open).await.unwrap();
+    let mut open2 = file(t, Signal::Traces, 3, 3, &[]);
+    open2.range.end = Utc::now();
+    db.catalog.register_file(&open2).await.unwrap();
+    assert_eq!(
+        db.catalog
+            .compaction_candidate(Signal::Traces, closed, 2)
+            .await
+            .unwrap()
+            .unwrap()
+            .hour,
+        hour(2),
+        "hour 3 is still open"
+    );
+    assert!(
+        db.catalog
+            .compaction_candidate(Signal::Traces, closed, 4)
+            .await
+            .unwrap()
+            .is_none(),
+        "no hour has four files"
+    );
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn watcher_sees_file_changes() {
     let Some(db) = TestDb::new().await else {
