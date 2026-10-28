@@ -379,7 +379,7 @@ async fn trace_index_prunes_files_without_the_trace() {
         "served from memory"
     );
     assert_eq!(stat(&f, |s| &s.trace_index_pruned), 5);
-    assert!(f.querier.trace_index().bytes().await > 0);
+    assert!(f.querier.trace_index().bytes() > 0);
 
     let (all, _) = table.plan_files(&[]).await.unwrap();
     assert_eq!(all.len(), 3, "without a pinned trace nothing is consulted");

@@ -402,13 +402,17 @@ derives the sidecar path from the file path, so the catalog does not list
 sidecars. A lookup that pins trace ids fetches the sidecars of the files the
 catalog keeps, in parallel, and opens only those listing one of the ids in
 that file; a sidecar that does not cover the file is not trusted. Decoded
-sidecars stay in memory up to `query.trace_index_cache_bytes`, a ceiling that
-counts downloads in flight: a download is reserved from its announced size
-before a byte is read, idle entries are evicted to make room, one larger than
-the budget is never read, and one that finds the budget busy is skipped for
-that query. A file whose sidecar is missing, unreadable, too large or naming
-other files is remembered as such and scanned. Fetches, misses and pruned
-files are counted.
+sidecars stay in memory up to `query.trace_index_cache_bytes`, a ceiling on
+what the cache makes the process hold: decoded sidecars alive anywhere,
+including ones evicted while a query still uses them, plus downloads in
+flight. A download holds a lease, one per file at a time, that reserves the
+announced object size before a byte is read and the decoded heap, measured
+from the frame, before a byte is decoded, evicting idle entries to make room;
+dropping the lease on a timeout returns everything. One larger than the
+budget is never read, and one that finds the budget busy is skipped for that
+query. A file whose sidecar is missing, unreadable, too large or naming other
+files is remembered as such and scanned. Fetches, misses and pruned files are
+counted.
 
 ## 6. Hot window
 
