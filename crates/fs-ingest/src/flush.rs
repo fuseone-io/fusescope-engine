@@ -423,7 +423,8 @@ pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<Uplo
 /// Uploads the file's `trace_id` sidecar under the same create-once rule.
 /// Goes after the file and before the catalog row. A sidecar already
 /// there must be byte for byte the one these rows produce: a valid one
-/// listing other traces would make the querier skip the file.
+/// listing other traces would make the querier skip the file. Its size is
+/// compared first, so only one of the right size is ever read back.
 ///
 /// # Errors
 /// Store failure, or an existing sidecar with other bytes.
@@ -432,16 +433,20 @@ pub async fn upload_index(
     prepared: &Prepared,
 ) -> Result<Upload, IngestError> {
     let outcome = put_once(store, &prepared.index_path, prepared.index.clone()).await?;
-    if let Upload::Existing { .. } = outcome {
+    if let Upload::Existing { size } = outcome {
+        let mismatch = || IngestError::IndexMismatch {
+            path: prepared.index_path.clone(),
+        };
+        if size != u64::try_from(prepared.index.len()).unwrap_or(u64::MAX) {
+            return Err(mismatch());
+        }
         let existing = store
             .get(&Path::from(prepared.index_path.as_str()))
             .await?
             .bytes()
             .await?;
         if existing != prepared.index {
-            return Err(IngestError::IndexMismatch {
-                path: prepared.index_path.clone(),
-            });
+            return Err(mismatch());
         }
     }
     Ok(outcome)
