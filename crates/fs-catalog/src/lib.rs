@@ -11,6 +11,7 @@
 mod catalog;
 mod compaction;
 mod lease;
+mod orphans;
 mod token;
 mod types;
 mod watch;

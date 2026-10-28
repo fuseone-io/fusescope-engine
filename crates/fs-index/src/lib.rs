@@ -8,7 +8,7 @@
 
 pub mod trace_index;
 
-pub use trace_index::{TraceIndex, sidecar_path};
+pub use trace_index::{TraceIndex, owners_of_sidecar, sidecar_path};
 
 /// Crate version, exposed for diagnostics and the `--version` flag.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

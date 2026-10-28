@@ -338,6 +338,21 @@ fn has_duplicates(files: &[String]) -> bool {
     refs.windows(2).any(|pair| pair.first() == pair.last())
 }
 
+/// The span files a sidecar at `tix` could belong to, one per level, since
+/// the sidecar path does not say which level wrote it. Empty for a path
+/// this engine does not lay out.
+pub fn owners_of_sidecar(tix: &str) -> Vec<String> {
+    let Some(stem) = tix.strip_suffix(".tix") else {
+        return Vec::new();
+    };
+    let Some((prefix, partition)) = stem.split_once("/traces/index/trace_id/") else {
+        return Vec::new();
+    };
+    (0..3)
+        .map(|level| format!("{prefix}/traces/l{level}/{partition}.parquet"))
+        .collect()
+}
+
 fn checksum(body: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(body)
 }
@@ -653,6 +668,23 @@ mod tests {
         assert_eq!(
             sidecar_path("t/abc/traces/lx/dt=2026-10-24/hr=14/id.parquet"),
             None
+        );
+        let owners = owners_of_sidecar("t/abc/traces/index/trace_id/dt=2026-10-24/hr=14/id.tix");
+        assert_eq!(
+            owners,
+            [
+                "t/abc/traces/l0/dt=2026-10-24/hr=14/id.parquet",
+                "t/abc/traces/l1/dt=2026-10-24/hr=14/id.parquet",
+                "t/abc/traces/l2/dt=2026-10-24/hr=14/id.parquet",
+            ]
+        );
+        assert!(owners.iter().all(|o| {
+            sidecar_path(o).as_deref()
+                == Some("t/abc/traces/index/trace_id/dt=2026-10-24/hr=14/id.tix")
+        }));
+        assert_eq!(
+            owners_of_sidecar("t/abc/traces/l0/dt=2026-10-24/hr=14/id.parquet"),
+            Vec::<String>::new()
         );
     }
 }

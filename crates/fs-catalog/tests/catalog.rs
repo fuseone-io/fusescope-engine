@@ -842,6 +842,75 @@ async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
     db.finish().await;
 }
 
+/// Orphans keep their first sighting across sweeps and come due by it.
+#[tokio::test]
+async fn orphans_keep_their_first_sighting() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let registered = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 0, 0, &[]))
+        .await
+        .unwrap();
+    let found = db
+        .catalog
+        .registered_paths(&[registered.path.clone(), "t/nobody.parquet".into()])
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found.contains(&registered.path));
+
+    db.catalog
+        .orphans_seen(&["a".into(), "b".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog
+            .orphans_due(StdDuration::from_secs(60))
+            .await
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        db.catalog.orphans_due(StdDuration::ZERO).await.unwrap(),
+        ["a", "b"]
+    );
+    sqlx::query(
+        "update engine_orphan set first_seen = now() - interval '2 hours' where path = 'a'",
+    )
+    .execute(db.catalog.pool())
+    .await
+    .unwrap();
+    db.catalog
+        .orphans_seen(&["a".into(), "c".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog
+            .orphans_due(StdDuration::from_secs(3600))
+            .await
+            .unwrap(),
+        ["a"],
+        "seen again, a keeps its first sighting; c is new"
+    );
+    db.catalog
+        .orphans_forget(&["a".into(), "zzz".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        db.catalog.orphans_due(StdDuration::ZERO).await.unwrap(),
+        ["b", "c"]
+    );
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn watcher_sees_file_changes() {
     let Some(db) = TestDb::new().await else {
