@@ -503,5 +503,8 @@ fn verify_same_content(file: &NewFile, existing: &FileRow) -> Result<(), Catalog
     if existing.summary != file.summary {
         return mismatch("summary");
     }
+    if existing.origin != file.origin {
+        return mismatch("origin");
+    }
     Ok(())
 }

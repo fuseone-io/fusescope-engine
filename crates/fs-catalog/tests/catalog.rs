@@ -1257,6 +1257,59 @@ async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
     db.finish().await;
 }
 
+/// Registering an id again with another origin is a mismatch like any
+/// other field, and a server that sends no origin gets the id as origin.
+#[tokio::test]
+async fn origin_is_part_of_the_idempotent_check_and_defaults_to_the_id() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let first = file(t, Signal::Traces, 0, 0, &[]);
+    let registered = db.catalog.register_file(&first).await.unwrap();
+    assert_eq!(registered.origin, first.id);
+    let mut other = first.clone();
+    other.origin = FileId::new();
+    let err = db.catalog.register_file(&other).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CatalogError::FileMismatch {
+                field: "origin",
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    // The previous version's insert, without an origin column.
+    let legacy = file(t, Signal::Traces, 1, 1, &[]);
+    sqlx::query(
+        "insert into engine_file
+             (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, state)
+         values ($1, $2, 1, 0, $3, 1, 1, now(), now(), '{}', 1)",
+    )
+    .bind(legacy.id)
+    .bind(t)
+    .bind(&legacy.path)
+    .execute(db.catalog.pool())
+    .await
+    .unwrap();
+    let rows = db
+        .catalog
+        .all_visible_files(t, Signal::Traces)
+        .await
+        .unwrap();
+    let row = rows.iter().find(|r| r.id == legacy.id).unwrap();
+    assert_eq!(row.origin, legacy.id, "defaulted by the trigger");
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn watcher_sees_file_changes() {
     let Some(db) = TestDb::new().await else {
