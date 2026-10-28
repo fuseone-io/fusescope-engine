@@ -231,12 +231,16 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
         quarantine_ttl: Duration::ZERO,
         purge_batch: 10,
         lease_ttl: Duration::from_millis(600),
+        compaction_interval: Duration::from_secs(3600),
+        compaction: no_compaction(),
     };
     let task = tokio::spawn(fs_compactor::run(
         db.catalog.clone(),
         slow.clone(),
+        Path::from(""),
         config,
         "loop",
+        Arc::new(fs_compactor::CompactorStats::default()),
         rx,
     ));
 
@@ -334,6 +338,18 @@ async fn a_stuck_renewal_counts_as_losing_the_lease() {
     db.finish().await;
 }
 
+/// Compaction settings that never find a closed hour in these tests.
+fn no_compaction() -> fs_compactor::CompactionConfig {
+    fs_compactor::CompactionConfig {
+        hour_close_delay: Duration::from_secs(3600),
+        l1_target_bytes: 512 * 1024 * 1024,
+        max_inputs_per_pass: 16,
+        max_input_bytes: 2 << 30,
+        row_group_rows: 1024,
+        inject_swap_failures: 0,
+    }
+}
+
 /// Objects and sidecars of `paths` still in the store.
 async fn count_present(store: &dyn ObjectStore, paths: &[String]) -> usize {
     let mut present = 0;
@@ -372,12 +388,16 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
         quarantine_ttl: Duration::ZERO,
         purge_batch: 10,
         lease_ttl: Duration::from_millis(600),
+        compaction_interval: Duration::from_secs(3600),
+        compaction: no_compaction(),
     };
     let task = tokio::spawn(fs_compactor::run(
         db.catalog.clone(),
         store.clone(),
+        Path::from(""),
         config,
         "loop",
+        Arc::new(fs_compactor::CompactorStats::default()),
         rx,
     ));
     tokio::time::sleep(Duration::from_millis(2500)).await;

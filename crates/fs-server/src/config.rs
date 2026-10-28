@@ -537,6 +537,22 @@ pub struct CompactorConfig {
     /// third of it. Another instance takes over this long after a crash.
     #[serde(default = "default_lease_ttl")]
     pub lease_ttl_secs: u64,
+    /// How often closed hours are looked at for L0 to L1 compaction.
+    #[serde(default = "default_compaction_interval")]
+    pub compaction_interval_secs: u64,
+    /// An hour is compacted only once every file in it ended this long ago.
+    #[serde(default = "default_hour_close_delay")]
+    pub hour_close_delay_secs: u64,
+    /// An L1 file closes once it reaches this many bytes.
+    #[serde(default = "default_l1_target_bytes")]
+    pub l1_target_bytes: usize,
+    /// Most L0 files one compaction pass merges; memory holds one row group
+    /// of each.
+    #[serde(default = "default_max_inputs_per_pass")]
+    pub max_inputs_per_pass: usize,
+    /// Most input bytes one compaction pass merges.
+    #[serde(default = "default_max_input_bytes")]
+    pub max_input_bytes: u64,
 }
 
 impl Default for CompactorConfig {
@@ -546,24 +562,59 @@ impl Default for CompactorConfig {
             quarantine_ttl_secs: default_quarantine_ttl(),
             purge_batch: default_purge_batch(),
             lease_ttl_secs: default_lease_ttl(),
+            compaction_interval_secs: default_compaction_interval(),
+            hour_close_delay_secs: default_hour_close_delay(),
+            l1_target_bytes: default_l1_target_bytes(),
+            max_inputs_per_pass: default_max_inputs_per_pass(),
+            max_input_bytes: default_max_input_bytes(),
         }
     }
 }
 
 impl CompactorConfig {
-    /// Converts to the compactor crate's settings.
-    pub fn to_compactor(&self) -> fs_compactor::CompactorConfig {
+    /// Converts to the compactor crate's settings; outputs use the
+    /// ingester's row group size so L0 and L1 files share one layout.
+    pub fn to_compactor(&self, row_group_rows: usize) -> fs_compactor::CompactorConfig {
         fs_compactor::CompactorConfig {
             purge_interval: std::time::Duration::from_secs(self.purge_interval_secs),
             quarantine_ttl: std::time::Duration::from_secs(self.quarantine_ttl_secs),
             purge_batch: self.purge_batch,
             lease_ttl: std::time::Duration::from_secs(self.lease_ttl_secs),
+            compaction_interval: std::time::Duration::from_secs(self.compaction_interval_secs),
+            compaction: fs_compactor::CompactionConfig {
+                hour_close_delay: std::time::Duration::from_secs(self.hour_close_delay_secs),
+                l1_target_bytes: self.l1_target_bytes,
+                max_inputs_per_pass: self.max_inputs_per_pass,
+                max_input_bytes: self.max_input_bytes,
+                row_group_rows,
+                inject_swap_failures: 0,
+            },
         }
     }
 }
 
 fn default_lease_ttl() -> u64 {
     30
+}
+
+fn default_compaction_interval() -> u64 {
+    60
+}
+
+fn default_hour_close_delay() -> u64 {
+    900
+}
+
+fn default_l1_target_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+fn default_max_inputs_per_pass() -> usize {
+    16
+}
+
+fn default_max_input_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_purge_interval() -> u64 {
@@ -722,6 +773,14 @@ impl Config {
         if self.compactor.lease_ttl_secs < 3 {
             return invalid(
                 "compactor.lease_ttl_secs must be at least 3, it is renewed every third",
+            );
+        }
+        if self.compactor.max_inputs_per_pass < 2
+            || self.compactor.l1_target_bytes < 1024 * 1024
+            || self.compactor.max_input_bytes < self.compactor.l1_target_bytes as u64
+        {
+            return invalid(
+                "compactor.max_inputs_per_pass must be at least 2, l1_target_bytes at least 1 MiB and max_input_bytes at least l1_target_bytes",
             );
         }
         // A querier may read a file for its cache TTL plus one query after

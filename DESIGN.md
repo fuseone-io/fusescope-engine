@@ -474,6 +474,31 @@ At every level the compactor:
 4. Decides promotions: an attribute filtered in more than N% of the last
    week's queries, using querier statistics, becomes a native column at L2.
 
+### 7.1 L0 to L1
+
+A pass takes the oldest hour, across tenants, whose visible L0 files all
+ended more than `compactor.hour_close_delay_secs` ago (so the hot window
+has let go of them) and number at least two, and merges its oldest files up
+to `compactor.max_inputs_per_pass` and `compactor.max_input_bytes`. A large
+hour closes over several passes; an hour left with a single L0 file keeps
+it. Every input is already sorted by `(service_name, timestamp)`, so the
+merge is a k-way heap over one row group per input, ties in registration
+order, producing row groups of the ingester's size through the same writer
+settings as the flush (`fs-schema::parquet`); an L1 file closes once it
+reaches `compactor.l1_target_bytes` and the next one starts. Memory holds
+one decoded row group per input, the row group being gathered and the
+compressed bytes of the file being written. Outputs go to
+`traces/l1/dt=…/hr=…/{id}.parquet`, each with its own `trace_id` sidecar,
+and are uploaded under the create-once rule before one fenced swap
+quarantines the inputs and publishes the outputs. A crash before the swap
+leaves the inputs visible and the outputs as objects without rows for the
+orphan sweep; a swap refused for a conflict or a lost lease leaves them the
+same way; a crash after the swap leaves the inputs quarantined for the
+purge. An L0 file that crosses the hour boundary belongs to the hour of its
+`ts_min` until the ingester cuts flushes at the hour; the output carries the
+real range of its rows, so pruning stays correct. The merged per-hour
+`trace_id` index waits until an hour's file set is final.
+
 Derived tables replacing the ClickHouse materialized views:
 
 | Derived | Replaces | Key |

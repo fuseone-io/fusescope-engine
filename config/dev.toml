@@ -48,6 +48,12 @@ trace_index_cache_bytes = 268435456
 purge_interval_secs = 60
 # One compactor per deployment holds this lease; another takes over this long after a crash.
 lease_ttl_secs = 30
+# L0 to L1 compaction: closed hours only, up to 16 inputs or 2 GiB per pass, 512 MiB outputs.
+compaction_interval_secs = 60
+hour_close_delay_secs = 900
+l1_target_bytes = 536870912
+max_inputs_per_pass = 16
+max_input_bytes = 2147483648
 quarantine_ttl_secs = 3600
 
 [log]

@@ -21,6 +21,7 @@ pub struct Metrics {
     flush: OnceLock<Arc<fs_ingest::FlushStats>>,
     wal_bytes: OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
     query: OnceLock<Arc<fs_query::QueryStats>>,
+    compactor: OnceLock<Arc<fs_compactor::CompactorStats>>,
 }
 
 impl Default for Metrics {
@@ -32,6 +33,7 @@ impl Default for Metrics {
             flush: OnceLock::new(),
             wal_bytes: OnceLock::new(),
             query: OnceLock::new(),
+            compactor: OnceLock::new(),
         }
     }
 }
@@ -68,12 +70,18 @@ impl Metrics {
         let _ = self.query.set(stats);
     }
 
+    /// Registers the compactor's counters.
+    pub fn register_compactor(&self, stats: Arc<fs_compactor::CompactorStats>) {
+        let _ = self.compactor.set(stats);
+    }
+
     /// Renders the exposition page.
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(4096);
         self.render_ingest(&mut out);
         self.render_flush(&mut out);
         self.render_query(&mut out);
+        self.render_compactor(&mut out);
         if let Some(f) = self.wal_bytes.get() {
             gauge(
                 &mut out,
@@ -341,6 +349,67 @@ impl Metrics {
             "Time to build one chunk",
             &f.coalesce_time,
         );
+    }
+
+    fn render_compactor(&self, out: &mut String) {
+        let Some(c) = self.compactor.get() else {
+            return;
+        };
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        for (name, help, value) in [
+            (
+                "fusescope_compaction_passes_total",
+                "Compaction passes that swapped outputs in",
+                load(&c.passes),
+            ),
+            (
+                "fusescope_compaction_inputs_total",
+                "L0 files merged by completed passes",
+                load(&c.inputs),
+            ),
+            (
+                "fusescope_compaction_outputs_total",
+                "L1 files published by completed passes",
+                load(&c.outputs),
+            ),
+            (
+                "fusescope_compaction_rows_total",
+                "Rows written by completed passes",
+                load(&c.rows),
+            ),
+            (
+                "fusescope_compaction_input_bytes_total",
+                "Bytes of inputs merged by completed passes",
+                load(&c.input_bytes),
+            ),
+            (
+                "fusescope_compaction_output_bytes_total",
+                "Bytes of outputs published by completed passes",
+                load(&c.output_bytes),
+            ),
+            (
+                "fusescope_compaction_conflicts_total",
+                "Swaps refused because an input was no longer visible",
+                load(&c.conflicts),
+            ),
+            (
+                "fusescope_compaction_lease_lost_total",
+                "Swaps refused because the lease had changed hands",
+                load(&c.lease_lost),
+            ),
+            (
+                "fusescope_compaction_failures_total",
+                "Passes that failed for any other reason",
+                load(&c.failures),
+            ),
+            (
+                "fusescope_compaction_orphaned_total",
+                "Outputs uploaded by passes that did not publish them",
+                load(&c.orphaned),
+            ),
+        ] {
+            counter(out, name, help, value);
+        }
     }
 
     fn render_query(&self, out: &mut String) {

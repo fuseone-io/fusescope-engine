@@ -136,11 +136,17 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
 /// Never; failures are logged and the next pass retries.
 pub async fn compactor(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<(), ServerError> {
     info!(role = "compactor", holder = %ctx.node_id, "ready");
+    let stats = Arc::new(fs_compactor::CompactorStats::default());
+    ctx.metrics.register_compactor(Arc::clone(&stats));
     fs_compactor::run(
         ctx.catalog.clone(),
         ctx.store.clone(),
-        ctx.config.compactor.to_compactor(),
+        ctx.root.clone(),
+        ctx.config
+            .compactor
+            .to_compactor(ctx.config.ingest.row_group_rows),
         &ctx.node_id,
+        stats,
         shutdown,
     )
     .await;
