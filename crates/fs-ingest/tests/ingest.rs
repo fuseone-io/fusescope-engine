@@ -829,8 +829,9 @@ async fn a_failed_confirmation_is_retried_after_its_backoff() {
 
 /// A confirmation the catalog holds takes no flush permit and does not
 /// hold the stop: the flush returns once its rows are retained, the next
-/// flush gets the only permit, and the stop cancels the held attempt,
-/// gives it back and confirms it in its last pass.
+/// flushes get the only flush permit, and the stop cancels the held
+/// attempt, waits for it to give its entry back, and confirms everything
+/// due in its last pass, refilling the single confirmation permit.
 #[tokio::test]
 async fn a_held_confirmation_holds_neither_a_flush_permit_nor_the_stop() {
     let Some(db) = TestDb::new().await else {
@@ -849,6 +850,7 @@ async fn a_held_confirmation_holds_neither_a_flush_permit_nor_the_stop() {
         .unwrap();
     let config = IngestConfig {
         max_flushes: 1,
+        max_confirms: 1,
         inject_confirm_failures: 1,
         inject_confirm_delay: Some(Duration::from_secs(30)),
         confirm_timeout: Duration::from_secs(60),
@@ -857,21 +859,16 @@ async fn a_held_confirmation_holds_neither_a_flush_permit_nor_the_stop() {
     };
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
     let mut client = h.client().await;
-    client
-        .export(authed(request("api", 7, 10), &token))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), h.ingester.flush_all())
-        .await
-        .expect("a flush does not wait for its confirmation");
-    client
-        .export(authed(request("api", 8, 3), &token))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), h.ingester.flush_all())
-        .await
-        .expect("a held confirmation takes no flush permit");
-    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 2);
+    for trace in 7..10 {
+        client
+            .export(authed(request("api", trace, 10), &token))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), h.ingester.flush_all())
+            .await
+            .expect("a flush neither waits for its confirmation nor for the held one");
+    }
+    assert_eq!(parquet_files(&h.dir.path().join("bucket")).len(), 3);
     assert_eq!(
         h.ingester
             .flush_stats()
@@ -880,14 +877,64 @@ async fn a_held_confirmation_holds_neither_a_flush_permit_nor_the_stop() {
         0,
         "still held, not failed"
     );
+    assert_eq!(confirmations(&db).await, [false, false, false]);
     tokio::time::timeout(Duration::from_secs(5), h.stop())
         .await
         .expect("a held confirmation does not hold the stop");
     assert_eq!(
         confirmations(&db).await,
-        [true, true],
-        "the stop gave the attempt back and its last pass confirmed it"
+        [true, true, true],
+        "the stop gave the attempt back and its last pass confirmed everything due"
     );
+    db.finish().await;
+}
+
+/// A backlog of confirmations due drains at `max_confirms` calls at a
+/// time, a finished attempt starting the next, not `max_confirms` per
+/// interval.
+#[tokio::test]
+async fn a_backlog_of_confirmations_drains_without_waiting_for_the_interval() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        max_confirms: 1,
+        inject_confirm_failures: 3,
+        confirm_interval: Duration::from_secs(5),
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    for trace in 7..10 {
+        client
+            .export(authed(request("api", trace, 10), &token))
+            .await
+            .unwrap();
+        h.ingester.flush_all().await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !confirmations(&db).await.contains(&true) {
+        assert!(tokio::time::Instant::now() < deadline, "no retry ever ran");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        confirmations(&db).await,
+        [true, true, true],
+        "the rest followed within the same interval"
+    );
+    h.stop().await;
     db.finish().await;
 }
 

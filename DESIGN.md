@@ -491,8 +491,10 @@ replay confirms it. The confirmation runs off the flusher: a flush returns
 once its rows are retained, and the confirmer attempts each confirmation
 on one of `ingest.max_confirms` permits, within `ingest.confirm_timeout_secs`,
 with the flush backoff after a failure, so a catalog that is down never
-holds a flush or a stop; an attempt cancelled by the stop gives its entry
-back, and the stop makes one last pass, waited for the timeout at most.
+holds a flush or a stop; a finished attempt starts the next one due, so a
+backlog drains at that many calls at a time. An attempt cancelled by the
+stop gives its entry back, and the stop then confirms everything due,
+refilling the permits, for the timeout at most.
 The pending count is the `fusescope_flush_unconfirmed` gauge. A confirmation
 changes nothing a querier reads, so the catalog does not announce it: the
 change notification fires for the columns queriers read, and a column

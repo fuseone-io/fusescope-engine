@@ -734,16 +734,21 @@ impl Shared {
         }
     }
 
-    /// One pass over the confirmations due, waited for up to
-    /// `confirm_timeout`: a stop leaves nothing to the replay that a
-    /// reachable catalog could take now.
+    /// Confirms everything due, refilling the permits as attempts finish,
+    /// until nothing is due or `confirm_timeout` has passed: a stop leaves
+    /// nothing to the replay that a reachable catalog could take now.
     async fn confirm_remaining(self: &Arc<Self>) {
         let mut attempts = JoinSet::new();
-        self.confirm_due(None, &mut attempts).await;
         let _ = tokio::time::timeout(self.config.confirm_timeout, async {
-            while attempts.join_next().await.is_some() {}
+            loop {
+                self.confirm_due(None, &mut attempts).await;
+                if attempts.join_next().await.is_none() {
+                    break;
+                }
+            }
         })
         .await;
+        attempts.shutdown().await;
     }
 
     fn publish_unconfirmed(&self, buffers: &Buffers) {
@@ -1356,22 +1361,23 @@ impl Ingester {
             }
         };
 
-        // Dropping `attempts` at the end cancels the calls still running;
-        // each gives its entry back.
+        // Every wake refills the permits, a finished attempt included, so a
+        // backlog drains at `max_confirms` calls at a time. The stop cancels
+        // the calls still running and waits for each to give its entry back.
         let shared = self.shared.clone();
         let confirmer = async move {
             let mut tick = tokio::time::interval(shared.config.confirm_interval);
             let mut attempts = JoinSet::new();
             loop {
                 tokio::select! {
-                    _ = tick.tick() => shared.confirm_due(Some(&shutdown), &mut attempts).await,
-                    () = shared.confirm_now.notified() => {
-                        shared.confirm_due(Some(&shutdown), &mut attempts).await;
-                    }
+                    _ = tick.tick() => {}
+                    () = shared.confirm_now.notified() => {}
                     Some(_) = attempts.join_next(), if !attempts.is_empty() => {}
                     _ = shutdown.changed() => break,
                 }
+                shared.confirm_due(Some(&shutdown), &mut attempts).await;
             }
+            attempts.shutdown().await;
         };
 
         let (transport, hot_result, (), ()) = tokio::join!(server, hot, flusher, confirmer);
