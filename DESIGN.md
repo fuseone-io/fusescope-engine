@@ -97,7 +97,8 @@ OTLP ──► authentication (mTLS or per-tenant bearer)
          group commit: one writer thread drains the queue, appends the batch,
          fsyncs once and acknowledges every request in it; rotate every 64 MB
      ──► in-memory buffer: RecordBatches per (tenant, signal), sorted at flush
-     ──► flush when: 128 MB, or 30 s, or end of hour
+     ──► flush when: 128 MB, or 30 s; rows spanning hours are cut into
+         one file per hour, so no L0 file holds two
          1. sort each batch by (service_name, timestamp, row), merge them
             into row groups of `row_group_rows`, encode each as it completes
          2. write Parquet L0 to the bucket under a temporary path
@@ -127,7 +128,15 @@ arriving meanwhile:
   smallest position in the buffer, not the position of the record that got
   there first. Replay groups records
   under their intents, so a retry produces the same object and the same
-  catalog row even if later rows arrived during the original flush.
+  catalog row even if later rows arrived during the original flush. A cut
+  makes one file per calendar hour its rows fall in, each under the id
+  derived from the range's first position and that hour; rows spanning
+  hours get one intent per hour over the same range, each naming its hour,
+  written under WAL record version 2 so an ingester of the previous version
+  fails on it instead of reading the intent as the whole range, and replay
+  filters each record by the intent's hour. The hot window announces, for
+  the live rows, the id of every hour they fall in, so a querier excludes
+  the files whichever way the cut goes.
 - Uploads never overwrite (conditional create), and registering an existing
   id verifies the immutable fields; a mismatch is an error, never a silent
   accept.
@@ -522,9 +531,11 @@ swap quarantines the inputs and publishes the outputs. A crash or failure
 before the swap commits leaves the inputs visible and every object created
 so far as an orphan for the orphan sweep, counted whatever the failure; a
 swap refused for a conflict or a lost lease leaves them the same way; a
-crash after the swap leaves the inputs quarantined for the purge. An L0 file that crosses the hour boundary belongs to the hour of its
-`ts_min` until the ingester cuts flushes at the hour; the output carries the
-real range of its rows, so pruning stays correct. The merged per-hour
+crash after the swap leaves the inputs quarantined for the purge. The
+ingester cuts flushes at the hour, so an L0 file is within the hour of its
+`ts_min`; a file of the previous version that crossed the boundary belongs
+to that hour and the output carries the real range of its rows, so pruning
+stays correct. The merged per-hour
 `trace_id` index waits until an hour's file set is final.
 
 Derived tables replacing the ClickHouse materialized views:
