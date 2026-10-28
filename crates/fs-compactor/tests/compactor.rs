@@ -267,8 +267,15 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
         later.expires_at > during.expires_at,
         "renewed during the pass"
     );
-    let remaining_before = count_present(slow.as_ref(), &paths).await;
-    assert!(remaining_before < 12, "deletes are happening");
+    // A slow runner may still be listing: wait for the deletes to show.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while count_present(slow.as_ref(), &paths).await >= 12 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "deletes are happening"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Take the lease away in one statement, so the renewer cannot slip in
     // between: the pass stops within a renewal period.
