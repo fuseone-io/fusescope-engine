@@ -66,7 +66,7 @@ Done, in this repository (phase 0 and most of the engine side of phase 1):
   pruning, `trace_id` sidecar pruning with an in-memory cache, byte budget,
   hot-window union with partial-result warnings, Flight SQL front end.
 - `fs-server`: configuration, bootstrap, roles, admin commands, `/metrics`,
-  graceful shutdown. `fs-compactor`: leader lease in the catalog, purge of quarantined files while holding it.
+  graceful shutdown. `fs-compactor`: leader lease in the catalog, purge of quarantined files and L0 to L1 compaction of closed hours while holding it.
 - `fs-bench`: ingest stages, OTLP load generator with `/metrics` deltas,
   Flight SQL query suite. Benchmarks recorded for the baseline, group
   commit, flush stages, coalescing and the gate.
@@ -108,7 +108,7 @@ retention holds about 570 bytes per span.
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
 | C1 | Compactor leader lease in the catalog, single active compactor per deployment | two compactors would race on the same files | lease test with two instances | S | done: `engine_lease` (migration 0004), `Catalog::acquire_lease/release_lease/lease`, `fs_compactor::Leadership` and `run` (`two_instances_hand_the_lease_over_by_release_or_expiry`, `the_loop_purges_only_while_it_holds_the_lease`), `compactor.lease_ttl_secs`; review rounds added the per-incarnation holder, the generation fence checked under a row lock (`swap_files_fenced`), renewal on its own loop bounded by its period with the work aborted and awaited on loss, sidecar purge, the database-clock purge cutoff and the quarantine TTL floor |
-| C2 | L0 to L1 per closed hour: re-sort, 512 MB targets, quarantine and swap in one transaction, `tix` rebuilt | small L0 files make queries open hundreds of files | compaction test with crash before and after the swap; query results identical before and after | L | todo |
+| C2 | L0 to L1 per closed hour: re-sort, 512 MB targets, quarantine and swap in one transaction, `tix` rebuilt | small L0 files make queries open hundreds of files | compaction test with crash before and after the swap; query results identical before and after | L | done: streaming k-way merge in `fs-compactor::merge` over `fs-schema::parquet`, passes bounded by `max_inputs_per_pass` and `max_input_bytes`, fenced swap, per-output sidecars (`a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file`, `outputs_close_at_the_target_size`, `a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned`, `a_stale_fence_publishes_nothing`); the per-hour merged `.tix` waits for a final file set per hour |
 | C3 | Orphan collector: objects without a catalog row are quarantined, then deleted after the TTL | a crash between upload and registration leaves objects behind | test creating an orphan and running the collector | S | todo |
 | C4 | Retention by tenant: delete day prefixes beyond `retention_days`, catalog first, bucket second | staging keeps data for a bounded time | retention test with a crash between the two steps | S | todo |
 | C5 | Content digest column on `files` (sha256 of the object), verified on re-registration | the no-overwrite guarantee rests on size and metadata today; needs a decision because it is a catalog schema change | migration 0004; register test with a different object of the same size fails | S | todo, decision pending |
