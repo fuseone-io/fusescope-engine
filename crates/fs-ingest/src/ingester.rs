@@ -19,7 +19,8 @@
 //! anywhere after step 2 reproduces the same file and the same catalog row;
 //! a crash before step 2 simply flushes the rows again under a new intent.
 //! The checkpoint stays behind the intent of a file not yet confirmed, so a
-//! crash before the confirmation replays the flush and confirms it.
+//! crash before the confirmation replays the flush and confirms it; a failed
+//! confirmation is retried off the flusher, in bounded batches with backoff.
 //! After step 2 a failure of any later step keeps the rows bound to the same
 //! id and retries them unchanged: an id has exactly one possible content.
 
@@ -134,6 +135,8 @@ pub struct FlushStats {
     pub superseded: AtomicU64,
     /// Registration confirmations that failed and wait for a retry.
     pub confirm_failures: AtomicU64,
+    /// Registered files whose confirmation has not landed.
+    pub unconfirmed: AtomicU64,
 }
 
 /// Permits of the flush semaphore for a configured `max_flushes`.
@@ -438,6 +441,7 @@ impl Shared {
                 {
                     let mut buffers = self.buffers.lock().await;
                     buffers.finish_flush(tenant, file_id, rows, Instant::now());
+                    self.publish_unconfirmed(&buffers);
                     drop(held);
                 }
                 self.confirm(tenant, file_id).await;
@@ -637,8 +641,8 @@ impl Shared {
 
     /// Confirms the registration of `file` now that its rows are retained
     /// in the persisted state. A failure leaves the checkpoint behind the
-    /// file's intent; the confirmation is retried every flusher tick and by
-    /// the replay after a restart.
+    /// file's intent and schedules a retry with backoff; the replay after a
+    /// restart confirms what was left.
     async fn confirm(&self, tenant: TenantId, file: FileId) {
         let outcome = if take_injected(&self.inject_confirm_failures) {
             Err(IngestError::Injected("catalog confirmation"))
@@ -648,22 +652,41 @@ impl Shared {
                 .await
                 .map_err(IngestError::from)
         };
+        let mut buffers = self.buffers.lock().await;
         match outcome {
-            Ok(()) => self.buffers.lock().await.confirmed(file),
+            Ok(()) => buffers.confirmed(file),
             Err(e) => {
+                buffers.confirm_failed(file, Instant::now());
                 self.flush_stats
                     .confirm_failures
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(tenant = %tenant.0, file = %file.0, error = %e, "registration not confirmed; will retry");
             }
         }
+        self.publish_unconfirmed(&buffers);
     }
 
-    async fn confirm_pending(&self) {
-        let pending = self.buffers.lock().await.unconfirmed();
-        for (tenant, file) in pending {
-            self.confirm(tenant, file).await;
-        }
+    /// Retries the confirmations due, at most `confirm_batch` of them and
+    /// `max_confirms` at a time, so a catalog that is down costs one bounded
+    /// pass per interval and never holds a flush.
+    async fn confirm_due(&self) {
+        let due = self
+            .buffers
+            .lock()
+            .await
+            .take_confirmations(Instant::now(), self.config.confirm_batch);
+        futures_util::StreamExt::for_each_concurrent(
+            futures_util::stream::iter(due),
+            self.config.max_confirms,
+            |(tenant, file)| self.confirm(tenant, file),
+        )
+        .await;
+    }
+
+    fn publish_unconfirmed(&self, buffers: &Buffers) {
+        self.flush_stats
+            .unconfirmed
+            .store(buffers.unconfirmed_count() as u64, Ordering::Relaxed);
     }
 
     /// Retries flushes whose earlier attempt failed after the intent, or
@@ -895,7 +918,6 @@ impl Shared {
     /// `everything` the call returns only once every flush, including those
     /// started earlier, has finished.
     async fn flush_due(self: &Arc<Self>, everything: bool) {
-        self.confirm_pending().await;
         let now = Instant::now();
         let tenants = {
             let mut buffers = self.buffers.lock().await;
@@ -1252,6 +1274,7 @@ impl Ingester {
         );
 
         let shared = self.shared.clone();
+        let mut flusher_shutdown = shutdown.clone();
         let flusher = async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -1262,12 +1285,23 @@ impl Ingester {
                     }
                     () = shared.coalesce_now.notified() => shared.coalesce_due().await,
                     () = shared.flush_now.notified() => shared.flush_due(false).await,
+                    _ = flusher_shutdown.changed() => break,
+                }
+            }
+        };
+
+        let shared = self.shared.clone();
+        let confirmer = async move {
+            let mut tick = tokio::time::interval(shared.config.confirm_interval);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => shared.confirm_due().await,
                     _ = shutdown.changed() => break,
                 }
             }
         };
 
-        let (transport, hot_result, ()) = tokio::join!(server, hot, flusher);
+        let (transport, hot_result, (), ()) = tokio::join!(server, hot, flusher, confirmer);
         transport?;
         hot_result?;
         info!("otlp server stopped, flushing buffers");

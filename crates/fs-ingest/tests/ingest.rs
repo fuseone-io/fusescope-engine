@@ -777,10 +777,11 @@ async fn confirmations(db: &TestDb) -> Vec<bool> {
         .unwrap()
 }
 
-/// A registration is confirmed only once its rows are retained in the
-/// persisted state; a confirmation that fails is retried by the flusher.
+/// A confirmation that fails waits for its backoff and is retried off the
+/// flusher: a flush meanwhile does not retry it, the pending count is
+/// published until it lands, and it lands without another flush.
 #[tokio::test]
-async fn a_failed_confirmation_is_retried_by_the_flusher() {
+async fn a_failed_confirmation_is_retried_after_its_backoff() {
     let Some(db) = TestDb::new().await else {
         return;
     };
@@ -797,6 +798,7 @@ async fn a_failed_confirmation_is_retried_by_the_flusher() {
         .unwrap();
     let config = IngestConfig {
         inject_confirm_failures: 1,
+        confirm_interval: Duration::from_millis(50),
         ..test_config()
     };
     let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
@@ -806,15 +808,21 @@ async fn a_failed_confirmation_is_retried_by_the_flusher() {
         .await
         .unwrap();
     h.ingester.flush_all().await;
-    assert_eq!(
-        h.ingester
-            .flush_stats()
-            .confirm_failures
-            .load(Ordering::Relaxed),
-        1
-    );
+    let stats = h.ingester.flush_stats();
+    assert_eq!(stats.confirm_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.unconfirmed.load(Ordering::Relaxed), 1);
     h.ingester.flush_all().await;
-    assert_eq!(confirmations(&db).await, [true], "a later tick confirmed");
+    assert_eq!(
+        confirmations(&db).await,
+        [false],
+        "a flush does not retry it and the backoff has not passed"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while confirmations(&db).await != [true] {
+        assert!(tokio::time::Instant::now() < deadline, "never confirmed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(stats.unconfirmed.load(Ordering::Relaxed), 0);
     h.stop().await;
     db.finish().await;
 }

@@ -355,6 +355,12 @@ impl Metrics {
             "Registration confirmations that failed and wait for a retry",
             ns(&f.confirm_failures),
         );
+        gauge(
+            out,
+            "fusescope_flush_unconfirmed",
+            "Registered files whose confirmation has not landed",
+            ns(&f.unconfirmed),
+        );
         histogram(
             out,
             "fusescope_coalesce_seconds",

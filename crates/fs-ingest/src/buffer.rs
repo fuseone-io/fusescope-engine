@@ -394,6 +394,18 @@ impl Flushing {
     }
 }
 
+/// A registered file waiting for its confirmation.
+#[derive(Debug)]
+struct Unconfirmed {
+    tenant: TenantId,
+    /// First record of the intent, which the checkpoint stays behind.
+    first: Position,
+    attempts: u32,
+    next_attempt: Instant,
+    /// An attempt is running right now; a pass must not start another.
+    in_progress: bool,
+}
+
 /// Copies of its inputs a flush holds while the file is prepared: the
 /// merged rows, the sorted rows, and the encoder's output and buffers,
 /// each at most the size of the inputs. Admission keeps this much room for
@@ -402,6 +414,11 @@ pub const FLUSH_SCRATCH_FACTOR: usize = 3;
 
 /// Longest wait between retries of a failed flush.
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Exponential backoff after `attempts` failures, capped.
+fn retry_backoff(attempts: u32) -> Duration {
+    Duration::from_secs(1u64 << attempts.min(6)).min(MAX_RETRY_BACKOFF)
+}
 
 /// Bytes admitted against the caps but not yet in a buffer. Dropping it
 /// releases them, so a request cancelled between admission and its push
@@ -494,10 +511,10 @@ pub struct Buffers {
     tenants: HashMap<TenantId, TenantBuffer>,
     flushing: HashMap<TenantId, Vec<Flushing>>,
     persisted: HashMap<TenantId, Vec<Persisted>>,
-    /// Registered files whose confirmation has not landed, with the first
-    /// record of their intent: the checkpoint never passes it, so a restart
-    /// replays the flush and confirms.
-    unconfirmed: HashMap<FileId, (TenantId, Position)>,
+    /// Registered files whose confirmation has not landed: the checkpoint
+    /// never passes their intent, so a restart replays the flush and
+    /// confirms.
+    unconfirmed: HashMap<FileId, Unconfirmed>,
     reserved: HashMap<TenantId, Arc<AtomicUsize>>,
     reserved_total: Arc<AtomicUsize>,
     scratch_total: Arc<AtomicU64>,
@@ -895,8 +912,7 @@ impl Buffers {
             .and_then(|l| l.iter_mut().find(|f| f.file == file))
         {
             entry.attempts = entry.attempts.saturating_add(1);
-            let backoff = Duration::from_secs(1u64 << entry.attempts.min(6)).min(MAX_RETRY_BACKOFF);
-            entry.next_attempt = now + backoff;
+            entry.next_attempt = now + retry_backoff(entry.attempts);
             entry.in_progress = false;
             entry.detached = 0;
         }
@@ -915,7 +931,16 @@ impl Buffers {
         now: Instant,
     ) {
         if let Some(entry) = self.remove_flushing(tenant, file) {
-            self.unconfirmed.insert(file, (tenant, entry.range.0));
+            self.unconfirmed.insert(
+                file,
+                Unconfirmed {
+                    tenant,
+                    first: entry.range.0,
+                    attempts: 0,
+                    next_attempt: now,
+                    in_progress: true,
+                },
+            );
             let budget = entry.buffer.bytes;
             let written = hot_batches_bytes(&rows);
             let (batches, bytes) = if written <= budget {
@@ -959,12 +984,33 @@ impl Buffers {
         self.unconfirmed.remove(&file);
     }
 
-    /// Registered files whose confirmation is still pending.
-    pub fn unconfirmed(&self) -> Vec<(TenantId, FileId)> {
+    /// Records a failed confirmation attempt and schedules the next one
+    /// with the flush backoff.
+    pub fn confirm_failed(&mut self, file: FileId, now: Instant) {
+        if let Some(entry) = self.unconfirmed.get_mut(&file) {
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.next_attempt = now + retry_backoff(entry.attempts);
+            entry.in_progress = false;
+        }
+    }
+
+    /// Up to `limit` confirmations due at `now` and not being attempted,
+    /// marked in progress until they are confirmed or fail.
+    pub fn take_confirmations(&mut self, now: Instant, limit: usize) -> Vec<(TenantId, FileId)> {
         self.unconfirmed
-            .iter()
-            .map(|(file, (tenant, _))| (*tenant, *file))
+            .iter_mut()
+            .filter(|(_, e)| !e.in_progress && e.next_attempt <= now)
+            .take(limit)
+            .map(|(file, e)| {
+                e.in_progress = true;
+                (e.tenant, *file)
+            })
             .collect()
+    }
+
+    /// Registered files whose confirmation has not landed.
+    pub fn unconfirmed_count(&self) -> usize {
+        self.unconfirmed.len()
     }
 
     /// Drops persisted rows older than `retain`.
@@ -1029,7 +1075,7 @@ impl Buffers {
             .values()
             .flatten()
             .filter_map(|f| f.buffer.first_wal);
-        let unconfirmed = self.unconfirmed.values().map(|(_, first)| *first);
+        let unconfirmed = self.unconfirmed.values().map(|e| e.first);
         live.chain(flushing).chain(unconfirmed).min()
     }
 
@@ -1113,6 +1159,63 @@ mod tests {
         buffers.abort_flush(tenant, file);
         assert_eq!(buffers.live_first_wal(tenant), Some(at(15)));
         assert_eq!(buffers.earliest_wal(), Some(at(15)));
+    }
+
+    /// A registered file waits for its confirmation with the inline attempt
+    /// in progress; a failed attempt is retried after its backoff, taken in
+    /// bounded batches, and the intent holds the checkpoint until confirmed.
+    #[test]
+    fn confirmations_are_taken_in_bounded_batches_after_their_backoff() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let now = Instant::now();
+        let mut buffers = Buffers::default();
+        let a = FileId(uuid::Uuid::from_u128(1));
+        let b = FileId(uuid::Uuid::from_u128(2));
+        let c = FileId(uuid::Uuid::from_u128(3));
+        let files = [a, b, c];
+        for (i, file) in files.iter().enumerate() {
+            let first = 10 * (u64::try_from(i).unwrap() + 1);
+            buffers.get_mut(tenant).push(batch(1), at(first), now);
+            let (_, lease) = buffers
+                .begin_flush(
+                    tenant,
+                    *file,
+                    FileLayout::current(8),
+                    (at(first), at(first + 1)),
+                )
+                .unwrap();
+            drop(lease);
+            buffers.finish_flush(tenant, *file, Vec::new(), now);
+        }
+        assert_eq!(buffers.unconfirmed_count(), 3);
+        assert_eq!(
+            buffers.earliest_wal(),
+            Some(at(10)),
+            "the intent holds the checkpoint"
+        );
+        assert!(
+            buffers.take_confirmations(now, 8).is_empty(),
+            "the inline attempt is in progress"
+        );
+        for file in &files {
+            buffers.confirm_failed(*file, now);
+        }
+        assert!(buffers.take_confirmations(now, 8).is_empty(), "backoff");
+        let later = now + Duration::from_secs(3);
+        assert_eq!(buffers.take_confirmations(later, 2).len(), 2, "bounded");
+        assert_eq!(
+            buffers.take_confirmations(later, 2).len(),
+            1,
+            "taken entries are in progress"
+        );
+        assert_eq!(buffers.take_confirmations(later, 2).len(), 0);
+        buffers.confirmed(a);
+        assert_eq!(buffers.earliest_wal(), Some(at(20)));
+        buffers.confirm_failed(b, later);
+        buffers.confirmed(b);
+        buffers.confirmed(c);
+        assert_eq!(buffers.unconfirmed_count(), 0);
+        assert_eq!(buffers.earliest_wal(), None);
     }
 
     /// A flush that changes id while its attempt is still in progress is
