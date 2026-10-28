@@ -1556,8 +1556,9 @@ async fn a_tenant_refused_for_its_hours_is_cut_without_waiting_for_the_interval(
 
 /// The hours of a cut count until its intent is durable and while its
 /// rows are flushed: a new hour cannot slip in between the cut and the
-/// log, so an intent that fails brings the rows back under the cap, and
-/// the tenant stays due until a cut of them holds.
+/// log; an intent that fails brings the rows back under the cap, and the
+/// refusal that made the tenant due outlives it, so the flusher cuts the
+/// rows again on its own.
 #[tokio::test]
 async fn hours_being_cut_still_count_until_their_intent_holds() {
     const HOUR: u64 = 3_600_000_000_000;
@@ -1594,33 +1595,48 @@ async fn hours_being_cut_still_count_until_their_intent_holds() {
             .await
             .unwrap();
     }
-    // The cut takes both hours out of the live rows at once; its first
-    // intent is held for two seconds and then fails.
-    let ingester = h.ingester.clone();
-    let flushing = tokio::spawn(async move { ingester.flush_all().await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let status = client
-        .export(authed(request_at("api", 2, 1, T0 + 2 * HOUR), &token))
-        .await
-        .unwrap_err();
+    // The refusal makes the tenant due; the flusher cuts both hours and
+    // the first intent is held, then fails.
+    let third = || authed(request_at("api", 2, 1, T0 + 2 * HOUR), &token);
+    let status = client.export(third()).await.unwrap_err();
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    let held = h.ingester.flush_stats();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while held.intents_held.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flusher never cut the pressed tenant"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = client.export(third()).await.unwrap_err();
     assert_eq!(
         status.code(),
         Code::ResourceExhausted,
         "the hours being cut still count: {status:?}"
     );
-    flushing.await.unwrap();
-    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        registered_by_hour(&db, tenant)
+
+    // The failed intent's rows come back live and the flusher, not a
+    // flush_all, cuts them again: the pressure survived the failure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let hours: Vec<_> = registered_by_hour(&db, tenant)
             .await
-            .iter()
-            .map(|(hour, _, _)| hour.as_str())
-            .collect::<Vec<_>>(),
-        ["hr=14", "hr=15"],
-        "the failed intent's rows were cut again by the same call"
-    );
+            .into_iter()
+            .map(|(hour, _, _)| hour)
+            .collect();
+        if hours == ["hr=14", "hr=15"] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rows of the failed intent were not cut again: {hours:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
     client
-        .export(authed(request_at("api", 2, 1, T0 + 2 * HOUR), &token))
+        .export(third())
         .await
         .expect("flushed hours no longer count");
     h.stop().await;

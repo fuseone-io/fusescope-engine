@@ -128,6 +128,9 @@ pub struct FlushStats {
     /// Injected registration failures being held by the test delay right
     /// now, so a test can act inside that window.
     pub registrations_held: AtomicU64,
+    /// Injected intent failures being held by the test delay right now:
+    /// the rows are cut and their intent is not durable.
+    pub intents_held: AtomicU64,
     /// Most bytes the Parquet writer held for one row group, ever.
     pub writer_peak_bytes: AtomicU64,
     /// Sum over flushes of the writer's peak bytes; `/ flushes` is the mean.
@@ -475,7 +478,9 @@ impl Shared {
         for (intent, part) in intents.into_iter().zip(parts) {
             let logged_intent = if take_injected(&self.inject_intent_failures) {
                 if let Some(delay) = self.config.inject_intent_delay {
+                    self.flush_stats.intents_held.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
+                    self.flush_stats.intents_held.fetch_sub(1, Ordering::SeqCst);
                 }
                 Err(IngestError::Injected("flush intent"))
             } else {
