@@ -1,82 +1,83 @@
-//! What the compactor asks the catalog: which hour to compact next and
-//! which files make it up.
+//! What the compactor asks the catalog: the next hour to compact and the
+//! files that make it up, in one statement so both come from one snapshot.
 
-use chrono::{DateTime, Utc};
-use sqlx::FromRow;
+use chrono::{DateTime, Timelike, Utc};
 
 use crate::types::{FileRecord, FileRow, FileState, Level, Signal, TenantId};
 use crate::{Catalog, CatalogError};
 
-/// An hour of one tenant with enough L0 files to compact.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
-pub struct CompactionCandidate {
+/// An hour of one tenant with its visible L0 files, all cold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionInputs {
     /// Owner.
     pub tenant_id: TenantId,
     /// Start of the hour, by the files' `ts_min`.
     pub hour: DateTime<Utc>,
-    /// Visible L0 files in it.
-    pub files: i64,
+    /// Every visible L0 file of the hour, oldest registration first.
+    pub files: Vec<FileRecord>,
 }
 
 impl Catalog {
     /// The oldest hour, across tenants, whose visible L0 files of `signal`
-    /// number at least `min_files` and all ended more than `closed_for`
-    /// ago on the database clock. `None` when nothing qualifies.
+    /// number at least `min_files` and are all cold: every one ended and
+    /// was registered more than `closed_for` ago on the database clock, so
+    /// nothing in the hour is still served by a hot window or about to be
+    /// joined by late data. Candidate and files come from one statement,
+    /// so a file registered meanwhile is neither counted nor returned.
     ///
     /// # Errors
     /// Database failure.
-    pub async fn compaction_candidate(
+    pub async fn compaction_inputs(
         &self,
         signal: Signal,
         closed_for: std::time::Duration,
         min_files: i64,
-    ) -> Result<Option<CompactionCandidate>, CatalogError> {
-        let row = sqlx::query_as::<_, CompactionCandidate>(
-            "select tenant_id, date_trunc('hour', ts_min) as hour, count(*) as files
-             from engine_file
-             where signal = $1 and level = $2 and state = $3
-               and ts_max < now() - make_interval(secs => $4)
-             group by tenant_id, hour
-             having count(*) >= $5
-             order by hour, tenant_id
-             limit 1",
-        )
-        .bind(signal.code())
-        .bind(Level::L0.code())
-        .bind(FileState::Visible.code())
-        .bind(closed_for.as_secs_f64())
-        .bind(min_files)
-        .fetch_optional(self.pool())
-        .await?;
-        Ok(row)
-    }
-
-    /// Visible L0 files of `tenant` and `signal` whose `ts_min` falls in
-    /// the hour starting at `hour`, oldest registration first.
-    ///
-    /// # Errors
-    /// Database failure.
-    pub async fn l0_files_in_hour(
-        &self,
-        tenant: TenantId,
-        signal: Signal,
-        hour: DateTime<Utc>,
-    ) -> Result<Vec<FileRecord>, CatalogError> {
+    ) -> Result<Option<CompactionInputs>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
-            "select id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, state, created_at, quarantined_at
-             from engine_file
-             where tenant_id = $1 and signal = $2 and level = $3 and state = $4
-               and date_trunc('hour', ts_min) = $5
-             order by created_at, id",
+            "with hours as (
+                 select tenant_id, date_trunc('hour', ts_min) as hour
+                 from engine_file
+                 where signal = $1 and level = $2 and state = $3
+                 group by tenant_id, hour
+                 having count(*) >= $4
+                    and max(ts_max) < now() - make_interval(secs => $5)
+                    and max(created_at) < now() - make_interval(secs => $5)
+                 order by hour, tenant_id
+                 limit 1
+             )
+             select f.id, f.tenant_id, f.signal, f.level, f.path, f.size_bytes, f.row_count,
+                    f.ts_min, f.ts_max, f.services, f.summary, f.state, f.created_at,
+                    f.quarantined_at
+             from engine_file f
+             join hours h on f.tenant_id = h.tenant_id and date_trunc('hour', f.ts_min) = h.hour
+             where f.signal = $1 and f.level = $2 and f.state = $3
+             order by f.created_at, f.id",
         )
-        .bind(tenant)
         .bind(signal.code())
         .bind(Level::L0.code())
         .bind(FileState::Visible.code())
-        .bind(hour)
+        .bind(min_files)
+        .bind(closed_for.as_secs_f64())
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter().map(FileRecord::try_from).collect()
+        let files: Vec<FileRecord> = rows
+            .into_iter()
+            .map(FileRecord::try_from)
+            .collect::<Result<_, _>>()?;
+        let Some(first) = files.first() else {
+            return Ok(None);
+        };
+        let hour = first
+            .range
+            .start
+            .with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(first.range.start);
+        Ok(Some(CompactionInputs {
+            tenant_id: first.tenant_id,
+            hour,
+            files,
+        }))
     }
 }

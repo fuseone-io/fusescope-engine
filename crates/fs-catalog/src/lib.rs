@@ -16,7 +16,7 @@ mod types;
 mod watch;
 
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
-pub use compaction::CompactionCandidate;
+pub use compaction::CompactionInputs;
 pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
 pub use token::{
     TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token, looks_like_token,

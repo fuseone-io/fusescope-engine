@@ -725,10 +725,21 @@ async fn wait_for_lock_waiter(catalog: &Catalog) {
     }
 }
 
-/// The oldest closed hour with enough L0 files comes first; open hours,
-/// other levels and quarantined files do not count.
+/// Backdates the registration of `ids` by an hour, as files flushed long
+/// ago would show.
+async fn registered_an_hour_ago(db: &TestDb, ids: &[FileId]) {
+    sqlx::query("update engine_file set created_at = now() - interval '1 hour' where id = any($1)")
+        .bind(ids)
+        .execute(db.catalog.pool())
+        .await
+        .unwrap();
+}
+
+/// The oldest cold hour with enough L0 files comes first, with every L0
+/// file of that hour; an hour with a file that ended or was registered
+/// recently is not cold; other levels do not count.
 #[tokio::test]
-async fn compaction_candidates_are_closed_hours_with_enough_l0_files() {
+async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
     let Some(db) = TestDb::new().await else {
         return;
     };
@@ -739,15 +750,10 @@ async fn compaction_candidates_are_closed_hours_with_enough_l0_files() {
         .unwrap()
         .id;
     let closed = StdDuration::from_secs(60);
-    assert!(
-        db.catalog
-            .compaction_candidate(Signal::Traces, closed, 2)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let inputs = |min: i64| db.catalog.compaction_inputs(Signal::Traces, closed, min);
+    assert!(inputs(2).await.unwrap().is_none());
 
-    // Hour 1 has two files, hour 0 one, hour 2 three; all long closed.
+    // Hour 1 has two files, hour 0 one, hour 2 three; all ended long ago.
     let h0 = db
         .catalog
         .register_file(&file(t, Signal::Traces, 0, 0, &[]))
@@ -763,84 +769,60 @@ async fn compaction_candidates_are_closed_hours_with_enough_l0_files() {
         .register_file(&file(t, Signal::Traces, 1, 1, &[]))
         .await
         .unwrap();
+    let mut h2 = Vec::new();
     for _ in 0..3 {
-        db.catalog
-            .register_file(&file(t, Signal::Traces, 2, 2, &[]))
-            .await
-            .unwrap();
+        h2.push(
+            db.catalog
+                .register_file(&file(t, Signal::Traces, 2, 2, &[]))
+                .await
+                .unwrap()
+                .id,
+        );
     }
-    let candidate = db
-        .catalog
-        .compaction_candidate(Signal::Traces, closed, 2)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(candidate.tenant_id, t);
+    assert!(
+        inputs(2).await.unwrap().is_none(),
+        "registered just now: late data may still be coming and the hot window may serve them"
+    );
+    registered_an_hour_ago(&db, &[h0.id, h1a.id, h1b.id]).await;
+    registered_an_hour_ago(&db, &h2).await;
+
+    let found = inputs(2).await.unwrap().unwrap();
+    assert_eq!(found.tenant_id, t);
     assert_eq!(
-        candidate.hour,
+        found.hour,
         hour(1),
         "hour 0 has one file; hour 1 is the oldest with two"
     );
-    assert_eq!(candidate.files, 2);
-    let in_hour = db
-        .catalog
-        .l0_files_in_hour(t, Signal::Traces, hour(1))
-        .await
-        .unwrap();
     assert_eq!(
-        in_hour.iter().map(|f| f.id).collect::<Vec<_>>(),
+        found.files.iter().map(|f| f.id).collect::<Vec<_>>(),
         [h1a.id, h1b.id],
         "registration order"
     );
-    assert!(
-        db.catalog
-            .l0_files_in_hour(t, Signal::Traces, hour(0))
-            .await
-            .unwrap()
-            .iter()
-            .all(|f| f.id == h0.id)
+
+    // A file of hour 1 that ended recently keeps the whole hour out, even
+    // though two cold files are there.
+    let mut recent = file(t, Signal::Traces, 1, 1, &[]);
+    recent.range.end = Utc::now();
+    let recent = db.catalog.register_file(&recent).await.unwrap();
+    registered_an_hour_ago(&db, &[recent.id]).await;
+    assert_eq!(
+        inputs(2).await.unwrap().unwrap().hour,
+        hour(2),
+        "hour 1 is not cold"
     );
 
-    // Once hour 1 is swapped for an L1 file, hour 2 is next; the L1 does not count.
-    let mut l1 = file(t, Signal::Traces, 1, 1, &[]);
+    // Once hour 2 is swapped for an L1 file, nothing qualifies: the L1
+    // does not count and hour 1 is still not cold.
+    let mut l1 = file(t, Signal::Traces, 2, 2, &[]);
     l1.level = Level::L1;
     db.catalog
-        .swap_files(t, Signal::Traces, &[h1a.id, h1b.id], &[l1])
+        .swap_files(t, Signal::Traces, &h2, &[l1])
         .await
         .unwrap();
-    let next = db
-        .catalog
-        .compaction_candidate(Signal::Traces, closed, 2)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(next.hour, hour(2));
-    assert_eq!(next.files, 3);
-
-    // A file that ended recently keeps its hour open.
-    let mut open = file(t, Signal::Traces, 3, 3, &[]);
-    open.range.end = Utc::now();
-    db.catalog.register_file(&open).await.unwrap();
-    let mut open2 = file(t, Signal::Traces, 3, 3, &[]);
-    open2.range.end = Utc::now();
-    db.catalog.register_file(&open2).await.unwrap();
-    assert_eq!(
-        db.catalog
-            .compaction_candidate(Signal::Traces, closed, 2)
-            .await
-            .unwrap()
-            .unwrap()
-            .hour,
-        hour(2),
-        "hour 3 is still open"
-    );
+    assert!(inputs(2).await.unwrap().is_none());
     assert!(
-        db.catalog
-            .compaction_candidate(Signal::Traces, closed, 4)
-            .await
-            .unwrap()
-            .is_none(),
-        "no hour has four files"
+        inputs(1).await.unwrap().is_some(),
+        "hour 0 alone qualifies at one file"
     );
     db.finish().await;
 }
