@@ -1089,14 +1089,61 @@ async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
     });
     wait_for_lock_waiter(&db.catalog).await;
     assert!(!second.is_finished(), "B waits for A");
-    claim.finish().await.unwrap();
+    claim.deleted().await.unwrap();
     assert!(
         !second.await.unwrap(),
         "B finds nothing to delete once A finished"
     );
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap(),
+        Vec::<String>::new(),
+        "a tombstone is not a pending delete"
+    );
+    assert!(
+        db.catalog
+            .orphan_claim(&pending.path)
+            .await
+            .unwrap()
+            .is_none(),
+        "nor claimable"
+    );
 
-    // The writer re-uploads and registers: a claim in flight makes the
-    // registration wait, and it goes through once the claim is finished.
+    // The writer that never saw the refusal retries the path: the
+    // tombstone refuses it until pruned, long after any delete could
+    // still be in flight.
+    let err = db.catalog.register_file(&pending).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { ref path } if *path == pending.path),
+        "{err}"
+    );
+    assert_eq!(
+        db.catalog
+            .orphans_prune_tombstones(StdDuration::from_secs(3600), 10)
+            .await
+            .unwrap(),
+        0,
+        "too young to prune"
+    );
+    assert_eq!(
+        db.catalog
+            .orphans_prune_tombstones(StdDuration::ZERO, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    db.catalog.register_file(&pending).await.unwrap();
+    db.catalog
+        .swap_files(t, Signal::Traces, &[pending.id], &[])
+        .await
+        .unwrap();
+    sqlx::query("delete from engine_file where id = $1")
+        .bind(pending.id)
+        .execute(db.catalog.pool())
+        .await
+        .unwrap();
+
+    // A claim in flight makes a registration wait; refused once the
+    // claim left a tombstone.
     db.catalog
         .orphans_seen(std::slice::from_ref(&pending.path))
         .await
@@ -1124,11 +1171,19 @@ async fn a_claim_holds_the_path_against_another_sweeper_and_a_registration() {
         !registration.is_finished(),
         "the registration waits for the claim"
     );
-    claim.finish().await.unwrap();
-    registration.await.unwrap().unwrap();
+    claim.deleted().await.unwrap();
+    let err = registration.await.unwrap().unwrap_err();
+    assert!(matches!(err, CatalogError::ObjectDoomed { .. }), "{err}");
     assert_eq!(
         db.catalog.orphans_doomed(10).await.unwrap(),
         Vec::<String>::new()
+    );
+    assert_eq!(
+        db.catalog
+            .orphans_prune_tombstones(StdDuration::ZERO, 10)
+            .await
+            .unwrap(),
+        1
     );
 
     // A delete that failed waits its backoff behind the others, and longer

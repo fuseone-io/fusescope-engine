@@ -15,7 +15,11 @@
 //! itself, both of which end the same way. Deleting the object and
 //! forgetting the row happen under a claim that holds the path's lock in
 //! an open transaction, so two sweepers never delete the same path and a
-//! registration that re-uploads it waits for the claim to end.
+//! registration that re-uploads it waits for the claim to end. A path
+//! whose object was deleted stays as a tombstone, still refused to
+//! registration, for the tombstone TTL: a writer that never saw the
+//! refusal before the delete is refused on its next try and gives the
+//! rows a fresh id, so no delete still in flight can find the new object.
 
 use std::collections::HashSet;
 
@@ -38,12 +42,26 @@ impl OrphanClaim {
         &self.path
     }
 
-    /// Forgets the row and releases the lock: the object is gone, or is
-    /// not the engine's to delete.
+    /// The object is gone: the row stays as a tombstone, refused to
+    /// registration until pruned, and the lock is released.
     ///
     /// # Errors
     /// Database failure.
-    pub async fn finish(mut self) -> Result<(), CatalogError> {
+    pub async fn deleted(mut self) -> Result<(), CatalogError> {
+        sqlx::query("update engine_orphan set deleted_at = now() where path = $1")
+            .bind(&self.path)
+            .execute(&mut *self.tx)
+            .await?;
+        self.tx.commit().await?;
+        Ok(())
+    }
+
+    /// The path is not the engine's to delete: the row is forgotten and
+    /// the lock released, the object left in place.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn forget(mut self) -> Result<(), CatalogError> {
         sqlx::query("delete from engine_orphan where path = $1")
             .bind(&self.path)
             .execute(&mut *self.tx)
@@ -201,11 +219,13 @@ impl Catalog {
     pub async fn orphan_claim(&self, path: &str) -> Result<Option<OrphanClaim>, CatalogError> {
         let mut tx = self.pool().begin().await?;
         lock_path(&mut tx, path).await?;
-        let marked: Option<(bool,)> =
-            sqlx::query_as("select deleting from engine_orphan where path = $1 for update")
-                .bind(path)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let marked: Option<(bool,)> = sqlx::query_as(
+            "select deleting from engine_orphan
+             where path = $1 and deleted_at is null for update",
+        )
+        .bind(path)
+        .fetch_optional(&mut *tx)
+        .await?;
         if marked != Some((true,)) {
             tx.rollback().await?;
             return Ok(None);
@@ -226,7 +246,7 @@ impl Catalog {
     pub async fn orphans_doomed(&self, limit: i64) -> Result<Vec<String>, CatalogError> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "select path from engine_orphan
-             where deleting and retry_after <= now()
+             where deleting and deleted_at is null and retry_after <= now()
              order by retry_after, path
              limit $1",
         )
@@ -236,7 +256,51 @@ impl Catalog {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
-    /// Forgets `paths`: deleted, or seen with a row after all.
+    /// The path among `path` and its sidecar that is marked for deletion
+    /// or a tombstone, if any: a writer checks before uploading so a
+    /// refused path is not written again even as an orphan. Not a lock;
+    /// the registration's own check is the one that decides.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn object_refused(&self, path: &str) -> Result<Option<String>, CatalogError> {
+        let mut paths = vec![path.to_owned()];
+        paths.extend(fs_index::sidecar_path(path));
+        let doomed: Option<(String,)> = sqlx::query_as(
+            "select path from engine_orphan where path = any($1) and deleting limit 1",
+        )
+        .bind(&paths)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(doomed.map(|(p,)| p))
+    }
+
+    /// Prunes up to `limit` tombstones older than `ttl`: long past any
+    /// delete that could still be in flight.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn orphans_prune_tombstones(
+        &self,
+        ttl: std::time::Duration,
+        limit: i64,
+    ) -> Result<usize, CatalogError> {
+        let pruned = sqlx::query(
+            "delete from engine_orphan where path in (
+                 select path from engine_orphan
+                 where deleted_at < now() - make_interval(secs => $1)
+                 order by deleted_at limit $2
+             )",
+        )
+        .bind(ttl.as_secs_f64())
+        .bind(limit)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(usize::try_from(pruned).unwrap_or(usize::MAX))
+    }
+
+    /// Forgets `paths`: seen with a row after all, or never the engine's.
     ///
     /// # Errors
     /// Database failure.
