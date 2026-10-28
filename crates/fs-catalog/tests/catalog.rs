@@ -1307,6 +1307,42 @@ async fn origin_is_part_of_the_idempotent_check_and_defaults_to_the_id() {
         .unwrap();
     let row = rows.iter().find(|r| r.id == legacy.id).unwrap();
     assert_eq!(row.origin, legacy.id, "defaulted by the trigger");
+
+    // An origin names one flush: a second file cannot carry it.
+    let mut twin = file(t, Signal::Traces, 2, 2, &[]);
+    twin.origin = first.id;
+    assert!(
+        db.catalog.register_file(&twin).await.is_err(),
+        "origin is unique"
+    );
+
+    // A registration that waited for the path's lock is stamped when it
+    // was written, not when its transaction began.
+    let late = file(t, Signal::Traces, 3, 3, &[]);
+    let mut holding = db.catalog.pool().begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&late.path)
+        .execute(&mut *holding)
+        .await
+        .unwrap();
+    let registration = tokio::spawn({
+        let catalog = db.catalog.clone();
+        let late = late.clone();
+        async move { catalog.register_file(&late).await.unwrap() }
+    });
+    wait_for_lock_waiter(&db.catalog).await;
+    tokio::time::sleep(StdDuration::from_millis(1200)).await;
+    let (released_at,): (chrono::DateTime<Utc>,) = sqlx::query_as("select clock_timestamp()")
+        .fetch_one(db.catalog.pool())
+        .await
+        .unwrap();
+    holding.commit().await.unwrap();
+    let registered = registration.await.unwrap();
+    assert!(
+        registered.created_at >= released_at,
+        "stamped after the wait: {} < {released_at}",
+        registered.created_at
+    );
     db.finish().await;
 }
 
