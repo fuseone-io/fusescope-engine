@@ -98,14 +98,14 @@ impl TraceIndex {
         heap_bytes(self.files.iter().map(String::len), self.entries.len())
     }
 
-    /// Heap bytes [`decode`](Self::decode) would allocate for `bytes`,
-    /// found by walking the frame without allocating, so a reader can
-    /// reserve them first. Checks everything `decode` checks except the
-    /// entries' order and file indexes.
+    /// What [`decode`](Self::decode) allocates for `bytes`, found by walking
+    /// the frame without allocating, so a reader can reserve it first.
+    /// Checks everything `decode` checks except the entries' order, the
+    /// file indexes and duplicate paths.
     ///
     /// # Errors
     /// Any header or framing check that fails.
-    pub fn heap_bytes_of(bytes: &[u8]) -> Result<usize, IndexError> {
+    pub fn decode_cost(bytes: &[u8]) -> Result<DecodeCost, IndexError> {
         let body = frame(bytes)?;
         let mut cursor = Cursor { bytes: body, at: 0 };
         let file_count = cursor.u32()? as usize;
@@ -124,7 +124,19 @@ impl TraceIndex {
         if cursor.at != body.len() {
             return Err(IndexError::BadBody("trailing bytes"));
         }
-        Ok(entry_count * ENTRY_LEN + paths + file_count * STRING_OVERHEAD)
+        Ok(DecodeCost {
+            retained: entry_count * ENTRY_LEN + paths + file_count * STRING_OVERHEAD,
+            scratch: duplicate_check_bytes(file_count),
+        })
+    }
+
+    /// Bytes the index's vectors and strings have allocated, retained or
+    /// not: `decode` makes this equal to [`heap_bytes`](Self::heap_bytes).
+    #[cfg(test)]
+    fn allocated_bytes(&self) -> usize {
+        self.entries.capacity() * ENTRY_LEN
+            + self.files.capacity() * STRING_OVERHEAD
+            + self.files.iter().map(String::capacity).sum::<usize>()
     }
 
     /// Files holding `trace`, in index order.
@@ -208,7 +220,13 @@ impl TraceIndex {
         let body = frame(bytes)?;
         let mut cursor = Cursor { bytes: body, at: 0 };
         let file_count = cursor.u32()? as usize;
-        let mut files = Vec::with_capacity(file_count.min(1 << 16));
+        // Every count is checked against the bytes present before its
+        // vector is allocated, exactly, so a damaged count allocates
+        // nothing and a valid one allocates what was reserved.
+        if file_count > cursor.remaining() / 2 {
+            return Err(IndexError::BadBody("count past the end"));
+        }
+        let mut files = Vec::with_capacity(file_count);
         for _ in 0..file_count {
             let len = cursor.u16()? as usize;
             let raw = cursor.take(len)?;
@@ -219,7 +237,10 @@ impl TraceIndex {
             return Err(IndexError::BadBody("duplicate file path"));
         }
         let entry_count = cursor.u32()? as usize;
-        let mut entries = Vec::with_capacity(entry_count.min(1 << 20));
+        if entry_count != cursor.remaining() / ENTRY_LEN || cursor.remaining() % ENTRY_LEN != 0 {
+            return Err(IndexError::BadBody("count past the end"));
+        }
+        let mut entries = Vec::with_capacity(entry_count);
         let mut last: Option<Entry> = None;
         for _ in 0..entry_count {
             let mut trace = [0u8; TRACE_ID_BYTES];
@@ -282,12 +303,34 @@ fn frame(bytes: &[u8]) -> Result<&[u8], IndexError> {
 /// Bytes of one `String` beyond its characters.
 const STRING_OVERHEAD: usize = 24;
 
+/// What decoding a sidecar allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeCost {
+    /// Heap the decoded index keeps: its entries and file paths.
+    pub retained: usize,
+    /// Scratch the decoder uses and frees: the set that checks paths for
+    /// duplicates.
+    pub scratch: usize,
+}
+
+/// Bytes of the set `has_duplicates` builds for `files` paths: a hash
+/// table of string slices sized for them, buckets rounded up to a power of
+/// two with one control byte each.
+fn duplicate_check_bytes(files: usize) -> usize {
+    if files == 0 {
+        return 0;
+    }
+    let buckets = (files * 8).div_ceil(7).next_power_of_two();
+    buckets * (std::mem::size_of::<&str>() + 1) + 16
+}
+
 fn heap_bytes(path_lens: impl Iterator<Item = usize>, entries: usize) -> usize {
     entries * ENTRY_LEN + path_lens.map(|len| len + STRING_OVERHEAD).sum::<usize>()
 }
 
 fn has_duplicates(files: &[String]) -> bool {
-    let mut seen = std::collections::HashSet::with_capacity(files.len());
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(files.len());
     files.iter().any(|f| !seen.insert(f.as_str()))
 }
 
@@ -315,6 +358,10 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.at)
+    }
+
     fn take(&mut self, len: usize) -> Result<&'a [u8], IndexError> {
         let end = self
             .at
@@ -430,18 +477,39 @@ mod tests {
     }
 
     #[test]
-    fn the_heap_of_a_frame_is_known_before_decoding_it() {
+    fn the_cost_of_a_frame_is_known_before_decoding_it_and_decode_allocates_exactly_that() {
         let index = sample();
         let bytes = index.encode();
-        assert_eq!(
-            TraceIndex::heap_bytes_of(&bytes).unwrap(),
-            index.heap_bytes()
+        let cost = TraceIndex::decode_cost(&bytes).unwrap();
+        assert_eq!(cost.retained, index.heap_bytes());
+        assert!(
+            cost.scratch >= 2 * (std::mem::size_of::<&str>() + 1),
+            "room for two paths"
         );
+        let decoded = TraceIndex::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.allocated_bytes(),
+            cost.retained,
+            "no capacity beyond the count"
+        );
+
+        let many = TraceIndex::new(
+            (0..300).map(|n| format!("f{n}")).collect(),
+            (0..3000u32).map(|n| ([u8::try_from(n % 256).unwrap(); 16], n % 300)),
+        )
+        .unwrap();
+        let bytes = many.encode();
+        let cost = TraceIndex::decode_cost(&bytes).unwrap();
+        assert_eq!(
+            TraceIndex::decode(&bytes).unwrap().allocated_bytes(),
+            cost.retained
+        );
+
         let mut flipped = bytes.clone();
         let last = flipped.len() - 1;
         flipped[last] ^= 0xff;
         assert_eq!(
-            TraceIndex::heap_bytes_of(&flipped).unwrap_err(),
+            TraceIndex::decode_cost(&flipped).unwrap_err(),
             IndexError::ChecksumMismatch
         );
     }
