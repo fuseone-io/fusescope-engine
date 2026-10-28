@@ -54,18 +54,24 @@ impl Leadership {
         })
     }
 
-    /// Takes or renews the lease. A catalog failure counts as not holding
-    /// it: the instance stops working until a refresh succeeds, so two
-    /// instances never work at once on a partitioned catalog.
+    /// Takes or renews the lease. A catalog failure, or a renewal that
+    /// takes longer than the renewal period, counts as not holding it:
+    /// the instance stops working until a refresh succeeds, so two
+    /// instances never work at once on a partitioned catalog and a
+    /// renewal stuck on the network does not keep the work going past
+    /// the TTL.
     pub async fn refresh(&self) -> bool {
-        let held = match self
+        let acquire = self
             .catalog
-            .acquire_lease(COMPACTOR_LEASE, &self.holder, self.ttl)
-            .await
-        {
-            Ok(generation) => generation,
-            Err(e) => {
+            .acquire_lease(COMPACTOR_LEASE, &self.holder, self.ttl);
+        let held = match tokio::time::timeout(self.renew_every(), acquire).await {
+            Ok(Ok(generation)) => generation,
+            Ok(Err(e)) => {
                 warn!(role = "compactor", holder = %self.holder, error = %e, "lease refresh failed; standing by");
+                None
+            }
+            Err(_) => {
+                warn!(role = "compactor", holder = %self.holder, timeout = ?self.renew_every(), "lease refresh timed out; standing by");
                 None
             }
         };

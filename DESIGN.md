@@ -425,12 +425,15 @@ database clock. The holder is the node id plus an id of the process
 incarnation, so two processes configured alike are two holders. Every change
 of hands bumps the lease generation; the holder quotes holder and generation
 as a fence, and a swap checked against a stale fence changes nothing
-(`swap_files_fenced`, `CatalogError::LeaseLost`). The lease is renewed every
-third of `compactor.lease_ttl_secs` on its own loop, never behind the work:
-the work runs on a task started when the lease is taken and aborted when it
-is lost, so a slow pass neither lets the lease lapse nor outlives it. A
-catalog failure on renewal counts as losing the lease, so a partitioned
-instance stops working rather than racing the next holder. Release lets the
+(`swap_files_fenced`, `CatalogError::LeaseLost`); the check locks the lease
+row until the swap commits, so a takeover waits behind it and a swap that
+waited behind a takeover is refused. The lease is renewed every third of
+`compactor.lease_ttl_secs` on its own loop, never behind the work: the work
+runs on a task started when the lease is taken and aborted, and waited for,
+when it is lost, so a slow pass neither lets the lease lapse nor outlives it.
+A renewal is bounded by the renewal period, and a catalog failure or timeout
+on renewal counts as losing the lease, so a partitioned or stuck instance
+stops working before the TTL rather than racing the next holder. Release lets the
 lease expire at once, keeping the generation. A purge deletes the catalog
 rows of files quarantined for `compactor.quarantine_ttl_secs` on the database
 clock, then each object and its `trace_id` sidecar; the server refuses a TTL

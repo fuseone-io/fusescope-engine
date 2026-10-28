@@ -257,20 +257,9 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
     let remaining_before = count_present(slow.as_ref(), &paths).await;
     assert!(remaining_before < 12, "deletes are happening");
 
-    // Take the lease away: the pass stops within a renewal period.
-    assert!(
-        db.catalog
-            .release_lease(COMPACTOR_LEASE, &later.holder)
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        db.catalog
-            .acquire_lease(COMPACTOR_LEASE, "elsewhere", Duration::from_secs(60))
-            .await
-            .unwrap(),
-        Some(later.generation + 1)
-    );
+    // Take the lease away in one statement, so the renewer cannot slip in
+    // between: the pass stops within a renewal period.
+    take_over(&db.catalog, "elsewhere").await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     let at_loss = count_present(slow.as_ref(), &paths).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -299,6 +288,49 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
         "elsewhere",
         "a lease that is not ours is left alone on shutdown"
     );
+    db.finish().await;
+}
+
+/// Moves the compactor lease to `holder` for a minute, atomically, as a
+/// takeover after expiry would.
+async fn take_over(catalog: &Catalog, holder: &str) {
+    sqlx::query(
+        "update engine_lease set holder = $1, generation = generation + 1,
+         expires_at = now() + interval '60 seconds' where name = $2",
+    )
+    .bind(holder)
+    .bind(COMPACTOR_LEASE)
+    .execute(catalog.pool())
+    .await
+    .unwrap();
+}
+
+/// A renewal that cannot complete within the renewal period reports the
+/// lease lost, whatever the catalog would have answered.
+#[tokio::test]
+async fn a_stuck_renewal_counts_as_losing_the_lease() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let ttl = Duration::from_millis(900);
+    let a = Leadership::new(db.catalog.clone(), "node-a", ttl);
+    assert!(a.refresh().await);
+
+    // The row is locked elsewhere: the renewal cannot complete.
+    let mut holding = db.catalog.pool().begin().await.unwrap();
+    sqlx::query("select generation from engine_lease where name = $1 for update")
+        .bind(COMPACTOR_LEASE)
+        .execute(&mut *holding)
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    assert!(!a.refresh().await, "timed out: not held");
+    assert!(started.elapsed() < ttl, "reported before the TTL");
+    assert!(!a.is_leader());
+    assert!(a.fence().is_none());
+
+    holding.commit().await.unwrap();
+    assert!(a.refresh().await, "held again once the catalog answers");
     db.finish().await;
 }
 

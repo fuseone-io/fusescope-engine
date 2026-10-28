@@ -3,10 +3,11 @@
 //! ([`lease`]); the others stand by and take over when it lapses.
 //!
 //! The lease is renewed on its own loop, never behind the work: work runs
-//! on a task that is started when the lease is taken and aborted when it
-//! is lost, so a slow pass neither lets the lease lapse nor outlives it.
-//! Work cut short that way leaves at most objects without rows, which the
-//! orphan sweep removes.
+//! on a task that is started when the lease is taken and aborted, and
+//! waited for, when it is lost, so a slow pass neither lets the lease
+//! lapse nor outlives it. A renewal is bounded by the renewal period, so a
+//! stuck one reports the loss before the TTL. Work cut short that way
+//! leaves at most objects without rows, which the orphan sweep removes.
 //!
 //! See DESIGN.md at the repository root for the role of this crate.
 
@@ -71,16 +72,23 @@ pub async fn run(
                         )));
                     }
                 } else if let Some(task) = work.take() {
-                    task.abort();
+                    stop(task).await;
                 }
             }
             _ = shutdown.changed() => break,
         }
     }
     if let Some(task) = work.take() {
-        task.abort();
+        stop(task).await;
     }
     leadership.release().await;
+}
+
+/// Aborts the work and waits until it has stopped, so nothing of it runs
+/// once the lease is reported lost or released.
+async fn stop(task: JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
 }
 
 /// The work of the leader: purge passes at their interval until the lease
