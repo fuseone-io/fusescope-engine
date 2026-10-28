@@ -573,9 +573,11 @@ async fn an_hour_with_a_recent_or_late_file_is_not_cold() {
     let done = compactor.compact_once(&me).await.unwrap().unwrap();
     assert_eq!(done.inputs.len(), cold.len() + 1);
 
-    // A file whose rows end recently keeps its hour open however old its registration.
-    let recent_hour = Utc::now() - chrono::Duration::minutes(30);
-    let recent_hour = recent_hour
+    // A file whose rows end now keeps its hour open however old its
+    // registration: two cold files at the start of the current hour and
+    // one ending now, all in the same hour.
+    let now = Utc::now();
+    let recent_hour = now
         .with_minute(0)
         .unwrap()
         .with_second(0)
@@ -602,7 +604,7 @@ async fn an_hour_with_a_recent_or_late_file_is_not_cold() {
         &f.db.catalog,
         &f.store,
         f.tenant,
-        &[request("api", 13, nanos(Utc::now()) - 1, 2)],
+        &[request("api", 13, nanos(now), 2)],
         4,
     )
     .await;
@@ -839,6 +841,152 @@ async fn a_cancelled_pass_counts_the_orphans_it_created() {
     );
     assert_eq!(l1_objects(&f).await.len(), 1);
     assert_eq!(visible(&f).await.len(), 3, "nothing published");
+    f.db.finish().await;
+}
+
+/// Backdates the first sighting of every remembered orphan by two hours.
+async fn orphans_seen_two_hours_ago(f: &Fixture) {
+    sqlx::query("update engine_orphan set first_seen = now() - interval '2 hours'")
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
+}
+
+/// Objects without a row are remembered on first sight and deleted only
+/// when still without a row a TTL later; registered files, their
+/// sidecars and objects the engine does not lay out are left alone, and an
+/// orphan that gets a row meanwhile is forgotten, not deleted.
+#[tokio::test]
+async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
+    let Some(f) = fixture().await else { return };
+    let registered = three_closed_l0(&f, 4).await;
+    // A compaction that uploads and does not publish: an L1 and its sidecar.
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            inject_swap_failures: 1,
+            ..config(4)
+        },
+    );
+    let me = fence(&f).await;
+    assert!(c.compact_once(&me).await.is_err());
+    let orphan_l1 = l1_objects(&f).await.remove(0);
+    // A stray span file nobody registered, and a note that is not ours.
+    let stray = format!(
+        "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
+        f.tenant.0,
+        uuid::Uuid::new_v4()
+    );
+    f.store
+        .put(&Path::from(stray.as_str()), b"stray".to_vec().into())
+        .await
+        .unwrap();
+    f.store
+        .put(&Path::from("t/notes.txt"), b"keep".to_vec().into())
+        .await
+        .unwrap();
+    let stats = Arc::new(fs_compactor::OrphanStats::default());
+    let ttl = Duration::from_secs(3600);
+
+    let first = fs_compactor::sweep_once(
+        &f.db.catalog,
+        f.store.as_ref(),
+        &Path::from(""),
+        ttl,
+        &stats,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.listed, 9,
+        "three files with sidecars, the L1 with its sidecar, the stray"
+    );
+    assert_eq!(first.seen, 3);
+    assert_eq!(first.deleted, 0, "first sight: nothing deleted");
+    for path in [&orphan_l1, &stray] {
+        assert!(
+            f.store.head(&Path::from(path.as_str())).await.is_ok(),
+            "{path} still there"
+        );
+    }
+    assert!(
+        fs_compactor::sweep_once(
+            &f.db.catalog,
+            f.store.as_ref(),
+            &Path::from(""),
+            ttl,
+            &stats
+        )
+        .await
+        .unwrap()
+        .deleted
+            == 0,
+        "seen twice within the TTL: still nothing"
+    );
+
+    // The stray gets a row before its TTL; the rest wait it out.
+    let mut adopted = registered[0].clone();
+    let row = fs_catalog::NewFile {
+        id: fs_catalog::FileId::new(),
+        tenant_id: f.tenant,
+        signal: Signal::Traces,
+        level: Level::L0,
+        path: stray.clone(),
+        size_bytes: 5,
+        row_count: 0,
+        range: adopted.range,
+        services: vec![],
+        summary: None,
+    };
+    adopted.path = stray.clone();
+    f.db.catalog.register_file(&row).await.unwrap();
+    orphans_seen_two_hours_ago(&f).await;
+    let second = fs_compactor::sweep_once(
+        &f.db.catalog,
+        f.store.as_ref(),
+        &Path::from(""),
+        ttl,
+        &stats,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.seen, 2, "the stray has a row now");
+    assert_eq!(second.deleted, 2, "the L1 and its sidecar");
+    assert_eq!(second.forgotten, 1, "the stray");
+    assert!(f.store.head(&Path::from(orphan_l1.as_str())).await.is_err());
+    assert!(
+        f.store
+            .head(&Path::from(
+                fs_index::sidecar_path(&orphan_l1).unwrap().as_str()
+            ))
+            .await
+            .is_err()
+    );
+    assert!(f.store.head(&Path::from(stray.as_str())).await.is_ok());
+    assert!(f.store.head(&Path::from("t/notes.txt")).await.is_ok());
+    for file in &registered {
+        assert!(f.store.head(&Path::from(file.path.as_str())).await.is_ok());
+        assert!(
+            f.store
+                .head(&Path::from(
+                    fs_index::sidecar_path(&file.path).unwrap().as_str()
+                ))
+                .await
+                .is_ok()
+        );
+    }
+    assert_eq!(visible(&f).await.len(), 4, "catalog untouched by the sweep");
+    assert!(
+        f.db.catalog
+            .orphans_due(Duration::ZERO)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing remembered"
+    );
+    assert_eq!(stats.sweeps.load(Ordering::Relaxed), 3);
+    assert_eq!(stats.deleted.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.forgotten.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }
 

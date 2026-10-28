@@ -524,6 +524,22 @@ Retention: the compactor deletes day prefixes beyond the tenant's
 rules are the safety net, never the primary mechanism, because the catalog
 must never point at files that do not exist.
 
+### 7.2 Orphan sweep
+
+A crash between an upload and its registration, a compaction that did not
+publish, or a cancelled pass leaves objects no row points at. The leader
+sweeps the engine's prefix every `compactor.orphan_interval_secs`: it lists
+the span files and sidecars, asks the catalog which have a row (a sidecar
+has one when the span file of any level it could belong to has one),
+remembers the rest in `engine_orphan` with their first sighting, and
+deletes an object only when it is still without a row more than
+`compactor.orphan_ttl_secs` after that first sighting, so an upload still
+waiting for its registration is seen once and registered before the next
+look. An orphan that gets a row meanwhile, or that is gone, is forgotten.
+Objects the engine does not lay out are left alone. The sweep runs on the
+leader only and never alongside a compaction pass, so the outputs of the
+pass under way are never candidates.
+
 ## 8. Contract with the Go backend
 
 ### 8.1 Transport

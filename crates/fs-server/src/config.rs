@@ -553,6 +553,13 @@ pub struct CompactorConfig {
     /// Most input bytes one compaction pass merges.
     #[serde(default = "default_max_input_bytes")]
     pub max_input_bytes: u64,
+    /// How often the bucket is swept for objects without a catalog row.
+    #[serde(default = "default_orphan_interval")]
+    pub orphan_interval_secs: u64,
+    /// How long an object must have been seen without a row before it is
+    /// deleted; longer than any upload waits for its registration.
+    #[serde(default = "default_orphan_ttl")]
+    pub orphan_ttl_secs: u64,
 }
 
 impl Default for CompactorConfig {
@@ -567,6 +574,8 @@ impl Default for CompactorConfig {
             l1_target_bytes: default_l1_target_bytes(),
             max_inputs_per_pass: default_max_inputs_per_pass(),
             max_input_bytes: default_max_input_bytes(),
+            orphan_interval_secs: default_orphan_interval(),
+            orphan_ttl_secs: default_orphan_ttl(),
         }
     }
 }
@@ -591,8 +600,18 @@ impl CompactorConfig {
                 inject_put_failure_at: None,
                 inject_put_hold: None,
             },
+            orphan_interval: std::time::Duration::from_secs(self.orphan_interval_secs),
+            orphan_ttl: std::time::Duration::from_secs(self.orphan_ttl_secs),
         }
     }
+}
+
+fn default_orphan_interval() -> u64 {
+    3600
+}
+
+fn default_orphan_ttl() -> u64 {
+    3600
 }
 
 fn default_lease_ttl() -> u64 {
@@ -783,6 +802,11 @@ impl Config {
         {
             return invalid(
                 "compactor.max_inputs_per_pass must be at least 2, l1_target_bytes at least 1 MiB and max_input_bytes at least l1_target_bytes",
+            );
+        }
+        if self.compactor.orphan_ttl_secs < 60 || self.compactor.orphan_interval_secs == 0 {
+            return invalid(
+                "compactor.orphan_ttl_secs must be at least 60 and orphan_interval_secs positive",
             );
         }
         // Two L0 files must always fit a pass, or an hour could never close;

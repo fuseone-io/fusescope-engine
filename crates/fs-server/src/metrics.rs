@@ -21,7 +21,7 @@ pub struct Metrics {
     flush: OnceLock<Arc<fs_ingest::FlushStats>>,
     wal_bytes: OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
     query: OnceLock<Arc<fs_query::QueryStats>>,
-    compactor: OnceLock<Arc<fs_compactor::CompactorStats>>,
+    compactor: OnceLock<Arc<fs_compactor::Stats>>,
 }
 
 impl Default for Metrics {
@@ -71,7 +71,7 @@ impl Metrics {
     }
 
     /// Registers the compactor's counters.
-    pub fn register_compactor(&self, stats: Arc<fs_compactor::CompactorStats>) {
+    pub fn register_compactor(&self, stats: Arc<fs_compactor::Stats>) {
         let _ = self.compactor.set(stats);
     }
 
@@ -352,9 +352,11 @@ impl Metrics {
     }
 
     fn render_compactor(&self, out: &mut String) {
-        let Some(c) = self.compactor.get() else {
+        let Some(stats) = self.compactor.get() else {
             return;
         };
+        let c = &stats.compaction;
+        let o = &stats.orphans;
         let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         for (name, help, value) in [
             (
@@ -411,6 +413,31 @@ impl Metrics {
                 "fusescope_compaction_skipped_total",
                 "Hours skipped because their two oldest files exceed the input cap",
                 load(&c.skipped),
+            ),
+            (
+                "fusescope_orphan_sweeps_total",
+                "Orphan sweeps completed",
+                load(&o.sweeps),
+            ),
+            (
+                "fusescope_orphan_listed_total",
+                "Objects listed by completed sweeps",
+                load(&o.listed),
+            ),
+            (
+                "fusescope_orphan_seen_total",
+                "Objects seen without a catalog row",
+                load(&o.seen),
+            ),
+            (
+                "fusescope_orphan_deleted_total",
+                "Objects deleted after a TTL without a row",
+                load(&o.deleted),
+            ),
+            (
+                "fusescope_orphan_forgotten_total",
+                "Remembered orphans found with a row, or gone, before their TTL",
+                load(&o.forgotten),
             ),
         ] {
             counter(out, name, help, value);
@@ -610,12 +637,20 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("fusescope_buffer_live_bytes 77\n"), "{page}");
-        let compactor = Arc::new(fs_compactor::CompactorStats::default());
-        compactor.passes.fetch_add(4, Ordering::Relaxed);
-        compactor.orphaned.fetch_add(3, Ordering::Relaxed);
-        compactor.skipped.fetch_add(1, Ordering::Relaxed);
+        let compactor = Arc::new(fs_compactor::Stats::default());
+        compactor.compaction.passes.fetch_add(4, Ordering::Relaxed);
+        compactor
+            .compaction
+            .orphaned
+            .fetch_add(3, Ordering::Relaxed);
+        compactor.compaction.skipped.fetch_add(1, Ordering::Relaxed);
+        compactor.orphans.deleted.fetch_add(6, Ordering::Relaxed);
         metrics.register_compactor(compactor);
         let page = metrics.render();
+        assert!(
+            page.contains("fusescope_orphan_deleted_total 6\n"),
+            "{page}"
+        );
         assert!(
             page.contains("fusescope_compaction_passes_total 4\n"),
             "{page}"

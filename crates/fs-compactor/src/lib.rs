@@ -24,9 +24,11 @@ use tracing::{info, warn};
 pub mod compact;
 pub mod lease;
 pub mod merge;
+pub mod orphans;
 
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
 pub use lease::Leadership;
+pub use orphans::{OrphanStats, sweep_once};
 
 /// Why a compaction pass failed.
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +81,20 @@ pub struct CompactorConfig {
     pub compaction_interval: Duration,
     /// What one compaction pass takes on.
     pub compaction: CompactionConfig,
+    /// How often the bucket is swept for objects without a row.
+    pub orphan_interval: Duration,
+    /// How long an object must have been seen without a row before it is
+    /// deleted; longer than any upload waits for its registration.
+    pub orphan_ttl: Duration,
+}
+
+/// Counters of every kind of work the compactor does.
+#[derive(Debug, Default)]
+pub struct Stats {
+    /// Compaction passes.
+    pub compaction: Arc<CompactorStats>,
+    /// Orphan sweeps.
+    pub orphans: Arc<OrphanStats>,
 }
 
 /// Runs the compactor until `shutdown` flips. Work happens only while this
@@ -90,16 +106,16 @@ pub async fn run(
     root: Path,
     config: CompactorConfig,
     node_id: &str,
-    stats: Arc<CompactorStats>,
+    stats: Arc<Stats>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let leadership = Arc::new(Leadership::new(catalog.clone(), node_id, config.lease_ttl));
     let compactor = Arc::new(Compactor::new(
         catalog.clone(),
         Arc::clone(&store),
-        root,
+        root.clone(),
         config.compaction.clone(),
-        stats,
+        Arc::clone(&stats.compaction),
     ));
     let (leader_tx, leader_rx) = watch::channel(false);
     let mut renew = tokio::time::interval(leadership.renew_every());
@@ -115,8 +131,10 @@ pub async fn run(
                         work = Some(tokio::spawn(work_loop(
                             catalog.clone(),
                             Arc::clone(&store),
+                            root.clone(),
                             Arc::clone(&compactor),
                             Arc::clone(&leadership),
+                            Arc::clone(&stats.orphans),
                             config.clone(),
                             leader_rx.clone(),
                         )));
@@ -144,14 +162,17 @@ async fn stop(task: JoinHandle<()>) {
 /// Most compaction passes one tick runs before yielding to the next tick.
 const PASSES_PER_TICK: usize = 64;
 
-/// The work of the leader: purge and compaction passes at their intervals
-/// until the lease is lost. Every swap carries the fence of the lease as
-/// it is at that moment; no fence, no pass.
+/// The work of the leader: purge, compaction and orphan passes at their
+/// intervals until the lease is lost, one at a time. Every swap carries
+/// the fence of the lease as it is at that moment; no fence, no pass.
+#[allow(clippy::too_many_arguments)]
 async fn work_loop(
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
+    root: Path,
     compactor: Arc<Compactor>,
     leadership: Arc<Leadership>,
+    orphan_stats: Arc<OrphanStats>,
     config: CompactorConfig,
     mut leader: watch::Receiver<bool>,
 ) {
@@ -159,8 +180,15 @@ async fn work_loop(
     purge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut compact = tokio::time::interval(config.compaction_interval.max(Duration::from_secs(1)));
     compact.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut orphans = tokio::time::interval(config.orphan_interval.max(Duration::from_secs(1)));
+    orphans.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = orphans.tick() => {
+                if let Err(e) = sweep_once(&catalog, store.as_ref(), &root, config.orphan_ttl, &orphan_stats).await {
+                    warn!(role = "compactor", error = %e, "orphan sweep failed");
+                }
+            }
             _ = purge.tick() => {
                 purge_once(&catalog, store.as_ref(), config.quarantine_ttl, config.purge_batch).await;
             }
