@@ -239,6 +239,7 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
             objects_per_pass: 100_000,
             deletes_per_pass: 100,
             delete_backoff: Duration::from_secs(600),
+            tombstone_ttl: Duration::from_secs(7 * 24 * 3600),
             inject_delete_failure: None,
         },
     };
@@ -406,6 +407,7 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
             objects_per_pass: 100_000,
             deletes_per_pass: 100,
             delete_backoff: Duration::from_secs(600),
+            tombstone_ttl: Duration::from_secs(7 * 24 * 3600),
             inject_delete_failure: None,
         },
     };

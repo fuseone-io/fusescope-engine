@@ -561,7 +561,14 @@ keeps its object; a mark that wins means the writer gives the same rows a
 fresh id, logged as a second intent for the same records so a restart
 retries under it too, and writes the same bytes under the new path. A path
 once marked is never written again, since a delete still in flight when a
-sweeper lost its lease could remove an object re-uploaded under it.
+sweeper lost its lease could remove an object re-uploaded under it: a
+deleted path stays in the catalog as a tombstone, refused to registration,
+for `compactor.sweep_tombstone_ttl_secs`, so a writer that was down while
+its object was deleted is refused on its first retry and takes a fresh id
+too; a writer also asks before uploading, so a refused path is not written
+again even as an orphan, the registration's own check being the one that
+decides. The id changes while the failed attempt still holds the flush, so
+no concurrent retry takes the old id meanwhile.
 A mark is never undone: a sweeper that finds a row already marked, by an
 earlier pass or by another instance during a handover, deletes the object
 itself; only a path a file row owns, or one that is not the engine's, is

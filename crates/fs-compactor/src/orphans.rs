@@ -64,6 +64,9 @@ pub struct SweepConfig {
     /// How long a marked object whose delete failed waits before the next
     /// try, times the number of failures so far, up to six times.
     pub delete_backoff: Duration,
+    /// How long a deleted path stays refused to registration; longer than
+    /// any delete request could stay in flight.
+    pub tombstone_ttl: Duration,
     /// Make the delete of every object whose path contains this fail
     /// artificially. `None` in production; tests use it for the backoff.
     pub inject_delete_failure: Option<String>,
@@ -85,6 +88,8 @@ pub struct OrphanStats {
     pub forgotten: AtomicU64,
     /// Deletes that failed and wait their backoff.
     pub delete_failures: AtomicU64,
+    /// Tombstones pruned after their TTL.
+    pub tombstones_pruned: AtomicU64,
 }
 
 /// What one pass did.
@@ -160,6 +165,16 @@ impl Sweeper {
     /// Catalog or bucket failure; the next pass redoes what this one left.
     pub async fn sweep_once(&mut self) -> Result<Swept, CompactError> {
         let mut swept = Swept::default();
+        let pruned = self
+            .catalog
+            .orphans_prune_tombstones(
+                self.config.tombstone_ttl,
+                i64::try_from(self.config.deletes_per_pass).unwrap_or(i64::MAX),
+            )
+            .await?;
+        self.stats
+            .tombstones_pruned
+            .fetch_add(pruned as u64, Ordering::Relaxed);
         self.finish_marked(&mut swept).await?;
         self.walk(&mut swept).await?;
         self.reap(&mut swept).await?;
@@ -353,9 +368,9 @@ impl Sweeper {
         self.delete_all(&doomed, swept).await
     }
 
-    /// Deletes marked objects and forgets them, each under its claim; an
-    /// object already gone counts as deleted, one that fails to delete
-    /// stays marked for the next pass, one that is not the engine's is
+    /// Deletes marked objects, each under its claim, leaving a tombstone;
+    /// an object already gone counts as deleted, one that fails to delete
+    /// stays marked for its backoff, one that is not the engine's is
     /// forgotten and left in place, and one another sweeper finished
     /// meanwhile is skipped.
     async fn delete_all(&self, marked: &[String], swept: &mut Swept) -> Result<(), CompactError> {
@@ -365,7 +380,7 @@ impl Sweeper {
             };
             if !self.is_engine_object(path) {
                 warn!(role = "compactor", path = %path, "marked path is not an engine object; forgotten, left in place");
-                claim.finish().await?;
+                claim.forget().await?;
                 swept.forgotten += 1;
                 continue;
             }
@@ -384,7 +399,7 @@ impl Sweeper {
             };
             match outcome {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                    claim.finish().await?;
+                    claim.deleted().await?;
                     swept.deleted += 1;
                 }
                 Err(e) => {

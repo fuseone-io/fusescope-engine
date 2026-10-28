@@ -450,6 +450,11 @@ impl Metrics {
                 "Deletes that failed and wait their backoff",
                 load(&o.delete_failures),
             ),
+            (
+                "fusescope_orphan_tombstones_pruned_total",
+                "Tombstones of deleted paths pruned after their TTL",
+                load(&o.tombstones_pruned),
+            ),
         ] {
             counter(out, name, help, value);
         }
