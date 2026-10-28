@@ -533,6 +533,10 @@ pub struct CompactorConfig {
     /// Files purged per pass.
     #[serde(default = "default_purge_batch")]
     pub purge_batch: i64,
+    /// How long the compactor lease lasts without a renewal; renewed every
+    /// third of it. Another instance takes over this long after a crash.
+    #[serde(default = "default_lease_ttl")]
+    pub lease_ttl_secs: u64,
 }
 
 impl Default for CompactorConfig {
@@ -541,8 +545,25 @@ impl Default for CompactorConfig {
             purge_interval_secs: default_purge_interval(),
             quarantine_ttl_secs: default_quarantine_ttl(),
             purge_batch: default_purge_batch(),
+            lease_ttl_secs: default_lease_ttl(),
         }
     }
+}
+
+impl CompactorConfig {
+    /// Converts to the compactor crate's settings.
+    pub fn to_compactor(&self) -> fs_compactor::CompactorConfig {
+        fs_compactor::CompactorConfig {
+            purge_interval: std::time::Duration::from_secs(self.purge_interval_secs),
+            quarantine_ttl: std::time::Duration::from_secs(self.quarantine_ttl_secs),
+            purge_batch: self.purge_batch,
+            lease_ttl: std::time::Duration::from_secs(self.lease_ttl_secs),
+        }
+    }
+}
+
+fn default_lease_ttl() -> u64 {
+    30
 }
 
 fn default_purge_interval() -> u64 {
@@ -737,6 +758,11 @@ impl Config {
         }
         if self.compactor.purge_batch <= 0 {
             return invalid("compactor.purge_batch must be positive");
+        }
+        if self.compactor.lease_ttl_secs < 3 {
+            return invalid(
+                "compactor.lease_ttl_secs must be at least 3, it is renewed every third",
+            );
         }
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {

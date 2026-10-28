@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fs_catalog::Catalog;
+use object_store::ObjectStore;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -128,60 +128,22 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     Ok(())
 }
 
-/// Compactor: purges quarantined files past their TTL, deleting the objects
-/// after the rows. Assumes a single compactor until the lease lands.
+/// Compactor: takes the compactor lease in the catalog and, while it holds
+/// it, purges quarantined files past their TTL. Without the lease it
+/// stands by and takes over when the holder lets go or lapses.
 ///
 /// # Errors
-/// Never in phase 0; failures are logged and the next pass retries.
-pub async fn compactor(
-    ctx: Context,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), ServerError> {
-    info!(role = "compactor", "ready");
-    let mut tick = tokio::time::interval(Duration::from_secs(
-        ctx.config.compactor.purge_interval_secs.max(1),
-    ));
-    loop {
-        tokio::select! {
-            _ = tick.tick() => purge_once(&ctx).await,
-            _ = shutdown.changed() => break,
-        }
-    }
+/// Never; failures are logged and the next pass retries.
+pub async fn compactor(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<(), ServerError> {
+    info!(role = "compactor", holder = %ctx.node_id, "ready");
+    fs_compactor::run(
+        ctx.catalog.clone(),
+        ctx.store.clone(),
+        ctx.config.compactor.to_compactor(),
+        ctx.node_id.clone(),
+        shutdown,
+    )
+    .await;
     info!(role = "compactor", "stopped");
     Ok(())
-}
-
-/// One purge pass. Public so tests and an operator command can run it directly.
-pub async fn purge_once(ctx: &Context) {
-    let ttl = chrono::Duration::seconds(
-        i64::try_from(ctx.config.compactor.quarantine_ttl_secs).unwrap_or(i64::MAX),
-    );
-    let purged = match ctx
-        .catalog
-        .purge_quarantined(ttl, ctx.config.compactor.purge_batch)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(role = "compactor", error = %e, "purge query failed");
-            return;
-        }
-    };
-    let mut deleted = 0usize;
-    for file in &purged {
-        match ctx.store.delete(&Path::from(file.path.as_str())).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted += 1,
-            Err(e) => {
-                warn!(role = "compactor", path = %file.path, error = %e, "object delete failed; orphan sweep will retry");
-            }
-        }
-    }
-    if !purged.is_empty() {
-        info!(
-            role = "compactor",
-            rows = purged.len(),
-            deleted,
-            "purged quarantined files"
-        );
-    }
 }

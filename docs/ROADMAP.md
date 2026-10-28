@@ -66,7 +66,7 @@ Done, in this repository (phase 0 and most of the engine side of phase 1):
   pruning, `trace_id` sidecar pruning with an in-memory cache, byte budget,
   hot-window union with partial-result warnings, Flight SQL front end.
 - `fs-server`: configuration, bootstrap, roles, admin commands, `/metrics`,
-  graceful shutdown. `fs-compactor`: purge of quarantined files only.
+  graceful shutdown. `fs-compactor`: leader lease in the catalog, purge of quarantined files while holding it.
 - `fs-bench`: ingest stages, OTLP load generator with `/metrics` deltas,
   Flight SQL query suite. Benchmarks recorded for the baseline, group
   commit, flush stages, coalescing and the gate.
@@ -107,7 +107,7 @@ retention holds about 570 bytes per span.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| C1 | Compactor leader lease in the catalog, single active compactor per deployment | two compactors would race on the same files | lease test with two instances | S | todo |
+| C1 | Compactor leader lease in the catalog, single active compactor per deployment | two compactors would race on the same files | lease test with two instances | S | done: `engine_lease` (migration 0004), `Catalog::acquire_lease/release_lease/lease`, `fs_compactor::Leadership` and `run` (`two_instances_hand_the_lease_over_by_release_or_expiry`, `the_loop_purges_only_while_it_holds_the_lease`), `compactor.lease_ttl_secs` |
 | C2 | L0 to L1 per closed hour: re-sort, 512 MB targets, quarantine and swap in one transaction, `tix` rebuilt | small L0 files make queries open hundreds of files | compaction test with crash before and after the swap; query results identical before and after | L | todo |
 | C3 | Orphan collector: objects without a catalog row are quarantined, then deleted after the TTL | a crash between upload and registration leaves objects behind | test creating an orphan and running the collector | S | todo |
 | C4 | Retention by tenant: delete day prefixes beyond `retention_days`, catalog first, bucket second | staging keeps data for a bounded time | retention test with a crash between the two steps | S | todo |

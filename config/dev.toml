@@ -46,6 +46,8 @@ trace_index_cache_bytes = 268435456
 
 [compactor]
 purge_interval_secs = 60
+# One compactor per deployment holds this lease; another takes over this long after a crash.
+lease_ttl_secs = 30
 quarantine_ttl_secs = 3600
 
 [log]

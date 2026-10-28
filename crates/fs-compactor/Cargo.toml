@@ -10,6 +10,16 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+fs-catalog = { path = "../fs-catalog" }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

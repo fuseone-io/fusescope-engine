@@ -416,6 +416,18 @@ query. A file whose sidecar is missing, unreadable, too large or naming other
 files is remembered as such and scanned. Fetches, misses and pruned files are
 counted.
 
+### 5.1 One compactor per deployment
+
+The compactor takes the `compactor` lease in the catalog (`engine_lease`,
+migration 0004) before it works: one statement takes or renews the lease
+when it is free, expired or already this holder's, evaluated on the database
+clock. The holder renews every third of `compactor.lease_ttl_secs` and
+releases on shutdown; other instances stand by and take over when the lease
+lapses or is released. A catalog failure on renewal counts as losing the
+lease, so a partitioned instance stops working rather than racing the next
+holder. Purges, and the compaction that follows, run only while the lease is
+held.
+
 ## 6. Hot window
 
 Data from the last seconds up to the flush exists only in the ingester. The

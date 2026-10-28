@@ -1643,6 +1643,16 @@ dependencies = [
 [[package]]
 name = "fs-compactor"
 version = "0.0.1"
+dependencies = [
+ "chrono",
+ "fs-catalog",
+ "object_store",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "fs-index"
