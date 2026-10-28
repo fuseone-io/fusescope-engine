@@ -14,11 +14,12 @@ chrono = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 fs-catalog = { path = "../fs-catalog" }
+fs-index = { path = "../fs-index" }
 
 [dev-dependencies]
 sqlx = { workspace = true }
-uuid = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

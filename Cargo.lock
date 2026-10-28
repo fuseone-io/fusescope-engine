@@ -1646,6 +1646,7 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "fs-catalog",
+ "fs-index",
  "object_store",
  "sqlx",
  "tempfile",

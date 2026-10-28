@@ -73,9 +73,11 @@ fn config(dir: &std::path::Path) -> Config {
         path = "{bucket}"
         [wal]
         dir = "{wal}"
+        [query]
+        timeout_secs = 1
         [compactor]
         purge_interval_secs = 1
-        quarantine_ttl_secs = 0
+        quarantine_ttl_secs = 6
         "#,
         bucket = dir.join("bucket").display(),
         wal = dir.join("wal").display(),

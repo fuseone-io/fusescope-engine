@@ -714,6 +714,27 @@ impl Config {
         Ok(())
     }
 
+    fn validate_compactor(&self) -> Result<(), ServerError> {
+        let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
+        if self.compactor.purge_batch <= 0 {
+            return invalid("compactor.purge_batch must be positive");
+        }
+        if self.compactor.lease_ttl_secs < 3 {
+            return invalid(
+                "compactor.lease_ttl_secs must be at least 3, it is renewed every third",
+            );
+        }
+        // A querier may read a file for its cache TTL plus one query after
+        // the swap that quarantined it.
+        let readers_may_hold = fs_query::files::STALE_AFTER.as_secs() + self.query.timeout_secs;
+        if self.compactor.quarantine_ttl_secs < readers_may_hold {
+            return invalid(
+                "compactor.quarantine_ttl_secs must cover the querier's file cache TTL plus query.timeout_secs",
+            );
+        }
+        Ok(())
+    }
+
     /// Checks internal consistency. Connectivity is checked by the server.
     ///
     /// # Errors
@@ -756,14 +777,7 @@ impl Config {
         if self.wal.segment_max_bytes < 1024 * 1024 {
             return invalid("wal.segment_max_bytes must be at least 1 MiB");
         }
-        if self.compactor.purge_batch <= 0 {
-            return invalid("compactor.purge_batch must be positive");
-        }
-        if self.compactor.lease_ttl_secs < 3 {
-            return invalid(
-                "compactor.lease_ttl_secs must be at least 3, it is renewed every third",
-            );
-        }
+        self.validate_compactor()?;
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
@@ -931,6 +945,24 @@ mod tests {
             catalog_url: Some("postgres://x".into()),
             ..Secrets::default()
         };
+        let short_quarantine = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\ntimeout_secs = 60\n[compactor]\nquarantine_ttl_secs = 64\n",
+        )
+        .unwrap();
+        assert!(
+            short_quarantine
+                .validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("quarantine_ttl_secs"),
+            "a querier may still read a quarantined file for its cache TTL plus one query"
+        );
+        let long_enough = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\ntimeout_secs = 60\n[compactor]\nquarantine_ttl_secs = 65\n",
+        )
+        .unwrap();
+        assert!(long_enough.validate(&secrets).is_ok());
+
         let no_name = Config::parse("[bucket]\nkind = \"s3\"\n").unwrap();
         assert!(
             no_name

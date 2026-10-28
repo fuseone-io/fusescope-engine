@@ -1,26 +1,31 @@
 //! Who the active compactor is.
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use fs_catalog::{COMPACTOR_LEASE, Catalog};
+use fs_catalog::{COMPACTOR_LEASE, Catalog, LeaseFence};
 use tracing::{info, warn};
 
-/// This instance's claim on the compactor lease.
+/// This process's claim on the compactor lease. The holder is the node id
+/// plus an id of this incarnation, so two processes configured alike never
+/// pass for one another.
 pub struct Leadership {
     catalog: Catalog,
     holder: String,
     ttl: Duration,
-    leader: bool,
+    leader: AtomicBool,
+    generation: AtomicI64,
 }
 
 impl Leadership {
-    /// A claim for `holder`, not yet made.
-    pub fn new(catalog: Catalog, holder: String, ttl: Duration) -> Self {
+    /// A claim for this incarnation of `node_id`, not yet made.
+    pub fn new(catalog: Catalog, node_id: &str, ttl: Duration) -> Self {
         Self {
             catalog,
-            holder,
+            holder: format!("{node_id}/{}", uuid::Uuid::new_v4().simple()),
             ttl,
-            leader: false,
+            leader: AtomicBool::new(false),
+            generation: AtomicI64::new(0),
         }
     }
 
@@ -30,48 +35,61 @@ impl Leadership {
         (self.ttl / 3).max(Duration::from_millis(100))
     }
 
-    /// True after the last refresh found this instance holding the lease.
+    /// True after the last refresh found this incarnation holding the lease.
     pub fn is_leader(&self) -> bool {
-        self.leader
+        self.leader.load(Ordering::SeqCst)
     }
 
-    /// Who this instance is to the catalog.
+    /// Who this incarnation is to the catalog.
     pub fn holder(&self) -> &str {
         &self.holder
+    }
+
+    /// The fence for writes under the lease, while it is held.
+    pub fn fence(&self) -> Option<LeaseFence> {
+        self.is_leader().then(|| LeaseFence {
+            name: COMPACTOR_LEASE.to_owned(),
+            holder: self.holder.clone(),
+            generation: self.generation.load(Ordering::SeqCst),
+        })
     }
 
     /// Takes or renews the lease. A catalog failure counts as not holding
     /// it: the instance stops working until a refresh succeeds, so two
     /// instances never work at once on a partitioned catalog.
-    pub async fn refresh(&mut self) -> bool {
+    pub async fn refresh(&self) -> bool {
         let held = match self
             .catalog
             .acquire_lease(COMPACTOR_LEASE, &self.holder, self.ttl)
             .await
         {
-            Ok(held) => held,
+            Ok(generation) => generation,
             Err(e) => {
                 warn!(role = "compactor", holder = %self.holder, error = %e, "lease refresh failed; standing by");
-                false
+                None
             }
         };
-        if held != self.leader {
-            if held {
-                info!(role = "compactor", holder = %self.holder, "lease taken; this instance compacts");
-            } else {
+        let was = self.leader.swap(held.is_some(), Ordering::SeqCst);
+        match held {
+            Some(generation) => {
+                self.generation.store(generation, Ordering::SeqCst);
+                if !was {
+                    info!(role = "compactor", holder = %self.holder, generation, "lease taken; this instance compacts");
+                }
+            }
+            None if was => {
                 info!(role = "compactor", holder = %self.holder, "lease lost or held elsewhere; standing by");
             }
+            None => {}
         }
-        self.leader = held;
-        held
+        held.is_some()
     }
 
     /// Gives the lease up so another instance takes over at once.
-    pub async fn release(&mut self) {
-        if !self.leader {
+    pub async fn release(&self) {
+        if !self.leader.swap(false, Ordering::SeqCst) {
             return;
         }
-        self.leader = false;
         match self
             .catalog
             .release_lease(COMPACTOR_LEASE, &self.holder)

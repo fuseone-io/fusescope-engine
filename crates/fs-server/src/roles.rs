@@ -140,7 +140,7 @@ pub async fn compactor(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<
         ctx.catalog.clone(),
         ctx.store.clone(),
         ctx.config.compactor.to_compactor(),
-        ctx.node_id.clone(),
+        &ctx.node_id,
         shutdown,
     )
     .await;

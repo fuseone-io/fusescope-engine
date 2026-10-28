@@ -419,14 +419,23 @@ counted.
 ### 5.1 One compactor per deployment
 
 The compactor takes the `compactor` lease in the catalog (`engine_lease`,
-migration 0004) before it works: one statement takes or renews the lease
-when it is free, expired or already this holder's, evaluated on the database
-clock. The holder renews every third of `compactor.lease_ttl_secs` and
-releases on shutdown; other instances stand by and take over when the lease
-lapses or is released. A catalog failure on renewal counts as losing the
-lease, so a partitioned instance stops working rather than racing the next
-holder. Purges, and the compaction that follows, run only while the lease is
-held.
+migrations 0004 and 0005) before it works: one statement takes or renews the
+lease when it is free, expired or already this holder's, evaluated on the
+database clock. The holder is the node id plus an id of the process
+incarnation, so two processes configured alike are two holders. Every change
+of hands bumps the lease generation; the holder quotes holder and generation
+as a fence, and a swap checked against a stale fence changes nothing
+(`swap_files_fenced`, `CatalogError::LeaseLost`). The lease is renewed every
+third of `compactor.lease_ttl_secs` on its own loop, never behind the work:
+the work runs on a task started when the lease is taken and aborted when it
+is lost, so a slow pass neither lets the lease lapse nor outlives it. A
+catalog failure on renewal counts as losing the lease, so a partitioned
+instance stops working rather than racing the next holder. Release lets the
+lease expire at once, keeping the generation. A purge deletes the catalog
+rows of files quarantined for `compactor.quarantine_ttl_secs` on the database
+clock, then each object and its `trace_id` sidecar; the server refuses a TTL
+shorter than the querier's file cache TTL plus one query timeout, since a
+querier may still read a quarantined file that long.
 
 ## 6. Hot window
 
