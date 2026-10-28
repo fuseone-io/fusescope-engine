@@ -852,14 +852,14 @@ async fn orphans_seen_two_hours_ago(f: &Fixture) {
         .unwrap();
 }
 
-fn sweeper(f: &Fixture, prefixes_per_pass: usize) -> fs_compactor::Sweeper {
+fn sweeper(f: &Fixture, objects_per_pass: usize) -> fs_compactor::Sweeper {
     fs_compactor::Sweeper::new(
         f.db.catalog.clone(),
         f.store.clone(),
         Path::from(""),
         fs_compactor::SweepConfig {
             ttl: Duration::from_secs(3600),
-            prefixes_per_pass,
+            objects_per_pass,
             deletes_per_pass: 100,
         },
         Arc::new(fs_compactor::OrphanStats::default()),
@@ -920,7 +920,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
             .await
             .unwrap();
     }
-    let mut sweeper = sweeper(&f, 32);
+    let mut sweeper = sweeper(&f, 1000);
     let stats = sweeper.stats();
 
     let first = sweeper.sweep_once().await.unwrap();
@@ -1006,8 +1006,8 @@ async fn a_sweep_walks_in_bounded_passes_and_finishes_what_it_marked() {
             .await
             .unwrap();
     }
-    // Two partitions, the L0 day and the sidecar day, one per pass: two
-    // passes to wrap.
+    // Two partitions, the L0 day and the sidecar day; a cap of one object
+    // stops each pass after its first partition: two passes to wrap.
     let mut sweeper = sweeper(&f, 1);
     let mut passes = 0;
     let mut seen = 0;
@@ -1023,14 +1023,16 @@ async fn a_sweep_walks_in_bounded_passes_and_finishes_what_it_marked() {
     assert_eq!(passes, 2);
     assert_eq!(seen, 4, "every stray seen exactly once across the walk");
 
-    // A pass that marked but died before deleting: the next pass deletes.
+    // A pass that marked but died before deleting, or another sweeper's
+    // mark: the next pass deletes, never forgets.
     orphans_seen_two_hours_ago(&f).await;
     for path in &strays[..2] {
-        assert!(
+        assert_eq!(
             f.db.catalog
                 .orphan_doom(path, std::slice::from_ref(path))
                 .await
-                .unwrap()
+                .unwrap(),
+            fs_catalog::Doom::Marked
         );
     }
     let swept = sweeper.sweep_once().await.unwrap();
@@ -1038,6 +1040,57 @@ async fn a_sweep_walks_in_bounded_passes_and_finishes_what_it_marked() {
     for path in &strays {
         assert!(!present(&f, path).await);
     }
+    f.db.finish().await;
+}
+
+/// A remembered path that is not the engine's, as an older version could
+/// have left, is forgotten and its object left in place; a path another
+/// sweeper marked is deleted, not forgotten.
+#[tokio::test]
+async fn the_sweep_forgets_foreign_paths_and_finishes_another_sweepers_marks() {
+    let Some(f) = fixture().await else { return };
+    let foreign = "t/notes.parquet".to_owned();
+    let stray = format!(
+        "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
+        f.tenant.0,
+        uuid::Uuid::new_v4()
+    );
+    for path in [&foreign, &stray] {
+        f.store
+            .put(&Path::from(path.as_str()), b"x".to_vec().into())
+            .await
+            .unwrap();
+    }
+    f.db.catalog
+        .orphans_seen(&[foreign.clone(), stray.clone()])
+        .await
+        .unwrap();
+    orphans_seen_two_hours_ago(&f).await;
+    assert_eq!(
+        f.db.catalog
+            .orphan_doom(&stray, std::slice::from_ref(&stray))
+            .await
+            .unwrap(),
+        fs_catalog::Doom::Marked,
+        "another sweeper marked the stray"
+    );
+    let mut sweeper = sweeper(&f, 1000);
+    let swept = sweeper.sweep_once().await.unwrap();
+    assert_eq!(swept.forgotten, 1, "the foreign path");
+    assert_eq!(swept.deleted, 1, "the stray, by the mark it found");
+    assert!(
+        present(&f, &foreign).await,
+        "not the engine's: left in place"
+    );
+    assert!(!present(&f, &stray).await);
+    assert_eq!(
+        f.db.catalog.orphans_due(Duration::ZERO, 10).await.unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        f.db.catalog.orphans_doomed(10).await.unwrap(),
+        Vec::<String>::new()
+    );
     f.db.finish().await;
 }
 

@@ -2539,11 +2539,12 @@ async fn a_retry_refused_by_the_orphan_sweep_uploads_again_once_the_object_is_go
         .orphans_seen(std::slice::from_ref(&relative))
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         db.catalog
             .orphan_doom(&relative, std::slice::from_ref(&relative))
             .await
-            .unwrap()
+            .unwrap(),
+        fs_catalog::Doom::Marked
     );
     h.ingester.flush_all().await;
     assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);

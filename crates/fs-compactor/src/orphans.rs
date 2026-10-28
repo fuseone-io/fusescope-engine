@@ -2,30 +2,33 @@
 //!
 //! A crash between an upload and its registration, or a compaction that
 //! did not publish, leaves objects no row points at. The sweep walks the
-//! engine's prefix in bounded steps, remembers in the catalog the span
-//! files and sidecars without a row, and deletes an object only once it
-//! has been remembered for longer than the orphan TTL and the catalog has
-//! marked it for deletion. The mark is what makes the delete safe: it is
-//! refused when a row exists, it takes the orphan's row lock, and every
-//! registration locks and checks the same row, so a writer still retrying
-//! its registration either commits before the mark or is refused and
-//! uploads again once the object is gone.
+//! engine's prefix, remembers in the catalog the span files and sidecars
+//! without a row, and deletes an object only once it has been remembered
+//! for longer than the orphan TTL and the catalog has marked it for
+//! deletion. The mark is what makes the delete safe: it is refused when a
+//! row exists, it is taken under the path's lock, and every registration
+//! takes the same lock and checks the same mark, so a writer still
+//! retrying its registration either commits before the mark or is refused
+//! and uploads again once the object is gone. A mark is never undone by
+//! another sweeper.
 //!
 //! Only paths the engine lays out are considered
-//! ([`fs_index::SpanObject`]); anything else under the prefix is left
-//! alone. The bucket is walked by partitions, one tenant, level and day
-//! each, enumerated with delimiter listings; one pass walks at most
-//! `prefixes_per_pass` of them, whole, from where the last pass stopped,
-//! and deletes at most `deletes_per_pass`, so memory, queries and the
-//! time taken from purge and compaction are bounded. Walking whole
-//! partitions needs no order from the store's listing, which the local
-//! store does not give.
+//! ([`fs_index::SpanObject`]), checked again just before an object is
+//! marked; anything else, in the bucket or remembered by an older
+//! version, is left alone or forgotten. The bucket is walked by
+//! partitions, one tenant, level and day each, found with delimiter
+//! listings as the walk reaches them, so no listing order is assumed and
+//! nothing is enumerated ahead. A pass walks whole partitions until it
+//! has listed `objects_per_pass` objects, then stops and the next pass
+//! continues from the next partition; it deletes at most
+//! `deletes_per_pass`. Memory holds one chunk of paths and one partition
+//! list at a time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fs_catalog::Catalog;
+use fs_catalog::{Catalog, Doom};
 use fs_index::SpanObject;
 use futures_util::StreamExt;
 use object_store::path::Path;
@@ -37,15 +40,19 @@ use crate::CompactError;
 /// Objects per membership query and sighting insert.
 const CHUNK: usize = 1000;
 
+/// The kinds of partition under a tenant's traces, in walk order.
+const KINDS: [&str; 4] = ["l0", "l1", "l2", "index/trace_id"];
+
 /// Bounds of the sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepConfig {
     /// How long an object must have been seen without a row before it is
     /// deleted; longer than any upload waits for its registration.
     pub ttl: Duration,
-    /// Most partitions, one tenant, level and day each, one pass walks
-    /// before it stops and the next pass continues from there.
-    pub prefixes_per_pass: usize,
+    /// A pass stops walking once it has listed this many objects, after
+    /// finishing the partition it is in; one partition is one tenant,
+    /// level and day.
+    pub objects_per_pass: usize,
     /// Most objects one pass deletes.
     pub deletes_per_pass: usize,
 }
@@ -61,7 +68,8 @@ pub struct OrphanStats {
     pub seen: AtomicU64,
     /// Objects deleted after a TTL without a row.
     pub deleted: AtomicU64,
-    /// Remembered orphans found with a row before their TTL.
+    /// Remembered paths forgotten: owned by a row after all, or not the
+    /// engine's.
     pub forgotten: AtomicU64,
 }
 
@@ -74,7 +82,7 @@ pub struct Swept {
     pub seen: usize,
     /// Objects deleted.
     pub deleted: usize,
-    /// Remembered orphans forgotten.
+    /// Remembered paths forgotten.
     pub forgotten: usize,
     /// Partitions walked.
     pub prefixes: usize,
@@ -89,10 +97,21 @@ pub struct Sweeper {
     root: Path,
     config: SweepConfig,
     stats: Arc<OrphanStats>,
-    /// The partitions of the current walk and the next one to visit;
-    /// enumerated anew when the walk starts over.
-    partitions: Vec<Path>,
-    next: usize,
+    inventory: Inventory,
+}
+
+/// Where the walk is: the tenants of the current walk, and within the
+/// current tenant and kind, its days. Days are listed when reached. The
+/// partition the next pass starts with is looked up at the end of a pass,
+/// so a pass knows whether it finished the walk.
+#[derive(Default)]
+struct Inventory {
+    tenants: Vec<Path>,
+    tenant: usize,
+    kind: usize,
+    days: Option<Vec<Path>>,
+    day: usize,
+    pending: Option<Path>,
 }
 
 impl Sweeper {
@@ -110,8 +129,7 @@ impl Sweeper {
             root,
             config,
             stats,
-            partitions: Vec::new(),
-            next: 0,
+            inventory: Inventory::default(),
         }
     }
 
@@ -151,6 +169,7 @@ impl Sweeper {
                 without_row = swept.seen,
                 deleted = swept.deleted,
                 forgotten = swept.forgotten,
+                partitions = swept.prefixes,
                 wrapped = swept.wrapped,
                 "orphan sweep"
             );
@@ -168,59 +187,91 @@ impl Sweeper {
         self.delete_all(&marked).await
     }
 
-    /// Walks up to `prefixes_per_pass` partitions, whole, remembering the
-    /// engine's objects without a row.
+    /// Walks partitions, whole, until `objects_per_pass` objects have been
+    /// listed or the walk wraps, remembering the engine's objects without
+    /// a row. A pass that ends the walk starts the next one over.
     async fn walk(&mut self, swept: &mut Swept) -> Result<(), CompactError> {
-        if self.next >= self.partitions.len() {
-            self.partitions = self.enumerate().await?;
-            self.next = 0;
+        if self.inventory.pending.is_none() {
+            self.inventory = Inventory {
+                tenants: self.tenants().await?,
+                ..Inventory::default()
+            };
+            self.inventory.pending = self.next_partition().await?;
         }
-        let end = self
-            .next
-            .saturating_add(self.config.prefixes_per_pass.max(1))
-            .min(self.partitions.len());
-        let batch: Vec<Path> = self.partitions.get(self.next..end).unwrap_or(&[]).to_vec();
-        for prefix in &batch {
-            self.walk_prefix(prefix, swept).await?;
+        while swept.listed < self.config.objects_per_pass.max(1) {
+            let Some(partition) = self.inventory.pending.take() else {
+                break;
+            };
+            self.walk_prefix(&partition, swept).await?;
             swept.prefixes += 1;
+            self.inventory.pending = self.next_partition().await?;
         }
-        self.next = end;
-        swept.wrapped = self.next >= self.partitions.len();
+        swept.wrapped = self.inventory.pending.is_none();
         Ok(())
     }
 
-    /// Every partition under the root: for each tenant, each level and
-    /// the sidecar index, each day. Only names the engine lays out.
-    async fn enumerate(&self) -> Result<Vec<Path>, CompactError> {
-        let mut out = Vec::new();
-        let tenants = self.store.list_with_delimiter(Some(&self.prefix())).await?;
-        for tenant in tenants.common_prefixes {
-            let Some(id) = tenant.parts().next_back().map(|p| p.as_ref().to_owned()) else {
+    /// The tenant prefixes under the root whose name is a tenant id.
+    async fn tenants(&self) -> Result<Vec<Path>, CompactError> {
+        let listed = self.store.list_with_delimiter(Some(&self.prefix())).await?;
+        let mut tenants: Vec<Path> = listed
+            .common_prefixes
+            .into_iter()
+            .filter(|p| {
+                p.parts().next_back().is_some_and(|id| {
+                    SpanObject::parse(&format!(
+                        "t/{}/traces/l0/dt=2000-01-01/hr=00/00000000-0000-0000-0000-000000000000.parquet",
+                        id.as_ref()
+                    ))
+                    .is_some()
+                })
+            })
+            .collect();
+        tenants.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        Ok(tenants)
+    }
+
+    /// The next day partition of the walk, listing a tenant's days of a
+    /// kind when the walk reaches them. `None` when the walk is over.
+    async fn next_partition(&mut self) -> Result<Option<Path>, CompactError> {
+        loop {
+            let Some(tenant) = self.inventory.tenants.get(self.inventory.tenant) else {
+                return Ok(None);
+            };
+            let Some(kind) = KINDS.get(self.inventory.kind) else {
+                self.inventory.tenant += 1;
+                self.inventory.kind = 0;
+                self.inventory.days = None;
                 continue;
             };
-            if SpanObject::parse(&format!(
-                "t/{id}/traces/l0/dt=2000-01-01/hr=00/00000000-0000-0000-0000-000000000000.parquet"
-            ))
-            .is_none()
-            {
-                continue;
-            }
-            for kind in ["l0", "l1", "l2", "index/trace_id"] {
+            if self.inventory.days.is_none() {
                 let level = Path::from(format!("{tenant}/traces/{kind}"));
-                let days = self.store.list_with_delimiter(Some(&level)).await?;
-                for day in days.common_prefixes {
-                    if day
-                        .parts()
-                        .next_back()
-                        .is_some_and(|p| p.as_ref().starts_with("dt="))
-                    {
-                        out.push(day);
-                    }
-                }
+                let listed = self.store.list_with_delimiter(Some(&level)).await?;
+                let mut days: Vec<Path> = listed
+                    .common_prefixes
+                    .into_iter()
+                    .filter(|p| {
+                        p.parts()
+                            .next_back()
+                            .is_some_and(|d| d.as_ref().starts_with("dt="))
+                    })
+                    .collect();
+                days.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+                self.inventory.days = Some(days);
+                self.inventory.day = 0;
             }
+            let day = self
+                .inventory
+                .days
+                .as_ref()
+                .and_then(|days| days.get(self.inventory.day))
+                .cloned();
+            if let Some(day) = day {
+                self.inventory.day += 1;
+                return Ok(Some(day));
+            }
+            self.inventory.kind += 1;
+            self.inventory.days = None;
         }
-        out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        Ok(out)
     }
 
     /// Walks one partition, whole, in chunks.
@@ -230,10 +281,8 @@ impl Sweeper {
         while let Some(meta) = stream.next().await.transpose()? {
             swept.listed += 1;
             let location = meta.location;
-            if let Some(relative) = self.relative(&location) {
-                if SpanObject::parse(relative).is_some() {
-                    chunk.push(location.to_string());
-                }
+            if self.is_engine_object(location.as_ref()) {
+                chunk.push(location.to_string());
             }
             if chunk.len() >= CHUNK {
                 swept.seen += self.remember(&chunk).await?;
@@ -259,8 +308,9 @@ impl Sweeper {
         Ok(without_row.len())
     }
 
-    /// Marks and deletes orphans past the TTL, up to the pass's cap; the
-    /// ones that got a row meanwhile are forgotten.
+    /// Marks and deletes orphans past the TTL, up to the pass's cap. A
+    /// remembered path that is not the engine's, or that got a row, is
+    /// forgotten; one another sweeper marked is deleted all the same.
     async fn reap(&self, swept: &mut Swept) -> Result<(), CompactError> {
         let budget = self.config.deletes_per_pass.saturating_sub(swept.deleted);
         if budget == 0 {
@@ -271,16 +321,21 @@ impl Sweeper {
             .orphans_due(self.config.ttl, i64::try_from(budget).unwrap_or(i64::MAX))
             .await?;
         let mut doomed = Vec::new();
-        let mut adopted = Vec::new();
+        let mut forgotten = Vec::new();
         for path in due {
-            if self.catalog.orphan_doom(&path, &owners(&path)).await? {
-                doomed.push(path);
-            } else {
-                adopted.push(path);
+            if !self.is_engine_object(&path) {
+                warn!(role = "compactor", path = %path, "remembered orphan is not an engine object; forgotten, not deleted");
+                forgotten.push(path);
+                continue;
+            }
+            match self.catalog.orphan_doom(&path, &owners(&path)).await? {
+                Doom::Marked | Doom::AlreadyMarked => doomed.push(path),
+                Doom::Owned => forgotten.push(path),
+                Doom::Missing => {}
             }
         }
-        self.catalog.orphans_forget(&adopted).await?;
-        swept.forgotten += adopted.len();
+        self.catalog.orphans_forget(&forgotten).await?;
+        swept.forgotten += forgotten.len();
         swept.deleted += self.delete_all(&doomed).await?;
         Ok(())
     }
@@ -291,6 +346,10 @@ impl Sweeper {
     async fn delete_all(&self, marked: &[String]) -> Result<usize, CompactError> {
         let mut deleted = Vec::new();
         for path in marked {
+            if !self.is_engine_object(path) {
+                warn!(role = "compactor", path = %path, "marked path is not an engine object; left in place");
+                continue;
+            }
             match self.store.delete(&Path::from(path.as_str())).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted.push(path.clone()),
                 Err(e) => {
@@ -302,6 +361,13 @@ impl Sweeper {
         Ok(deleted.len())
     }
 
+    /// True when `path`, a full object path, is one the engine lays out
+    /// under the root.
+    fn is_engine_object(&self, path: &str) -> bool {
+        self.relative(path)
+            .is_some_and(|relative| SpanObject::parse(relative).is_some())
+    }
+
     fn prefix(&self) -> Path {
         if self.root.as_ref().is_empty() {
             Path::from("t")
@@ -310,13 +376,12 @@ impl Sweeper {
         }
     }
 
-    /// `location` without the root, when it is under it.
-    fn relative<'a>(&self, location: &'a Path) -> Option<&'a str> {
-        let full = location.as_ref();
+    /// `path` without the root, when it is under it.
+    fn relative<'a>(&self, path: &'a str) -> Option<&'a str> {
         if self.root.as_ref().is_empty() {
-            return Some(full);
+            return Some(path);
         }
-        full.strip_prefix(self.root.as_ref())?.strip_prefix('/')
+        path.strip_prefix(self.root.as_ref())?.strip_prefix('/')
     }
 }
 

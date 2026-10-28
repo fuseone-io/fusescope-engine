@@ -560,10 +560,11 @@ pub struct CompactorConfig {
     /// deleted; longer than any upload waits for its registration.
     #[serde(default = "default_orphan_ttl")]
     pub orphan_ttl_secs: u64,
-    /// Most partitions, one tenant, level and day each, one sweep walks
-    /// before the next one continues.
-    #[serde(default = "default_sweep_prefixes")]
-    pub sweep_prefixes_per_pass: usize,
+    /// A sweep stops walking once it has listed this many objects, after
+    /// finishing the partition (tenant, level, day) it is in; the next
+    /// sweep continues from there.
+    #[serde(default = "default_sweep_objects")]
+    pub sweep_objects_per_pass: usize,
     /// Most objects one sweep deletes.
     #[serde(default = "default_sweep_deletes")]
     pub sweep_deletes_per_pass: usize,
@@ -583,7 +584,7 @@ impl Default for CompactorConfig {
             max_input_bytes: default_max_input_bytes(),
             orphan_interval_secs: default_orphan_interval(),
             orphan_ttl_secs: default_orphan_ttl(),
-            sweep_prefixes_per_pass: default_sweep_prefixes(),
+            sweep_objects_per_pass: default_sweep_objects(),
             sweep_deletes_per_pass: default_sweep_deletes(),
         }
     }
@@ -612,7 +613,7 @@ impl CompactorConfig {
             orphan_interval: std::time::Duration::from_secs(self.orphan_interval_secs),
             sweep: fs_compactor::SweepConfig {
                 ttl: std::time::Duration::from_secs(self.orphan_ttl_secs),
-                prefixes_per_pass: self.sweep_prefixes_per_pass,
+                objects_per_pass: self.sweep_objects_per_pass,
                 deletes_per_pass: self.sweep_deletes_per_pass,
             },
         }
@@ -627,8 +628,8 @@ fn default_orphan_ttl() -> u64 {
     3600
 }
 
-fn default_sweep_prefixes() -> usize {
-    32
+fn default_sweep_objects() -> usize {
+    100_000
 }
 
 fn default_sweep_deletes() -> usize {
@@ -827,11 +828,11 @@ impl Config {
         }
         if self.compactor.orphan_ttl_secs < 60
             || self.compactor.orphan_interval_secs == 0
-            || self.compactor.sweep_prefixes_per_pass == 0
+            || self.compactor.sweep_objects_per_pass == 0
             || self.compactor.sweep_deletes_per_pass == 0
         {
             return invalid(
-                "compactor.orphan_ttl_secs must be at least 60 and orphan_interval_secs, sweep_prefixes_per_pass and sweep_deletes_per_pass positive",
+                "compactor.orphan_ttl_secs must be at least 60 and orphan_interval_secs, sweep_objects_per_pass and sweep_deletes_per_pass positive",
             );
         }
         // Two L0 files must always fit a pass, or an hour could never close;
