@@ -1240,3 +1240,63 @@ impl Ingester {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use fs_catalog::{FileId, TenantId};
+    use fs_wal::Position;
+
+    use super::{Replayed, rebuild};
+    use crate::record::FlushIntent;
+
+    fn batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let values = Int64Array::from_iter_values(0..i64::try_from(rows).unwrap());
+        RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap()
+    }
+
+    fn at(offset: u64) -> Position {
+        Position { segment: 1, offset }
+    }
+
+    /// The origin of a replayed flush is the id of the first intent logged
+    /// for its records, whatever that id is, and the flush runs under the
+    /// id of the last.
+    #[test]
+    fn a_replayed_flush_takes_its_origin_from_the_first_intent_logged() {
+        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        // Deliberately not the id a fresh cut would derive from the position.
+        let first = FileId(uuid::Uuid::from_u128(0xf1a5));
+        let second = FileId(uuid::Uuid::from_u128(0xf1a6));
+        let intent = |file: FileId| FlushIntent {
+            tenant,
+            file,
+            first: at(10),
+            end: at(30),
+            layout: None,
+        };
+        let replayed = Replayed {
+            rows: vec![(tenant, at(10), batch(2)), (tenant, at(20), batch(3))],
+            intents: vec![intent(first), intent(second)],
+            records: 2,
+            damaged: 0,
+        };
+        let mut buffers = rebuild(replayed, Arc::new(AtomicU64::new(0)));
+        assert!(
+            buffers.flushing_range(tenant, first).is_none(),
+            "the first id was given up"
+        );
+        let (batches, _lease, _, origin) = buffers.take_flushing(tenant, second).unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        assert_eq!(
+            origin, first,
+            "announced by the id the rows were first given"
+        );
+    }
+}
