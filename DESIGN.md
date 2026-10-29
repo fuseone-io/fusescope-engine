@@ -854,7 +854,12 @@ surface and is handled as follows:
 - Sessions are always read-only. DDL, DML, `COPY`, `CREATE EXTERNAL TABLE`,
   `INSERT` and table functions that take a path (`read_parquet`, `read_csv`
   and the like) are removed from the function registry and rejected by the
-  analyzer. A query that mentions them fails at parse time.
+  analyzer. A query that mentions them fails at parse time, also when
+  wrapped in `EXPLAIN` or `EXPLAIN ANALYZE`, which would describe or run
+  it; the planned tree is walked whole afterwards as a second gate. One
+  request is one statement. The query tests refuse each construct one by
+  one (`sandbox` in `crates/fs-query/tests/query.rs`), so CI proves the
+  list.
 - `information_schema` shows only the session tenant's tables.
 - Per-query limits: memory through the DataFusion `MemoryPool` with spill to
   SSD, timeout, maximum files, maximum output rows, and the tenant byte
