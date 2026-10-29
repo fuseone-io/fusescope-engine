@@ -1515,6 +1515,94 @@ async fn a_pass_rebuilds_the_attribute_keys_table_from_its_inputs_and_the_table_
     f.db.finish().await;
 }
 
+/// A key admitted on one hour's budget stays charged to it when late
+/// data of an earlier hour carries it: the earlier hour's budget goes to
+/// keys new to the table, and once it is full nothing more is admitted
+/// there while the known keys keep counting.
+#[tokio::test]
+async fn a_known_key_keeps_the_hour_that_admitted_it_when_late_data_arrives() {
+    let Some(f) = fixture().await else { return };
+    sqlx::query("update engine_tenant set max_keys_hour = 1 where id = $1")
+        .bind(f.tenant)
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
+    let minute = 60_000_000_000u64;
+    let h14 = nanos(closed_hour());
+    let h15 = nanos(closed_hour() + chrono::Duration::hours(1));
+    let c = compactor(&f, config(4));
+
+    // Hour 15 is compacted first: one key, the resource's, is admitted.
+    let mut files = Vec::new();
+    for trace in [1u8, 2] {
+        let req = request("api", trace, h15 + u64::from(trace) * minute, 3);
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let keys = attribute_keys_of(&f, &attribute_keys_files(&f).await[0]);
+    let admitted = |keys: &fs_schema::attribute_keys::KeyStats| {
+        keys.iter()
+            .map(|(_, key, _, seen)| (key.to_owned(), seen.count, seen.admitted_hour))
+            .collect::<Vec<_>>()
+    };
+    let (h14_ns, h15_ns) = (i64::try_from(h14).unwrap(), i64::try_from(h15).unwrap());
+    assert_eq!(
+        admitted(&keys),
+        vec![("service.name".to_owned(), 6, h15_ns)]
+    );
+
+    // Late data of hour 14 arrives with the same key and another: the
+    // known key stays on 15, the other takes 14's budget.
+    let mut files = Vec::new();
+    for trace in [3u8, 4] {
+        let req = request("api", trace, h14 + u64::from(trace) * minute, 3);
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let keys = attribute_keys_of(&f, &attribute_keys_files(&f).await[0]);
+    assert_eq!(
+        admitted(&keys),
+        vec![
+            ("service.name".to_owned(), 12, h15_ns),
+            ("http.request.method".to_owned(), 6, h14_ns),
+        ]
+    );
+    assert_eq!((keys.admitted_in(h14_ns), keys.admitted_in(h15_ns)), (1, 1));
+
+    // More late data of hour 14, with a key new to the table: 14 is
+    // full, so it is dropped; the known keys still count.
+    let mut files = Vec::new();
+    for trace in [5u8, 6] {
+        let req = request_with_attribute(
+            "api",
+            trace,
+            h14 + u64::from(trace) * minute,
+            3,
+            "late.key",
+            "x",
+        );
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let keys = attribute_keys_of(&f, &attribute_keys_files(&f).await[0]);
+    assert_eq!(
+        admitted(&keys),
+        vec![
+            ("service.name".to_owned(), 18, h15_ns),
+            ("http.request.method".to_owned(), 12, h14_ns),
+        ]
+    );
+    assert_eq!(
+        c.stats().derived_keys_dropped.load(Ordering::Relaxed),
+        12,
+        "the method key over hour 15's six spans, the late key over 14's"
+    );
+    f.db.finish().await;
+}
+
 /// An hour admits at most the tenant's `max_keys_hour` keys new to the
 /// table, whatever the number of passes it takes, across a restart and
 /// whatever the pass size: the table remembers which hour admitted each
