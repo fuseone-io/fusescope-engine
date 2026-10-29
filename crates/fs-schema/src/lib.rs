@@ -4,6 +4,7 @@
 //! the semantic conventions and observed data. See `MAPPING.md` next to this
 //! crate and ADR 0008.
 
+pub mod attribute_keys;
 pub mod attrs;
 pub mod bucket;
 pub mod fingerprint;
