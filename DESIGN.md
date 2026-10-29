@@ -856,10 +856,14 @@ surface and is handled as follows:
   and the like) are removed from the function registry and rejected by the
   analyzer. A query that mentions them fails at parse time, also when
   wrapped in `EXPLAIN` or `EXPLAIN ANALYZE`, which would describe or run
-  it; the planned tree is walked whole afterwards as a second gate. One
-  request is one statement. The query tests refuse each construct one by
-  one (`sandbox` in `crates/fs-query/tests/query.rs`), so CI proves the
-  list.
+  it; the planned tree is walked whole afterwards as a second gate that
+  names every plan node and allows only the reading ones, so a node a
+  DataFusion upgrade adds fails to compile until reviewed, and
+  `Extension` is refused outright. One request is one statement. The
+  query tests refuse each construct one by one (`sandbox` in
+  `crates/fs-query/tests/query.rs`), the path-taking functions at planning
+  alone, and `SELECT INTO`, a query by statement that plans to DDL, keeps
+  the second gate exercised; CI proves the list.
 - `information_schema` shows only the session tenant's tables.
 - Per-query limits: memory through the DataFusion `MemoryPool` with spill to
   SSD, timeout, maximum files, maximum output rows, and the tenant byte
