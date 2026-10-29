@@ -1470,7 +1470,10 @@ async fn a_pass_rebuilds_the_attribute_keys_table_from_its_inputs_and_the_table_
     assert_eq!(c.stats().derived.load(Ordering::Relaxed), 2);
     assert_eq!(c.stats().derived_unreadable.load(Ordering::Relaxed), 0);
 
-    // A table before that cannot be read is replaced, not fatal.
+    // A table before that cannot be read ends the pass before anything is
+    // created: inputs and table stay as they were, history is never
+    // replaced by one pass's view.
+    let good = std::fs::read(f.dir.path().join(&second.path)).unwrap();
     std::fs::write(f.dir.path().join(&second.path), b"not parquet").unwrap();
     let hour_after = nanos(closed_hour() + chrono::Duration::hours(2));
     let mut files = Vec::new();
@@ -1479,12 +1482,108 @@ async fn a_pass_rebuilds_the_attribute_keys_table_from_its_inputs_and_the_table_
         files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
     }
     registered_an_hour_ago(&f, &files).await;
-    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let objects_before = derived_objects(&f).await.len();
+    let err = c.compact_once(&fence(&f).await).await.unwrap_err();
+    assert!(matches!(err, CompactError::Schema(_)), "{err}");
     let tables = attribute_keys_files(&f).await;
     assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].id, second.id, "the table before stays");
+    assert_eq!(
+        visible(&f).await.len(),
+        4,
+        "the two L1 of the hours done and the two L0 of the hour refused"
+    );
+    assert_eq!(
+        derived_objects(&f).await.len(),
+        objects_before,
+        "nothing created"
+    );
+    assert_eq!(c.stats().derived_unreadable.load(Ordering::Relaxed), 1);
+    assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
+
+    // Repaired, the pass goes through and keeps the history.
+    std::fs::write(f.dir.path().join(&second.path), good).unwrap();
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let tables = attribute_keys_files(&f).await;
     assert_ne!(tables[0].id, second.id);
     let keys = attribute_keys_of(&f, &tables[0]);
-    assert_eq!(keys.len(), 2, "only what the pass saw");
-    assert_eq!(c.stats().derived_unreadable.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        keys.len(),
+        3,
+        "service.name, http.request.method, db.system"
+    );
+    f.db.finish().await;
+}
+
+/// A pass admits at most the tenant's `max_keys_hour` keys new to the
+/// table, in merge order, counts the known ones whatever their number,
+/// and reports what it dropped; several passes of one hour each admit
+/// that many.
+#[tokio::test]
+async fn a_pass_admits_at_most_the_tenants_new_keys_in_merge_order() {
+    let Some(f) = fixture().await else { return };
+    sqlx::query("update engine_tenant set max_keys_hour = 2 where id = $1")
+        .bind(f.tenant)
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
+    let h = nanos(closed_hour());
+    let minute = 60_000_000_000u64;
+    let mut files = Vec::new();
+    for (service, trace, offset) in [("web", 1u8, 5), ("api", 2, 1), ("web", 3, 2)] {
+        let key = format!("k{trace}");
+        let req = request_with_attribute(service, trace, h + offset * minute, 6, &key, "v");
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    let c = compactor(&f, config(4));
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let tables = attribute_keys_files(&f).await;
+    let keys = attribute_keys_of(&f, &tables[0]);
+    let rows: Vec<_> = keys
+        .iter()
+        .map(|(_, key, _, seen)| (key.to_owned(), seen.count))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("service.name".to_owned(), 18),
+            ("http.request.method".to_owned(), 18),
+        ],
+        "the resource and the first span key of the first merged rows; k1, k2 and k3 dropped"
+    );
+    assert_eq!(c.stats().derived_keys_dropped.load(Ordering::Relaxed), 18);
+
+    // The next hour: the known keys keep counting, two more are admitted.
+    let later = nanos(closed_hour() + chrono::Duration::hours(1));
+    let mut files = Vec::new();
+    for trace in [7u8, 8] {
+        let req = request_with_attribute(
+            "api",
+            trace,
+            later + u64::from(trace) * minute,
+            3,
+            "db.system",
+            "pg",
+        );
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let tables = attribute_keys_files(&f).await;
+    let keys = attribute_keys_of(&f, &tables[0]);
+    let count_of = |key: &str| {
+        keys.iter()
+            .find(|(_, k, _, _)| *k == key)
+            .map(|(_, _, _, seen)| seen.count)
+    };
+    assert_eq!(count_of("service.name"), Some(24));
+    assert_eq!(
+        count_of("db.system"),
+        Some(6),
+        "admitted: one of two allowed"
+    );
+    assert_eq!(count_of("k1"), None);
+    assert_eq!(c.stats().derived_keys_dropped.load(Ordering::Relaxed), 18);
     f.db.finish().await;
 }

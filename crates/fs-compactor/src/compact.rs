@@ -80,9 +80,12 @@ pub struct CompactorStats {
     pub skipped: AtomicU64,
     /// `attribute_keys` tables rebuilt by completed passes.
     pub derived: AtomicU64,
-    /// Previous `attribute_keys` tables that could not be read; the pass
-    /// replaced them with what it saw and reported it.
+    /// Passes aborted because the `attribute_keys` table before could not
+    /// be read; inputs and table stay as they were.
     pub derived_unreadable: AtomicU64,
+    /// Entries of keys beyond the tenant's `max_keys_hour` a pass did not
+    /// count.
+    pub derived_keys_dropped: AtomicU64,
 }
 
 /// The compaction side of the compactor.
@@ -218,6 +221,13 @@ impl Compactor {
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         let owned: Vec<FileRecord> = inputs.to_vec();
+        let max_new_keys = self
+            .catalog
+            .tenant(tenant)
+            .await?
+            .ok_or(CompactError::TenantGone(tenant))
+            .map(|t| usize::try_from(t.max_keys_hour).unwrap_or(0))?;
+        let (table_before, replaced) = self.table_before(tenant).await?;
         let mut merger = L1Merger::open(
             Arc::clone(&self.store),
             &self.root,
@@ -227,7 +237,9 @@ impl Compactor {
             MergeConfig {
                 row_group_rows: self.config.row_group_rows,
                 target_bytes: self.config.l1_target_bytes,
+                max_new_keys,
             },
+            table_before,
         )
         .await?;
         // Each output is uploaded as it closes; only its row stays. Any
@@ -256,8 +268,21 @@ impl Compactor {
         }
         let keys = merger.take_keys();
         drop(merger);
-        let (derived, replaced) = self
-            .rebuild_attribute_keys(tenant, hour, keys, &mut guard, &mut puts)
+        if keys.dropped() > 0 {
+            self.stats
+                .derived_keys_dropped
+                .fetch_add(keys.dropped(), Ordering::Relaxed);
+            warn!(
+                role = "compactor",
+                tenant = %tenant.0,
+                hour = %hour,
+                admitted = keys.new_keys(),
+                dropped = keys.dropped(),
+                "attribute keys beyond max_keys_hour were not counted"
+            );
+        }
+        let derived = self
+            .publish_attribute_keys(tenant, hour, &keys, &mut guard, &mut puts)
             .await?;
         let compaction = self
             .swap(tenant, &owned, &replaced, &outputs, derived.as_ref(), fence)
@@ -279,25 +304,21 @@ impl Compactor {
         Ok(compaction)
     }
 
-    /// The tenant's `attribute_keys` table rebuilt from `keys`, what the
-    /// pass merged, and the table before it, which the swap then replaces:
-    /// the new file, uploaded, and the rows it supersedes. A previous table
-    /// that cannot be read is replaced by what the pass saw and counted.
-    async fn rebuild_attribute_keys(
+    /// The tenant's `attribute_keys` table before this pass, read whole,
+    /// and the rows the pass will replace. Any failure to read it ends the
+    /// pass before anything is created, so inputs and table stay as they
+    /// are: the history of the table is never replaced by one pass's view.
+    async fn table_before(
         &self,
         tenant: fs_catalog::TenantId,
-        hour: chrono::DateTime<chrono::Utc>,
-        mut keys: KeyStats,
-        guard: &mut OrphanGuard,
-        puts: &mut usize,
-    ) -> Result<(Option<NewFile>, Vec<(Signal, FileId)>), CompactError> {
+    ) -> Result<(KeyStats, Vec<(Signal, FileId)>), CompactError> {
         let previous = self
             .catalog
             .all_visible_files(tenant, Signal::AttributeKeys)
             .await?;
+        let mut keys = KeyStats::default();
         let mut replaced = Vec::with_capacity(previous.len());
         for file in &previous {
-            replaced.push((Signal::AttributeKeys, file.id));
             match self.read_attribute_keys(&file.path).await {
                 Ok(known) => keys.merge(known),
                 Err(e) => {
@@ -309,15 +330,30 @@ impl Compactor {
                         tenant = %tenant.0,
                         path = %file.path,
                         error = %e,
-                        "attribute_keys table unreadable; replaced by what this pass saw"
+                        "attribute_keys table unreadable; pass aborted"
                     );
+                    return Err(e);
                 }
             }
+            replaced.push((Signal::AttributeKeys, file.id));
         }
+        Ok((keys.settled(), replaced))
+    }
+
+    /// Uploads `keys` as the tenant's `attribute_keys` table of this pass:
+    /// the file for the swap, or `None` when there is nothing to list.
+    async fn publish_attribute_keys(
+        &self,
+        tenant: fs_catalog::TenantId,
+        hour: chrono::DateTime<chrono::Utc>,
+        keys: &KeyStats,
+        guard: &mut OrphanGuard,
+        puts: &mut usize,
+    ) -> Result<Option<NewFile>, CompactError> {
         let Some((first, last)) = keys.range() else {
-            return Ok((None, replaced));
+            return Ok(None);
         };
-        let bytes = Bytes::from(fs_schema::attribute_keys::encode(&keys)?);
+        let bytes = Bytes::from(fs_schema::attribute_keys::encode(keys)?);
         let id = FileId::new();
         let path = attribute_keys_path(&self.root, tenant, hour, id);
         self.put_once(path.as_ref(), bytes.clone(), puts).await?;
@@ -338,7 +374,7 @@ impl Compactor {
             services: Vec::new(),
             summary: None,
         };
-        Ok((Some(file), replaced))
+        Ok(Some(file))
     }
 
     async fn read_attribute_keys(&self, path: &str) -> Result<KeyStats, CompactError> {

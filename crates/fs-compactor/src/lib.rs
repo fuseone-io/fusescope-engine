@@ -60,6 +60,9 @@ pub enum CompactError {
     /// A failure injected by test configuration.
     #[error("injected failure: {0}")]
     Injected(&'static str),
+    /// The tenant of the hour being compacted is no longer in the catalog.
+    #[error("tenant {} is gone", .0.0)]
+    TenantGone(fs_catalog::TenantId),
 }
 
 /// Crate version, exposed for diagnostics and the `--version` flag.

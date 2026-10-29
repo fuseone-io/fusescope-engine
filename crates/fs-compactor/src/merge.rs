@@ -57,6 +57,8 @@ pub struct MergeConfig {
     pub row_group_rows: usize,
     /// An output closes once its bytes reach this.
     pub target_bytes: usize,
+    /// Most keys new to the `attribute_keys` table one merge admits.
+    pub max_new_keys: usize,
 }
 
 /// Merges L0 files of one tenant and hour into L1 outputs, one at a time.
@@ -74,7 +76,8 @@ pub struct L1Merger {
 
 impl L1Merger {
     /// Opens `inputs`, all L0 files of `tenant` in the hour starting at
-    /// `hour`; outputs go under `root`.
+    /// `hour`; outputs go under `root`. `keys` is the tenant's
+    /// `attribute_keys` table before, which the merge counts into.
     ///
     /// # Errors
     /// Store or Parquet failures opening an input.
@@ -85,6 +88,7 @@ impl L1Merger {
         hour: DateTime<Utc>,
         inputs: &[FileRecord],
         config: MergeConfig,
+        keys: KeyStats,
     ) -> Result<Self, CompactError> {
         let schema = span_schema_v1();
         let merge = Merge::open(store, inputs, &schema, config.row_group_rows).await?;
@@ -96,13 +100,12 @@ impl L1Merger {
             hour,
             config,
             done: false,
-            keys: KeyStats::default(),
+            keys,
         })
     }
 
-    /// The attribute keys of every row merged so far, with their counts
-    /// and sightings; taken once the inputs are spent, for the derived
-    /// table.
+    /// The `attribute_keys` table with every row merged so far counted
+    /// in; taken once the inputs are spent.
     pub fn take_keys(&mut self) -> KeyStats {
         std::mem::take(&mut self.keys)
     }
@@ -124,7 +127,7 @@ impl L1Merger {
             .next_group(&self.schema, self.config.row_group_rows)
             .await?
         {
-            self.keys.absorb(&group)?;
+            self.keys.absorb(&group, self.config.max_new_keys)?;
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
                 return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
