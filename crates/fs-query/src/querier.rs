@@ -165,6 +165,7 @@ pub struct Querier {
     limits: QueryLimits,
     stats: Arc<QueryStats>,
     prepared: Arc<std::sync::Mutex<PreparedPlans>>,
+    verified: crate::derived_table::VerifiedPaths,
 }
 
 impl Querier {
@@ -219,6 +220,7 @@ impl Querier {
                 &stats,
             )))),
             stats,
+            verified: Arc::default(),
         })
     }
 
@@ -295,6 +297,7 @@ impl Querier {
             &self.store_url,
             budget,
             self.limits.batch_size,
+            Arc::clone(&self.verified),
         )?;
         Ok((ctx, warnings))
     }
@@ -387,6 +390,7 @@ impl Querier {
                     tenant,
                     &pruning,
                     Some(vec![span_col::SERVICE_NAME.to_owned()]),
+                    true,
                 )
                 .await?;
             for ingester in &hot.unavailable {
@@ -395,8 +399,9 @@ impl Querier {
                 ));
             }
             for batch in &hot.batches {
-                for service in service_names(batch)? {
-                    admit(&mut services, &service, limit)?;
+                let names = service_names(batch)?;
+                for service in names.as_string::<i32>().iter().flatten() {
+                    admit(&mut services, service, limit)?;
                 }
             }
         }
@@ -552,6 +557,11 @@ impl Querier {
     /// Prepared plans waiting for their `DoGet`.
     pub fn prepared_count(&self) -> usize {
         self.prepared.lock().map_or(0, |p| p.queue.len())
+    }
+
+    /// Derived table files whose footer passed the version check so far.
+    pub fn verified_derived_files(&self) -> usize {
+        self.verified.lock().map_or(0, |v| v.len())
     }
 
     /// Bytes the waiting plans are estimated to retain.
@@ -756,16 +766,11 @@ fn services_schema() -> SchemaRef {
     )]))
 }
 
-/// The service names of a hot-window batch, whatever encoding it arrived in.
-fn service_names(batch: &RecordBatch) -> Result<Vec<String>, QueryError> {
+/// The `service_name` column of a hot-window batch as plain strings,
+/// whatever encoding it arrived in; read in place, never copied out.
+fn service_names(batch: &RecordBatch) -> Result<arrow::array::ArrayRef, QueryError> {
     let index = batch.schema().index_of(span_col::SERVICE_NAME)?;
-    let column = arrow::compute::cast(batch.column(index), &DataType::Utf8)?;
-    Ok(column
-        .as_string::<i32>()
-        .iter()
-        .flatten()
-        .map(str::to_owned)
-        .collect())
+    Ok(arrow::compute::cast(batch.column(index), &DataType::Utf8)?)
 }
 
 /// Adds `service` to `services` unless that would exceed `limit`.

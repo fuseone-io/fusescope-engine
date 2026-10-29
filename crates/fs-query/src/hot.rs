@@ -97,7 +97,9 @@ impl HotWindow {
     }
 
     /// Asks every live ingester for `tenant`'s rows matching `pruning`,
-    /// projected to `columns`.
+    /// projected to `columns`; with `distinct`, for the distinct values
+    /// of the one projected column instead, so the ingester keeps and
+    /// sends each value once.
     ///
     /// # Errors
     /// Catalog failure while listing ingesters. Ingester failures are not
@@ -107,6 +109,7 @@ impl HotWindow {
         tenant: TenantId,
         pruning: &Pruning,
         columns: Option<Vec<String>>,
+        distinct: bool,
     ) -> Result<HotResult, fs_catalog::CatalogError> {
         let stale = ChronoDuration::from_std(self.config.stale_after)
             .unwrap_or(ChronoDuration::seconds(10));
@@ -122,6 +125,7 @@ impl HotWindow {
             columns,
             trace_ids: pruning.trace_ids.clone(),
             span_ids: pruning.span_ids.clone(),
+            distinct,
         };
         let calls = ingesters.iter().map(|ingester| {
             let request = request.clone();

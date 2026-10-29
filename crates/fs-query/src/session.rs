@@ -18,7 +18,7 @@ use fs_catalog::{Signal, TenantId};
 use fs_schema::attribute_keys;
 
 use crate::QueryError;
-use crate::derived_table::DerivedTable;
+use crate::derived_table::{DerivedTable, VerifiedPaths};
 use crate::files::FileCache;
 use crate::spans_table::SpansTable;
 
@@ -44,6 +44,7 @@ pub fn tenant_session(
     store_url: &ObjectStoreUrl,
     bytes_budget: u64,
     batch_size: usize,
+    verified: VerifiedPaths,
 ) -> Result<SessionContext, QueryError> {
     let config = SessionConfig::new()
         .with_default_catalog_and_schema(CATALOG, SCHEMA)
@@ -79,8 +80,9 @@ pub fn tenant_session(
             cache,
             store_url.clone(),
             Signal::AttributeKeys,
-            attribute_keys::attribute_keys_schema_v1(),
+            attribute_keys::attribute_keys_schema_v2(),
             attribute_keys::check_schema,
+            verified,
         )),
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());

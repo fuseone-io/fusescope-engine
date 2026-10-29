@@ -2,8 +2,10 @@
 //! one derived signal, read whole. No pruning, no hot window and no budget
 //! apply: a derived table is one small file per tenant, rebuilt by the
 //! compactor, and only the tenant's own files are ever listed. Every
-//! file's schema metadata is checked before the scan, so a file of
-//! another version or signal fails the query instead of being misread.
+//! file's schema metadata is checked before the scan, from its footer
+//! alone and once per path, since objects are created once and never
+//! rewritten, so a file of another version or signal fails the query
+//! instead of being misread.
 
 use std::sync::Arc;
 
@@ -15,7 +17,9 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, Pa
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, utils::conjunction};
-use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::async_reader::MetadataFetch;
+use datafusion::parquet::arrow::parquet_to_arrow_schema;
+use datafusion::parquet::file::metadata::ParquetMetaDataReader;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::PartitionedFile;
@@ -23,6 +27,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::table_schema::TableSchema;
 use fs_catalog::{FileRecord, Signal, TenantId};
 use fs_schema::SchemaError;
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -32,6 +38,14 @@ use crate::files::FileCache;
 /// Refuses a file schema the table's reader does not know.
 pub type SchemaCheck = fn(&arrow::datatypes::Schema) -> Result<(), SchemaError>;
 
+/// Paths whose footer passed the check, shared by every session; a path
+/// never changes content, so once is enough. Cleared when it reaches
+/// [`VERIFIED_PATHS`].
+pub type VerifiedPaths = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Most paths remembered as verified before the set starts over.
+pub const VERIFIED_PATHS: usize = 65_536;
+
 /// The tenant's files of one derived signal as a table of `schema`.
 pub struct DerivedTable {
     tenant: TenantId,
@@ -40,11 +54,13 @@ pub struct DerivedTable {
     signal: Signal,
     schema: SchemaRef,
     check: SchemaCheck,
+    verified: VerifiedPaths,
 }
 
 impl DerivedTable {
     /// Table over `tenant`'s visible files of `signal`, read through
-    /// `store_url` as `schema`; `check` refuses a file of another version.
+    /// `store_url` as `schema`; `check` refuses a file of another version
+    /// and `verified` remembers the paths it accepted.
     pub fn new(
         tenant: TenantId,
         cache: Arc<FileCache>,
@@ -52,6 +68,7 @@ impl DerivedTable {
         signal: Signal,
         schema: SchemaRef,
         check: SchemaCheck,
+        verified: VerifiedPaths,
     ) -> Self {
         Self {
             tenant,
@@ -60,29 +77,71 @@ impl DerivedTable {
             signal,
             schema,
             check,
+            verified,
         }
     }
 
-    /// Reads `file`, small by construction, and refuses a schema `check`
-    /// does not accept.
+    /// Refuses `file` unless its footer, fetched by ranges and only the
+    /// first time the path is met, carries a schema `check` accepts.
     async fn check_file(
         &self,
         store: &Arc<dyn ObjectStore>,
         file: &FileRecord,
     ) -> Result<(), QueryError> {
-        let bytes = store
-            .get(&Path::from(file.path.as_str()))
-            .await
-            .map_err(datafusion::error::DataFusionError::from)?
-            .bytes()
+        let known = self
+            .verified
+            .lock()
+            .is_ok_and(|verified| verified.contains(&file.path));
+        if known {
+            return Ok(());
+        }
+        let size = u64::try_from(file.size_bytes).unwrap_or(0);
+        let footer = Footer {
+            store: Arc::clone(store),
+            path: Path::from(file.path.as_str()),
+        };
+        let metadata = ParquetMetaDataReader::new()
+            .load_and_finish(footer, size)
             .await
             .map_err(datafusion::error::DataFusionError::from)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .map_err(datafusion::error::DataFusionError::from)?;
-        (self.check)(builder.schema()).map_err(|source| QueryError::DerivedTable {
+        let file_metadata = metadata.file_metadata();
+        let schema = parquet_to_arrow_schema(
+            file_metadata.schema_descr(),
+            file_metadata.key_value_metadata(),
+        )
+        .map_err(datafusion::error::DataFusionError::from)?;
+        (self.check)(&schema).map_err(|source| QueryError::DerivedTable {
             path: file.path.clone(),
             source,
-        })
+        })?;
+        if let Ok(mut verified) = self.verified.lock() {
+            if verified.len() >= VERIFIED_PATHS {
+                verified.clear();
+            }
+            verified.insert(file.path.clone());
+        }
+        Ok(())
+    }
+}
+
+/// Fetches byte ranges of one object for the Parquet footer reader.
+struct Footer {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+}
+
+impl MetadataFetch for Footer {
+    fn fetch(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<bytes::Bytes>> {
+        async move {
+            self.store
+                .get_range(&self.path, range)
+                .await
+                .map_err(|e| datafusion::parquet::errors::ParquetError::External(Box::new(e)))
+        }
+        .boxed()
     }
 }
 

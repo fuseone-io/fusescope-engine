@@ -581,16 +581,21 @@ table before, transient or not, ends the pass before anything is created
 (`fusescope_compaction_derived_unreadable_total`): the history is never
 replaced by one pass's view, and a table damaged for good is repaired by an
 operator, by rebuilding it from the L1 files, which is not automated yet.
-A pass admits at most the tenant's `max_keys_hour` keys new to the table,
-in merge order, so which keys an hour adds is the same for the same rows,
-and never allocates for a key beyond that
-(`fusescope_compaction_derived_keys_dropped_total`); an hour merged over
-several passes may admit that many per pass. Keys of rows not yet
-compacted are not listed: the table lags ingestion by the hour close delay.
-The format carries its signal and version in the schema metadata; the
-compactor and the querier both check them before reading a file and refuse
-anything else, so an older engine never rewrites a newer table and a
-newer table is never read as an older one.
+Every key records the hour whose budget admitted it (`admitted_hour`),
+so an hour admits at most the tenant's `max_keys_hour` keys new to the
+table over all its passes, across restarts and whatever the pass size:
+each pass gets what the table says is left for its hour. Within a pass
+keys are admitted in merge order and never allocated for beyond the
+budget (`fusescope_compaction_derived_keys_dropped_total`); which keys an
+hour admits depends on how its files were split into passes, the total
+does not. Keys of rows not yet compacted are not listed: the table lags
+ingestion by the hour close delay. The format carries its signal and
+version in the schema metadata (v2; a v1 file, without `admitted_hour`,
+reads with the hour of `first_seen` in its place); the compactor and the
+querier both check them before reading a file, the querier from the
+footer alone, fetched by ranges and remembered per path since an object
+is never rewritten, and refuse anything else, so an older engine never
+rewrites a newer table and a newer table is never read as an older one.
 
 Retention: the compactor deletes day prefixes beyond the tenant's
 `retention_days`, first in the catalog, then in the bucket. Bucket lifecycle
@@ -734,9 +739,10 @@ parsing or planning SQL (`fusescope_query_trace_lookups_total`).
 "limit": n}` and answers the distinct `service_name` of the tenant, sorted,
 from the catalog alone: the services of every file overlapping the range,
 so a range answers at file granularity, plus what the ingesters still hold
-when the range touches the recent window; no file is read, and more
-services than the limit is `RESOURCE_EXHAUSTED` as soon as it is known,
-so the answer never holds more than that.
+when the range touches the recent window, asked for the distinct names
+only, so an ingester keeps and sends each name once; no file is read, and
+more services than the limit is `RESOURCE_EXHAUSTED` as soon as it is
+known, so the answer never holds more than that.
 `metadata.operations` takes `{"service_name": s, "start_unix_nano": n,
 "end_unix_nano": n, "limit": n}` and answers the span `name`s of that
 service with their span counts, most frequent first, through the spans

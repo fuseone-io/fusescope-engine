@@ -1481,7 +1481,11 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
     let mut builder = SpanBatchBuilder::new(Limits::default());
     builder.append_request(&request("api", 1, T0, 3)).unwrap();
     stats
-        .absorb(&builder.finish().unwrap(), usize::MAX)
+        .absorb(
+            &builder.finish().unwrap(),
+            i64::try_from(T0 - T0 % HOUR).unwrap(),
+            usize::MAX,
+        )
         .unwrap();
     let bytes = fs_schema::attribute_keys::encode(&stats).unwrap();
     let id = FileId::new();
@@ -1494,7 +1498,6 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         .put(&Path::from(path.as_str()), bytes.clone().into())
         .await
         .unwrap();
-    let all_path = path.clone();
     let (first, last) = stats.range().unwrap();
     f.db.catalog
         .register_file(&NewFile {
@@ -1560,6 +1563,11 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         strings(&by_sql, "key"),
         ["http.request.method", "service.name"]
     );
+    assert_eq!(
+        f.querier.verified_derived_files(),
+        1,
+        "the footer was checked once and remembered"
+    );
 
     let mut other = sql_client(addr, &other_token).await;
     let theirs = action(&mut other, METADATA_KEYS, r#"{"signal": "traces"}"#)
@@ -1571,21 +1579,95 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         "no table of their own, nothing of ours"
     );
 
-    // A table of a version this reader does not know fails the query,
-    // over the action and over SQL alike, instead of being read as v1.
+    // A v1 file, which lacks admitted_hour, reads through the v2 table
+    // with that column null; a version this reader does not know fails
+    // the query, over the action and over SQL alike, instead of being
+    // read as one it knows. Each is a new object with a fresh row, as
+    // every table the compactor writes is.
     let batch = stats.to_batch().unwrap();
-    let mut metadata = batch.schema().metadata().clone();
-    metadata.insert("fusescope.schema_version".into(), "2".into());
-    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        batch.schema().fields().clone(),
-        metadata,
-    ));
-    let foreign = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
-    let mut writer =
-        datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
-    writer.write(&foreign).unwrap();
-    let v2 = writer.into_inner().unwrap();
-    std::fs::write(f.dir.path().join("bucket").join(&all_path), v2).unwrap();
+    let file_of = |version: &str, fields: usize| {
+        let mut metadata = batch.schema().metadata().clone();
+        metadata.insert("fusescope.schema_version".into(), version.into());
+        let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .take(fields)
+                .cloned()
+                .collect::<Vec<_>>(),
+            metadata,
+        ));
+        let foreign =
+            RecordBatch::try_new(Arc::clone(&schema), batch.columns()[..fields].to_vec()).unwrap();
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&foreign).unwrap();
+        writer.into_inner().unwrap()
+    };
+    let register = |bytes: Vec<u8>, hour: &'static str| {
+        let id = FileId::new();
+        let path = format!(
+            "t/{}/derived/attribute_keys/dt=2026-10-22/{hour}/{}.parquet",
+            f.tenant.0, id.0
+        );
+        let catalog = f.db.catalog.clone();
+        let dir = f.dir.path().join("bucket");
+        let tenant = f.tenant;
+        async move {
+            let target = dir.join(&path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, &bytes).unwrap();
+            catalog
+                .register_file(&NewFile {
+                    id,
+                    origin: id,
+                    tenant_id: tenant,
+                    signal: Signal::AttributeKeys,
+                    level: Level::L1,
+                    path,
+                    size_bytes: i64::try_from(bytes.len()).unwrap(),
+                    row_count: 2,
+                    range: TimeRange {
+                        start: chrono::Utc.timestamp_nanos(first),
+                        end: chrono::Utc.timestamp_nanos(last),
+                    },
+                    services: vec![],
+                    summary: None,
+                })
+                .await
+                .unwrap();
+            id
+        }
+    };
+    let v1 = register(file_of("1", 6), "hr=15").await;
+    f.querier
+        .cache()
+        .invalidate(f.tenant, Signal::AttributeKeys)
+        .await;
+    let rows = f
+        .querier
+        .collect(
+            f.tenant,
+            "select key, admitted_hour is null as unknown from attribute_keys order by key, unknown",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        4,
+        "both files read; the v1 rows carry a null admission"
+    );
+    assert_eq!(f.querier.verified_derived_files(), 2);
+    f.db.catalog
+        .swap_files(f.tenant, Signal::AttributeKeys, &[v1], &[])
+        .await
+        .unwrap();
+    register(file_of("3", 7), "hr=16").await;
+    f.querier
+        .cache()
+        .invalidate(f.tenant, Signal::AttributeKeys)
+        .await;
     let err = action(&mut client, METADATA_KEYS, r#"{"signal": "traces"}"#)
         .await
         .unwrap_err();
