@@ -61,6 +61,10 @@ pub struct HotScanRequest {
     /// Keep only these spans (8-byte ids). Absent in older tickets.
     #[serde(default)]
     pub span_ids: Option<Vec<Vec<u8>>>,
+    /// Answer the distinct values of the one projected column, as one
+    /// batch, instead of every row. Absent in older tickets.
+    #[serde(default)]
+    pub distinct: bool,
 }
 
 impl HotScanRequest {
@@ -258,6 +262,58 @@ struct HotService {
     shared: Arc<Shared>,
 }
 
+/// The distinct values of the one projected column of a scan, gathered
+/// batch by batch so no row is kept beyond its first sighting.
+struct Distinct {
+    column: String,
+    values: std::collections::BTreeSet<String>,
+}
+
+impl Distinct {
+    fn for_request(scan: &HotScanRequest) -> Result<Self, Status> {
+        match scan.columns.as_deref() {
+            Some([column]) => Ok(Self {
+                column: column.clone(),
+                values: std::collections::BTreeSet::new(),
+            }),
+            _ => Err(Status::invalid_argument(
+                "a distinct scan projects exactly one column",
+            )),
+        }
+    }
+
+    fn fold(&mut self, batch: &RecordBatch) -> Result<(), Status> {
+        let invalid = |e: arrow::error::ArrowError| Status::invalid_argument(e.to_string());
+        let column = batch.column(batch.schema().index_of(&self.column).map_err(invalid)?);
+        let strings = cast(column, &DataType::Utf8).map_err(invalid)?;
+        for value in strings.as_string::<i32>().iter().flatten() {
+            if !self.values.contains(value) {
+                self.values.insert(value.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// One batch of the values in the column's declared type; none when
+    /// nothing was seen.
+    fn finish(self) -> Result<Option<RecordBatch>, Status> {
+        if self.values.is_empty() {
+            return Ok(None);
+        }
+        let internal = |e: arrow::error::ArrowError| Status::internal(e.to_string());
+        let full = span_schema_v1();
+        let field = full
+            .field_with_name(&self.column)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let values = arrow::array::StringArray::from_iter_values(self.values);
+        let typed = cast(&values, field.data_type()).map_err(internal)?;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![field.clone()]));
+        Ok(Some(
+            RecordBatch::try_new(schema, vec![typed]).map_err(internal)?,
+        ))
+    }
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
@@ -290,6 +346,10 @@ impl FlightService for HotService {
                     .collect()
             });
         let mut batches = Vec::new();
+        let mut distinct = scan
+            .distinct
+            .then(|| Distinct::for_request(&scan))
+            .transpose()?;
         let mut skipped = 0u64;
         for source in sources {
             if let (Some(wanted), Some(traces)) = (&wanted, &source.traces) {
@@ -300,9 +360,16 @@ impl FlightService for HotService {
             }
             let kept =
                 apply(&source.batch, &scan).map_err(|e| Status::invalid_argument(e.to_string()))?;
-            if kept.num_rows() > 0 {
-                batches.push(kept);
+            if kept.num_rows() == 0 {
+                continue;
             }
+            match &mut distinct {
+                Some(distinct) => distinct.fold(&kept)?,
+                None => batches.push(kept),
+            }
+        }
+        if let Some(distinct) = distinct {
+            batches.extend(distinct.finish()?);
         }
         self.shared
             .stats
@@ -418,6 +485,7 @@ mod tests {
             columns: Some(vec!["timestamp".into(), "name".into()]),
             trace_ids: None,
             span_ids: None,
+            distinct: false,
         };
         assert_eq!(
             HotScanRequest::from_ticket(&request.to_ticket()).unwrap(),
@@ -434,5 +502,6 @@ mod tests {
         assert_eq!(decoded.tenant, request.tenant);
         assert_eq!(decoded.trace_ids, None);
         assert_eq!(decoded.span_ids, None);
+        assert!(!decoded.distinct);
     }
 }
