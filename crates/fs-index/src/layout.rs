@@ -4,7 +4,11 @@
 //! ```text
 //! t/{tenant uuid}/traces/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
+//! t/{tenant uuid}/derived/attribute_keys/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
+//!
+//! A derived table is partitioned by the hour of the compaction pass that
+//! rebuilt it.
 
 /// What an object under the engine's prefix is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +23,8 @@ pub struct SpanObject {
     pub id: String,
     /// True for a `trace_id` sidecar.
     pub sidecar: bool,
+    /// True for a derived table file.
+    pub derived: bool,
 }
 
 impl SpanObject {
@@ -31,19 +37,27 @@ impl SpanObject {
             return None;
         }
         let tenant = parts.next()?;
-        if !is_uuid(tenant) || parts.next()? != "traces" {
+        if !is_uuid(tenant) {
             return None;
         }
-        let kind = parts.next()?;
-        let (level, sidecar) = match kind {
-            "l0" => (Some(0), false),
-            "l1" => (Some(1), false),
-            "l2" => (Some(2), false),
-            "index" => {
-                if parts.next()? != "trace_id" {
+        let (level, sidecar, derived) = match parts.next()? {
+            "traces" => match parts.next()? {
+                "l0" => (Some(0), false, false),
+                "l1" => (Some(1), false, false),
+                "l2" => (Some(2), false, false),
+                "index" => {
+                    if parts.next()? != "trace_id" {
+                        return None;
+                    }
+                    (None, true, false)
+                }
+                _ => return None,
+            },
+            "derived" => {
+                if parts.next()? != "attribute_keys" {
                     return None;
                 }
-                (None, true)
+                (None, false, true)
             }
             _ => return None,
         };
@@ -67,6 +81,7 @@ impl SpanObject {
             partition: format!("{date}/{hour}"),
             id: id.to_owned(),
             sidecar,
+            derived,
         })
     }
 }
@@ -154,6 +169,15 @@ mod tests {
         assert!(tix.sidecar);
         assert_eq!(tix.level, None);
         assert_eq!(tix.tenant, T);
+        assert!(!tix.derived);
+        let keys = SpanObject::parse(&format!(
+            "t/{T}/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.parquet"
+        ))
+        .unwrap();
+        assert!(keys.derived);
+        assert!(!keys.sidecar);
+        assert_eq!(keys.level, None);
+        assert_eq!(keys.partition, "dt=2026-10-24/hr=14");
     }
 
     #[test]
@@ -174,6 +198,9 @@ mod tests {
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet/extra"),
             &format!("t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/index/other/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/derived/other/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/derived/attribute_keys/{F}.parquet"),
             &format!("x/{T}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!(
                 "t/{}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet",
