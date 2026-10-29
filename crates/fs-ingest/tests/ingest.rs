@@ -229,7 +229,8 @@ impl ObjectStore for HeldStore {
     ) -> object_store::Result<PutResult> {
         if location.as_ref().starts_with(&self.held) && !*self.gate.borrow() {
             self.retained.fetch_add(1, Ordering::SeqCst);
-            self.arrived.notify_waiters();
+            // One permit is stored for the one waiter, registered or not yet.
+            self.arrived.notify_one();
             let mut gate = self.gate.clone();
             while !*gate.borrow() {
                 if gate.changed().await.is_err() {
