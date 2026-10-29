@@ -620,7 +620,8 @@ reads the marker and refuses a prefix marked for another catalog. A
 prefix that holds objects and no marker is refused too, unless the
 operator sets `bucket.adopt_prefix = true` for one start, which marks it;
 a reader role meeting an empty, unmarked prefix proceeds and leaves the
-marking to the writer. The
+marking to the writer. Nothing is written under a prefix before the claim
+holds, the write probe included. The
 bucket is walked by partitions, one tenant, level and day each, found with
 delimiter listings as the walk reaches them, so no listing order is assumed
 and nothing is enumerated ahead but the list of tenants; a pass walks whole

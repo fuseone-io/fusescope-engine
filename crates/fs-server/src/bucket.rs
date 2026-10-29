@@ -184,22 +184,30 @@ pub fn root(config: &BucketConfig) -> Path {
         .map_or_else(|| Path::from(""), Path::from)
 }
 
-/// Confirms the store answers: lists one page under the engine prefix and
-/// writes and deletes a marker under `_probe/`. The marker proves the
-/// credentials allow writes, which every role except the querier needs.
+/// Confirms the store answers by listing one page under the engine
+/// prefix. Reads only: it runs before the prefix is known to be ours.
 ///
 /// # Errors
 /// Any failure talking to the store.
-pub async fn probe(store: &dyn ObjectStore, root: &Path, write: bool) -> Result<(), ServerError> {
+pub async fn reachable(store: &dyn ObjectStore, root: &Path) -> Result<(), ServerError> {
     store.list_with_delimiter(Some(root)).await?;
-    if write {
-        let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let marker = Path::from(format!("{root}/_probe/{stamp}.txt"));
-        store
-            .put(&marker, PutPayload::from_static(b"fusescope-engine probe"))
-            .await?;
-        store.delete(&marker).await?;
-    }
+    Ok(())
+}
+
+/// Writes and deletes a marker under `_probe/`, proving the credentials
+/// allow writes, which every role except the querier needs. Only after
+/// [`claim`] said the prefix is ours: nothing is written into another
+/// catalog's prefix, not even a probe.
+///
+/// # Errors
+/// Any failure talking to the store.
+pub async fn probe_write(store: &dyn ObjectStore, root: &Path) -> Result<(), ServerError> {
+    let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let marker = under(root, &format!("_probe/{stamp}.txt"));
+    store
+        .put(&marker, PutPayload::from_static(b"fusescope-engine probe"))
+        .await?;
+    store.delete(&marker).await?;
     Ok(())
 }
 

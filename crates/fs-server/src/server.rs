@@ -45,7 +45,7 @@ pub async fn bootstrap(
 
     let store = bucket::open(&config.bucket, secrets)?;
     let root = bucket::root(&config.bucket);
-    bucket::probe(store.as_ref(), &root, write_probe).await?;
+    bucket::reachable(store.as_ref(), &root).await?;
     info!(kind = ?config.bucket.kind, bucket = ?config.bucket.name, endpoint = ?config.bucket.endpoint, prefix = %root, "bucket reachable");
 
     let catalog = Catalog::connect(url, config.catalog.max_connections).await?;
@@ -67,6 +67,10 @@ pub async fn bootstrap(
     )
     .await?;
     info!(catalog = %identity, prefix = %root, ?ownership, "bucket prefix is this catalog's");
+    // Only now may anything be written: the prefix is ours.
+    if write_probe {
+        bucket::probe_write(store.as_ref(), &root).await?;
+    }
 
     Ok(Context {
         config: Arc::new(config),

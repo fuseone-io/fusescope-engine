@@ -261,7 +261,8 @@ async fn a_bucket_prefix_belongs_to_one_catalog() {
     assert_eq!(report.ownership, Ownership::Held);
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), written);
 
-    // Another catalog, same prefix: refused before anything runs.
+    // Another catalog, same prefix: refused before anything runs, and
+    // nothing at all is written there, not even the write probe.
     let Some(other) = TestDb::new().await else {
         return;
     };
@@ -269,6 +270,7 @@ async fn a_bucket_prefix_belongs_to_one_catalog() {
         catalog_url: Some(other.url.clone()),
         ..Secrets::default()
     };
+    let before = snapshot(&dir.path().join("bucket"));
     let err = server::check(config(dir.path()), other_secrets.clone(), "b".into())
         .await
         .unwrap_err();
@@ -285,6 +287,11 @@ async fn a_bucket_prefix_belongs_to_one_catalog() {
         "{err}"
     );
     drop(tx);
+    assert_eq!(
+        snapshot(&dir.path().join("bucket")),
+        before,
+        "another catalog's prefix is never written"
+    );
 
     // Objects without a marker: refused, then adopted on the operator's say.
     let stray = tempfile::tempdir().unwrap();
@@ -314,6 +321,28 @@ async fn a_bucket_prefix_belongs_to_one_catalog() {
     );
     other.finish().await;
     db.finish().await;
+}
+
+/// Every entry under `dir`, with its size and modification time.
+fn snapshot(dir: &std::path::Path) -> Vec<(String, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            out.push((
+                entry.path().display().to_string(),
+                meta.len(),
+                meta.modified().unwrap(),
+            ));
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[tokio::test]
