@@ -258,8 +258,10 @@ async fn work_loop(
 }
 
 /// Expiry passes until nothing is beyond its cut, then rebuilds until no
-/// table is stale, each kind bounded per tick; a failure ends its kind
-/// for this tick.
+/// table is left to rebuild, each kind bounded per tick. A rebuild that
+/// fails on its own tenant's files holds that tenant back and the next is
+/// tried; a lost lease ends the tick's work and a catalog failure ends
+/// its kind for the tick.
 async fn retention_passes(retention: &Retention, leadership: &Leadership) {
     retention.forget_failures();
     for _ in 0..PASSES_PER_TICK {
@@ -269,6 +271,10 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
         match retention.expire_once(&fence).await {
             Ok(Some(_)) => {}
             Ok(None) => break,
+            Err(e @ CompactError::Catalog(fs_catalog::CatalogError::LeaseLost { .. })) => {
+                warn!(role = "compactor", error = %e, "retention pass refused");
+                return;
+            }
             Err(e) => {
                 warn!(role = "compactor", error = %e, "retention pass failed");
                 break;
@@ -282,9 +288,19 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
         match retention.rebuild_once(&fence).await {
             Ok(Some(_)) => {}
             Ok(None) => break,
-            Err(e) => {
-                warn!(role = "compactor", error = %e, "attribute_keys rebuild failed");
+            Err(e @ CompactError::Catalog(fs_catalog::CatalogError::LeaseLost { .. })) => {
+                warn!(role = "compactor", error = %e, "attribute_keys rebuild refused");
+                return;
+            }
+            Err(e @ CompactError::Catalog(fs_catalog::CatalogError::CompactionConflict { .. })) => {
+                warn!(role = "compactor", error = %e, "attribute_keys rebuild conflicted; tried again");
+            }
+            Err(e @ CompactError::Catalog(_)) => {
+                warn!(role = "compactor", error = %e, "attribute_keys rebuild failed on the catalog");
                 break;
+            }
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "attribute_keys rebuild failed; the tenant is held back this tick");
             }
         }
     }

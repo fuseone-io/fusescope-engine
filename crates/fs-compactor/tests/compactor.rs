@@ -351,7 +351,9 @@ async fn a_replay_during_the_purge_is_refused_and_never_leaves_a_row_without_an_
         )
         .await
     });
-    arrived.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .expect("the purge never reached the delete");
 
     assert_eq!(
         db.catalog
@@ -373,7 +375,7 @@ async fn a_replay_during_the_purge_is_refused_and_never_leaves_a_row_without_an_
     let catalog = db.catalog.clone();
     let again = replayed.clone();
     let registration = tokio::spawn(async move { catalog.register_file(&again).await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_lock_waiter(&db.catalog).await;
     assert!(
         !registration.is_finished(),
         "the registration waits behind the claim"
@@ -399,6 +401,30 @@ async fn a_replay_during_the_purge_is_refused_and_never_leaves_a_row_without_an_
         0
     );
     db.finish().await;
+}
+
+/// Waits until a backend of the catalog waits on an advisory lock, the
+/// path's, or fails after a while.
+async fn wait_for_lock_waiter(catalog: &Catalog) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (waiting,): (i64,) = sqlx::query_as(
+            "select count(*) from pg_stat_activity a
+             where a.wait_event_type = 'Lock'
+               and exists (select 1 from pg_locks l where l.pid = a.pid and l.locktype = 'advisory')",
+        )
+        .fetch_one(catalog.pool())
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no backend ever waited on the path's lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A pass slower than the lease TTL keeps the lease: renewal runs on its

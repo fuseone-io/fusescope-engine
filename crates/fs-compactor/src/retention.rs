@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{
-    Catalog, CatalogError, Compaction, ExpiredFiles, FileRecord, LeaseFence, Level, Signal,
-    StaleTable, TenantId,
+    Catalog, CatalogError, Compaction, ExpiredFiles, FileRecord, LeaseFence, Level, RebuildInput,
+    Signal, StaleTable, TenantId,
 };
 use fs_schema::attribute_keys::{KeyStats, READ_COLUMNS};
 use fs_schema::limits::Limits;
@@ -50,6 +50,9 @@ const KEY_ROW_OVERHEAD: u64 = 128;
 /// Bytes a table row holds in the output arrays, and again in the Parquet
 /// bytes, beyond its key: six fixed columns and the offsets.
 const OUTPUT_ROW_OVERHEAD: u64 = 56;
+
+/// Inputs listed per catalog round trip; the budget sees each page.
+const INPUT_PAGE: i64 = 1000;
 
 /// Bounds of retention.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,16 +124,17 @@ pub struct Retention {
 }
 
 /// Bytes a rebuild of a table of `table_bytes` and `table_rows` from L1
-/// files no larger than `largest_input` holds at its peak, by the worst
-/// case `config.limits` allow: the table before as fetched and as
-/// decoded, the rebuilt table, its arrays and its Parquet bytes, the
-/// column chunks of one input and one decoded batch of `batch_rows`
-/// spans with every attribute map full.
+/// files no larger than `largest_input`, listed in `list_bytes`, holds at
+/// its peak, by the worst case `config.limits` allow: the list of inputs,
+/// the table before as fetched and as decoded, the rebuilt table, its
+/// arrays and its Parquet bytes, the column chunks of one input and one
+/// decoded batch of `batch_rows` spans with every attribute map full.
 #[must_use]
 pub fn rebuild_footprint(
     table_bytes: u64,
     table_rows: u64,
     largest_input: u64,
+    list_bytes: u64,
     config: &RetentionConfig,
 ) -> u64 {
     let key = config.limits.max_key_bytes as u64;
@@ -142,11 +146,71 @@ pub fn rebuild_footprint(
     let number_map = attributes * (key + 8);
     let bool_map = attributes * (key + 1);
     let span_row = string_maps + number_map + bool_map + 8 + 5 * 4;
-    table_bytes
+    list_bytes
+        .saturating_add(table_bytes)
         .saturating_add(table_rows.saturating_mul(2 * key_row))
         .saturating_add(table_rows.saturating_mul(2 * output_row))
         .saturating_add(largest_input)
         .saturating_add((config.batch_rows as u64).saturating_mul(span_row))
+}
+
+/// What a rebuild would read and hold, added up page by page as the
+/// catalog lists the inputs, against the caps; the first cap exceeded is
+/// remembered.
+struct Budget<'a> {
+    config: &'a RetentionConfig,
+    table_bytes: u64,
+    table_rows: u64,
+    input_bytes: u64,
+    largest: u64,
+    list_bytes: u64,
+    over: Option<(&'static str, u64, u64)>,
+}
+
+impl<'a> Budget<'a> {
+    fn new(config: &'a RetentionConfig, table: &FileRecord) -> Self {
+        Self {
+            config,
+            table_bytes: u64::try_from(table.size_bytes).unwrap_or(u64::MAX),
+            table_rows: u64::try_from(table.row_count).unwrap_or(u64::MAX),
+            input_bytes: 0,
+            largest: 0,
+            list_bytes: 0,
+            over: None,
+        }
+    }
+
+    /// Adds `page` and tells whether everything so far fits.
+    fn admit(&mut self, page: &[RebuildInput]) -> bool {
+        for input in page {
+            let size = u64::try_from(input.size_bytes).unwrap_or(u64::MAX);
+            self.input_bytes = self.input_bytes.saturating_add(size);
+            self.largest = self.largest.max(size);
+            let record = input.path.len() as u64 + std::mem::size_of::<RebuildInput>() as u64;
+            self.list_bytes = self.list_bytes.saturating_add(record);
+        }
+        self.fits()
+    }
+
+    fn fits(&mut self) -> bool {
+        let footprint = rebuild_footprint(
+            self.table_bytes,
+            self.table_rows,
+            self.largest,
+            self.list_bytes,
+            self.config,
+        );
+        if self.input_bytes > self.config.rebuild_max_input_bytes {
+            self.over = Some((
+                "input",
+                self.input_bytes,
+                self.config.rebuild_max_input_bytes,
+            ));
+        } else if footprint > self.config.rebuild_max_bytes {
+            self.over = Some(("memory", footprint, self.config.rebuild_max_bytes));
+        }
+        self.over.is_none()
+    }
 }
 
 impl Retention {
@@ -255,35 +319,23 @@ impl Retention {
             if self.held_back(stale.tenant_id) {
                 continue;
             }
-            let totals = self
-                .catalog
-                .files_from_totals(stale.tenant_id, Signal::Traces, Level::L1, stale.cutoff)
-                .await?;
-            let input_bytes = u64::try_from(totals.bytes).unwrap_or(u64::MAX);
-            let footprint = rebuild_footprint(
-                u64::try_from(stale.table.size_bytes).unwrap_or(u64::MAX),
-                u64::try_from(stale.table.row_count).unwrap_or(u64::MAX),
-                u64::try_from(totals.largest).unwrap_or(u64::MAX),
-                &self.config,
-            );
-            let cap = &self.config;
-            if input_bytes > cap.rebuild_max_input_bytes {
-                self.report_over_cap(
-                    stale.tenant_id,
-                    "input",
-                    input_bytes,
-                    cap.rebuild_max_input_bytes,
-                );
-                continue;
-            }
-            if footprint > cap.rebuild_max_bytes {
-                self.report_over_cap(stale.tenant_id, "memory", footprint, cap.rebuild_max_bytes);
-                continue;
-            }
+            let mut budget = Budget::new(&self.config, &stale.table);
             let inputs = self
                 .catalog
-                .visible_files_from(stale.tenant_id, Signal::Traces, Level::L1, stale.cutoff)
+                .rebuild_inputs(
+                    stale.tenant_id,
+                    Signal::Traces,
+                    Level::L1,
+                    stale.cutoff,
+                    INPUT_PAGE,
+                    |page| budget.admit(page),
+                )
                 .await?;
+            let Some(inputs) = inputs.filter(|_| budget.fits()) else {
+                let (what, bytes, cap) = budget.over.unwrap_or(("memory", 0, 0));
+                self.report_over_cap(stale.tenant_id, what, bytes, cap);
+                continue;
+            };
             break (stale, inputs);
         };
         let result = self.rebuild(&stale, &inputs, fence).await;
@@ -339,7 +391,7 @@ impl Retention {
     async fn rebuild(
         &self,
         stale: &StaleTable,
-        inputs: &[FileRecord],
+        inputs: &[RebuildInput],
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         let tenant = stale.tenant_id;
@@ -391,7 +443,7 @@ impl Retention {
     async fn count_remaining(
         &self,
         stale: &StaleTable,
-        inputs: &[FileRecord],
+        inputs: &[RebuildInput],
     ) -> Result<KeyStats, CompactError> {
         let before = read_table(self.store.as_ref(), &stale.table.path)
             .await
@@ -417,7 +469,7 @@ impl Retention {
         &self,
         keys: &mut KeyStats,
         before: &KeyStats,
-        file: &FileRecord,
+        file: &RebuildInput,
     ) -> Result<(), CompactError> {
         let reader = ObjectReader {
             store: Arc::clone(&self.store),
@@ -474,29 +526,34 @@ mod tests {
     #[test]
     fn the_footprint_adds_every_resident_under_the_default_limits() {
         let none = config(0);
-        assert_eq!(rebuild_footprint(0, 0, 0, &none), 0);
+        assert_eq!(rebuild_footprint(0, 0, 0, 0, &none), 0);
         assert_eq!(
-            rebuild_footprint(1_000, 0, 0, &none),
+            rebuild_footprint(1_000, 0, 0, 0, &none),
             1_000,
             "the table as fetched"
         );
         assert_eq!(
-            rebuild_footprint(0, 0, 5_000, &none),
+            rebuild_footprint(0, 0, 5_000, 0, &none),
             5_000,
             "one input's chunks"
         );
         assert_eq!(
-            rebuild_footprint(0, 1, 0, &none),
+            rebuild_footprint(0, 0, 0, 300, &none),
+            300,
+            "the list of inputs"
+        );
+        assert_eq!(
+            rebuild_footprint(0, 1, 0, 0, &none),
             2 * (256 + 128) + 2 * (256 + 56),
             "a key row decoded twice, in arrays and in bytes"
         );
         assert_eq!(
-            rebuild_footprint(0, 0, 0, &config(1)),
+            rebuild_footprint(0, 0, 0, 0, &config(1)),
             3 * 256 * (256 + 8 * 1024) + 256 * (256 + 8) + 256 * (256 + 1) + 8 + 20,
             "one span with every map full"
         );
         assert_eq!(
-            rebuild_footprint(u64::MAX, 1, 1, &config(1)),
+            rebuild_footprint(u64::MAX, 1, 1, 1, &config(1)),
             u64::MAX,
             "saturates"
         );

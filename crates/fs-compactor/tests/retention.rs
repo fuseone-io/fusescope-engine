@@ -543,6 +543,7 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         u64::try_from(before[0].size_bytes).unwrap(),
         u64::try_from(before[0].row_count).unwrap(),
         largest,
+        (remaining[0].path.len() + std::mem::size_of::<fs_catalog::RebuildInput>()) as u64,
         &retention_config(),
     );
     for config in [
@@ -722,8 +723,9 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
     f.db.finish().await;
 }
 
-/// The leader's loop expires files and rebuilds the table on its own
-/// interval.
+/// The leader's loop expires files and rebuilds the tables on its own
+/// interval, and a tenant whose rebuild fails does not keep the others
+/// from theirs: it is tried again on the next tick.
 #[tokio::test]
 async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
     let Some(f) = fixture().await else { return };
@@ -747,14 +749,45 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
         ("http.route", "/b"),
     )
     .await;
+    let other =
+        f.db.catalog
+            .create_tenant(&NewTenant {
+                retention_days: 1,
+                ..NewTenant::with_defaults("other")
+            })
+            .await
+            .unwrap()
+            .id;
+    let half = 30 * 60_000_000_000;
+    write_l0_for(&f, other, "api", 5, f.at(-2) + half, 3, ("db.system", "pg")).await;
+    write_l0_for(
+        &f,
+        other,
+        "api",
+        6,
+        f.at(-2) + half + 60_000_000_000,
+        3,
+        ("db.system", "pg"),
+    )
+    .await;
     let c = compactor(&f);
     let fence = fence(&f).await;
-    c.compact_once(&fence).await.unwrap().unwrap();
-    c.compact_once(&fence).await.unwrap().unwrap();
+    for _ in 0..3 {
+        c.compact_once(&fence).await.unwrap().unwrap();
+    }
     f.db.catalog
         .release_lease(COMPACTOR_LEASE, "me")
         .await
         .unwrap();
+    let table_before = tables(&f).await[0].id;
+    // The first tenant's remaining L1 cannot be read until it is repaired.
+    let kept = visible(&f)
+        .await
+        .into_iter()
+        .find(|x| x.range.start >= f.cut)
+        .unwrap();
+    let good = std::fs::read(f.dir.path().join(&kept.path)).unwrap();
+    std::fs::write(f.dir.path().join(&kept.path), b"not parquet").unwrap();
 
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let stats = Arc::new(fs_compactor::Stats::default());
@@ -793,15 +826,36 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
         Arc::clone(&stats),
         rx,
     ));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while stats.retention.rebuilds.load(Ordering::Relaxed) == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "no rebuild in time");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let wait_for = |done: u64| {
+        let stats = Arc::clone(&stats);
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while stats.retention.rebuilds.load(Ordering::Relaxed) < done {
+                assert!(tokio::time::Instant::now() < deadline, "no rebuild in time");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    wait_for(1).await;
+    assert_eq!(
+        tables_of(&f, other).await.len(),
+        0,
+        "the other tenant's table went"
+    );
+    assert_eq!(
+        tables(&f).await[0].id,
+        table_before,
+        "the failed tenant's stays"
+    );
+    assert!(stats.retention.rebuild_failures.load(Ordering::Relaxed) >= 1);
+    std::fs::write(f.dir.path().join(&kept.path), good).unwrap();
+    wait_for(2).await;
     shutdown.send(true).unwrap();
     task.await.unwrap();
-    assert_eq!(stats.retention.expired.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.retention.expired.load(Ordering::Relaxed), 2);
     assert_eq!(visible(&f).await.len(), 1, "the L1 of the hour kept");
-    assert_eq!(keys_of(&f, &tables(&f).await[0]).len(), 2);
+    let table = tables(&f).await;
+    assert_ne!(table[0].id, table_before, "rebuilt once repaired");
+    assert_eq!(keys_of(&f, &table[0]).len(), 2);
     f.db.finish().await;
 }
