@@ -24,6 +24,8 @@ use crate::spans_table::SpansTable;
 pub const CATALOG: &str = "fusescope";
 /// Schema name.
 pub const SCHEMA: &str = "public";
+/// Name of the spans table in every session.
+pub const SPANS_TABLE: &str = "spans";
 
 /// Builds a session that only sees `tenant`'s tables and cannot write.
 ///
@@ -61,7 +63,7 @@ pub fn tenant_session(
 
     let schema = Arc::new(MemorySchemaProvider::new());
     schema.register_table(
-        "spans".into(),
+        SPANS_TABLE.into(),
         Arc::new(
             SpansTable::new(tenant, cache, store_url.clone(), bytes_budget)
                 .with_hot_window(hot, warnings)

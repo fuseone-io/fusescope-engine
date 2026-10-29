@@ -7,6 +7,7 @@
 //! page indexes narrow further inside DataFusion. A per-tenant byte budget
 //! refuses scans that would read too much.
 
+pub mod actions;
 pub mod files;
 pub mod flight;
 pub mod hot;
@@ -52,6 +53,9 @@ pub enum QueryError {
     /// Unknown tenant.
     #[error("unknown tenant")]
     UnknownTenant,
+    /// An action body that does not describe a valid request.
+    #[error("invalid action: {0}")]
+    InvalidAction(String),
     /// A lock around the prepared plans was poisoned by a panic.
     #[error("prepared plans unavailable")]
     Poisoned,

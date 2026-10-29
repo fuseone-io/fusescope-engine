@@ -6,19 +6,23 @@
 //! The ticket is the tenant id followed by the SQL, unchanged since before
 //! plans were kept, so a ticket issued by either version executes on the
 //! other: `DoGet` re-authenticates, refuses a ticket from another tenant,
-//! and plans the SQL again only when no kept plan matches it.
+//! and plans the SQL again only when no kept plan matches it. The typed
+//! actions of [`crate::actions`] arrive through `DoAction` and answer in
+//! Arrow IPC.
 
 use std::pin::Pin;
 
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, SqlInfo, TicketStatementQuery};
-use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use arrow_flight::{Action, ActionType, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use datafusion::execution::SendableRecordBatchStream;
 use fs_catalog::{Catalog, TenantId, TokenScope};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use tokio::sync::watch;
 use tonic::metadata::MetadataMap;
@@ -26,7 +30,8 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::QueryError;
-use crate::querier::Querier;
+use crate::actions::{TRACE_LOOKUP, TraceLookup};
+use crate::querier::{Querier, QueryLimits, QueryWarnings};
 
 /// Response header set when the result may be incomplete, with the reasons.
 pub const PARTIAL_HEADER: &str = "x-fusescope-partial";
@@ -113,9 +118,71 @@ fn decode_ticket(handle: &[u8]) -> Result<(TenantId, String), Status> {
     Ok((TenantId(tenant), sql.to_owned()))
 }
 
+/// Applies the row cap and the deadline to `stream`.
+fn bound_rows(
+    stream: SendableRecordBatchStream,
+    limits: QueryLimits,
+) -> impl Stream<Item = Result<RecordBatch, QueryError>> + Send + 'static {
+    let mut rows = 0usize;
+    let deadline = tokio::time::Instant::now() + limits.timeout;
+    stream.map(move |batch| {
+        let batch = batch?;
+        rows += batch.num_rows();
+        if rows > limits.max_rows {
+            return Err(QueryError::TooManyRows(limits.max_rows));
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(QueryError::Timeout(limits.timeout));
+        }
+        Ok(batch)
+    })
+}
+
+/// Encodes `batches` as one Arrow IPC stream, one `Result` body per batch
+/// with the schema ahead of the first and the end-of-stream marker last.
+fn ipc_results(
+    schema: &SchemaRef,
+    batches: impl Stream<Item = Result<RecordBatch, QueryError>> + Send + 'static,
+) -> Result<impl Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static, Status> {
+    let internal = |e: arrow::error::ArrowError| Status::internal(e.to_string());
+    let writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema).map_err(internal)?;
+    let body = |writer: &mut arrow::ipc::writer::StreamWriter<Vec<u8>>| arrow_flight::Result {
+        body: std::mem::take(writer.get_mut()).into(),
+    };
+    Ok(futures_util::stream::try_unfold(
+        (writer, Box::pin(batches), false),
+        move |(mut writer, mut batches, done)| async move {
+            if done {
+                return Ok(None);
+            }
+            match batches.next().await {
+                Some(Ok(batch)) => {
+                    writer.write(&batch).map_err(internal)?;
+                    Ok(Some((body(&mut writer), (writer, batches, false))))
+                }
+                Some(Err(e)) => Err(status_of(&e)),
+                None => {
+                    writer.finish().map_err(internal)?;
+                    Ok(Some((body(&mut writer), (writer, batches, true))))
+                }
+            }
+        },
+    ))
+}
+
+fn announce_partial<T>(response: &mut Response<T>, warnings: &QueryWarnings) {
+    let warnings = warnings.list();
+    if !warnings.is_empty() {
+        if let Ok(value) = warnings.join("; ").parse() {
+            response.metadata_mut().insert(PARTIAL_HEADER, value);
+        }
+    }
+}
+
 fn status_of(error: &QueryError) -> Status {
     match error {
         QueryError::NotAllowed(_) => Status::permission_denied(error.to_string()),
+        QueryError::InvalidAction(_) => Status::invalid_argument(error.to_string()),
         QueryError::OverBudget { .. } | QueryError::TooManyRows(_) => {
             Status::resource_exhausted(error.to_string())
         }
@@ -196,26 +263,8 @@ impl FlightSqlService for FlightSql {
                 .map_err(|e| status_of(&e))?,
         };
         let schema = stream.schema();
-        let max_rows = limits.max_rows;
-        let mut rows = 0usize;
-        let deadline = tokio::time::Instant::now() + limits.timeout;
-        let limited = stream.map(
-            move |batch| -> Result<arrow::record_batch::RecordBatch, FlightError> {
-                let batch = batch.map_err(|e| FlightError::ExternalError(Box::new(e)))?;
-                rows += batch.num_rows();
-                if rows > max_rows {
-                    return Err(FlightError::ExternalError(Box::new(
-                        QueryError::TooManyRows(max_rows),
-                    )));
-                }
-                if tokio::time::Instant::now() > deadline {
-                    return Err(FlightError::ExternalError(Box::new(QueryError::Timeout(
-                        limits.timeout,
-                    ))));
-                }
-                Ok(batch)
-            },
-        );
+        let limited =
+            bound_rows(stream, limits).map_err(|e| FlightError::ExternalError(Box::new(e)));
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(limited)
@@ -228,13 +277,51 @@ impl FlightSqlService for FlightSql {
                         + 'static,
                 >,
             >);
-        let warnings = warnings.list();
-        if !warnings.is_empty() {
-            if let Ok(value) = warnings.join("; ").parse() {
-                response.metadata_mut().insert(PARTIAL_HEADER, value);
-            }
-        }
+        announce_partial(&mut response, &warnings);
         Ok(response)
+    }
+
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let action = request.get_ref();
+        if action.r#type != TRACE_LOOKUP {
+            return Err(Status::unimplemented(format!(
+                "unknown action {:?}",
+                action.r#type
+            )));
+        }
+        let tenant = self.authenticate(request.metadata()).await?;
+        let query = TraceLookup::parse(&action.body)
+            .and_then(|lookup| lookup.query())
+            .map_err(|e| status_of(&e))?;
+        let (stream, warnings) = self
+            .querier
+            .trace_lookup(tenant, query)
+            .await
+            .map_err(|e| status_of(&e))?;
+        let schema = stream.schema();
+        let results = ipc_results(&schema, bound_rows(stream, self.querier.limits()))?;
+        let mut response = Response::new(Box::pin(results)
+            as Pin<
+                Box<
+                    dyn futures_util::Stream<Item = Result<arrow_flight::Result, Status>>
+                        + Send
+                        + 'static,
+                >,
+            >);
+        announce_partial(&mut response, &warnings);
+        Ok(response)
+    }
+
+    async fn list_custom_actions(&self) -> Option<Vec<Result<ActionType, Status>>> {
+        Some(vec![Ok(ActionType {
+            r#type: TRACE_LOOKUP.into(),
+            description: "Spans of one trace in timestamp order, as an Arrow IPC stream; \
+                          body {\"trace_id\": hex, \"start_unix_nano\"?, \"end_unix_nano\"?}"
+                .into(),
+        })])
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}

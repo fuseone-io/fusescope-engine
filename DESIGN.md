@@ -688,6 +688,20 @@ by the engine: `attr_string(attributes, 'http.method')`, `attr_number(...)`,
 | `catalog.estimate` | tenant, SQL | bytes, files, row groups after pruning | `TelemetryStore.Estimate` |
 | `catalog.explain` | tenant, SQL | logical and physical plan | `TelemetryStore.Plan` and `Indexes` |
 
+An action is authenticated like a statement; the tenant is the token's.
+Its body is JSON and its results are one Arrow IPC stream split in order
+across the `Result` bodies: concatenated, they are the stream, the schema
+in the first body, the end-of-stream marker in the last, which is how the
+Go `Do` hands back an `arrow.RecordReader`. The row cap, the timeout and
+the `x-fusescope-partial` header apply as for `DoGet`; `ListActions` names
+the actions served. `trace.lookup` takes `{"trace_id": "<32 hex digits>",
+"start_unix_nano": n, "end_unix_nano": n}`, the bounds optional and
+inclusive, and answers every column of the spans table for that trace in
+`timestamp` order; it goes through the spans table like SQL would, so the
+`trace_id` sidecars, the hot window and the byte budget apply, without
+parsing or planning SQL (`fusescope_query_trace_lookups_total`). An unknown
+action is `UNIMPLEMENTED`, a malformed body `INVALID_ARGUMENT`.
+
 ### 8.2 Changes in Go
 
 | Where | Change |

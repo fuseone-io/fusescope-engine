@@ -13,15 +13,19 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arrow::array::AsArray;
+use arrow::array::FixedSizeBinaryArray;
 use arrow::datatypes::Int64Type;
+use arrow::datatypes::TimestampNanosecondType;
 use arrow::record_batch::RecordBatch;
-use arrow_flight::Ticket;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::sql::{Any, TicketStatementQuery};
+use arrow_flight::{Action, Empty, Ticket};
 use datafusion::logical_expr::{col, lit};
 use datafusion::scalar::ScalarValue;
 use fs_catalog::{Catalog, NewTenant, TenantId, TokenScope};
 use fs_ingest::flush;
+use fs_query::actions::{TRACE_LOOKUP, TraceLookup};
 use fs_query::flight::FlightSql;
 use fs_query::querier::{MAX_PREPARED_TTL, PREPARED_PLAN_OVERHEAD};
 use fs_query::{Querier, QueryError, QueryLimits};
@@ -923,6 +927,167 @@ async fn a_ticket_whose_plan_is_gone_plans_again() {
     );
     assert_eq!(counters.prepared_hits.load(Ordering::Relaxed), hits + 3);
     assert_eq!(f.querier.prepared_count(), 0);
+
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
+async fn lookup(
+    client: &mut FlightSqlServiceClient<Channel>,
+    body: &str,
+) -> Result<Vec<RecordBatch>, tonic::Status> {
+    let action = Action {
+        r#type: TRACE_LOOKUP.into(),
+        body: body.to_owned().into(),
+    };
+    let results: Vec<arrow_flight::Result> = client
+        .do_action(action)
+        .await
+        .map_err(|e| match e {
+            arrow_flight::error::FlightError::Tonic(status) => *status,
+            other => tonic::Status::internal(other.to_string()),
+        })?
+        .try_collect()
+        .await?;
+    let mut stream = Vec::new();
+    for result in results {
+        stream.extend_from_slice(&result.body);
+    }
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(stream), None)
+        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| tonic::Status::internal(e.to_string()))
+}
+
+fn timestamps(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("timestamp")
+                .unwrap()
+                .as_primitive::<TimestampNanosecondType>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// `trace.lookup` answers with the spans of one trace, in timestamp order,
+/// as one Arrow IPC stream split across the result bodies; an optional
+/// range narrows it with inclusive bounds; the tenant sees only its own
+/// traces; a bad body or an unknown action is refused with the right code.
+#[tokio::test]
+async fn trace_lookup_action_returns_the_spans_of_one_trace() {
+    let Some(f) = fixture().await else { return };
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let counters = f.querier.stats();
+
+    let trace = "02".repeat(16);
+    let body = serde_json::to_string(&TraceLookup {
+        trace_id: trace.clone(),
+        start_unix_nano: None,
+        end_unix_nano: None,
+    })
+    .unwrap();
+    let batches = lookup(&mut client, &body).await.unwrap();
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 5, "trace 2 has 5 spans in the worker file");
+    let first = T0 + 60_000_000_000;
+    let expected: Vec<i64> = (0..5)
+        .map(|i| i64::try_from(first + i * 1_000_000).unwrap())
+        .collect();
+    assert_eq!(timestamps(&batches), expected, "timestamp order");
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("trace_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert!(ids.iter().all(|id| id == Some(&[2u8; 16][..])));
+    }
+    assert_eq!(counters.trace_lookups.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.plannings.load(Ordering::Relaxed), 0, "no SQL");
+
+    let narrowed = serde_json::json!({
+        "trace_id": trace,
+        "start_unix_nano": first,
+        "end_unix_nano": first + 1_000_000,
+    });
+    let batches = lookup(&mut client, &narrowed.to_string()).await.unwrap();
+    assert_eq!(timestamps(&batches), &expected[..2], "inclusive bounds");
+
+    let unknown = serde_json::json!({ "trace_id": "ff".repeat(16) });
+    let batches = lookup(&mut client, &unknown.to_string()).await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+
+    let other_tenants = serde_json::json!({ "trace_id": "09".repeat(16) });
+    let batches = lookup(&mut client, &other_tenants.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0,
+        "trace 9 belongs to the other tenant"
+    );
+
+    for bad in [
+        "not json",
+        r#"{"trace_id": "0102"}"#,
+        r#"{"trace_id": "zz".repeat(16)}"#,
+        &serde_json::json!({ "trace_id": trace, "start_unix_nano": first + 1, "end_unix_nano": first })
+            .to_string(),
+    ] {
+        let err = lookup(&mut client, bad).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{bad}: {err}");
+    }
+    let err = client
+        .do_action(Action {
+            r#type: "trace.delete".into(),
+            body: body.clone().into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::Unimplemented),
+        "{err}"
+    );
+
+    let mut anon = sql_client(addr, "nope").await;
+    let err = lookup(&mut anon, &body).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    let mut raw = FlightServiceClient::new(
+        Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let listed: Vec<arrow_flight::ActionType> = raw
+        .list_actions(Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        listed.iter().any(|a| a.r#type == TRACE_LOOKUP),
+        "{listed:?}"
+    );
 
     shutdown.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)

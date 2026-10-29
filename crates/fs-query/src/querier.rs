@@ -6,17 +6,21 @@ use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{LogicalPlan, col, lit};
+use datafusion::scalar::ScalarValue;
 use fs_catalog::{Catalog, TenantId};
+use fs_schema::spans::col as span_col;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
 use tracing::info;
 
 use crate::QueryError;
+use crate::actions::TraceQuery;
 use crate::files::FileCache;
-use crate::session::{plan_read_only, tenant_session};
+use crate::session::{SPANS_TABLE, plan_read_only, tenant_session};
 
 /// Notes a query collected while planning, for example ingesters that did
 /// not answer. Stored as a session extension so table providers can reach it.
@@ -62,6 +66,8 @@ pub struct QueryStats {
     pub prepared_bytes: std::sync::atomic::AtomicU64,
     /// Statements that failed to plan or were refused.
     pub errors: std::sync::atomic::AtomicU64,
+    /// `trace.lookup` actions served.
+    pub trace_lookups: std::sync::atomic::AtomicU64,
     /// Rows returned by `collect`.
     pub rows: std::sync::atomic::AtomicU64,
     /// Hot-window fan-outs performed.
@@ -236,14 +242,29 @@ impl Querier {
         &self,
         tenant: TenantId,
         sql: &str,
-    ) -> Result<
-        (
-            datafusion::execution::context::SessionContext,
-            LogicalPlan,
-            Arc<QueryWarnings>,
-        ),
-        QueryError,
-    > {
+    ) -> Result<(SessionContext, LogicalPlan, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings) = self.session(tenant).await?;
+        self.stats
+            .plannings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plan = match plan_read_only(&ctx, sql).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.stats
+                    .errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        Ok((ctx, plan, warnings))
+    }
+
+    /// A session scoped to `tenant`, with its byte budget, and the warnings
+    /// its table providers report into. Counts as a query.
+    async fn session(
+        &self,
+        tenant: TenantId,
+    ) -> Result<(SessionContext, Arc<QueryWarnings>), QueryError> {
         let budget = self
             .catalog
             .tenant(tenant)
@@ -266,19 +287,47 @@ impl Querier {
             budget,
             self.limits.batch_size,
         )?;
+        Ok((ctx, warnings))
+    }
+
+    /// The spans of one trace for `tenant`, in `timestamp` order, within
+    /// the query's bounds when it has them. Goes through the spans table
+    /// like SQL would, so the sidecars, the hot window and the budget all
+    /// apply, without parsing or planning SQL.
+    ///
+    /// # Errors
+    /// Unknown tenant, planning or execution failure.
+    pub async fn trace_lookup(
+        &self,
+        tenant: TenantId,
+        query: TraceQuery,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings) = self.session(tenant).await?;
         self.stats
-            .plannings
+            .trace_lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let plan = match plan_read_only(&ctx, sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                self.stats
-                    .errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(e);
-            }
+        let timestamp = |ns: i64| {
+            lit(ScalarValue::TimestampNanosecond(
+                Some(ns),
+                Some("UTC".into()),
+            ))
         };
-        Ok((ctx, plan, warnings))
+        let mut frame = ctx
+            .table(SPANS_TABLE)
+            .await?
+            .filter(col(span_col::TRACE_ID).eq(lit(ScalarValue::FixedSizeBinary(
+                16,
+                Some(query.trace_id.to_vec()),
+            ))))?;
+        if let Some(start) = query.start_ns {
+            frame = frame.filter(col(span_col::TIMESTAMP).gt_eq(timestamp(start)))?;
+        }
+        if let Some(end) = query.end_ns {
+            frame = frame.filter(col(span_col::TIMESTAMP).lt_eq(timestamp(end)))?;
+        }
+        let frame = frame.sort(vec![col(span_col::TIMESTAMP).sort(true, false)])?;
+        let stream = frame.execute_stream().await?;
+        Ok((stream, warnings))
     }
 
     /// Plans `sql` for `tenant`, returns the result schema and keeps the
