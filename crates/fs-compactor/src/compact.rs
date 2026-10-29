@@ -221,13 +221,19 @@ impl Compactor {
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         let owned: Vec<FileRecord> = inputs.to_vec();
-        let max_new_keys = self
+        let max_keys_hour = self
             .catalog
             .tenant(tenant)
             .await?
             .ok_or(CompactError::TenantGone(tenant))
             .map(|t| usize::try_from(t.max_keys_hour).unwrap_or(0))?;
         let (table_before, replaced) = self.table_before(tenant).await?;
+        // The hour's budget is what the table remembers admitting on it,
+        // so passes of one hour share it, across restarts and pass sizes.
+        let hour_ns = hour
+            .timestamp_nanos_opt()
+            .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
+        let max_new_keys = max_keys_hour.saturating_sub(table_before.admitted_in(hour_ns));
         let mut merger = L1Merger::open(
             Arc::clone(&self.store),
             &self.root,

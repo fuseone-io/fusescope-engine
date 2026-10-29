@@ -57,7 +57,8 @@ pub struct MergeConfig {
     pub row_group_rows: usize,
     /// An output closes once its bytes reach this.
     pub target_bytes: usize,
-    /// Most keys new to the `attribute_keys` table one merge admits.
+    /// Most keys new to the `attribute_keys` table this merge admits: what
+    /// is left of the tenant's `max_keys_hour` for the hour being merged.
     pub max_new_keys: usize,
 }
 
@@ -72,6 +73,8 @@ pub struct L1Merger {
     /// Set once the inputs are spent.
     done: bool,
     keys: KeyStats,
+    /// `hour` in nanoseconds, the budget the merge admits keys on.
+    hour_ns: i64,
 }
 
 impl L1Merger {
@@ -92,6 +95,9 @@ impl L1Merger {
     ) -> Result<Self, CompactError> {
         let schema = span_schema_v1();
         let merge = Merge::open(store, inputs, &schema, config.row_group_rows).await?;
+        let hour_ns = hour
+            .timestamp_nanos_opt()
+            .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
         Ok(Self {
             schema,
             merge,
@@ -101,6 +107,7 @@ impl L1Merger {
             config,
             done: false,
             keys,
+            hour_ns,
         })
     }
 
@@ -127,7 +134,8 @@ impl L1Merger {
             .next_group(&self.schema, self.config.row_group_rows)
             .await?
         {
-            self.keys.absorb(&group, self.config.max_new_keys)?;
+            self.keys
+                .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
                 return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
