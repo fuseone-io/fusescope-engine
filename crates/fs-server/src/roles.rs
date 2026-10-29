@@ -104,15 +104,14 @@ pub async fn ingester(
     };
     ctx.health.wal(true);
     let (otlp_tx, otlp_rx) = tokio::sync::oneshot::channel();
-    let came_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let up = tokio::spawn({
         let health = Arc::clone(&ctx.health);
-        let came_up = Arc::clone(&came_up);
         async move {
-            if otlp_rx.await.is_ok() {
+            let bound = otlp_rx.await.is_ok();
+            if bound {
                 health.role_up();
-                came_up.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            bound
         }
     });
     // The server ending, by the stop or by a failure such as a port it
@@ -125,8 +124,9 @@ pub async fn ingester(
             std::future::pending::<()>().await;
         } => Ok(()),
     };
-    up.abort();
-    if came_up.load(std::sync::atomic::Ordering::SeqCst) {
+    // The server is done, so the sender was sent or dropped: the task ends
+    // on its own, and its answer says whether the role ever came up.
+    if up.await.unwrap_or(false) {
         ctx.health.role_down();
     }
     ctx.health.wal(false);
@@ -160,15 +160,14 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     let service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
     info!(role = "querier", %listen, "ready");
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-    let came_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let up = tokio::spawn({
         let health = Arc::clone(&ctx.health);
-        let came_up = Arc::clone(&came_up);
         async move {
-            if bound_rx.await.is_ok() {
+            let bound = bound_rx.await.is_ok();
+            if bound {
                 health.role_up();
-                came_up.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            bound
         }
     });
     // The server ending ends the follower with it, so a port that cannot
@@ -180,8 +179,7 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
             std::future::pending::<()>().await;
         } => Ok(()),
     };
-    up.abort();
-    if came_up.load(std::sync::atomic::Ordering::SeqCst) {
+    if up.await.unwrap_or(false) {
         ctx.health.role_down();
     }
     served?;
