@@ -595,13 +595,35 @@ mod sandbox {
         };
     }
 
+    /// The statement never reaches execution: `Querier::plan` alone fails,
+    /// with a parser or planner error whose message names `$needle`.
     macro_rules! refuses_at_planning {
-        ($name:ident, $sql:expr) => {
+        ($name:ident, $sql:expr, $needle:expr) => {
             #[tokio::test]
             async fn $name() {
+                use datafusion::error::DataFusionError;
                 let Some(f) = fixture().await else { return };
-                let err = refused(&f, $sql).await;
-                assert!(matches!(err, QueryError::DataFusion(_)), "{err}");
+                let err = f
+                    .querier
+                    .plan(f.tenant, $sql)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{}: planned", $sql));
+                assert!(
+                    matches!(
+                        err,
+                        QueryError::DataFusion(ref e)
+                            if matches!(e.find_root(), DataFusionError::Plan(_) | DataFusionError::SQL(..))
+                    ),
+                    "{}: not a parser or planner error: {err}",
+                    $sql
+                );
+                assert!(
+                    err.to_string().contains($needle),
+                    "{}: expected {:?} in {err}",
+                    $sql,
+                    $needle
+                );
                 spans_untouched(&f).await;
                 f.db.finish().await;
             }
@@ -647,6 +669,12 @@ mod sandbox {
     );
     refuses!(update, "update spans set name = 'x'", "UPDATE");
     refuses!(delete, "delete from spans", "DELETE");
+    // A query by statement that plans to DDL: only the plan walk sees it.
+    refuses!(
+        select_into,
+        "select * into t from spans",
+        "writes or changes state"
+    );
     refuses!(
         merge,
         "merge into spans using spans s on true when matched then delete",
@@ -654,27 +682,45 @@ mod sandbox {
     );
     // Files
     refuses!(copy_to, "copy (select 1) to '/tmp/x.parquet'", "COPY");
-    refuses_at_planning!(copy_from, "copy spans from '/etc/passwd'");
+    refuses_at_planning!(copy_from, "copy spans from '/etc/passwd'", "Expected");
     refuses!(
         create_external_table,
         "create external table x stored as parquet location '/etc/passwd'",
         "CREATE EXTERNAL TABLE"
     );
-    refuses_at_planning!(read_parquet, "select * from read_parquet('/etc/passwd')");
-    refuses_at_planning!(read_csv, "select * from read_csv('/etc/passwd')");
-    refuses_at_planning!(read_json, "select * from read_json('/etc/passwd')");
-    refuses_at_planning!(read_avro, "select * from read_avro('/etc/passwd')");
+    refuses_at_planning!(
+        read_parquet,
+        "select * from read_parquet('/etc/passwd')",
+        "read_parquet"
+    );
+    refuses_at_planning!(
+        read_csv,
+        "select * from read_csv('/etc/passwd')",
+        "read_csv"
+    );
+    refuses_at_planning!(
+        read_json,
+        "select * from read_json('/etc/passwd')",
+        "read_json"
+    );
+    refuses_at_planning!(
+        read_avro,
+        "select * from read_avro('/etc/passwd')",
+        "read_avro"
+    );
     refuses_at_planning!(
         parquet_metadata,
-        "select * from parquet_metadata('/etc/passwd')"
+        "select * from parquet_metadata('/etc/passwd')",
+        "parquet_metadata"
     );
     refuses_at_planning!(
         table_function_in_a_subquery,
-        "select n from (select count(*) as n from read_parquet('/etc/passwd'))"
+        "select n from (select count(*) as n from read_parquet('/etc/passwd'))",
+        "read_parquet"
     );
     // Session state
     refuses!(set, "set datafusion.execution.batch_size = 1", "SET");
-    refuses_at_planning!(set_variable, "set variable x = 1");
+    refuses_at_planning!(set_variable, "set variable x = 1", "Expected");
     refuses!(reset, "reset datafusion.execution.batch_size", "RESET");
     refuses!(show_tables, "show tables", "non-query");
     refuses!(begin_transaction, "begin", "non-query");

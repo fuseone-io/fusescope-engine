@@ -104,21 +104,46 @@ pub async fn plan_read_only(ctx: &SessionContext, sql: &str) -> Result<LogicalPl
     let statement = state.sql_to_statement(sql, &Dialect::PostgreSQL)?;
     check_statement(&statement)?;
     let plan = state.statement_to_plan(statement).await?;
-    let writes = plan.exists(|node| {
-        Ok(matches!(
-            node,
-            LogicalPlan::Ddl(_)
-                | LogicalPlan::Dml(_)
-                | LogicalPlan::Copy(_)
-                | LogicalPlan::Statement(_)
-        ))
-    })?;
+    let writes = plan.exists(|node| Ok(!reads(node)))?;
     if writes {
         return Err(QueryError::NotAllowed(
             "statement writes or changes state".into(),
         ));
     }
     Ok(plan)
+}
+
+/// True for a plan node that only reads. Every variant is named, so a
+/// node DataFusion adds later fails to compile here and gets reviewed
+/// instead of passing; `Extension` is refused because it is anything.
+fn reads(node: &LogicalPlan) -> bool {
+    match node {
+        LogicalPlan::Projection(_)
+        | LogicalPlan::Filter(_)
+        | LogicalPlan::Window(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::Repartition(_)
+        | LogicalPlan::Union(_)
+        | LogicalPlan::TableScan(_)
+        | LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::Subquery(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::Explain(_)
+        | LogicalPlan::Analyze(_)
+        | LogicalPlan::Distinct(_)
+        | LogicalPlan::DescribeTable(_)
+        | LogicalPlan::Unnest(_)
+        | LogicalPlan::RecursiveQuery(_) => true,
+        LogicalPlan::Statement(_)
+        | LogicalPlan::Extension(_)
+        | LogicalPlan::Dml(_)
+        | LogicalPlan::Ddl(_)
+        | LogicalPlan::Copy(_) => false,
+    }
 }
 
 /// Refuses anything but a query, looking through `EXPLAIN` and
