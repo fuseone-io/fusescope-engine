@@ -640,22 +640,28 @@ in under the fence, the table before quarantined with it, or the table
 before is swapped out alone, without being read, when nothing remains. A
 rebuild that does not commit, for a lost lease, a conflict, an unreadable
 table before or L1 file, or a crash, leaves the table before in place and
-the new table an orphan (`fusescope_retention_rebuild_*`), and holds the
-tenant back for the rest of the tick so the other tenants' tables are
-rebuilt; it is tried again on the next tick. A rebuild is admitted by what
-it reads and by what it holds: a tenant whose remaining L1 files exceed
-`compactor.rebuild_max_input_bytes`, or whose rebuild would hold more
-than `compactor.rebuild_max_bytes` at its peak, keeps its table and is
-reported once, and the operator raises the cap or waits for retention to
-shrink the set. The peak is counted by the worst case the ingest limits
-allow (`rebuild_footprint`): the table before as fetched and as decoded,
-by its row count, the rebuilt table, its arrays and its Parquet bytes,
-the column chunks of the largest L1 file, read one file and one row group
-at a time, and one decoded batch of `REBUILD_BATCH_ROWS` spans with every
-attribute map full, the only part of the peak the row count of the table
-does not bound; the server refuses a budget below one L1 file of
-`l1_target_bytes` plus that batch. The totals are read from the catalog
-before any file is listed.
+the new table an orphan (`fusescope_retention_rebuild_*`). A failure on
+the tenant's own files, the table before or an L1 unreadable, holds the
+tenant back for the rest of the tick and the leader's loop goes on to the
+next tenant, so one damaged tenant never keeps the others' tables stale;
+it is tried again on the next tick. A lost lease ends the tick's work and
+a catalog failure ends the rebuilds for the tick. A rebuild is admitted
+by what it reads and by what it holds: a tenant whose remaining L1 files
+exceed `compactor.rebuild_max_input_bytes`, or whose rebuild would hold
+more than `compactor.rebuild_max_bytes` at its peak, keeps its table and
+is reported once, and the operator raises the cap or waits for retention
+to shrink the set. The peak is counted by the worst case the ingest
+limits allow (`rebuild_footprint`): the list of inputs, the table before
+as fetched and as decoded, by its row count, the rebuilt table, its
+arrays and its Parquet bytes, the column chunks of the largest L1 file,
+read one file and one row group at a time, and one decoded batch of
+`REBUILD_BATCH_ROWS` spans with every attribute map full, the only part of
+the peak the row count of the table does not bound; the server refuses a
+budget below one L1 file of `l1_target_bytes` plus that batch. The inputs
+are listed as path and size only, a page at a time in one repeatable-read
+snapshot (`rebuild_inputs`), and the budget sees each page as it arrives
+and ends the read on the first one that does not fit, so a list beyond
+the budget is never held whole and what was admitted is what was read.
 
 ### 7.2 Orphan sweep
 
