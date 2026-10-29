@@ -988,9 +988,12 @@ impl Config {
 
     /// The ingest bounds the runtime or the cut enforces as hard ceilings.
     fn validate_server(&self) -> Result<(), ServerError> {
-        if self.server.health_interval_secs == 0 || self.server.drain_timeout_secs == 0 {
+        let day = 86_400;
+        let within = |secs: u64| (1..=day).contains(&secs);
+        if !within(self.server.health_interval_secs) || !within(self.server.drain_timeout_secs) {
             return Err(ServerError::InvalidConfig(
-                "server.health_interval_secs and server.drain_timeout_secs must be positive".into(),
+                "server.health_interval_secs and server.drain_timeout_secs must be between 1 and 86400"
+                    .into(),
             ));
         }
         Ok(())

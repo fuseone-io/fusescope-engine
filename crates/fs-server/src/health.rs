@@ -110,9 +110,18 @@ impl Health {
         self.up.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// One role stopped serving.
+    /// One role stopped serving; never below none.
     pub fn role_down(&self) {
-        self.up.fetch_sub(1, Ordering::SeqCst);
+        let mut up = self.up.load(Ordering::SeqCst);
+        while up > 0 {
+            match self
+                .up
+                .compare_exchange(up, up - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(now) => up = now,
+            }
+        }
     }
 
     /// A stop was asked for: not ready from here on.
@@ -152,7 +161,7 @@ impl Health {
             WalState::None
         };
         Readiness {
-            ready: up >= expected
+            ready: up == expected
                 && expected > 0
                 && !draining
                 && catalog_ok
@@ -197,6 +206,23 @@ mod tests {
         let verdict = health.readiness();
         assert!(!verdict.ready && verdict.draining);
         assert!(verdict.render().starts_with("not ready\n"));
+    }
+
+    #[test]
+    fn a_role_going_down_without_having_come_up_changes_nothing() {
+        let health = Health::default();
+        health.expect(1, false);
+        health.catalog(true);
+        health.bucket(true);
+        health.role_down();
+        assert_eq!(health.readiness().roles, (0, 1));
+        health.role_up();
+        assert!(health.readiness().ready);
+        health.role_up();
+        assert!(
+            !health.readiness().ready,
+            "more roles than expected is not ready either"
+        );
     }
 
     #[test]

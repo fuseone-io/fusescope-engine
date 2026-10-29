@@ -224,20 +224,7 @@ pub async fn run_with(
         }
     });
 
-    let mut http: JoinSet<Result<(), ServerError>> = JoinSet::new();
-    if !ctx.config.server.metrics_addr.is_empty() {
-        let listen: std::net::SocketAddr = ctx.config.server.metrics_addr.parse().map_err(|e| {
-            ServerError::InvalidConfig(format!(
-                "server.metrics_addr {:?}: {e}",
-                ctx.config.server.metrics_addr
-            ))
-        })?;
-        let metrics = Arc::clone(&ctx.metrics);
-        let health = Arc::clone(&ctx.health);
-        let rx = http_stop_rx.clone();
-        http.spawn(async move { crate::metrics::serve(listen, metrics, health, rx, None).await });
-    }
-    http.spawn(probe(ctx.clone(), http_stop_rx));
+    let mut http = start_health(&ctx, http_stop_rx, &forwarder).await?;
 
     let mut tasks: JoinSet<(&'static str, Result<(), ServerError>)> = JoinSet::new();
     for r in role.expand() {
@@ -256,45 +243,7 @@ pub async fn run_with(
     }
 
     let drain = Duration::from_secs(ctx.config.server.drain_timeout_secs);
-    let mut first_error: Option<ServerError> = None;
-    let mut draining_since: Option<tokio::time::Instant> = None;
-    let mut stop_rx = stop_rx;
-    loop {
-        let deadline = draining_since.map(|since| since + drain);
-        let joined = tokio::select! {
-            joined = tasks.join_next() => joined,
-            _ = stop_rx.changed(), if draining_since.is_none() => {
-                draining_since = Some(tokio::time::Instant::now());
-                continue;
-            }
-            () = async { tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)).await }, if deadline.is_some() => {
-                error!(after = ?drain, "drain deadline passed; abandoning what the roles still hold");
-                first_error.get_or_insert(ServerError::DrainTimeout(drain));
-                tasks.abort_all();
-                draining_since = None;
-                continue;
-            }
-        };
-        let Some(joined) = joined else { break };
-        match joined {
-            Ok((_, Ok(()))) => {}
-            Ok((name, Err(e))) => {
-                error!(role = name, error = %e, "role failed");
-                first_error.get_or_insert(e);
-                forwarder.abort();
-                tasks.abort_all();
-            }
-            Err(join) if join.is_cancelled() => {}
-            Err(join) => {
-                let e = ServerError::RoleStopped {
-                    role: "unknown",
-                    reason: join.to_string(),
-                };
-                first_error.get_or_insert(e);
-                tasks.abort_all();
-            }
-        }
-    }
+    let mut first_error = supervise(&mut tasks, &mut http, stop_rx, &forwarder, drain).await;
     forwarder.abort();
     let _ = http_stop_tx.send(true);
     while let Some(joined) = http.join_next().await {
@@ -305,6 +254,120 @@ pub async fn run_with(
     }
     info!("fusescope-engine stopped");
     first_error.map_or(Ok(()), Err)
+}
+
+/// Starts the health listener, bound before any role starts, and the
+/// prober; a port already taken ends the start here.
+async fn start_health(
+    ctx: &Context,
+    http_stop_rx: watch::Receiver<bool>,
+    forwarder: &tokio::task::JoinHandle<()>,
+) -> Result<JoinSet<Result<(), ServerError>>, ServerError> {
+    let mut http: JoinSet<Result<(), ServerError>> = JoinSet::new();
+    if !ctx.config.server.metrics_addr.is_empty() {
+        let listen: std::net::SocketAddr = ctx.config.server.metrics_addr.parse().map_err(|e| {
+            ServerError::InvalidConfig(format!(
+                "server.metrics_addr {:?}: {e}",
+                ctx.config.server.metrics_addr
+            ))
+        })?;
+        let metrics = Arc::clone(&ctx.metrics);
+        let health = Arc::clone(&ctx.health);
+        let rx = http_stop_rx.clone();
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        http.spawn(async move {
+            crate::metrics::serve(listen, metrics, health, rx, Some(bound_tx)).await
+        });
+        // The listener binds before any role starts: a port already taken
+        // ends the start here, not after the roles are up and unwatched.
+        if bound_rx.await.is_err() {
+            forwarder.abort();
+            let error = match http.join_next().await {
+                Some(Ok(Err(e))) => e,
+                Some(Err(join)) => ServerError::RoleStopped {
+                    role: "health",
+                    reason: join.to_string(),
+                },
+                _ => ServerError::InvalidConfig("health listener ended before binding".into()),
+            };
+            return Err(error);
+        }
+    }
+    http.spawn(probe(ctx.clone(), http_stop_rx));
+    Ok(http)
+}
+
+/// Waits for the roles, watching the health tasks with them, until every
+/// role is done: a failure anywhere stops the rest, a stop starts the
+/// drain and its deadline abandons what is still held.
+async fn supervise(
+    tasks: &mut JoinSet<(&'static str, Result<(), ServerError>)>,
+    http: &mut JoinSet<Result<(), ServerError>>,
+    mut stop_rx: watch::Receiver<bool>,
+    forwarder: &tokio::task::JoinHandle<()>,
+    drain: Duration,
+) -> Option<ServerError> {
+    let mut first_error: Option<ServerError> = None;
+    let mut draining_since: Option<tokio::time::Instant> = None;
+    loop {
+        let deadline = draining_since.map(|since| {
+            since
+                .checked_add(drain)
+                .unwrap_or_else(|| since + Duration::from_secs(86_400))
+        });
+        tokio::select! {
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else { break };
+                match joined {
+                    Ok((_, Ok(()))) => {}
+                    Ok((name, Err(e))) => {
+                        error!(role = name, error = %e, "role failed");
+                        first_error.get_or_insert(e);
+                        forwarder.abort();
+                        tasks.abort_all();
+                    }
+                    Err(join) if join.is_cancelled() => {}
+                    Err(join) => {
+                        let e = ServerError::RoleStopped {
+                            role: "unknown",
+                            reason: join.to_string(),
+                        };
+                        first_error.get_or_insert(e);
+                        tasks.abort_all();
+                    }
+                }
+            }
+            // The health listener and the prober are watched like a role:
+            // a process whose /readyz died must not run on unwatched.
+            Some(joined) = http.join_next(), if !http.is_empty() => {
+                let failure = match joined {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(join) if join.is_cancelled() => None,
+                    Err(join) => Some(ServerError::RoleStopped {
+                        role: "health",
+                        reason: join.to_string(),
+                    }),
+                };
+                if let Some(e) = failure {
+                    error!(error = %e, "health listener failed; stopping the roles");
+                    first_error.get_or_insert(e);
+                    forwarder.abort();
+                    tasks.abort_all();
+                }
+            }
+            _ = stop_rx.changed(), if draining_since.is_none() => {
+                draining_since = Some(tokio::time::Instant::now());
+            }
+            () = async { tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)).await }, if deadline.is_some() => {
+                error!(after = ?drain, "drain deadline passed; abandoning what the roles still hold");
+                first_error.get_or_insert(ServerError::DrainTimeout(drain));
+                tasks.abort_all();
+                draining_since = None;
+            }
+        }
+    }
+    first_error
 }
 
 /// Probes the catalog and the bucket every `health_interval_secs`, for

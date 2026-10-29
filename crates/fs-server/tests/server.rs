@@ -516,9 +516,18 @@ async fn readiness_follows_the_roles_and_the_drain() {
     wait_for_wal_bytes(&metrics_addr).await;
 
     tx.send(true).unwrap();
-    let (status, body) = http_get(&metrics_addr, "/readyz").await;
-    assert_eq!(status, 503, "{body}");
-    assert!(body.contains("draining=true\n"), "{body}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = http_get(&metrics_addr, "/readyz").await;
+        if status == 503 && body.contains("draining=true\n") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never draining: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (status, _) = http_get(&metrics_addr, "/healthz").await;
     assert_eq!(status, 200, "alive while draining");
     assert!(!server.is_finished(), "the drain is still going");
@@ -533,6 +542,39 @@ async fn readiness_follows_the_roles_and_the_drain() {
         "the health listener stops with the process"
     );
     catalog.pool().close().await;
+    db.finish().await;
+}
+
+/// A health listener that cannot bind ends the start before any role
+/// runs: a process without `/readyz` never runs on unwatched.
+#[tokio::test]
+async fn a_health_listener_that_cannot_bind_stops_the_process() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let mut cfg = config(dir.path());
+    cfg.server.metrics_addr = taken.local_addr().unwrap().to_string();
+    let (_tx, rx) = watch::channel(false);
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        server::run(cfg, secrets, Role::All, "test-node".into(), rx),
+    )
+    .await
+    .expect("the start ends promptly")
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&taken.local_addr().unwrap().to_string()),
+        "{err}"
+    );
+    assert!(!dir.path().join("wal").exists(), "no role ran");
+    drop(taken);
     db.finish().await;
 }
 

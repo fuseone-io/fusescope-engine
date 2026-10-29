@@ -107,17 +107,21 @@ pub async fn ingester(
     let up = {
         let health = Arc::clone(&ctx.health);
         async move {
-            if otlp_rx.await.is_ok() {
+            let bound = otlp_rx.await.is_ok();
+            if bound {
                 health.role_up();
             }
+            bound
         }
     };
-    let (served, (), ()) = tokio::join!(
+    let (served, (), came_up) = tokio::join!(
         ingester.run(shutdown.clone(), Some(otlp_tx), None),
         heartbeat,
         up
     );
-    ctx.health.role_down();
+    if came_up {
+        ctx.health.role_down();
+    }
     ctx.health.wal(false);
     served?;
     let _ = shutdown.borrow_and_update();
@@ -152,17 +156,21 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     let up = {
         let health = Arc::clone(&ctx.health);
         async move {
-            if bound_rx.await.is_ok() {
+            let bound = bound_rx.await.is_ok();
+            if bound {
                 health.role_up();
             }
+            bound
         }
     };
-    let (served, (), ()) = tokio::join!(
+    let (served, (), came_up) = tokio::join!(
         service.serve(listen, shutdown, Some(bound_tx)),
         follower,
         up
     );
-    ctx.health.role_down();
+    if came_up {
+        ctx.health.role_down();
+    }
     served?;
     info!(role = "querier", "stopped");
     Ok(())
