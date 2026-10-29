@@ -533,7 +533,7 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let got = scan(&addr, &all, Duration::from_secs(5)).await.unwrap();
     assert_eq!(
@@ -554,7 +554,7 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         columns: Some(vec!["timestamp".into(), "name".into()]),
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let got = scan(&addr, &api_names, Duration::from_secs(5))
         .await
@@ -570,7 +570,7 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
     // column's declared type, however many rows carry it.
     let names = HotScanRequest {
         columns: Some(vec!["service_name".into()]),
-        distinct: true,
+        distinct: Some(10),
         ..all.clone()
     };
     let got = scan(&addr, &names, Duration::from_secs(5)).await.unwrap();
@@ -582,11 +582,31 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         .map(|v| v.unwrap())
         .collect();
     assert_eq!(values, ["api", "worker"]);
+    let capped = scan(
+        &addr,
+        &HotScanRequest {
+            columns: Some(vec!["service_name".into()]),
+            distinct: Some(1),
+            ..all.clone()
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        capped
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1,
+        "the ingester keeps no more than the cap"
+    );
     let err = scan(
         &addr,
         &HotScanRequest {
             columns: Some(vec!["timestamp".into(), "name".into()]),
-            distinct: true,
+            distinct: Some(10),
             ..all.clone()
         },
         Duration::from_secs(5),
@@ -1123,7 +1143,7 @@ async fn a_flush_with_spans_across_an_hour_boundary_writes_one_file_per_hour() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -1776,7 +1796,7 @@ async fn hot_window_announces_prospective_file_id() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let before = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2036,7 +2056,7 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2165,7 +2185,7 @@ async fn out_of_order_pushes_keep_intent_and_file_id() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2339,7 +2359,7 @@ async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2401,7 +2421,7 @@ async fn coalesced_flush_matches_replay_byte_for_byte() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let served = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2552,7 +2572,7 @@ async fn announced_file_id_survives_a_restart_without_intent() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2741,7 +2761,7 @@ async fn hot_scan_keeps_only_the_requested_traces_and_spans() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let hot = h.hot_addr.to_string();
 
@@ -2988,7 +3008,7 @@ async fn hot_scan_skips_batches_without_the_trace() {
         columns: None,
         trace_ids: Some(vec![vec![trace; 16]]),
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let hot = h.hot_addr.to_string();
 
@@ -3101,7 +3121,7 @@ async fn oversized_requests_are_indexed_alone() {
         columns: None,
         trace_ids: Some(vec![vec![2u8; 16]]),
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let got = scan(&h.hot_addr.to_string(), &lookup, Duration::from_secs(5))
         .await
@@ -3189,7 +3209,7 @@ async fn flush_writes_row_groups_and_retains_each() {
         columns: None,
         trace_ids: Some(vec![vec![3u8; 16]]),
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let got = scan(&h.hot_addr.to_string(), &lookup, Duration::from_secs(5))
         .await
@@ -3519,7 +3539,7 @@ async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
         columns: None,
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let scanned =
         fs_ingest::hot::scan(&h.hot_addr.to_string(), &everything, Duration::from_secs(5))

@@ -272,7 +272,7 @@ pub async fn run(
         ]),
         trace_ids: None,
         span_ids: None,
-        distinct: false,
+        distinct: None,
     };
     let (filtered, d) = timed(|| {
         batches

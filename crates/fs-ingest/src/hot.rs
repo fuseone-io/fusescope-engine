@@ -61,10 +61,11 @@ pub struct HotScanRequest {
     /// Keep only these spans (8-byte ids). Absent in older tickets.
     #[serde(default)]
     pub span_ids: Option<Vec<Vec<u8>>>,
-    /// Answer the distinct values of the one projected column, as one
-    /// batch, instead of every row. Absent in older tickets.
+    /// Answer the distinct values of the one projected column, at most
+    /// this many, as one batch, instead of every row: the ingester keeps
+    /// no more than that. Absent in older tickets.
     #[serde(default)]
-    pub distinct: bool,
+    pub distinct: Option<usize>,
 }
 
 impl HotScanRequest {
@@ -263,17 +264,20 @@ struct HotService {
 }
 
 /// The distinct values of the one projected column of a scan, gathered
-/// batch by batch so no row is kept beyond its first sighting.
+/// batch by batch so no row is kept beyond its first sighting, and no
+/// more than `cap` of them, so the answer is bounded whatever the rows.
 struct Distinct {
     column: String,
+    cap: usize,
     values: std::collections::BTreeSet<String>,
 }
 
 impl Distinct {
-    fn for_request(scan: &HotScanRequest) -> Result<Self, Status> {
+    fn for_request(scan: &HotScanRequest, cap: usize) -> Result<Self, Status> {
         match scan.columns.as_deref() {
             Some([column]) => Ok(Self {
                 column: column.clone(),
+                cap,
                 values: std::collections::BTreeSet::new(),
             }),
             _ => Err(Status::invalid_argument(
@@ -287,6 +291,9 @@ impl Distinct {
         let column = batch.column(batch.schema().index_of(&self.column).map_err(invalid)?);
         let strings = cast(column, &DataType::Utf8).map_err(invalid)?;
         for value in strings.as_string::<i32>().iter().flatten() {
+            if self.values.len() >= self.cap {
+                break;
+            }
             if !self.values.contains(value) {
                 self.values.insert(value.to_owned());
             }
@@ -348,7 +355,7 @@ impl FlightService for HotService {
         let mut batches = Vec::new();
         let mut distinct = scan
             .distinct
-            .then(|| Distinct::for_request(&scan))
+            .map(|cap| Distinct::for_request(&scan, cap))
             .transpose()?;
         let mut skipped = 0u64;
         for source in sources {
@@ -485,7 +492,7 @@ mod tests {
             columns: Some(vec!["timestamp".into(), "name".into()]),
             trace_ids: None,
             span_ids: None,
-            distinct: false,
+            distinct: None,
         };
         assert_eq!(
             HotScanRequest::from_ticket(&request.to_ticket()).unwrap(),
@@ -502,6 +509,6 @@ mod tests {
         assert_eq!(decoded.tenant, request.tenant);
         assert_eq!(decoded.trace_ids, None);
         assert_eq!(decoded.span_ids, None);
-        assert!(!decoded.distinct);
+        assert_eq!(decoded.distinct, None);
     }
 }
