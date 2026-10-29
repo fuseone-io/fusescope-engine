@@ -1903,6 +1903,15 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
         ))
         .await
         .unwrap();
+    let kept_l1_later = c
+        .register_file(&file_spanning(
+            t,
+            Signal::Traces,
+            Level::L1,
+            span(2 * hour, 3 * hour),
+        ))
+        .await
+        .unwrap();
     let table = c
         .register_file(&file_spanning(
             t,
@@ -1954,7 +1963,7 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
     assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err}");
     assert_eq!(
         c.all_visible_files(t, Signal::Traces).await.unwrap().len(),
-        5,
+        6,
         "a stale fence expires nothing"
     );
 
@@ -1995,7 +2004,7 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
         .into_iter()
         .map(|f| f.id)
         .collect();
-    assert_eq!(visible, vec![kept_l1.id, kept_l0.id]);
+    assert_eq!(visible, vec![kept_l1.id, kept_l0.id, kept_l1_later.id]);
     assert_eq!(
         c.all_visible_files(other, Signal::Traces).await.unwrap()[0].id,
         others.id,
@@ -2025,26 +2034,41 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
             .is_none(),
         "one stale table"
     );
-    let remaining: Vec<_> = c
-        .visible_files_from(t, Signal::Traces, Level::L1, cut)
+    let mut pages = 0;
+    let remaining = c
+        .rebuild_inputs(t, Signal::Traces, Level::L1, cut, 1, |page| {
+            pages += 1;
+            assert_eq!(page.len(), 1, "a page of one, never an empty one");
+            true
+        })
         .await
         .unwrap()
-        .into_iter()
-        .map(|f| f.id)
-        .collect();
-    assert_eq!(
-        remaining,
-        vec![kept_l1.id],
-        "the L1 files at or after the cut"
-    );
-    let totals = c
-        .files_from_totals(t, Signal::Traces, Level::L1, cut)
-        .await
         .unwrap();
     assert_eq!(
-        (totals.files, totals.bytes, totals.largest),
-        (1, 1 << 20, 1 << 20)
+        remaining,
+        vec![
+            fs_catalog::RebuildInput {
+                path: kept_l1.path.clone(),
+                size_bytes: 1 << 20,
+            },
+            fs_catalog::RebuildInput {
+                path: kept_l1_later.path.clone(),
+                size_bytes: 1 << 20,
+            },
+        ],
+        "the L1 files at or after the cut, oldest first, a page at a time"
     );
+    assert_eq!(pages, 2);
+    let mut seen = 0;
+    let refused = c
+        .rebuild_inputs(t, Signal::Traces, Level::L1, cut, 1, |page| {
+            seen += page.len();
+            seen < 2
+        })
+        .await
+        .unwrap();
+    assert_eq!(refused, None, "a refused page ends the read");
+    assert_eq!(seen, 2, "nothing read past the refusal");
 
     // Rebuilt from what remains, the table is no longer stale.
     let rebuilt = file_spanning(t, Signal::AttributeKeys, Level::L1, span(0, hour));

@@ -35,16 +35,13 @@ pub struct StaleTable {
     pub cutoff: DateTime<Utc>,
 }
 
-/// What the files of one tenant, signal and level from a point on add up
-/// to, read before any of them is listed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
-pub struct FilesTotal {
-    /// How many.
-    pub files: i64,
-    /// Their bytes.
-    pub bytes: i64,
-    /// The largest one's bytes.
-    pub largest: i64,
+/// One file a rebuild reads: what the reader needs and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildInput {
+    /// Bucket path.
+    pub path: String,
+    /// Object size.
+    pub size_bytes: i64,
 }
 
 /// The tenant's cut, `t` being `engine_tenant`; UTC whatever the
@@ -173,65 +170,63 @@ impl Catalog {
 
     /// Visible files of one tenant, signal and level whose rows end at or
     /// after `since`, oldest first: what remains once retention has cut
-    /// there.
-    ///
-    /// # Errors
-    /// Database failure, or a row with values outside the domain.
-    pub async fn visible_files_from(
-        &self,
-        tenant: TenantId,
-        signal: Signal,
-        level: Level,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, FileRow>(
-            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, state, created_at, quarantined_at
-             from engine_file
-             where tenant_id = $1 and signal = $2 and level = $3 and state = $4 and ts_max >= $5
-             order by ts_min, id",
-        )
-        .bind(tenant)
-        .bind(signal.code())
-        .bind(level.code())
-        .bind(FileState::Visible.code())
-        .bind(since)
-        .fetch_all(self.pool())
-        .await?;
-        rows.into_iter().map(FileRecord::try_from).collect()
-    }
-}
-
-impl Catalog {
-    /// Count, bytes and largest of the files [`visible_files_from`] would
-    /// list, without listing them.
-    ///
-    /// [`visible_files_from`]: Self::visible_files_from
+    /// there. Read `page` rows at a time in one repeatable-read snapshot;
+    /// `admit` sees each page as it arrives and ends the read with `None`
+    /// when it refuses, so a list beyond the caller's budget is never
+    /// held whole.
     ///
     /// # Errors
     /// Database failure.
-    pub async fn files_from_totals(
+    pub async fn rebuild_inputs(
         &self,
         tenant: TenantId,
         signal: Signal,
         level: Level,
         since: DateTime<Utc>,
-    ) -> Result<FilesTotal, CatalogError> {
-        let totals = sqlx::query_as::<_, FilesTotal>(
-            "select count(*) as files,
-                    coalesce(sum(size_bytes), 0)::bigint as bytes,
-                    coalesce(max(size_bytes), 0)::bigint as largest
-             from engine_file
-             where tenant_id = $1 and signal = $2 and level = $3 and state = $4 and ts_max >= $5",
-        )
-        .bind(tenant)
-        .bind(signal.code())
-        .bind(level.code())
-        .bind(FileState::Visible.code())
-        .bind(since)
-        .fetch_one(self.pool())
-        .await?;
-        Ok(totals)
+        page: i64,
+        mut admit: impl FnMut(&[RebuildInput]) -> bool,
+    ) -> Result<Option<Vec<RebuildInput>>, CatalogError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await?;
+        let mut inputs = Vec::new();
+        let mut after: Option<(DateTime<Utc>, crate::FileId)> = None;
+        loop {
+            let rows: Vec<(crate::FileId, DateTime<Utc>, String, i64)> = sqlx::query_as(
+                "select id, ts_min, path, size_bytes from engine_file
+                 where tenant_id = $1 and signal = $2 and level = $3 and state = $4 and ts_max >= $5
+                   and ($6::timestamptz is null or (ts_min, id) > ($6, $7))
+                 order by ts_min, id
+                 limit $8",
+            )
+            .bind(tenant)
+            .bind(signal.code())
+            .bind(level.code())
+            .bind(FileState::Visible.code())
+            .bind(since)
+            .bind(after.map(|(ts, _)| ts))
+            .bind(after.map(|(_, id)| id))
+            .bind(page)
+            .fetch_all(&mut *tx)
+            .await?;
+            let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= page;
+            after = rows.last().map(|(id, ts_min, _, _)| (*ts_min, *id));
+            let arrived: Vec<RebuildInput> = rows
+                .into_iter()
+                .map(|(_, _, path, size_bytes)| RebuildInput { path, size_bytes })
+                .collect();
+            if !arrived.is_empty() && !admit(&arrived) {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            inputs.extend(arrived);
+            if !full {
+                break;
+            }
+        }
+        tx.rollback().await?;
+        Ok(Some(inputs))
     }
 }
 
