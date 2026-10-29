@@ -11,14 +11,19 @@
 //! admissions of the table before, and swapped in under the fence, the
 //! table before quarantined with it. A rebuild that does not commit, for
 //! any reason, leaves the table before in place and the new table an
-//! orphan, and the tenant is held back for the rest of the tick so the
-//! others are tried. A tenant whose remaining L1 files exceed the input
+//! orphan, and the tenant is held back, for longer each time it fails, so
+//! the others are tried: a tick's rebuilds are bounded, and without the
+//! backoff enough broken tenants ahead of a healthy one would take every
+//! pass of every tick. A tenant whose remaining L1 files exceed the input
 //! cap, or whose rebuild would hold more than the memory budget by the
-//! worst case the limits allow, keeps its table and is reported once.
+//! worst case the limits allow, keeps its table and is reported once; a
+//! tenant with no L1 file left loses its table whatever the caps, since
+//! nothing is read and nothing is written.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{
@@ -54,6 +59,10 @@ const OUTPUT_ROW_OVERHEAD: u64 = 56;
 /// Inputs listed per catalog round trip; the budget sees each page.
 const INPUT_PAGE: i64 = 1000;
 
+/// A tenant's backoff grows with each failure up to this many times the
+/// configured one.
+const MAX_BACKOFF_STEPS: u32 = 6;
+
 /// Bounds of retention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionConfig {
@@ -70,6 +79,11 @@ pub struct RetentionConfig {
     pub batch_rows: usize,
     /// The limits the rows were written under, which bound a row.
     pub limits: Limits,
+    /// Most rebuilds one tick of the leader's loop attempts.
+    pub rebuilds_per_tick: usize,
+    /// How long a tenant whose rebuild failed waits before it is tried
+    /// again, times its failures so far, up to six times.
+    pub rebuild_backoff: Duration,
     /// Make this many rebuild swaps fail artificially after the table is
     /// uploaded. Zero in production; tests use it to crash before the swap.
     pub inject_swap_failures: u32,
@@ -119,8 +133,14 @@ pub struct Retention {
     inject_swap_failures: AtomicU32,
     /// Tenants already reported as exceeding a cap.
     reported: Mutex<HashSet<TenantId>>,
-    /// Tenants whose rebuild failed this tick, passed over until the next.
-    failed: Mutex<HashSet<TenantId>>,
+    /// Tenants whose rebuild failed, passed over until their backoff ends.
+    failed: Mutex<HashMap<TenantId, Failure>>,
+}
+
+/// A tenant's failed rebuilds and when the next try is due.
+struct Failure {
+    count: u32,
+    until: Instant,
 }
 
 /// Bytes a rebuild of a table of `table_bytes` and `table_rows` from L1
@@ -232,7 +252,7 @@ impl Retention {
             stats,
             inject_swap_failures: AtomicU32::new(inject),
             reported: Mutex::new(HashSet::new()),
-            failed: Mutex::new(HashSet::new()),
+            failed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -241,13 +261,9 @@ impl Retention {
         Arc::clone(&self.stats)
     }
 
-    /// Tries again, from the next rebuild on, the tenants whose rebuild
-    /// failed; called at the start of a tick.
-    pub fn forget_failures(&self) {
-        self.failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+    /// Most rebuilds one tick attempts.
+    pub fn rebuilds_per_tick(&self) -> usize {
+        self.config.rebuilds_per_tick
     }
 
     /// Quarantines up to `files_per_pass` span files beyond their
@@ -331,7 +347,7 @@ impl Retention {
                     |page| budget.admit(page),
                 )
                 .await?;
-            let Some(inputs) = inputs.filter(|_| budget.fits()) else {
+            let Some(inputs) = inputs else {
                 let (what, bytes, cap) = budget.over.unwrap_or(("memory", 0, 0));
                 self.report_over_cap(stale.tenant_id, what, bytes, cap);
                 continue;
@@ -342,6 +358,10 @@ impl Retention {
         match &result {
             Ok(_) => {
                 self.stats.rebuilds.fetch_add(1, Ordering::Relaxed);
+                self.failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&stale.tenant_id);
             }
             Err(CompactError::Catalog(CatalogError::LeaseLost { .. })) => {
                 self.stats
@@ -353,10 +373,7 @@ impl Retention {
             }
             Err(_) => {
                 self.stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
-                self.failed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(stale.tenant_id);
+                self.hold_back(stale.tenant_id);
             }
         }
         result.map(Some)
@@ -366,7 +383,28 @@ impl Retention {
         self.failed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&tenant)
+            .get(&tenant)
+            .is_some_and(|failure| failure.until > Instant::now())
+    }
+
+    /// Puts `tenant` off for its backoff times its failures so far.
+    fn hold_back(&self, tenant: TenantId) {
+        let now = Instant::now();
+        let mut failed = self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failure = failed.entry(tenant).or_insert(Failure {
+            count: 0,
+            until: now,
+        });
+        failure.count = failure.count.saturating_add(1);
+        let wait = self
+            .config
+            .rebuild_backoff
+            .saturating_mul(failure.count.min(MAX_BACKOFF_STEPS))
+            .min(Duration::from_secs(366 * 86_400));
+        failure.until = now.checked_add(wait).unwrap_or(now);
     }
 
     fn report_over_cap(&self, tenant: TenantId, what: &'static str, bytes: u64, cap: u64) {
@@ -519,6 +557,8 @@ mod tests {
             rebuild_max_bytes: 1,
             batch_rows,
             limits: Limits::default(),
+            rebuilds_per_tick: 64,
+            rebuild_backoff: Duration::from_secs(1),
             inject_swap_failures: 0,
         }
     }

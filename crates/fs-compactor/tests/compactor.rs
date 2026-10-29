@@ -375,7 +375,7 @@ async fn a_replay_during_the_purge_is_refused_and_never_leaves_a_row_without_an_
     let catalog = db.catalog.clone();
     let again = replayed.clone();
     let registration = tokio::spawn(async move { catalog.register_file(&again).await });
-    wait_for_lock_waiter(&db.catalog).await;
+    wait_for_lock_waiter(&db.catalog, &path).await;
     assert!(
         !registration.is_finished(),
         "the registration waits behind the claim"
@@ -403,16 +403,20 @@ async fn a_replay_during_the_purge_is_refused_and_never_leaves_a_row_without_an_
     db.finish().await;
 }
 
-/// Waits until a backend of the catalog waits on an advisory lock, the
-/// path's, or fails after a while.
-async fn wait_for_lock_waiter(catalog: &Catalog) {
+/// Waits until a backend of the catalog waits on the advisory lock of
+/// `path`, the one every registration and claim of it takes, or fails
+/// after a while.
+async fn wait_for_lock_waiter(catalog: &Catalog, path: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let (waiting,): (i64,) = sqlx::query_as(
-            "select count(*) from pg_stat_activity a
+            "select count(*) from pg_stat_activity a join pg_locks l on l.pid = a.pid
              where a.wait_event_type = 'Lock'
-               and exists (select 1 from pg_locks l where l.pid = a.pid and l.locktype = 'advisory')",
+               and l.locktype = 'advisory' and not l.granted
+               and l.classid = ((hashtextextended($1, 0) >> 32) & 4294967295)::oid
+               and l.objid = (hashtextextended($1, 0) & 4294967295)::oid",
         )
+        .bind(path)
         .fetch_one(catalog.pool())
         .await
         .unwrap();
@@ -473,6 +477,8 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
             rebuild_max_bytes: 1 << 30,
             batch_rows: 16,
             limits: fs_schema::limits::Limits::default(),
+            rebuilds_per_tick: 64,
+            rebuild_backoff: Duration::from_secs(3600),
             inject_swap_failures: 0,
         },
     };
@@ -656,6 +662,8 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
             rebuild_max_bytes: 1 << 30,
             batch_rows: 16,
             limits: fs_schema::limits::Limits::default(),
+            rebuilds_per_tick: 64,
+            rebuild_backoff: Duration::from_secs(3600),
             inject_swap_failures: 0,
         },
     };

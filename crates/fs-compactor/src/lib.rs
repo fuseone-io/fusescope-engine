@@ -259,11 +259,10 @@ async fn work_loop(
 
 /// Expiry passes until nothing is beyond its cut, then rebuilds until no
 /// table is left to rebuild, each kind bounded per tick. A rebuild that
-/// fails on its own tenant's files holds that tenant back and the next is
-/// tried; a lost lease ends the tick's work and a catalog failure ends
-/// its kind for the tick.
+/// fails on its own tenant's files holds that tenant back for its backoff
+/// and the next is tried; a lost lease ends the tick's work and a catalog
+/// failure ends its kind for the tick.
 async fn retention_passes(retention: &Retention, leadership: &Leadership) {
-    retention.forget_failures();
     for _ in 0..PASSES_PER_TICK {
         let Some(fence) = leadership.fence() else {
             return;
@@ -281,7 +280,7 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
             }
         }
     }
-    for _ in 0..PASSES_PER_TICK {
+    for _ in 0..retention.rebuilds_per_tick() {
         let Some(fence) = leadership.fence() else {
             return;
         };
@@ -300,7 +299,7 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
                 break;
             }
             Err(e) => {
-                warn!(role = "compactor", error = %e, "attribute_keys rebuild failed; the tenant is held back this tick");
+                warn!(role = "compactor", error = %e, "attribute_keys rebuild failed; the tenant is held back");
             }
         }
     }

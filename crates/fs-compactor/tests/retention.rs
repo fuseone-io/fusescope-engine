@@ -256,6 +256,8 @@ fn retention_config() -> RetentionConfig {
         rebuild_max_bytes: 1 << 30,
         batch_rows: 4,
         limits: Limits::default(),
+        rebuilds_per_tick: 64,
+        rebuild_backoff: Duration::from_secs(2),
         inject_swap_failures: 0,
     }
 }
@@ -621,13 +623,13 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
     assert_eq!(tables_of(&f, other).await.len(), 0);
     assert!(
         r.rebuild_once(&fence).await.unwrap().is_none(),
-        "the failed tenant is held back for the tick"
+        "the failed tenant is held back"
     );
-    r.forget_failures();
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     let err = r.rebuild_once(&fence).await.unwrap_err();
     assert!(
         matches!(err, CompactError::Parquet(_)),
-        "tried again next tick: {err}"
+        "tried again after its backoff: {err}"
     );
     assert_eq!(r.stats().rebuild_failures.load(Ordering::Relaxed), 2);
     std::fs::write(f.dir.path().join(&remaining[0].path), good).unwrap();
@@ -710,11 +712,29 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
     let before = tables(&f).await;
     assert_eq!(before.len(), 1);
 
-    let r = retention(&f, retention_config());
+    let r = retention(
+        &f,
+        RetentionConfig {
+            rebuild_max_input_bytes: 1,
+            rebuild_max_bytes: 1,
+            ..retention_config()
+        },
+    );
     r.expire_once(&fence).await.unwrap().unwrap();
     std::fs::write(f.dir.path().join(&before[0].path), b"not parquet").unwrap();
+    sqlx::query("update engine_file set size_bytes = $2, row_count = $2 where id = $1")
+        .bind(before[0].id)
+        .bind(1i64 << 40)
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
     let done = r.rebuild_once(&fence).await.unwrap().unwrap();
     assert_eq!(done.inputs, vec![before[0].id]);
+    assert_eq!(
+        r.stats().rebuild_skipped.load(Ordering::Relaxed),
+        0,
+        "no cap applies to a table with nothing left to read"
+    );
     assert_eq!(done.outputs.len(), 0, "nothing to list");
     assert_eq!(tables(&f).await.len(), 0);
     assert_eq!(rows(&f, "select count(*) from attribute_keys").await, 0);
@@ -724,8 +744,9 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
 }
 
 /// The leader's loop expires files and rebuilds the tables on its own
-/// interval, and a tenant whose rebuild fails does not keep the others
-/// from theirs: it is tried again on the next tick.
+/// interval, one rebuild per tick here, and a tenant whose rebuild fails
+/// does not keep the others from theirs: held back for its backoff, it
+/// leaves the tick's one rebuild to the next tenant.
 #[tokio::test]
 async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
     let Some(f) = fixture().await else { return };
@@ -820,7 +841,11 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
                 inject_delete_failure: None,
             },
             retention_interval: Duration::from_secs(1),
-            retention: retention_config(),
+            retention: RetentionConfig {
+                rebuilds_per_tick: 1,
+                rebuild_backoff: Duration::from_secs(3600),
+                ..retention_config()
+            },
         },
         "loop",
         Arc::clone(&stats),
@@ -837,6 +862,8 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
         }
     };
     wait_for(1).await;
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
     assert_eq!(
         tables_of(&f, other).await.len(),
         0,
@@ -847,15 +874,13 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
         table_before,
         "the failed tenant's stays"
     );
-    assert!(stats.retention.rebuild_failures.load(Ordering::Relaxed) >= 1);
-    std::fs::write(f.dir.path().join(&kept.path), good).unwrap();
-    wait_for(2).await;
-    shutdown.send(true).unwrap();
-    task.await.unwrap();
+    assert_eq!(
+        stats.retention.rebuild_failures.load(Ordering::Relaxed),
+        1,
+        "failed once, then held back"
+    );
     assert_eq!(stats.retention.expired.load(Ordering::Relaxed), 2);
     assert_eq!(visible(&f).await.len(), 1, "the L1 of the hour kept");
-    let table = tables(&f).await;
-    assert_ne!(table[0].id, table_before, "rebuilt once repaired");
-    assert_eq!(keys_of(&f, &table[0]).len(), 2);
+    std::fs::write(f.dir.path().join(&kept.path), good).unwrap();
     f.db.finish().await;
 }
