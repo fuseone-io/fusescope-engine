@@ -716,6 +716,28 @@ mod tests {
             page.contains("fusescope_compaction_skipped_total 1\n"),
             "{page}"
         );
+        let query = Arc::new(fs_query::QueryStats::default());
+        query.plannings.fetch_add(2, Ordering::Relaxed);
+        query.prepared.store(5, Ordering::Relaxed);
+        query.prepared_bytes.store(9, Ordering::Relaxed);
+        metrics.register_query(query);
+        let page = metrics.render();
+        assert!(
+            page.contains("fusescope_query_plannings_total 2\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                "# TYPE fusescope_query_prepared_plans gauge\nfusescope_query_prepared_plans 5\n"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                "# TYPE fusescope_query_prepared_bytes gauge\nfusescope_query_prepared_bytes 9\n"
+            ),
+            "{page}"
+        );
         assert!(page.lines().all(|l| {
             l.starts_with('#')
                 || l.split_once(' ')

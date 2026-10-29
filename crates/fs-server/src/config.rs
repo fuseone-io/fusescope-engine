@@ -1086,6 +1086,9 @@ impl Config {
                 "query.prepared_plans, query.prepared_bytes and query.prepared_ttl_secs must be positive",
             );
         }
+        if self.query.prepared_ttl_secs > fs_query::querier::MAX_PREPARED_TTL.as_secs() {
+            return invalid("query.prepared_ttl_secs is at most 86400");
+        }
         Ok(())
     }
 
@@ -1380,6 +1383,7 @@ mod tests {
             "prepared_plans = 0",
             "prepared_bytes = 0",
             "prepared_ttl_secs = 0",
+            "prepared_ttl_secs = 86401",
         ] {
             let err = Config::parse(&format!(
                 "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\n{bad}\n"
@@ -1398,6 +1402,12 @@ mod tests {
         .to_limits();
         assert_eq!(limits.prepared_plans, 7);
         assert_eq!(limits.prepared_bytes, 8);
+        Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\nprepared_ttl_secs = 86400\n",
+        )
+        .unwrap()
+        .validate(&secrets)
+        .unwrap();
         assert_eq!(limits.prepared_ttl, std::time::Duration::from_secs(9));
     }
 
