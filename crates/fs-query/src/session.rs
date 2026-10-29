@@ -14,9 +14,11 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionConfig;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
-use fs_catalog::TenantId;
+use fs_catalog::{Signal, TenantId};
+use fs_schema::attribute_keys;
 
 use crate::QueryError;
+use crate::derived_table::DerivedTable;
 use crate::files::FileCache;
 use crate::spans_table::SpansTable;
 
@@ -65,10 +67,20 @@ pub fn tenant_session(
     schema.register_table(
         SPANS_TABLE.into(),
         Arc::new(
-            SpansTable::new(tenant, cache, store_url.clone(), bytes_budget)
+            SpansTable::new(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
                 .with_hot_window(hot, warnings)
                 .with_trace_index(trace_index),
         ),
+    )?;
+    schema.register_table(
+        attribute_keys::TABLE.into(),
+        Arc::new(DerivedTable::new(
+            tenant,
+            cache,
+            store_url.clone(),
+            Signal::AttributeKeys,
+            attribute_keys::attribute_keys_schema_v1(),
+        )),
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());
     catalog.register_schema(SCHEMA, schema)?;

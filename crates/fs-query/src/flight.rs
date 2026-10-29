@@ -11,6 +11,7 @@
 //! Arrow IPC.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -30,7 +31,10 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::QueryError;
-use crate::actions::{TRACE_LOOKUP, TraceLookup};
+use crate::actions::{
+    KeysLookup, METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, OperationsLookup,
+    ServicesLookup, TRACE_LOOKUP, TraceLookup,
+};
 use crate::querier::{Querier, QueryLimits, QueryWarnings};
 
 /// Response header set when the result may be incomplete, with the reasons.
@@ -84,6 +88,55 @@ impl FlightSql {
             .await?;
         info!("flight sql stopped");
         Ok(())
+    }
+
+    /// Runs `action` for `tenant` under `deadline`: the stream of its
+    /// answer and the warnings collected on the way.
+    async fn run_action(
+        &self,
+        tenant: TenantId,
+        action: &Action,
+        deadline: tokio::time::Instant,
+        limits: QueryLimits,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), Status> {
+        let invalid = |e: QueryError| status_of(&e);
+        match action.r#type.as_str() {
+            TRACE_LOOKUP => {
+                let query = TraceLookup::parse(&action.body)
+                    .and_then(|lookup| lookup.query())
+                    .map_err(invalid)?;
+                within(deadline, limits, self.querier.trace_lookup(tenant, query)).await
+            }
+            METADATA_SERVICES => {
+                let range = ServicesLookup::parse(&action.body)
+                    .and_then(|lookup| lookup.query())
+                    .map_err(invalid)?;
+                within(
+                    deadline,
+                    limits,
+                    self.querier.metadata_services(tenant, range),
+                )
+                .await
+            }
+            METADATA_OPERATIONS => {
+                let query = OperationsLookup::parse(&action.body)
+                    .and_then(|lookup| lookup.query())
+                    .map_err(invalid)?;
+                within(
+                    deadline,
+                    limits,
+                    self.querier.metadata_operations(tenant, &query),
+                )
+                .await
+            }
+            METADATA_KEYS => {
+                let query = KeysLookup::parse(&action.body)
+                    .and_then(|lookup| lookup.query())
+                    .map_err(invalid)?;
+                within(deadline, limits, self.querier.metadata_keys(tenant, &query)).await
+            }
+            other => Err(Status::unimplemented(format!("unknown action {other:?}"))),
+        }
     }
 
     /// Resolves the bearer token under the request's `deadline`, so a
@@ -342,18 +395,9 @@ impl FlightSqlService for FlightSql {
         let tenant = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await?;
-        let action = request.get_ref();
-        if action.r#type != TRACE_LOOKUP {
-            return Err(Status::unimplemented(format!(
-                "unknown action {:?}",
-                action.r#type
-            )));
-        }
-        let query = TraceLookup::parse(&action.body)
-            .and_then(|lookup| lookup.query())
-            .map_err(|e| status_of(&e))?;
-        let (stream, warnings) =
-            within(deadline, limits, self.querier.trace_lookup(tenant, query)).await?;
+        let (stream, warnings) = self
+            .run_action(tenant, request.get_ref(), deadline, limits)
+            .await?;
         let schema = stream.schema();
         let results = ipc_results(&schema, bound_rows(stream, limits, deadline))?;
         let mut response = Response::new(Box::pin(results)
@@ -369,12 +413,30 @@ impl FlightSqlService for FlightSql {
     }
 
     async fn list_custom_actions(&self) -> Option<Vec<Result<ActionType, Status>>> {
-        Some(vec![Ok(ActionType {
-            r#type: TRACE_LOOKUP.into(),
-            description: "Spans of one trace in timestamp order, as an Arrow IPC stream; \
-                          body {\"trace_id\": hex, \"start_unix_nano\"?, \"end_unix_nano\"?}"
-                .into(),
-        })])
+        let listed = |kind: &str, description: &str| {
+            Ok(ActionType {
+                r#type: kind.into(),
+                description: description.into(),
+            })
+        };
+        Some(vec![
+            listed(
+                TRACE_LOOKUP,
+                "Spans of one trace in timestamp order; body {trace_id: hex, start_unix_nano?, end_unix_nano?}",
+            ),
+            listed(
+                METADATA_SERVICES,
+                "Distinct service names; body {start_unix_nano?, end_unix_nano?}",
+            ),
+            listed(
+                METADATA_OPERATIONS,
+                "Span names of one service with their span counts; body {service_name, start_unix_nano?, end_unix_nano?, limit?}",
+            ),
+            listed(
+                METADATA_KEYS,
+                "Rows of the attribute_keys table; body {signal, prefix?, limit?}",
+            ),
+        ])
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}

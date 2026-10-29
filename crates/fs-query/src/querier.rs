@@ -1,25 +1,32 @@
 //! The querier facade: sessions, limits and execution.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use arrow::array::{AsArray, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::logical_expr::{LogicalPlan, col, lit};
+use datafusion::functions::expr_fn::starts_with;
+use datafusion::functions_aggregate::count::count_all;
+use datafusion::logical_expr::{LogicalPlan, cast, col, lit};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
-use fs_catalog::{Catalog, TenantId};
+use fs_catalog::{Catalog, Signal, TenantId};
+use fs_schema::attribute_keys::{self, col_names as key_col};
 use fs_schema::spans::col as span_col;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
 use tracing::info;
 
 use crate::QueryError;
-use crate::actions::TraceQuery;
+use crate::actions::{KeysQuery, OperationsQuery, Range, TraceQuery};
 use crate::files::FileCache;
+use crate::prune::Pruning;
 use crate::session::{SPANS_TABLE, plan_read_only, tenant_session};
 
 /// Notes a query collected while planning, for example ingesters that did
@@ -68,6 +75,8 @@ pub struct QueryStats {
     pub errors: std::sync::atomic::AtomicU64,
     /// `trace.lookup` actions served.
     pub trace_lookups: std::sync::atomic::AtomicU64,
+    /// `metadata.*` actions served.
+    pub metadata_lookups: std::sync::atomic::AtomicU64,
     /// Rows returned by `collect`.
     pub rows: std::sync::atomic::AtomicU64,
     /// Hot-window fan-outs performed.
@@ -306,12 +315,6 @@ impl Querier {
         self.stats
             .trace_lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let timestamp = |ns: i64| {
-            lit(ScalarValue::TimestampNanosecond(
-                Some(ns),
-                Some("UTC".into()),
-            ))
-        };
         let mut frame = ctx
             .table(SPANS_TABLE)
             .await?
@@ -328,6 +331,139 @@ impl Querier {
         let frame = frame.sort(vec![col(span_col::TIMESTAMP).sort(true, false)])?;
         let stream = frame.execute_stream().await?;
         Ok((stream, warnings))
+    }
+
+    /// The distinct `service_name` of `tenant`'s spans within `range`,
+    /// sorted, as one batch of one `service_name` column: the services of
+    /// every file the catalog holds that overlaps the range, so a range
+    /// answers at file granularity, and the services the ingesters still
+    /// hold when the range touches the recent window. No file is read.
+    ///
+    /// # Errors
+    /// Unknown tenant, or catalog failure.
+    pub async fn metadata_services(
+        &self,
+        tenant: TenantId,
+        range: Range,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        self.catalog
+            .tenant(tenant)
+            .await?
+            .ok_or(QueryError::UnknownTenant)?;
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        self.stats.queries.fetch_add(1, relaxed);
+        self.stats.metadata_lookups.fetch_add(1, relaxed);
+        let warnings = Arc::new(QueryWarnings::default());
+        let mut services = BTreeSet::new();
+        for file in self.cache.files(tenant, Signal::Traces).await?.iter() {
+            let start = file.range.start.timestamp_nanos_opt();
+            let end = file.range.end.timestamp_nanos_opt();
+            let overlaps = range
+                .start_ns
+                .is_none_or(|from| end.is_none_or(|end| end >= from))
+                && range
+                    .end_ns
+                    .is_none_or(|to| start.is_none_or(|start| start <= to));
+            if overlaps {
+                services.extend(file.services.iter().cloned());
+            }
+        }
+        let pruning = Pruning {
+            ts_min: range.start_ns,
+            ts_max: range.end_ns,
+            ..Pruning::default()
+        };
+        if self.hot.touches_recent(&pruning) {
+            let hot = self
+                .hot
+                .scan(
+                    tenant,
+                    &pruning,
+                    Some(vec![span_col::SERVICE_NAME.to_owned()]),
+                )
+                .await?;
+            for ingester in &hot.unavailable {
+                warnings.push(format!(
+                    "ingester {ingester} did not answer; recent services may be missing"
+                ));
+            }
+            for batch in &hot.batches {
+                services.extend(service_names(batch)?);
+            }
+        }
+        let batch = RecordBatch::try_new(
+            services_schema(),
+            vec![Arc::new(StringArray::from_iter_values(services))],
+        )?;
+        Ok((one_batch(batch), warnings))
+    }
+
+    /// The span names of `query.service_name` within its range, with how
+    /// many spans carry each, most frequent first, `query.limit` at most.
+    /// Goes through the spans table like SQL would.
+    ///
+    /// # Errors
+    /// Unknown tenant, planning or execution failure.
+    pub async fn metadata_operations(
+        &self,
+        tenant: TenantId,
+        query: &OperationsQuery,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings) = self.session(tenant).await?;
+        self.stats
+            .metadata_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut frame = ctx
+            .table(SPANS_TABLE)
+            .await?
+            .filter(col(span_col::SERVICE_NAME).eq(lit(query.service_name.as_str())))?;
+        if let Some(start) = query.range.start_ns {
+            frame = frame.filter(col(span_col::TIMESTAMP).gt_eq(timestamp(start)))?;
+        }
+        if let Some(end) = query.range.end_ns {
+            frame = frame.filter(col(span_col::TIMESTAMP).lt_eq(timestamp(end)))?;
+        }
+        let frame = frame
+            .aggregate(vec![col(span_col::NAME)], vec![count_all().alias("spans")])?
+            .select(vec![
+                cast(col(span_col::NAME), DataType::Utf8).alias("name"),
+                col("spans"),
+            ])?
+            .sort(vec![
+                col("spans").sort(false, false),
+                col("name").sort(true, false),
+            ])?
+            .limit(0, Some(query.limit.min(self.limits.max_rows)))?;
+        Ok((frame.execute_stream().await?, warnings))
+    }
+
+    /// The rows of the tenant's `attribute_keys` table whose key starts
+    /// with `query.prefix`, most frequent first, `query.limit` at most.
+    ///
+    /// # Errors
+    /// Unknown tenant, planning or execution failure.
+    pub async fn metadata_keys(
+        &self,
+        tenant: TenantId,
+        query: &KeysQuery,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings) = self.session(tenant).await?;
+        self.stats
+            .metadata_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut frame = ctx.table(attribute_keys::TABLE).await?;
+        if let Some(prefix) = &query.prefix {
+            frame = frame.filter(starts_with(col(key_col::KEY), lit(prefix.as_str())))?;
+        }
+        let frame = frame
+            .sort(vec![
+                col(key_col::COUNT).sort(false, false),
+                col(key_col::KEY).sort(true, false),
+                col(key_col::SOURCE).sort(true, false),
+                col(key_col::TYPE).sort(true, false),
+            ])?
+            .limit(0, Some(query.limit.min(self.limits.max_rows)))?;
+        Ok((frame.execute_stream().await?, warnings))
     }
 
     /// Plans `sql` for `tenant`, returns the result schema and keeps the
@@ -592,6 +728,43 @@ async fn reap_expired(weak: Weak<std::sync::Mutex<PreparedPlans>>, ttl: Duration
         };
         tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
     }
+}
+
+/// A `timestamp` literal of the span schema's type.
+fn timestamp(ns: i64) -> datafusion::logical_expr::Expr {
+    lit(ScalarValue::TimestampNanosecond(
+        Some(ns),
+        Some("UTC".into()),
+    ))
+}
+
+/// Schema of a `metadata.services` answer.
+fn services_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        span_col::SERVICE_NAME,
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// The service names of a hot-window batch, whatever encoding it arrived in.
+fn service_names(batch: &RecordBatch) -> Result<Vec<String>, QueryError> {
+    let index = batch.schema().index_of(span_col::SERVICE_NAME)?;
+    let column = arrow::compute::cast(batch.column(index), &DataType::Utf8)?;
+    Ok(column
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn one_batch(batch: RecordBatch) -> SendableRecordBatchStream {
+    let schema = batch.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures_util::stream::iter(vec![Ok(batch)]),
+    ))
 }
 
 #[cfg(test)]

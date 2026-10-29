@@ -21,17 +21,23 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::sql::{Any, TicketStatementQuery};
 use arrow_flight::{Action, Empty, Ticket};
+use chrono::TimeZone;
 use datafusion::logical_expr::{col, lit};
 use datafusion::scalar::ScalarValue;
-use fs_catalog::{Catalog, NewTenant, TenantId, TokenScope};
+use fs_catalog::{
+    Catalog, FileId, Level, NewFile, NewTenant, Signal, TenantId, TimeRange, TokenScope,
+};
 use fs_ingest::flush;
-use fs_query::actions::{TRACE_LOOKUP, TraceLookup};
+use fs_query::actions::{
+    METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, TRACE_LOOKUP, TraceLookup,
+};
 use fs_query::flight::FlightSql;
 use fs_query::querier::{MAX_PREPARED_TTL, PREPARED_PLAN_OVERHEAD};
 use fs_query::{Querier, QueryError, QueryLimits};
 use fs_schema::limits::Limits;
 use fs_schema::spans::SpanBatchBuilder;
 use futures_util::TryStreamExt;
+use object_store::ObjectStoreExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -933,8 +939,16 @@ async fn lookup(
     client: &mut FlightSqlServiceClient<Channel>,
     body: &str,
 ) -> Result<Vec<RecordBatch>, tonic::Status> {
+    action(client, TRACE_LOOKUP, body).await
+}
+
+async fn action(
+    client: &mut FlightSqlServiceClient<Channel>,
+    kind: &str,
+    body: &str,
+) -> Result<Vec<RecordBatch>, tonic::Status> {
     let action = Action {
-        r#type: TRACE_LOOKUP.into(),
+        r#type: kind.into(),
         body: body.to_owned().into(),
     };
     let results: Vec<arrow_flight::Result> = client
@@ -955,6 +969,41 @@ async fn lookup(
     reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| tonic::Status::internal(e.to_string()))
+}
+
+fn strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name(column)
+                .unwrap()
+                .as_string::<i32>()
+                .iter()
+                .map(|s| s.unwrap().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn counts(batches: &[RecordBatch], column: &str) -> Vec<u64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let column = b.column_by_name(column).unwrap();
+            match column.data_type() {
+                arrow::datatypes::DataType::Int64 => column
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .map(|v| u64::try_from(*v).unwrap())
+                    .collect::<Vec<_>>(),
+                _ => column
+                    .as_primitive::<arrow::datatypes::UInt64Type>()
+                    .values()
+                    .to_vec(),
+            }
+        })
+        .collect()
 }
 
 fn timestamps(batches: &[RecordBatch]) -> Vec<i64> {
@@ -1286,6 +1335,231 @@ async fn the_deadline_covers_planning_on_every_entry_point() {
     f.db.finish().await;
 }
 
+/// `metadata.services` lists the tenant's services from the catalog, within
+/// a range at file granularity, and never another tenant's.
+#[tokio::test]
+async fn metadata_services_action_lists_the_services_of_the_tenant() {
+    let Some(f) = fixture().await else { return };
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (other_token, _) =
+        f.db.catalog
+            .create_token(f.other_tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let counters = f.querier.stats();
+
+    let all = action(&mut client, METADATA_SERVICES, "{}").await.unwrap();
+    assert_eq!(strings(&all, "service_name"), ["api", "worker"]);
+    assert_eq!(
+        all[0].schema().field(0).data_type(),
+        &arrow::datatypes::DataType::Utf8
+    );
+    let later = serde_json::json!({ "start_unix_nano": T0 + 2 * HOUR }).to_string();
+    let later = action(&mut client, METADATA_SERVICES, &later)
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&later, "service_name"),
+        ["api"],
+        "the worker's file ends before the range"
+    );
+    let err = action(&mut client, METADATA_SERVICES, r#"{"end_unix_nanos": 1}"#)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(counters.metadata_lookups.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        counters.plannings.load(Ordering::Relaxed),
+        0,
+        "no file read"
+    );
+
+    let mut other = sql_client(addr, &other_token).await;
+    let theirs = action(&mut other, METADATA_SERVICES, "{}").await.unwrap();
+    assert_eq!(
+        strings(&theirs, "service_name"),
+        ["api"],
+        "the other tenant has no worker"
+    );
+
+    stop(shutdown, server).await;
+    f.db.finish().await;
+}
+
+/// `metadata.operations` lists the span names of one service with their
+/// counts, most frequent first, within a range and up to a limit.
+#[tokio::test]
+async fn metadata_operations_action_lists_the_operations_of_a_service() {
+    let Some(f) = fixture().await else { return };
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+
+    let api = action(
+        &mut client,
+        METADATA_OPERATIONS,
+        r#"{"service_name": "api"}"#,
+    )
+    .await
+    .unwrap();
+    let names: Vec<String> = (0..7).map(|i| format!("op-{i}")).collect();
+    let rest: Vec<String> = (7..10).map(|i| format!("op-{i}")).collect();
+    assert_eq!(strings(&api, "name"), [names.clone(), rest].concat());
+    assert_eq!(counts(&api, "spans"), [vec![2; 7], vec![1; 3]].concat());
+
+    let three = action(
+        &mut client,
+        METADATA_OPERATIONS,
+        r#"{"service_name": "api", "limit": 3}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(strings(&three, "name"), names[..3]);
+
+    let later =
+        serde_json::json!({ "service_name": "api", "start_unix_nano": T0 + 2 * HOUR }).to_string();
+    let later = action(&mut client, METADATA_OPERATIONS, &later)
+        .await
+        .unwrap();
+    assert_eq!(strings(&later, "name"), names);
+    assert_eq!(counts(&later, "spans"), vec![1; 7]);
+
+    let worker = action(
+        &mut client,
+        METADATA_OPERATIONS,
+        r#"{"service_name": "worker"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts(&worker, "spans"), vec![1; 5]);
+    let none = action(
+        &mut client,
+        METADATA_OPERATIONS,
+        r#"{"service_name": "nope"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(none.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let err = action(&mut client, METADATA_OPERATIONS, "{}")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+    stop(shutdown, server).await;
+    f.db.finish().await;
+}
+
+/// `metadata.keys` reads the tenant's `attribute_keys` table, most
+/// frequent first, narrowed by a prefix; SQL reads the same table; a tenant
+/// without one gets an empty answer; another signal is refused.
+#[tokio::test]
+async fn metadata_keys_action_reads_the_attribute_keys_table() {
+    let Some(f) = fixture().await else { return };
+    let mut stats = fs_schema::attribute_keys::KeyStats::default();
+    let mut builder = SpanBatchBuilder::new(Limits::default());
+    builder.append_request(&request("api", 1, T0, 3)).unwrap();
+    stats.absorb(&builder.finish().unwrap()).unwrap();
+    let bytes = fs_schema::attribute_keys::encode(&stats).unwrap();
+    let id = FileId::new();
+    let path = format!(
+        "t/{}/derived/attribute_keys/dt=2026-10-22/hr=14/{}.parquet",
+        f.tenant.0, id.0
+    );
+    let store = LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap();
+    store
+        .put(&Path::from(path.as_str()), bytes.clone().into())
+        .await
+        .unwrap();
+    let (first, last) = stats.range().unwrap();
+    f.db.catalog
+        .register_file(&NewFile {
+            id,
+            origin: id,
+            tenant_id: f.tenant,
+            signal: Signal::AttributeKeys,
+            level: Level::L1,
+            path,
+            size_bytes: i64::try_from(bytes.len()).unwrap(),
+            row_count: i64::try_from(stats.len()).unwrap(),
+            range: TimeRange {
+                start: chrono::Utc.timestamp_nanos(first),
+                end: chrono::Utc.timestamp_nanos(last),
+            },
+            services: vec![],
+            summary: None,
+        })
+        .await
+        .unwrap();
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (other_token, _) =
+        f.db.catalog
+            .create_token(f.other_tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+
+    let all = action(&mut client, METADATA_KEYS, r#"{"signal": "traces"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&all, "key"),
+        ["http.request.method", "service.name"]
+    );
+    assert_eq!(strings(&all, "source"), ["span", "resource"]);
+    assert_eq!(strings(&all, "type"), ["string", "string"]);
+    assert_eq!(counts(&all, "count"), [3, 3]);
+    let http = action(
+        &mut client,
+        METADATA_KEYS,
+        r#"{"signal": "traces", "prefix": "http."}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(strings(&http, "key"), ["http.request.method"]);
+    let err = action(&mut client, METADATA_KEYS, r#"{"signal": "logs"}"#)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+    let by_sql = f
+        .querier
+        .collect(f.tenant, "select key from attribute_keys order by key")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&by_sql, "key"),
+        ["http.request.method", "service.name"]
+    );
+
+    let mut other = sql_client(addr, &other_token).await;
+    let theirs = action(&mut other, METADATA_KEYS, r#"{"signal": "traces"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        theirs.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0,
+        "no table of their own, nothing of ours"
+    );
+
+    stop(shutdown, server).await;
+    f.db.finish().await;
+}
+
 /// The plans kept are bounded by the bytes they are estimated to retain,
 /// oldest dropped first; a plan over the budget on its own is not kept and
 /// drops nothing. The gauges follow.
@@ -1465,6 +1739,16 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
     let (rows, warnings) = querier.collect_with_warnings(tenant, sql).await.unwrap();
     assert_eq!(count(&rows), 12);
     assert!(warnings.is_empty(), "{warnings:?}");
+    let (stream, _) = querier
+        .metadata_services(tenant, fs_query::actions::Range::default())
+        .await
+        .unwrap();
+    let listed: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(
+        strings(&listed, "service_name"),
+        ["api"],
+        "the service lives only in the ingester"
+    );
 
     // A trace lookup reaches the hot rows through the typed predicate.
     let lookup =

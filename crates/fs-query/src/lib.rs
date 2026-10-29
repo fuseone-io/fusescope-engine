@@ -8,6 +8,7 @@
 //! refuses scans that would read too much.
 
 pub mod actions;
+pub mod derived_table;
 pub mod files;
 pub mod flight;
 pub mod hot;
@@ -30,6 +31,9 @@ pub enum QueryError {
     /// DataFusion planning or execution failure.
     #[error("{0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
+    /// Arrow refused an answer built outside DataFusion.
+    #[error("arrow: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
     /// Catalog failure.
     #[error("catalog: {0}")]
     Catalog(#[from] fs_catalog::CatalogError),
