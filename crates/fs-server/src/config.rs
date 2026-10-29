@@ -1011,6 +1011,7 @@ impl Config {
             0,
             0,
             self.compactor.l1_target_bytes as u64,
+            0,
             &self
                 .compactor
                 .to_compactor(self.ingest.row_group_rows)
@@ -1604,6 +1605,7 @@ mod tests {
             0,
             0,
             config.compactor.l1_target_bytes as u64,
+            0,
             &compactor.retention,
         );
         assert!(
