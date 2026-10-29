@@ -7,10 +7,11 @@
 //! columns `key` Utf8, `source` Utf8 (`resource`, `span`, `scope`), `type`
 //! Utf8 (`string`, `number`, `bool`), `count` UInt64 (spans carrying the
 //! key), `first_seen` and `last_seen` Timestamp(ns, UTC), rows sorted by
-//! (source, key, type). The schema metadata names the signal and the
-//! version; a reader that meets another version refuses the file.
+//! (source, type, key). The schema metadata names the signal and the
+//! version; every reader checks both with [`check_schema`] and refuses
+//! anything else.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, StringArray, TimestampNanosecondArray, UInt64Array};
@@ -26,6 +27,9 @@ use crate::spans::col;
 
 /// Version of the table layout.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Value of the `fusescope.signal` schema metadata.
+pub const SIGNAL: &str = "attribute_keys";
 
 /// Where a key lives on a span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -108,10 +112,15 @@ impl KeySeen {
     }
 }
 
-/// Keys of one tenant, in table order.
+/// Keys of one tenant, in table order. Keys seen since the stats were
+/// built or decoded count as new, against the cap [`absorb`] is given.
+///
+/// [`absorb`]: KeyStats::absorb
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyStats {
-    keys: BTreeMap<(KeySource, String, KeyType), KeySeen>,
+    keys: BTreeMap<(KeySource, KeyType), BTreeMap<String, KeySeen>>,
+    new_keys: usize,
+    dropped: u64,
 }
 
 /// The map columns of the span schema and what their keys are.
@@ -125,17 +134,22 @@ const MAP_COLUMNS: [(&str, KeySource, KeyType); 5] = [
 
 impl KeyStats {
     /// Counts the keys of every span in `batch`, a batch of the span
-    /// schema.
+    /// schema, once per span however often a span repeats a key. A key
+    /// not seen before is admitted while fewer than `max_new_keys` were
+    /// admitted since the stats were built; beyond that its entries are
+    /// dropped and counted, without allocating for them. Which keys are
+    /// admitted follows batch order, so it is the same for the same rows.
     ///
     /// # Errors
     /// A batch without the timestamp or one of the map columns, or with
     /// one of another type.
-    pub fn absorb(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
+    pub fn absorb(&mut self, batch: &RecordBatch, max_new_keys: usize) -> Result<(), SchemaError> {
         let schema = batch.schema();
         let timestamps = batch
             .column(schema.index_of(col::TIMESTAMP)?)
             .as_primitive_opt::<TimestampNanosecondType>()
             .ok_or(SchemaError::Layout("timestamp"))?;
+        let mut in_row: HashSet<&str> = HashSet::new();
         for (name, source, kind) in MAP_COLUMNS {
             let map = batch
                 .column(schema.index_of(name)?)
@@ -146,59 +160,93 @@ impl KeyStats {
                 .as_string_opt::<i32>()
                 .ok_or(SchemaError::Layout("attribute map keys"))?;
             let offsets = map.value_offsets();
+            let known = self.keys.entry((source, kind)).or_default();
             for row in 0..map.len() {
                 let (Some(start), Some(end)) = (offsets.get(row), offsets.get(row + 1)) else {
                     break;
                 };
                 let at = timestamps.value(row);
+                in_row.clear();
                 for entry in *start..*end {
                     let entry =
                         usize::try_from(entry).map_err(|_| SchemaError::Layout("offset"))?;
+                    let key = keys.value(entry);
+                    if !in_row.insert(key) {
+                        continue;
+                    }
                     let seen = KeySeen {
                         count: 1,
                         first_seen: at,
                         last_seen: at,
                     };
-                    self.keys
-                        .entry((source, keys.value(entry).to_owned(), kind))
-                        .and_modify(|known| known.widen(seen))
-                        .or_insert(seen);
+                    if let Some(known) = known.get_mut(key) {
+                        known.widen(seen);
+                    } else if self.new_keys < max_new_keys {
+                        known.insert(key.to_owned(), seen);
+                        self.new_keys += 1;
+                    } else {
+                        self.dropped += 1;
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// Adds everything `other` knows.
+    /// Adds everything `other` knows; its keys count as new here.
     pub fn merge(&mut self, other: KeyStats) {
-        for (key, seen) in other.keys {
-            self.keys
-                .entry(key)
-                .and_modify(|known| known.widen(seen))
-                .or_insert(seen);
+        for ((source, kind), keys) in other.keys {
+            let known = self.keys.entry((source, kind)).or_default();
+            for (key, seen) in keys {
+                if let Some(known) = known.get_mut(&key) {
+                    known.widen(seen);
+                } else {
+                    known.insert(key, seen);
+                    self.new_keys += 1;
+                }
+            }
         }
+        self.dropped = self.dropped.saturating_add(other.dropped);
     }
 
     /// Distinct (source, key, type) rows.
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.keys.values().map(BTreeMap::len).sum()
     }
 
     /// True when nothing was seen.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.len() == 0
+    }
+
+    /// Keys admitted since the stats were built, decoded or settled.
+    pub fn new_keys(&self) -> usize {
+        self.new_keys
+    }
+
+    /// The same stats with nothing counted as new, as a table read back.
+    #[must_use]
+    pub fn settled(mut self) -> Self {
+        self.new_keys = 0;
+        self
+    }
+
+    /// Entries of keys beyond the cap that were not counted.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Rows in table order.
     pub fn iter(&self) -> impl Iterator<Item = (KeySource, &str, KeyType, KeySeen)> {
-        self.keys
-            .iter()
-            .map(|((source, key, kind), seen)| (*source, key.as_str(), *kind, *seen))
+        self.keys.iter().flat_map(|((source, kind), keys)| {
+            keys.iter()
+                .map(move |(key, seen)| (*source, key.as_str(), *kind, *seen))
+        })
     }
 
     /// Earliest first and latest last seen over every key, nanoseconds.
     pub fn range(&self) -> Option<(i64, i64)> {
-        self.keys.values().fold(None, |range, seen| {
+        self.iter().fold(None, |range, (_, _, _, seen)| {
             Some(match range {
                 None => (seen.first_seen, seen.last_seen),
                 Some((first, last)) => (first.min(seen.first_seen), last.max(seen.last_seen)),
@@ -211,12 +259,13 @@ impl KeyStats {
     /// # Errors
     /// Arrow refusing the arrays, which cannot happen for a consistent map.
     pub fn to_batch(&self) -> Result<RecordBatch, SchemaError> {
-        let mut keys = Vec::with_capacity(self.keys.len());
-        let mut sources = Vec::with_capacity(self.keys.len());
-        let mut kinds = Vec::with_capacity(self.keys.len());
-        let mut counts = Vec::with_capacity(self.keys.len());
-        let mut firsts = Vec::with_capacity(self.keys.len());
-        let mut lasts = Vec::with_capacity(self.keys.len());
+        let rows = self.len();
+        let mut keys = Vec::with_capacity(rows);
+        let mut sources = Vec::with_capacity(rows);
+        let mut kinds = Vec::with_capacity(rows);
+        let mut counts = Vec::with_capacity(rows);
+        let mut firsts = Vec::with_capacity(rows);
+        let mut lasts = Vec::with_capacity(rows);
         for (source, key, kind, seen) in self.iter() {
             keys.push(key);
             sources.push(source.name());
@@ -238,7 +287,7 @@ impl KeyStats {
         )?)
     }
 
-    /// Reads a batch of the table.
+    /// Reads a batch of the table; nothing read counts as new.
     ///
     /// # Errors
     /// A batch missing a column or with a source or type the version does
@@ -277,7 +326,9 @@ impl KeyStats {
                 last_seen: lasts.value(row),
             };
             out.keys
-                .entry((source, keys.value(row).to_owned(), kind))
+                .entry((source, kind))
+                .or_default()
+                .entry(keys.value(row).to_owned())
                 .and_modify(|known| known.widen(seen))
                 .or_insert(seen);
         }
@@ -308,7 +359,7 @@ pub const TABLE: &str = "attribute_keys";
 pub fn attribute_keys_schema_v1() -> SchemaRef {
     let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
     let metadata = [
-        ("fusescope.signal".to_owned(), "attribute_keys".to_owned()),
+        ("fusescope.signal".to_owned(), SIGNAL.to_owned()),
         (
             "fusescope.schema_version".to_owned(),
             SCHEMA_VERSION.to_string(),
@@ -327,6 +378,24 @@ pub fn attribute_keys_schema_v1() -> SchemaRef {
     ))
 }
 
+/// Refuses a file schema that is not this table at this version.
+///
+/// # Errors
+/// Another signal, another version, or no version at all.
+pub fn check_schema(schema: &Schema) -> Result<(), SchemaError> {
+    let metadata = schema.metadata();
+    if metadata.get("fusescope.signal").map(String::as_str) != Some(SIGNAL) {
+        return Err(SchemaError::Layout("attribute_keys signal"));
+    }
+    let version = metadata
+        .get("fusescope.schema_version")
+        .and_then(|v| v.parse::<u32>().ok());
+    if version != Some(SCHEMA_VERSION) {
+        return Err(SchemaError::Layout("attribute_keys schema version"));
+    }
+    Ok(())
+}
+
 /// Encodes `stats` as one Parquet file of the table.
 ///
 /// # Errors
@@ -343,26 +412,18 @@ pub fn encode(stats: &KeyStats) -> Result<Vec<u8>, SchemaError> {
     Ok(writer.into_inner()?)
 }
 
-/// Reads a Parquet file of the table, refusing another version.
+/// Reads a Parquet file of the table, refusing another signal or version.
 ///
 /// # Errors
-/// Not a Parquet file of this table, or a version this reader does not
-/// know.
+/// Not a Parquet file of this table at this version.
 pub fn decode(bytes: bytes::Bytes) -> Result<KeyStats, SchemaError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
-    let version = builder
-        .schema()
-        .metadata()
-        .get("fusescope.schema_version")
-        .and_then(|v| v.parse::<u32>().ok());
-    if version != Some(SCHEMA_VERSION) {
-        return Err(SchemaError::Layout("attribute_keys schema version"));
-    }
+    check_schema(builder.schema())?;
     let mut out = KeyStats::default();
     for batch in builder.build()? {
         out.merge(KeyStats::from_batch(&batch?)?);
     }
-    Ok(out)
+    Ok(out.settled())
 }
 
 #[cfg(test)]
@@ -428,13 +489,22 @@ mod tests {
         }
     }
 
+    fn seen(count: u64, first: i64, last: i64) -> KeySeen {
+        KeySeen {
+            count,
+            first_seen: first,
+            last_seen: last,
+        }
+    }
+
     #[test]
-    fn keys_are_counted_by_source_and_type_with_their_first_and_last_sighting() {
+    fn keys_are_counted_once_per_span_by_source_and_type_with_their_sightings() {
         let batch = batch_with(vec![
             span(
                 1_000,
                 vec![
                     kv("http.method", string("GET")),
+                    kv("http.method", string("GET again")),
                     kv("http.status", Value::IntValue(200)),
                     kv("retry", Value::BoolValue(true)),
                 ],
@@ -442,13 +512,8 @@ mod tests {
             span(3_000, vec![kv("http.method", string("POST"))]),
         ]);
         let mut stats = KeyStats::default();
-        stats.absorb(&batch).unwrap();
+        stats.absorb(&batch, usize::MAX).unwrap();
         let rows: Vec<_> = stats.iter().collect();
-        let seen = |count, first, last| KeySeen {
-            count,
-            first_seen: first,
-            last_seen: last,
-        };
         assert_eq!(
             rows,
             vec![
@@ -488,26 +553,73 @@ mod tests {
                     KeyType::String,
                     seen(2, 1_000, 3_000)
                 ),
-            ]
+            ],
+            "a key repeated on one span counts once"
         );
         assert_eq!(stats.range(), Some((1_000, 3_000)));
+        assert_eq!((stats.new_keys(), stats.dropped()), (6, 0));
+    }
+
+    #[test]
+    fn keys_beyond_the_cap_are_dropped_in_batch_order_and_known_keys_still_count() {
+        let batch = batch_with(vec![span(
+            1_000,
+            vec![kv("a", string("1")), kv("b", string("2"))],
+        )]);
+        let mut stats = KeyStats::default();
+        stats.absorb(&batch, 3).unwrap();
+        let kept: Vec<&str> = stats.iter().map(|(_, key, _, _)| key).collect();
+        assert_eq!(
+            kept,
+            ["host.name", "service.name", "a"],
+            "the resource keys come first, then the first span key"
+        );
+        assert_eq!(stats.dropped(), 2, "b and the scope key");
+
+        // Decoded keys are not new: a cap of one admits one more key and
+        // keeps counting the known ones.
+        let table = decode(bytes::Bytes::from(encode(&stats).unwrap())).unwrap();
+        assert_eq!(table.new_keys(), 0);
+        let mut table = table;
+        table
+            .absorb(
+                &batch_with(vec![span(
+                    2_000,
+                    vec![kv("c", string("3")), kv("a", string("4"))],
+                )]),
+                1,
+            )
+            .unwrap();
+        let rows: Vec<_> = table
+            .iter()
+            .map(|(_, key, _, seen)| (key, seen.count))
+            .collect();
+        assert_eq!(
+            rows,
+            [("host.name", 2), ("service.name", 2), ("a", 2), ("c", 1)],
+            "c admitted, the scope key dropped again"
+        );
+        assert_eq!((table.new_keys(), table.dropped()), (1, 1));
     }
 
     #[test]
     fn a_merge_sums_counts_and_widens_the_sightings_and_the_file_round_trips() {
         let mut first = KeyStats::default();
         first
-            .absorb(&batch_with(vec![span(
-                5_000,
-                vec![kv("http.method", string("GET"))],
-            )]))
+            .absorb(
+                &batch_with(vec![span(5_000, vec![kv("http.method", string("GET"))])]),
+                usize::MAX,
+            )
             .unwrap();
         let mut second = KeyStats::default();
         second
-            .absorb(&batch_with(vec![span(
-                2_000,
-                vec![kv("http.method", string("PUT")), kv("db.name", string("x"))],
-            )]))
+            .absorb(
+                &batch_with(vec![span(
+                    2_000,
+                    vec![kv("http.method", string("PUT")), kv("db.name", string("x"))],
+                )]),
+                usize::MAX,
+            )
             .unwrap();
         first.merge(second);
         let method = first
@@ -521,7 +633,8 @@ mod tests {
 
         let bytes = encode(&first).unwrap();
         let back = decode(bytes::Bytes::from(bytes)).unwrap();
-        assert_eq!(back, first);
+        let rows: Vec<_> = back.iter().collect();
+        assert_eq!(rows, first.iter().collect::<Vec<_>>());
         assert_eq!(
             back.to_batch().unwrap().schema().metadata()["fusescope.schema_version"],
             "1"
@@ -529,21 +642,28 @@ mod tests {
     }
 
     #[test]
-    fn another_version_is_refused() {
-        let stats = KeyStats::default();
-        let batch = stats.to_batch().unwrap();
-        let mut metadata = batch.schema().metadata().clone();
-        metadata.insert("fusescope.schema_version".into(), "2".into());
-        let schema = Arc::new(Schema::new_with_metadata(
-            batch.schema().fields().clone(),
-            metadata,
-        ));
-        let foreign = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
-        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
-        writer.write(&foreign).unwrap();
-        let bytes = writer.into_inner().unwrap();
-        let err = decode(bytes::Bytes::from(bytes)).unwrap_err();
-        assert!(matches!(err, SchemaError::Layout(_)), "{err}");
+    fn another_version_or_signal_is_refused() {
+        let batch = KeyStats::default().to_batch().unwrap();
+        for (key, value) in [
+            ("fusescope.schema_version", "2"),
+            ("fusescope.signal", "spans"),
+        ] {
+            let mut metadata = batch.schema().metadata().clone();
+            metadata.insert(key.into(), value.into());
+            let schema = Arc::new(Schema::new_with_metadata(
+                batch.schema().fields().clone(),
+                metadata,
+            ));
+            assert!(matches!(check_schema(&schema), Err(SchemaError::Layout(_))));
+            let foreign =
+                RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+            let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+            writer.write(&foreign).unwrap();
+            let bytes = writer.into_inner().unwrap();
+            let err = decode(bytes::Bytes::from(bytes)).unwrap_err();
+            assert!(matches!(err, SchemaError::Layout(_)), "{err}");
+        }
+        assert!(check_schema(&attribute_keys_schema_v1()).is_ok());
         assert!(
             matches!(
                 KeyStats::from_batch(&batch_with(Vec::new())).unwrap_err(),
