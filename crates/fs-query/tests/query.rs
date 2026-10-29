@@ -706,15 +706,7 @@ async fn serve_flight(
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<Result<(), fs_query::QueryError>>,
 ) {
-    let service = FlightSql::new(f.querier.clone(), f.db.catalog.clone());
-    let (shutdown, rx) = tokio::sync::watch::channel(false);
-    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
-    let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
-        .await
-        .unwrap()
-        .unwrap();
-    (addr, shutdown, server)
+    serve(f, f.db.catalog.clone()).await
 }
 
 async fn sql_client(addr: std::net::SocketAddr, token: &str) -> FlightSqlServiceClient<Channel> {
@@ -1171,19 +1163,38 @@ async fn silent_catalog() -> (tokio::net::TcpListener, Catalog) {
     (listener, Catalog::from_pool(pool))
 }
 
+/// Serves `f.querier` behind `catalog` for authentication; the caller
+/// flips the shutdown and awaits the handle, so a server never outlives
+/// its test and a failure on the way down is seen.
 async fn serve(
     f: &Fixture,
     catalog: Catalog,
-) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<(), fs_query::QueryError>>,
+) {
     let service = FlightSql::new(f.querier.clone(), catalog);
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
+    let server = tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
     let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
         .await
         .unwrap()
         .unwrap();
-    (addr, shutdown)
+    (addr, shutdown, server)
+}
+
+async fn stop(
+    shutdown: tokio::sync::watch::Sender<bool>,
+    server: tokio::task::JoinHandle<Result<(), fs_query::QueryError>>,
+) {
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 /// Every entry point answers `DEADLINE_EXCEEDED` well before the test's
@@ -1241,12 +1252,12 @@ async fn authentication_runs_under_the_deadline() {
     let Some(mut f) = fixture().await else { return };
     f.querier = querier_over(&f, f.db.catalog.clone(), Duration::from_millis(200));
     let (silent, catalog) = silent_catalog().await;
-    let (addr, shutdown) = serve(&f, catalog).await;
+    let (addr, shutdown, server) = serve(&f, catalog).await;
     let mut client = sql_client(addr, &format!("fst_{}", "a".repeat(43))).await;
 
     every_entry_point_exceeds_its_deadline(&mut client, f.tenant).await;
 
-    shutdown.send(true).unwrap();
+    stop(shutdown, server).await;
     drop(silent);
     f.db.finish().await;
 }
@@ -1265,12 +1276,12 @@ async fn the_deadline_covers_planning_on_every_entry_point() {
             .create_token(f.tenant, "backend", TokenScope::Query)
             .await
             .unwrap();
-    let (addr, shutdown) = serve(&f, f.db.catalog.clone()).await;
+    let (addr, shutdown, server) = serve(&f, f.db.catalog.clone()).await;
     let mut client = sql_client(addr, &token).await;
 
     every_entry_point_exceeds_its_deadline(&mut client, f.tenant).await;
 
-    shutdown.send(true).unwrap();
+    stop(shutdown, server).await;
     drop(silent);
     f.db.finish().await;
 }
