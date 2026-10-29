@@ -695,8 +695,10 @@ in the first body, the end-of-stream marker in the last, which is how the
 Go `Do` hands back an `arrow.RecordReader`. The row cap, the timeout and
 the `x-fusescope-partial` header apply as for `DoGet`; `ListActions` names
 the actions served. The timeout runs from the request's arrival, over
-authentication, planning and every wait for a batch, so a stalled store
-or a slow plan ends in `DEADLINE_EXCEEDED` too. `trace.lookup` takes
+authentication, planning and every wait for a batch, so a stalled catalog,
+a stalled store or a slow plan ends in `DEADLINE_EXCEEDED` too, and a
+limit met while the stream is already flowing reaches the client with its
+own code. `trace.lookup` takes
 `{"trace_id": "<32 hex digits>", "start_unix_nano": n, "end_unix_nano": n}`,
 the bounds optional and inclusive, any other field refused, and answers
 every column of the spans table for that trace in

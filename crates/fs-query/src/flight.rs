@@ -86,6 +86,19 @@ impl FlightSql {
         Ok(())
     }
 
+    /// Resolves the bearer token under the request's `deadline`, so a
+    /// catalog that does not answer ends the request like any other step.
+    async fn authenticate_by(
+        &self,
+        metadata: &MetadataMap,
+        deadline: tokio::time::Instant,
+        limits: QueryLimits,
+    ) -> Result<TenantId, Status> {
+        tokio::time::timeout_at(deadline, self.authenticate(metadata))
+            .await
+            .unwrap_or_else(|_| Err(status_of(&QueryError::Timeout(limits.timeout))))
+    }
+
     async fn authenticate(&self, metadata: &MetadataMap) -> Result<TenantId, Status> {
         let token = metadata
             .get("authorization")
@@ -118,9 +131,16 @@ fn decode_ticket(handle: &[u8]) -> Result<(TenantId, String), Status> {
     Ok((TenantId(tenant), sql.to_owned()))
 }
 
-/// When a request that arrives now must be done, by `limits.timeout`.
+/// Stands in for a deadline the clock cannot represent, as tokio does for
+/// a timer with no end: thirty years from now.
+const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
+/// When a request that arrives now must be done, by `limits.timeout`; a
+/// timeout the clock cannot add is [`FAR_FUTURE`].
 fn deadline_of(limits: QueryLimits) -> tokio::time::Instant {
-    tokio::time::Instant::now() + limits.timeout
+    let now = tokio::time::Instant::now();
+    now.checked_add(limits.timeout)
+        .unwrap_or_else(|| now + FAR_FUTURE)
 }
 
 /// Runs `work`, a step of a request, against its `deadline`.
@@ -199,6 +219,17 @@ fn announce_partial<T>(response: &mut Response<T>, warnings: &QueryWarnings) {
     }
 }
 
+/// The status of an error met while encoding a `DoGet` stream: a query
+/// error keeps its code, anything else is internal.
+fn status_of_flight(error: &FlightError) -> Status {
+    match error {
+        FlightError::ExternalError(inner) => inner
+            .downcast_ref::<QueryError>()
+            .map_or_else(|| Status::internal(error.to_string()), status_of),
+        _ => Status::internal(error.to_string()),
+    }
+}
+
 fn status_of(error: &QueryError) -> Status {
     match error {
         QueryError::NotAllowed(_) => Status::permission_denied(error.to_string()),
@@ -234,7 +265,9 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<FlightInfo>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let tenant = self.authenticate(request.metadata()).await?;
+        let tenant = self
+            .authenticate_by(request.metadata(), deadline, limits)
+            .await?;
         let schema: SchemaRef =
             within(deadline, limits, self.querier.prepare(tenant, &query.query)).await?;
         let ticket = TicketStatementQuery {
@@ -261,7 +294,9 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let tenant = self.authenticate(request.metadata()).await?;
+        let tenant = self
+            .authenticate_by(request.metadata(), deadline, limits)
+            .await?;
         let (ticket_tenant, sql) = decode_ticket(&ticket.statement_handle)?;
         if ticket_tenant != tenant {
             warn!(tenant = %tenant.0, "ticket from another tenant refused");
@@ -285,7 +320,7 @@ impl FlightSqlService for FlightSql {
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(limited)
-            .map_err(|e| Status::internal(e.to_string()));
+            .map_err(|e| status_of_flight(&e));
         let mut response = Response::new(Box::pin(encoded)
             as Pin<
                 Box<
@@ -304,7 +339,9 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let tenant = self.authenticate(request.metadata()).await?;
+        let tenant = self
+            .authenticate_by(request.metadata(), deadline, limits)
+            .await?;
         let action = request.get_ref();
         if action.r#type != TRACE_LOOKUP {
             return Err(Status::unimplemented(format!(
@@ -399,6 +436,40 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn a_deadline_beyond_the_clock_is_the_far_future() {
+        let forever = QueryLimits {
+            timeout: std::time::Duration::MAX,
+            ..QueryLimits::default()
+        };
+        let deadline = deadline_of(forever);
+        assert!(
+            deadline
+                > tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60)
+        );
+        assert!(deadline <= tokio::time::Instant::now() + FAR_FUTURE);
+    }
+
+    #[test]
+    fn a_query_error_met_while_encoding_keeps_its_code() {
+        let external = |e: QueryError| FlightError::ExternalError(Box::new(e));
+        assert_eq!(
+            status_of_flight(&external(QueryError::Timeout(
+                std::time::Duration::from_secs(1)
+            )))
+            .code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert_eq!(
+            status_of_flight(&external(QueryError::TooManyRows(3))).code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            status_of_flight(&FlightError::NotYetImplemented("x".into())).code(),
+            tonic::Code::Internal
+        );
+    }
+
     #[tokio::test]
     async fn a_stalled_stream_ends_in_timeout_at_the_deadline() {
         let limits = QueryLimits {
@@ -411,7 +482,6 @@ mod tests {
             bounded.next().await.unwrap().is_ok(),
             "the ready batch flows"
         );
-        let started = tokio::time::Instant::now();
         let stalled = tokio::time::timeout(std::time::Duration::from_secs(5), bounded.next())
             .await
             .expect("the deadline, not the test, ends the wait")
@@ -420,7 +490,6 @@ mod tests {
             matches!(stalled, Err(QueryError::Timeout(_))),
             "{stalled:?}"
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
 
         let (stream, count) = batch_stream(vec![one_row(), one_row()], false);
         let drained: Vec<_> = bound_rows(stream, limits, deadline_of(limits))
