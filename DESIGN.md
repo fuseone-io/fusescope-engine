@@ -582,20 +582,24 @@ table before, transient or not, ends the pass before anything is created
 replaced by one pass's view, and a table damaged for good is repaired by an
 operator, by rebuilding it from the L1 files, which is not automated yet.
 Every key records the hour whose budget admitted it (`admitted_hour`),
-so an hour admits at most the tenant's `max_keys_hour` keys new to the
-table over all its passes, across restarts and whatever the pass size:
-each pass gets what the table says is left for its hour. Within a pass
+fixed once admitted, so late data of an earlier hour widens a known
+key's count and sightings and never moves its charge, and an hour admits
+at most the tenant's `max_keys_hour` keys new to the table over all its
+passes, across restarts and whatever the pass size: each pass gets what
+the table says is left for its hour. Within a pass
 keys are admitted in merge order and never allocated for beyond the
 budget (`fusescope_compaction_derived_keys_dropped_total`); which keys an
 hour admits depends on how its files were split into passes, the total
 does not. Keys of rows not yet compacted are not listed: the table lags
 ingestion by the hour close delay. The format carries its signal and
-version in the schema metadata (v2; a v1 file, without `admitted_hour`,
-reads with the hour of `first_seen` in its place); the compactor and the
-querier both check them before reading a file, the querier from the
-footer alone, fetched by ranges and remembered per path since an object
-is never rewritten, and refuse anything else, so an older engine never
-rewrites a newer table and a newer table is never read as an older one.
+version in the schema metadata and each version has one exact layout (v2
+the seven columns with `admitted_hour` never null; v1 the six, read with
+the hour of `first_seen` in its place); the compactor and the querier
+both check signal, version and layout before reading a file, the querier
+from the footer alone, fetched by ranges once per path and shared by the
+queries that meet a new path at the same time, since an object is never
+rewritten, and refuse anything else, so an older engine never rewrites a
+newer table and a file is never read as a version it is not.
 
 Retention: the compactor deletes day prefixes beyond the tenant's
 `retention_days`, first in the catalog, then in the bucket. Bucket lifecycle
@@ -740,7 +744,8 @@ parsing or planning SQL (`fusescope_query_trace_lookups_total`).
 from the catalog alone: the services of every file overlapping the range,
 so a range answers at file granularity, plus what the ingesters still hold
 when the range touches the recent window, asked for the distinct names
-only, so an ingester keeps and sends each name once; no file is read, and
+only and for one more than the limit at most, so an ingester keeps and
+sends each name once and never more than that; no file is read, and
 more services than the limit is `RESOURCE_EXHAUSTED` as soon as it is
 known, so the answer never holds more than that.
 `metadata.operations` takes `{"service_name": s, "start_unix_nano": n,

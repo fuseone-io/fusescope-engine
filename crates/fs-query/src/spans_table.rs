@@ -184,7 +184,7 @@ impl TableProvider for SpansTable {
         if let Some((hot, warnings)) = &self.hot {
             if hot.touches_recent(&pruning) {
                 let result = hot
-                    .scan(self.tenant, &pruning, projected_names.clone(), false)
+                    .scan(self.tenant, &pruning, projected_names.clone(), None)
                     .await
                     .map_err(|e| external(e.into()))?;
                 for ingester in &result.unavailable {

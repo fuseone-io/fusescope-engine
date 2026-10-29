@@ -1663,7 +1663,23 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         .swap_files(f.tenant, Signal::AttributeKeys, &[v1], &[])
         .await
         .unwrap();
-    register(file_of("3", 7), "hr=16").await;
+    let v3 = register(file_of("3", 7), "hr=16").await;
+    f.querier
+        .cache()
+        .invalidate(f.tenant, Signal::AttributeKeys)
+        .await;
+    let err = action(&mut client, METADATA_KEYS, r#"{"signal": "traces"}"#)
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("not readable by this version"),
+        "{err}"
+    );
+    f.db.catalog
+        .swap_files(f.tenant, Signal::AttributeKeys, &[v3], &[])
+        .await
+        .unwrap();
+    register(file_of("2", 6), "hr=17").await;
     f.querier
         .cache()
         .invalidate(f.tenant, Signal::AttributeKeys)

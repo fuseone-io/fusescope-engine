@@ -80,8 +80,8 @@ pub fn tenant_session(
             cache,
             store_url.clone(),
             Signal::AttributeKeys,
-            attribute_keys::attribute_keys_schema_v2(),
-            attribute_keys::check_schema,
+            attribute_keys::table_schema(),
+            |schema| attribute_keys::check_schema(schema).map(|_| ()),
             verified,
         )),
     )?;

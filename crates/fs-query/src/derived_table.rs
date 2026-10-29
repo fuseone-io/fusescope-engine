@@ -38,10 +38,13 @@ use crate::files::FileCache;
 /// Refuses a file schema the table's reader does not know.
 pub type SchemaCheck = fn(&arrow::datatypes::Schema) -> Result<(), SchemaError>;
 
-/// Paths whose footer passed the check, shared by every session; a path
-/// never changes content, so once is enough. Cleared when it reaches
-/// [`VERIFIED_PATHS`].
-pub type VerifiedPaths = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+/// Per path, whether its footer passed the check, shared by every
+/// session; a path never changes content, so once is enough. Each path
+/// has its own async lock, held while its footer is fetched, so queries
+/// meeting a new path at the same time fetch it once between them.
+/// Cleared when it reaches [`VERIFIED_PATHS`].
+pub type VerifiedPaths =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<bool>>>>>;
 
 /// Most paths remembered as verified before the set starts over.
 pub const VERIFIED_PATHS: usize = 65_536;
@@ -88,11 +91,15 @@ impl DerivedTable {
         store: &Arc<dyn ObjectStore>,
         file: &FileRecord,
     ) -> Result<(), QueryError> {
-        let known = self
-            .verified
-            .lock()
-            .is_ok_and(|verified| verified.contains(&file.path));
-        if known {
+        let slot = {
+            let mut paths = self.verified.lock().map_err(|_| QueryError::Poisoned)?;
+            if paths.len() >= VERIFIED_PATHS && !paths.contains_key(&file.path) {
+                paths.clear();
+            }
+            Arc::clone(paths.entry(file.path.clone()).or_default())
+        };
+        let mut done = slot.lock().await;
+        if *done {
             return Ok(());
         }
         let size = u64::try_from(file.size_bytes).unwrap_or(0);
@@ -114,12 +121,7 @@ impl DerivedTable {
             path: file.path.clone(),
             source,
         })?;
-        if let Ok(mut verified) = self.verified.lock() {
-            if verified.len() >= VERIFIED_PATHS {
-                verified.clear();
-            }
-            verified.insert(file.path.clone());
-        }
+        *done = true;
         Ok(())
     }
 }

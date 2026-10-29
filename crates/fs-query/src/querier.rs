@@ -390,7 +390,7 @@ impl Querier {
                     tenant,
                     &pruning,
                     Some(vec![span_col::SERVICE_NAME.to_owned()]),
-                    true,
+                    Some(limit.saturating_add(1)),
                 )
                 .await?;
             for ingester in &hot.unavailable {
@@ -561,7 +561,12 @@ impl Querier {
 
     /// Derived table files whose footer passed the version check so far.
     pub fn verified_derived_files(&self) -> usize {
-        self.verified.lock().map_or(0, |v| v.len())
+        self.verified.lock().map_or(0, |paths| {
+            paths
+                .values()
+                .filter(|slot| slot.try_lock().is_ok_and(|done| *done))
+                .count()
+        })
     }
 
     /// Bytes the waiting plans are estimated to retain.
