@@ -641,8 +641,10 @@ before is swapped out alone, without being read, when nothing remains. A
 rebuild that does not commit, for a lost lease, a conflict, an unreadable
 table before or L1 file, or a crash, leaves the table before in place and
 the new table an orphan (`fusescope_retention_rebuild_*`). A tick
-attempts at most `compactor.rebuilds_per_tick` rebuilds, 256 at most, so
-the leader's purge, compaction and sweep are never long behind them.
+examines at most `compactor.rebuilds_per_tick` stale tables, 256 at most
+and clamped there by the compactor itself, a table passed over counting
+like one rebuilt, so the leader's purge, compaction and sweep are never
+long behind the rebuilds whatever is held back or over a cap.
 The stale tables are walked by earliest sighting with a keyset cursor
 that outlives calls and ticks and wraps around at the end
 (`stale_derived_table`), each table once a round whether its rebuild
