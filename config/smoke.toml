@@ -1,0 +1,55 @@
+# Configuration for docs/smoke-test.md: the development services with the
+# clocks shortened so the whole path, flush to compaction, runs in minutes.
+# The validator keeps the order between them (see the comments). Uses its
+# own prefix so it never meets the development catalog's objects.
+# Secrets come from the environment: FS_CATALOG_URL, FS_BUCKET_ACCESS_KEY,
+# FS_BUCKET_SECRET_KEY, and FS_QUERY_TOKEN for `admin query`.
+
+[server]
+role = "all"
+node_id = "smoke-0"
+flight_addr = "0.0.0.0:8815"
+metrics_addr = "0.0.0.0:9464"
+
+[catalog]
+max_connections = 8
+migrate = true
+
+[bucket]
+kind = "s3"
+name = "fusescope"
+prefix = "smoke"
+endpoint = "http://localhost:9100"
+region = "us-east-1"
+allow_http = true
+
+[wal]
+dir = "./data/smoke/wal"
+
+[ingest]
+listen = "0.0.0.0:4317"
+hot_listen = "0.0.0.0:8816"
+hot_advertise = "127.0.0.1:8816"
+flush_interval_secs = 5
+persisted_retain_secs = 10       # >= the querier's file cache TTL (5 s) plus a hot scan
+
+[query]
+memory_bytes = 1073741824
+timeout_secs = 10
+max_rows = 1000000
+spill_dir = "./data/smoke/spill"
+
+[compactor]
+purge_interval_secs = 15
+lease_ttl_secs = 30
+compaction_interval_secs = 15
+hour_close_delay_secs = 30       # >= persisted_retain + query timeout + file cache TTL
+l1_target_bytes = 536870912
+max_inputs_per_pass = 16
+max_input_bytes = 2147483648
+orphan_interval_secs = 3600
+orphan_ttl_secs = 3600
+
+[log]
+level = "info"
+format = "text"

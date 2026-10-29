@@ -611,7 +611,16 @@ must never point at files that do not exist.
 
 A crash between an upload and its registration, a compaction that did not
 publish, or a cancelled pass leaves objects no row points at. The leader
-sweeps the engine's prefix every `compactor.orphan_interval_secs`. The
+sweeps the engine's prefix every `compactor.orphan_interval_secs`. Because
+the sweep deletes whatever its catalog does not know, a prefix belongs to
+exactly one catalog, durably: the catalog carries an identity given once
+(`engine_catalog`), the first writer marks the prefix with it in
+`{prefix}/_catalog`, created once and never rewritten, and every start
+reads the marker and refuses a prefix marked for another catalog. A
+prefix that holds objects and no marker is refused too, unless the
+operator sets `bucket.adopt_prefix = true` for one start, which marks it;
+a reader role meeting an empty, unmarked prefix proceeds and leaves the
+marking to the writer. The
 bucket is walked by partitions, one tenant, level and day each, found with
 delimiter listings as the walk reaches them, so no listing order is assumed
 and nothing is enumerated ahead but the list of tenants; a pass walks whole

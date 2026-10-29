@@ -15,6 +15,7 @@ migrate = true
 [bucket]
 kind = "s3"
 name = "fusescope"
+prefix = "dev"                 # one catalog per prefix; the smoke test uses "smoke"
 endpoint = "http://localhost:9100"
 region = "us-east-1"
 allow_http = true          # development only; production endpoints are https
