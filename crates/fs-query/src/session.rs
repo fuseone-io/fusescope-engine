@@ -5,6 +5,7 @@ use std::sync::Arc;
 use datafusion::catalog::{
     CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
 };
+use datafusion::common::tree_node::TreeNode;
 use datafusion::config::Dialect;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -91,29 +92,28 @@ pub fn tenant_session(
     Ok(ctx)
 }
 
-/// Parses and plans `sql`, refusing anything that is not a read.
+/// Parses and plans `sql`, refusing anything that is not a read: the
+/// statement is checked before planning, through every `EXPLAIN` it is
+/// wrapped in, and the plan is walked whole afterwards, so a write never
+/// reaches execution however it is dressed.
 ///
 /// # Errors
 /// Non-query statements, or planning failures.
 pub async fn plan_read_only(ctx: &SessionContext, sql: &str) -> Result<LogicalPlan, QueryError> {
     let state = ctx.state();
     let statement = state.sql_to_statement(sql, &Dialect::PostgreSQL)?;
-    match &statement {
-        Statement::Statement(inner) => match inner.as_ref() {
-            SqlStatement::Query(_)
-            | SqlStatement::Explain { .. }
-            | SqlStatement::ExplainTable { .. } => {}
-            other => return Err(QueryError::NotAllowed(statement_kind(other).to_owned())),
-        },
-        Statement::Explain(_) => {}
-        Statement::CreateExternalTable(_) => {
-            return Err(QueryError::NotAllowed("CREATE EXTERNAL TABLE".into()));
-        }
-        Statement::CopyTo(_) => return Err(QueryError::NotAllowed("COPY".into())),
-        Statement::Reset(_) => return Err(QueryError::NotAllowed("RESET".into())),
-    }
+    check_statement(&statement)?;
     let plan = state.statement_to_plan(statement).await?;
-    if !read_only(&plan) {
+    let writes = plan.exists(|node| {
+        Ok(matches!(
+            node,
+            LogicalPlan::Ddl(_)
+                | LogicalPlan::Dml(_)
+                | LogicalPlan::Copy(_)
+                | LogicalPlan::Statement(_)
+        ))
+    })?;
+    if writes {
         return Err(QueryError::NotAllowed(
             "statement writes or changes state".into(),
         ));
@@ -121,14 +121,26 @@ pub async fn plan_read_only(ctx: &SessionContext, sql: &str) -> Result<LogicalPl
     Ok(plan)
 }
 
-fn read_only(plan: &LogicalPlan) -> bool {
-    !matches!(
-        plan,
-        LogicalPlan::Ddl(_)
-            | LogicalPlan::Dml(_)
-            | LogicalPlan::Copy(_)
-            | LogicalPlan::Statement(_)
-    )
+/// Refuses anything but a query, looking through `EXPLAIN` and
+/// `EXPLAIN ANALYZE`, which would describe or run what they wrap.
+fn check_statement(statement: &Statement) -> Result<(), QueryError> {
+    match statement {
+        Statement::Statement(inner) => check_sql_statement(inner),
+        Statement::Explain(explain) => check_statement(&explain.statement),
+        Statement::CreateExternalTable(_) => {
+            Err(QueryError::NotAllowed("CREATE EXTERNAL TABLE".into()))
+        }
+        Statement::CopyTo(_) => Err(QueryError::NotAllowed("COPY".into())),
+        Statement::Reset(_) => Err(QueryError::NotAllowed("RESET".into())),
+    }
+}
+
+fn check_sql_statement(statement: &SqlStatement) -> Result<(), QueryError> {
+    match statement {
+        SqlStatement::Query(_) | SqlStatement::ExplainTable { .. } => Ok(()),
+        SqlStatement::Explain { statement, .. } => check_sql_statement(statement),
+        other => Err(QueryError::NotAllowed(statement_kind(other).to_owned())),
+    }
 }
 
 fn statement_kind(statement: &SqlStatement) -> &'static str {

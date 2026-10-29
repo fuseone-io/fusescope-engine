@@ -547,6 +547,232 @@ async fn trace_lookup_by_hex_id() {
     f.db.finish().await;
 }
 
+/// The sandbox: one test per construct DESIGN.md 10.2 promises to refuse.
+/// Each statement must fail before anything runs, and the tables a session
+/// sees are the tenant's own.
+mod sandbox {
+    use super::*;
+
+    async fn refused(f: &Fixture, sql: &str) -> QueryError {
+        let err = f.querier.collect(f.tenant, sql).await.unwrap_err();
+        assert!(
+            matches!(err, QueryError::NotAllowed(_) | QueryError::DataFusion(_)),
+            "{sql}: refused for the wrong reason: {err}"
+        );
+        err
+    }
+
+    async fn not_allowed(f: &Fixture, sql: &str, construct: &str) {
+        let err = refused(f, sql).await;
+        assert!(
+            matches!(err, QueryError::NotAllowed(ref what) if what.contains(construct)),
+            "{sql}: expected NotAllowed naming {construct}, got {err}"
+        );
+    }
+
+    async fn spans_untouched(f: &Fixture) {
+        let rows = f
+            .querier
+            .collect(f.tenant, "select count(*) as n from spans")
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&rows),
+            22,
+            "the spans table is as the fixture wrote it"
+        );
+    }
+
+    macro_rules! refuses {
+        ($name:ident, $sql:expr, $construct:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let Some(f) = fixture().await else { return };
+                not_allowed(&f, $sql, $construct).await;
+                spans_untouched(&f).await;
+                f.db.finish().await;
+            }
+        };
+    }
+
+    macro_rules! refuses_at_planning {
+        ($name:ident, $sql:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let Some(f) = fixture().await else { return };
+                let err = refused(&f, $sql).await;
+                assert!(matches!(err, QueryError::DataFusion(_)), "{err}");
+                spans_untouched(&f).await;
+                f.db.finish().await;
+            }
+        };
+    }
+
+    // DDL
+    refuses!(create_table, "create table t (a int)", "CREATE");
+    refuses!(
+        create_temporary_table,
+        "create temporary table t (a int)",
+        "CREATE"
+    );
+    refuses!(
+        create_table_as,
+        "create table t as select * from spans",
+        "CREATE"
+    );
+    refuses!(
+        create_view,
+        "create view v as select * from spans",
+        "CREATE"
+    );
+    refuses!(create_schema, "create schema s", "non-query");
+    refuses!(
+        create_function,
+        "create function f(int) returns int return 1",
+        "non-query"
+    );
+    refuses!(drop_table, "drop table spans", "DROP");
+    refuses!(alter_table, "alter table spans add column x int", "ALTER");
+    refuses!(truncate, "truncate table spans", "non-query");
+    // DML
+    refuses!(
+        insert_select,
+        "insert into spans select * from spans",
+        "INSERT"
+    );
+    refuses!(
+        insert_values,
+        "insert into attribute_keys values ('k', 'span', 'string', 1, now(), now(), now())",
+        "INSERT"
+    );
+    refuses!(update, "update spans set name = 'x'", "UPDATE");
+    refuses!(delete, "delete from spans", "DELETE");
+    refuses!(
+        merge,
+        "merge into spans using spans s on true when matched then delete",
+        "non-query"
+    );
+    // Files
+    refuses!(copy_to, "copy (select 1) to '/tmp/x.parquet'", "COPY");
+    refuses_at_planning!(copy_from, "copy spans from '/etc/passwd'");
+    refuses!(
+        create_external_table,
+        "create external table x stored as parquet location '/etc/passwd'",
+        "CREATE EXTERNAL TABLE"
+    );
+    refuses_at_planning!(read_parquet, "select * from read_parquet('/etc/passwd')");
+    refuses_at_planning!(read_csv, "select * from read_csv('/etc/passwd')");
+    refuses_at_planning!(read_json, "select * from read_json('/etc/passwd')");
+    refuses_at_planning!(read_avro, "select * from read_avro('/etc/passwd')");
+    refuses_at_planning!(
+        parquet_metadata,
+        "select * from parquet_metadata('/etc/passwd')"
+    );
+    refuses_at_planning!(
+        table_function_in_a_subquery,
+        "select n from (select count(*) as n from read_parquet('/etc/passwd'))"
+    );
+    // Session state
+    refuses!(set, "set datafusion.execution.batch_size = 1", "SET");
+    refuses_at_planning!(set_variable, "set variable x = 1");
+    refuses!(reset, "reset datafusion.execution.batch_size", "RESET");
+    refuses!(show_tables, "show tables", "non-query");
+    refuses!(begin_transaction, "begin", "non-query");
+    refuses!(commit, "commit", "non-query");
+    refuses!(prepare, "prepare p as select 1", "non-query");
+    refuses!(execute, "execute p", "non-query");
+    refuses!(deallocate, "deallocate p", "non-query");
+
+    /// `EXPLAIN` of a write describes nothing and `EXPLAIN ANALYZE` of one
+    /// would run it: both are refused as the write itself is.
+    #[tokio::test]
+    async fn explain_of_a_write() {
+        let Some(f) = fixture().await else { return };
+        not_allowed(
+            &f,
+            "explain insert into spans select * from spans",
+            "INSERT",
+        )
+        .await;
+        not_allowed(
+            &f,
+            "explain analyze insert into spans select * from spans",
+            "INSERT",
+        )
+        .await;
+        not_allowed(
+            &f,
+            "explain analyze copy (select 1) to '/tmp/x.parquet'",
+            "COPY",
+        )
+        .await;
+        spans_untouched(&f).await;
+        f.db.finish().await;
+    }
+
+    /// Reads, explained or not, are what the session is for.
+    #[tokio::test]
+    async fn reads_and_their_explanations_pass() {
+        let Some(f) = fixture().await else { return };
+        for sql in [
+            "select count(*) from spans",
+            "explain select count(*) from spans",
+            "explain analyze select count(*) from spans",
+            "select * from fusescope.public.spans limit 1",
+            "with t as (select service_name from spans) select count(*) from t",
+        ] {
+            f.querier
+                .collect(f.tenant, sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        f.db.finish().await;
+    }
+
+    /// One statement per request: a second one, however harmless, is refused
+    /// before the first is looked at.
+    #[tokio::test]
+    async fn two_statements() {
+        let Some(f) = fixture().await else { return };
+        let err = refused(&f, "select 1; drop table spans").await;
+        assert!(matches!(err, QueryError::DataFusion(_)), "{err}");
+        spans_untouched(&f).await;
+        f.db.finish().await;
+    }
+
+    /// A session sees its tenant's two tables and nothing else: no other
+    /// catalog, no other schema, and `information_schema` lists only them.
+    #[tokio::test]
+    async fn only_the_tenants_tables_exist() {
+        let Some(f) = fixture().await else { return };
+        for sql in [
+            "select * from other.public.spans",
+            "select * from fusescope.other.spans",
+            "select * from datafusion.public.spans",
+            "select * from engine_file",
+            "select * from engine_tenant",
+        ] {
+            let err = refused(&f, sql).await;
+            assert!(matches!(err, QueryError::DataFusion(_)), "{sql}: {err}");
+        }
+        let tables = f
+            .querier
+            .collect(
+                f.tenant,
+                "select table_catalog, table_schema, table_name from information_schema.tables \
+                 where table_schema = 'public' order by table_name",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            strings(&tables, "table_catalog"),
+            ["fusescope", "fusescope"]
+        );
+        assert_eq!(strings(&tables, "table_name"), ["attribute_keys", "spans"]);
+        f.db.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn sandbox_refuses_writes_and_budget_refuses_big_scans() {
     let Some(f) = fixture().await else { return };
