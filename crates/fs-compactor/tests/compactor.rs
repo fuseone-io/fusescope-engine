@@ -242,6 +242,13 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
             delete_backoff: Duration::from_secs(600),
             inject_delete_failure: None,
         },
+        retention_interval: Duration::from_secs(3600),
+        retention: fs_compactor::RetentionConfig {
+            files_per_pass: 100,
+            rebuild_max_bytes: 1 << 30,
+            batch_rows: 1024,
+            inject_swap_failures: 0,
+        },
     };
     let task = tokio::spawn(fs_compactor::run(
         db.catalog.clone(),
@@ -415,6 +422,13 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
             deletes_per_pass: 100,
             delete_backoff: Duration::from_secs(600),
             inject_delete_failure: None,
+        },
+        retention_interval: Duration::from_secs(3600),
+        retention: fs_compactor::RetentionConfig {
+            files_per_pass: 100,
+            rebuild_max_bytes: 1 << 30,
+            batch_rows: 1024,
+            inject_swap_failures: 0,
         },
     };
     let task = tokio::spawn(fs_compactor::run(

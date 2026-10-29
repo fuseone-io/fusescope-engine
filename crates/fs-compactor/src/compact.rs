@@ -13,18 +13,18 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::TimeZone;
 use fs_catalog::{
-    Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, Level, NewFile, Signal,
-    TimeRange,
+    Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, NewFile, Signal,
 };
 use fs_schema::attribute_keys::KeyStats;
+use object_store::ObjectStore;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use tracing::{info, warn};
 
 use crate::CompactError;
-use crate::merge::{L1Merger, MergeConfig, attribute_keys_path};
+use crate::derived::{read_table, table_file};
+use crate::merge::{L1Merger, MergeConfig};
+use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
 
 /// What one pass is allowed to take on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +86,12 @@ pub struct CompactorStats {
     /// Entries of keys beyond the tenant's `max_keys_hour` a pass did not
     /// count.
     pub derived_keys_dropped: AtomicU64,
+}
+
+impl CountsOrphans for CompactorStats {
+    fn count_orphans(&self, created: u64) {
+        self.orphaned.fetch_add(created, Ordering::Relaxed);
+    }
 }
 
 /// The compaction side of the compactor.
@@ -256,7 +262,7 @@ impl Compactor {
         let mut guard = OrphanGuard {
             stats: Arc::clone(&self.stats),
             tenant,
-            hour,
+            work: format!("compaction of {hour}"),
             created: 0,
             armed: true,
         };
@@ -325,7 +331,7 @@ impl Compactor {
         let mut keys = KeyStats::default();
         let mut replaced = Vec::with_capacity(previous.len());
         for file in &previous {
-            match self.read_attribute_keys(&file.path).await {
+            match read_table(self.store.as_ref(), &file.path).await {
                 Ok(known) => keys.merge(known),
                 Err(e) => {
                     self.stats
@@ -353,39 +359,15 @@ impl Compactor {
         tenant: fs_catalog::TenantId,
         hour: chrono::DateTime<chrono::Utc>,
         keys: &KeyStats,
-        guard: &mut OrphanGuard,
+        guard: &mut OrphanGuard<CompactorStats>,
         puts: &mut usize,
     ) -> Result<Option<NewFile>, CompactError> {
-        let Some((first, last)) = keys.range() else {
+        let Some((file, bytes)) = table_file(&self.root, tenant, hour, keys)? else {
             return Ok(None);
         };
-        let bytes = Bytes::from(fs_schema::attribute_keys::encode(keys)?);
-        let id = FileId::new();
-        let path = attribute_keys_path(&self.root, tenant, hour, id);
-        self.put_once(path.as_ref(), bytes.clone(), puts).await?;
+        self.put_once(&file.path, bytes, puts).await?;
         guard.created += 1;
-        let file = NewFile {
-            id,
-            origin: id,
-            tenant_id: tenant,
-            signal: Signal::AttributeKeys,
-            level: Level::L1,
-            path: path.to_string(),
-            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-            row_count: i64::try_from(keys.len()).unwrap_or(i64::MAX),
-            range: TimeRange {
-                start: chrono::Utc.timestamp_nanos(first),
-                end: chrono::Utc.timestamp_nanos(last),
-            },
-            services: Vec::new(),
-            summary: None,
-        };
         Ok(Some(file))
-    }
-
-    async fn read_attribute_keys(&self, path: &str) -> Result<KeyStats, CompactError> {
-        let bytes = self.store.get(&Path::from(path)).await?.bytes().await?;
-        Ok(fs_schema::attribute_keys::decode(bytes)?)
     }
 
     async fn swap(
@@ -428,21 +410,7 @@ impl Compactor {
                 tokio::time::sleep(hold).await;
             }
         }
-        let create = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        match self
-            .store
-            .put_opts(&Path::from(path), PutPayload::from_bytes(bytes), create)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                Err(CompactError::ObjectExists(path.to_owned()))
-            }
-            Err(e) => Err(e.into()),
-        }
+        create(self.store.as_ref(), path, bytes).await
     }
 
     fn count(&self, inputs: &[FileRecord], outputs: &[Published]) {
@@ -473,50 +441,4 @@ impl Compactor {
 struct Published {
     file: NewFile,
     bytes: u64,
-}
-
-/// Counts the objects a pass created as orphans when it ends without a
-/// committed swap, whether by error or by the task being dropped.
-struct OrphanGuard {
-    stats: Arc<CompactorStats>,
-    tenant: fs_catalog::TenantId,
-    hour: chrono::DateTime<chrono::Utc>,
-    /// Parquet objects created so far; their sidecars may or may not be.
-    created: u64,
-    armed: bool,
-}
-
-impl Drop for OrphanGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.stats
-            .orphaned
-            .fetch_add(self.created, Ordering::Relaxed);
-        if self.created > 0 {
-            warn!(
-                role = "compactor",
-                tenant = %self.tenant.0,
-                hour = %self.hour,
-                orphans = self.created,
-                "compaction not published; the objects it created are orphans"
-            );
-        }
-    }
-}
-
-/// Takes one injected failure when any is left.
-fn take_injected(counter: &AtomicU32) -> bool {
-    let mut remaining = counter.load(Ordering::SeqCst);
-    loop {
-        if remaining == 0 {
-            return false;
-        }
-        match counter.compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => return true,
-            Err(actual) => remaining = actual,
-        }
-    }
 }

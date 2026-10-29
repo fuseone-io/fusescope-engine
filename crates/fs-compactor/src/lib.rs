@@ -22,13 +22,17 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 pub mod compact;
+mod derived;
 pub mod lease;
 pub mod merge;
+mod objects;
 pub mod orphans;
+pub mod retention;
 
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
 pub use lease::Leadership;
 pub use orphans::{OrphanStats, SweepConfig, Sweeper};
+pub use retention::{Retention, RetentionConfig, RetentionStats};
 
 /// Why a compaction pass failed.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +92,10 @@ pub struct CompactorConfig {
     pub orphan_interval: Duration,
     /// Bounds of one sweep.
     pub sweep: SweepConfig,
+    /// How often files beyond their tenant's retention are looked for.
+    pub retention_interval: Duration,
+    /// Bounds of retention.
+    pub retention: RetentionConfig,
 }
 
 /// Counters of every kind of work the compactor does.
@@ -97,6 +105,8 @@ pub struct Stats {
     pub compaction: Arc<CompactorStats>,
     /// Orphan sweeps.
     pub orphans: Arc<OrphanStats>,
+    /// Retention passes and `attribute_keys` rebuilds.
+    pub retention: Arc<RetentionStats>,
 }
 
 /// Runs the compactor until `shutdown` flips. Work happens only while this
@@ -119,6 +129,13 @@ pub async fn run(
         config.compaction.clone(),
         Arc::clone(&stats.compaction),
     ));
+    let retention = Arc::new(Retention::new(
+        catalog.clone(),
+        Arc::clone(&store),
+        root.clone(),
+        config.retention.clone(),
+        Arc::clone(&stats.retention),
+    ));
     let (leader_tx, leader_rx) = watch::channel(false);
     let mut renew = tokio::time::interval(leadership.renew_every());
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -135,6 +152,7 @@ pub async fn run(
                             Arc::clone(&store),
                             root.clone(),
                             Arc::clone(&compactor),
+                            Arc::clone(&retention),
                             Arc::clone(&leadership),
                             Arc::clone(&stats.orphans),
                             config.clone(),
@@ -164,15 +182,17 @@ async fn stop(task: JoinHandle<()>) {
 /// Most compaction passes one tick runs before yielding to the next tick.
 const PASSES_PER_TICK: usize = 64;
 
-/// The work of the leader: purge, compaction and orphan passes at their
-/// intervals until the lease is lost, one at a time. Every swap carries
-/// the fence of the lease as it is at that moment; no fence, no pass.
+/// The work of the leader: purge, compaction, retention and orphan passes
+/// at their intervals until the lease is lost, one at a time. Every swap
+/// carries the fence of the lease as it is at that moment; no fence, no
+/// pass.
 #[allow(clippy::too_many_arguments)]
 async fn work_loop(
     catalog: Catalog,
     store: Arc<dyn ObjectStore>,
     root: Path,
     compactor: Arc<Compactor>,
+    retention: Arc<Retention>,
     leadership: Arc<Leadership>,
     orphan_stats: Arc<OrphanStats>,
     config: CompactorConfig,
@@ -184,6 +204,8 @@ async fn work_loop(
     compact.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut orphans = tokio::time::interval(config.orphan_interval.max(Duration::from_secs(1)));
     orphans.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut expire = tokio::time::interval(config.retention_interval.max(Duration::from_secs(1)));
+    expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sweeper = Sweeper::new(
         catalog.clone(),
         Arc::clone(&store),
@@ -216,10 +238,45 @@ async fn work_loop(
                     }
                 }
             }
+            _ = expire.tick() => {
+                retention_passes(&retention, &leadership).await;
+            }
             changed = leader.changed() => {
                 if changed.is_err() || !*leader.borrow() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// Expiry passes until nothing is beyond its cut, then rebuilds until no
+/// table is stale, each kind bounded per tick; a failure ends its kind
+/// for this tick.
+async fn retention_passes(retention: &Retention, leadership: &Leadership) {
+    for _ in 0..PASSES_PER_TICK {
+        let Some(fence) = leadership.fence() else {
+            return;
+        };
+        match retention.expire_once(&fence).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "retention pass failed");
+                break;
+            }
+        }
+    }
+    for _ in 0..PASSES_PER_TICK {
+        let Some(fence) = leadership.fence() else {
+            return;
+        };
+        match retention.rebuild_once(&fence).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "attribute_keys rebuild failed");
+                break;
             }
         }
     }

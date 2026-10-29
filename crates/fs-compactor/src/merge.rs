@@ -247,10 +247,10 @@ fn coerce(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Compact
 }
 
 /// Reads one object of known size through ranged gets.
-struct ObjectReader {
-    store: Arc<dyn ObjectStore>,
-    path: Path,
-    size: u64,
+pub(crate) struct ObjectReader {
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) path: Path,
+    pub(crate) size: u64,
 }
 
 fn to_parquet_err(e: object_store::Error) -> ParquetError {
