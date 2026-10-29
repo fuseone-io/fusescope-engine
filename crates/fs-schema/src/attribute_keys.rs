@@ -150,6 +150,55 @@ const MAP_COLUMNS: [(&str, KeySource, KeyType); 5] = [
     (col::SCOPE_STRING, KeySource::Scope, KeyType::String),
 ];
 
+/// The span columns [`KeyStats::absorb`] reads: a batch projected to
+/// these is enough.
+pub const READ_COLUMNS: [&str; 6] = [
+    col::TIMESTAMP,
+    col::RESOURCES_STRING,
+    col::ATTRIBUTES_STRING,
+    col::ATTRIBUTES_NUMBER,
+    col::ATTRIBUTES_BOOL,
+    col::SCOPE_STRING,
+];
+
+/// Who decides whether a key not seen before is counted, and on which
+/// hour.
+enum Admission<'a> {
+    /// The budget of one hour: so many keys, then entries are dropped.
+    Budget { hour: i64, max_new_keys: usize },
+    /// A table built before: its keys, on the hours that admitted them;
+    /// any other key is left out as it was then.
+    Known(&'a KeyStats),
+}
+
+impl Admission<'_> {
+    fn admit(
+        &self,
+        source: KeySource,
+        kind: KeyType,
+        key: &str,
+        new_keys: &mut usize,
+        dropped: &mut u64,
+    ) -> Option<i64> {
+        match self {
+            Admission::Budget { hour, max_new_keys } => {
+                if *new_keys < *max_new_keys {
+                    *new_keys += 1;
+                    Some(*hour)
+                } else {
+                    *dropped += 1;
+                    None
+                }
+            }
+            Admission::Known(known) => known
+                .keys
+                .get(&(source, kind))
+                .and_then(|keys| keys.get(key))
+                .map(|seen| seen.admitted_hour),
+        }
+    }
+}
+
 impl KeyStats {
     /// Counts the keys of every span in `batch`, a batch of the span
     /// schema, once per span however often a span repeats a key. A key
@@ -171,6 +220,35 @@ impl KeyStats {
         if hour.rem_euclid(HOUR_NS) != 0 {
             return Err(SchemaError::Layout("hour is not the start of an hour"));
         }
+        self.absorb_with(batch, &Admission::Budget { hour, max_new_keys })
+    }
+
+    /// Counts the keys of every span in `batch` that `known` lists, each
+    /// on the hour that admitted it there, as a table rebuilt from the
+    /// files that remain after some were deleted; a key `known` does not
+    /// list is left out, as it was when the files were compacted, and is
+    /// neither counted as new nor as dropped.
+    ///
+    /// # Errors
+    /// As [`absorb`](Self::absorb).
+    pub fn absorb_known(
+        &mut self,
+        batch: &RecordBatch,
+        known: &KeyStats,
+    ) -> Result<(), SchemaError> {
+        self.absorb_with(batch, &Admission::Known(known))
+    }
+
+    fn absorb_with(
+        &mut self,
+        batch: &RecordBatch,
+        admission: &Admission<'_>,
+    ) -> Result<(), SchemaError> {
+        let Self {
+            keys,
+            new_keys,
+            dropped,
+        } = self;
         let schema = batch.schema();
         let timestamps = batch
             .column(schema.index_of(col::TIMESTAMP)?)
@@ -182,12 +260,12 @@ impl KeyStats {
                 .column(schema.index_of(name)?)
                 .as_map_opt()
                 .ok_or(SchemaError::Layout("attribute map"))?;
-            let keys = map
+            let map_keys = map
                 .keys()
                 .as_string_opt::<i32>()
                 .ok_or(SchemaError::Layout("attribute map keys"))?;
             let offsets = map.value_offsets();
-            let known = self.keys.entry((source, kind)).or_default();
+            let seen_here = keys.entry((source, kind)).or_default();
             for row in 0..map.len() {
                 let (Some(start), Some(end)) = (offsets.get(row), offsets.get(row + 1)) else {
                     break;
@@ -197,23 +275,21 @@ impl KeyStats {
                 for entry in *start..*end {
                     let entry =
                         usize::try_from(entry).map_err(|_| SchemaError::Layout("offset"))?;
-                    let key = keys.value(entry);
+                    let key = map_keys.value(entry);
                     if !in_row.insert(key) {
                         continue;
                     }
-                    let seen = KeySeen {
+                    let sighting = |admitted_hour| KeySeen {
                         count: 1,
                         first_seen: at,
                         last_seen: at,
-                        admitted_hour: hour,
+                        admitted_hour,
                     };
-                    if let Some(known) = known.get_mut(key) {
-                        known.widen(seen);
-                    } else if self.new_keys < max_new_keys {
-                        known.insert(key.to_owned(), seen);
-                        self.new_keys += 1;
-                    } else {
-                        self.dropped += 1;
+                    if let Some(known) = seen_here.get_mut(key) {
+                        known.widen(sighting(known.admitted_hour));
+                    } else if let Some(hour) = admission.admit(source, kind, key, new_keys, dropped)
+                    {
+                        seen_here.insert(key.to_owned(), sighting(hour));
                     }
                 }
             }
@@ -937,6 +1013,62 @@ mod tests {
             (4, 0),
             "the hour is kept as written and nothing read counts as new"
         );
+    }
+
+    #[test]
+    fn a_rebuild_counts_only_the_keys_the_table_before_knows_on_their_hours() {
+        let mut before = KeyStats::default();
+        before
+            .absorb(
+                &batch_with(vec![span(
+                    H14 + 1_000,
+                    vec![kv("http.method", string("GET"))],
+                )]),
+                H14,
+                usize::MAX,
+            )
+            .unwrap();
+        let before = before.settled();
+        let remaining = batch_with(vec![
+            span(
+                H15 + 5_000,
+                vec![
+                    kv("http.method", string("POST")),
+                    kv("db.system", string("pg")),
+                ],
+            ),
+            span(H15 + 9_000, vec![kv("http.method", string("GET"))]),
+        ]);
+        let schema = remaining.schema();
+        let projected = remaining
+            .project(&READ_COLUMNS.map(|c| schema.index_of(c).unwrap()))
+            .unwrap();
+        let mut rebuilt = KeyStats::default();
+        rebuilt.absorb_known(&projected, &before).unwrap();
+        let rows: Vec<_> = rebuilt
+            .iter()
+            .map(|(_, key, _, seen)| {
+                (
+                    key,
+                    seen.count,
+                    seen.first_seen,
+                    seen.last_seen,
+                    seen.admitted_hour,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("host.name", 2, H15 + 5_000, H15 + 9_000, H14),
+                ("service.name", 2, H15 + 5_000, H15 + 9_000, H14),
+                ("http.method", 2, H15 + 5_000, H15 + 9_000, H14),
+                ("lib.flavour", 2, H15 + 5_000, H15 + 9_000, H14),
+            ],
+            "sightings from the rows that remain, admissions from the table before; db.system is left out"
+        );
+        assert_eq!(rebuilt.new_keys(), 0);
+        assert_eq!(rebuilt.dropped(), 0);
     }
 
     #[test]
