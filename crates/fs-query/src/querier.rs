@@ -99,7 +99,8 @@ pub struct QueryLimits {
     /// [`retained_bytes`]; the oldest are dropped to make room, and a plan
     /// that does not fit on its own is not kept at all.
     pub prepared_bytes: usize,
-    /// How long a prepared plan waits for its `DoGet` before it is dropped.
+    /// How long a prepared plan waits for its `DoGet` before it is dropped;
+    /// clamped to [`MAX_PREPARED_TTL`].
     pub prepared_ttl: Duration,
 }
 
@@ -125,6 +126,10 @@ pub const STORE_URL: &str = "fusescope://bucket/";
 /// Allowance for the session state a prepared plan keeps alongside its SQL
 /// and plan text, in bytes.
 pub const PREPARED_PLAN_OVERHEAD: usize = 64 * 1024;
+
+/// Longest `prepared_ttl` honoured, one day, so adding it to the instant a
+/// plan was kept cannot overflow.
+pub const MAX_PREPARED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Estimate of what a plan kept for `sql` retains: the SQL, the plan with
 /// its schemas as displayed, and [`PREPARED_PLAN_OVERHEAD`]. The heap is not
@@ -159,6 +164,10 @@ impl Querier {
         spill_dir: Option<std::path::PathBuf>,
         limits: QueryLimits,
     ) -> Result<Self, QueryError> {
+        let limits = QueryLimits {
+            prepared_ttl: limits.prepared_ttl.min(MAX_PREPARED_TTL),
+            ..limits
+        };
         let store_url = ObjectStoreUrl::parse(STORE_URL)?;
         let mut builder = RuntimeEnvBuilder::new().with_memory_limit(limits.memory_bytes, 1.0);
         if let Some(dir) = spill_dir {
@@ -288,7 +297,6 @@ impl Querier {
     ) -> Result<arrow::datatypes::SchemaRef, QueryError> {
         let (ctx, plan, warnings) = self.plan(tenant, sql).await?;
         let schema: arrow::datatypes::SchemaRef = Arc::new(plan.schema().as_arrow().clone());
-        let now = std::time::Instant::now();
         let prepared = Prepared {
             tenant,
             sql: sql.to_owned(),
@@ -296,11 +304,11 @@ impl Querier {
             ctx,
             plan,
             warnings,
-            at: now,
         };
         let mut plans = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
+        let now = std::time::Instant::now();
         plans.drop_expired(now, self.limits.prepared_ttl);
-        if plans.keep(prepared, &self.limits) && !plans.reaping {
+        if plans.keep(prepared, now, &self.limits) && !plans.reaping {
             plans.reaping = true;
             tokio::spawn(reap_expired(
                 Arc::downgrade(&self.prepared),
@@ -431,14 +439,20 @@ struct Prepared {
     ctx: datafusion::execution::context::SessionContext,
     plan: LogicalPlan,
     warnings: Arc<QueryWarnings>,
+}
+
+/// A plan in the queue, stamped by [`PreparedPlans::keep`] under the lock
+/// so that queue order is `at` order.
+struct Kept {
     at: std::time::Instant,
+    plan: Prepared,
 }
 
 /// Plans waiting for their `DoGet`, oldest first, so the expired and the
 /// ones dropped for room both leave from the front. `reaping` says a
 /// [`reap_expired`] task is alive for the queue.
 struct PreparedPlans {
-    queue: VecDeque<Prepared>,
+    queue: VecDeque<Kept>,
     bytes: usize,
     reaping: bool,
     stats: Arc<QueryStats>,
@@ -465,9 +479,10 @@ impl PreparedPlans {
         self.publish();
     }
 
-    /// Keeps `plan`, dropping the oldest until it fits; `false` when it does
-    /// not fit on its own.
-    fn keep(&mut self, plan: Prepared, limits: &QueryLimits) -> bool {
+    /// Keeps `plan` as of `now`, dropping the oldest until it fits; `false`
+    /// when it does not fit on its own. `now` must not precede the last
+    /// `now` kept, which holding the lock across clock and push guarantees.
+    fn keep(&mut self, plan: Prepared, now: std::time::Instant, limits: &QueryLimits) -> bool {
         if plan.bytes > limits.prepared_bytes {
             self.publish();
             return false;
@@ -478,7 +493,7 @@ impl PreparedPlans {
             self.pop_front();
         }
         self.bytes += plan.bytes;
-        self.queue.push_back(plan);
+        self.queue.push_back(Kept { at: now, plan });
         self.publish();
         true
     }
@@ -487,16 +502,16 @@ impl PreparedPlans {
         let index = self
             .queue
             .iter()
-            .position(|p| p.tenant == tenant && p.sql == sql)?;
-        let plan = self.queue.remove(index)?;
-        self.bytes -= plan.bytes;
+            .position(|k| k.plan.tenant == tenant && k.plan.sql == sql)?;
+        let kept = self.queue.remove(index)?;
+        self.bytes -= kept.plan.bytes;
         self.publish();
-        Some(plan)
+        Some(kept.plan)
     }
 
     fn pop_front(&mut self) {
-        if let Some(plan) = self.queue.pop_front() {
-            self.bytes -= plan.bytes;
+        if let Some(kept) = self.queue.pop_front() {
+            self.bytes -= kept.plan.bytes;
         }
     }
 
@@ -527,5 +542,63 @@ async fn reap_expired(weak: Weak<std::sync::Mutex<PreparedPlans>>, ttl: Duration
             at
         };
         tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::DFSchema;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::EmptyRelation;
+
+    use super::*;
+
+    fn plan(tenant: TenantId, sql: &str, bytes: usize) -> Prepared {
+        Prepared {
+            tenant,
+            sql: sql.to_owned(),
+            bytes,
+            ctx: SessionContext::new(),
+            plan: LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(DFSchema::empty()),
+            }),
+            warnings: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn plans_expire_and_make_room_in_the_order_they_were_kept() {
+        let tenant = TenantId::new();
+        let limits = QueryLimits {
+            prepared_plans: 2,
+            prepared_bytes: 100,
+            ..QueryLimits::default()
+        };
+        let ttl = Duration::from_secs(10);
+        let t0 = std::time::Instant::now();
+        let mut plans = PreparedPlans::new(Arc::default());
+        assert!(plans.keep(plan(tenant, "a", 40), t0, &limits));
+        assert!(plans.keep(plan(tenant, "b", 40), t0 + Duration::from_secs(1), &limits));
+        assert_eq!(plans.next_expiry(ttl), Some(t0 + ttl));
+
+        plans.drop_expired(t0 + Duration::from_secs(10), ttl);
+        assert!(plans.take(tenant, "a").is_none(), "a expired");
+        assert_eq!(plans.next_expiry(ttl), Some(t0 + Duration::from_secs(11)));
+        assert_eq!(plans.bytes, 40);
+
+        assert!(plans.keep(plan(tenant, "c", 40), t0 + Duration::from_secs(2), &limits));
+        assert!(plans.keep(plan(tenant, "d", 40), t0 + Duration::from_secs(3), &limits));
+        assert!(
+            plans.take(tenant, "b").is_none(),
+            "b made room, oldest first"
+        );
+        assert_eq!(plans.queue.len(), 2);
+        assert!(!plans.keep(plan(tenant, "e", 101), t0 + Duration::from_secs(4), &limits));
+        assert_eq!(plans.queue.len(), 2, "over budget alone, kept nothing out");
+        assert!(plans.take(tenant, "c").is_some());
+        assert!(plans.take(tenant, "d").is_some());
+        assert_eq!(plans.bytes, 0);
+        assert_eq!(plans.next_expiry(ttl), None);
     }
 }

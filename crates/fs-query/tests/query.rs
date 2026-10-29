@@ -23,7 +23,7 @@ use datafusion::scalar::ScalarValue;
 use fs_catalog::{Catalog, NewTenant, TenantId, TokenScope};
 use fs_ingest::flush;
 use fs_query::flight::FlightSql;
-use fs_query::querier::PREPARED_PLAN_OVERHEAD;
+use fs_query::querier::{MAX_PREPARED_TTL, PREPARED_PLAN_OVERHEAD};
 use fs_query::{Querier, QueryError, QueryLimits};
 use fs_schema::limits::Limits;
 use fs_schema::spans::SpanBatchBuilder;
@@ -998,6 +998,26 @@ async fn prepared_plans_are_bounded_by_the_bytes_they_retain() {
     assert_eq!(counters.prepared_misses.load(Ordering::Relaxed), 2);
     assert_eq!(counters.prepared_hits.load(Ordering::Relaxed), 2);
     assert_eq!(counters.prepared_bytes.load(Ordering::Relaxed), 0);
+
+    let forever = Querier::new(
+        f.db.catalog.clone(),
+        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
+        None,
+        QueryLimits {
+            prepared_ttl: Duration::MAX,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(forever.limits().prepared_ttl, MAX_PREPARED_TTL, "clamped");
+    forever.prepare(f.tenant, COUNT_ALL).await.unwrap();
+    assert!(
+        forever
+            .execute_prepared(f.tenant, COUNT_ALL)
+            .await
+            .unwrap()
+            .is_some()
+    );
     f.db.finish().await;
 }
 

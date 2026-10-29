@@ -665,8 +665,8 @@ it, returns its schema and keeps the plan, keyed by tenant and SQL, oldest
 first; `DoGet` re-authenticates, refuses a ticket of another tenant,
 executes the oldest kept plan for its tenant and SQL and drops it, and only
 plans the SQL again when no plan waits: after `query.prepared_ttl_secs`
-(60; a reaper drops expired plans as they come due, whether or not anything
-else happens), beyond `query.prepared_plans` kept at once (1024) or
+(60, at most one day; a reaper drops expired plans as they come due,
+whether or not anything else happens), beyond `query.prepared_plans` kept at once (1024) or
 `query.prepared_bytes` retained together (64 MiB, estimated as SQL plus
 displayed plan plus a 64 KiB allowance per session state; a plan over the
 budget on its own is not kept), oldest dropped first, on a second `DoGet`
