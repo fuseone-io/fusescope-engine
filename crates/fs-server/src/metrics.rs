@@ -535,6 +535,18 @@ impl Metrics {
                 "Tickets whose prepared plan was gone and whose SQL was planned again",
                 q.prepared_misses.load(Ordering::Relaxed),
             );
+            gauge(
+                out,
+                "fusescope_query_prepared_plans",
+                "Plans waiting for their DoGet",
+                q.prepared.load(Ordering::Relaxed),
+            );
+            gauge(
+                out,
+                "fusescope_query_prepared_bytes",
+                "Bytes the waiting plans are estimated to retain",
+                q.prepared_bytes.load(Ordering::Relaxed),
+            );
         }
     }
 }
