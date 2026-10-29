@@ -1158,126 +1158,120 @@ async fn a_limit_met_mid_stream_keeps_its_status_code() {
     f.db.finish().await;
 }
 
-/// Authentication runs under the deadline too: a catalog that accepts the
-/// connection and never answers ends the request in `DEADLINE_EXCEEDED`
-/// on every entry point, instead of holding it for as long as the lookup.
-#[tokio::test]
-async fn authentication_runs_under_the_deadline() {
-    let Some(mut f) = fixture().await else { return };
-    f.querier = Querier::new(
-        f.db.catalog.clone(),
-        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
-        None,
-        QueryLimits {
-            timeout: Duration::from_millis(200),
-            ..QueryLimits::default()
-        },
-    )
-    .unwrap();
-    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// A catalog whose connection is accepted and never answered, so any
+/// lookup on it waits for as long as it is allowed to.
+async fn silent_catalog() -> (tokio::net::TcpListener, Catalog) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy(&format!(
             "postgres://x:y@{}/x",
-            silent.local_addr().unwrap()
+            listener.local_addr().unwrap()
         ))
         .unwrap();
-    let service = FlightSql::new(f.querier.clone(), Catalog::from_pool(pool));
+    (listener, Catalog::from_pool(pool))
+}
+
+async fn serve(
+    f: &Fixture,
+    catalog: Catalog,
+) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
+    let service = FlightSql::new(f.querier.clone(), catalog);
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
+    tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
     let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
         .await
         .unwrap()
         .unwrap();
-    let token = format!("fst_{}", "a".repeat(43));
-    let mut client = sql_client(addr, &token).await;
+    (addr, shutdown)
+}
 
-    let err = tokio::time::timeout(
-        Duration::from_secs(5),
-        client.execute(BY_SERVICE.into(), None),
-    )
-    .await
-    .expect("the deadline, not the test, ends the lookup")
-    .unwrap_err();
+/// Every entry point answers `DEADLINE_EXCEEDED` well before the test's
+/// own patience runs out, so the engine's deadline is what ended it.
+async fn every_entry_point_exceeds_its_deadline(
+    client: &mut FlightSqlServiceClient<Channel>,
+    tenant: TenantId,
+) {
+    let patience = Duration::from_secs(5);
+    let err = tokio::time::timeout(patience, client.execute(BY_SERVICE.into(), None))
+        .await
+        .expect("GetFlightInfo: the deadline, not the test, ends the wait")
+        .unwrap_err();
     assert!(
         matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::DeadlineExceeded),
         "GetFlightInfo: {err}"
     );
     let err = tokio::time::timeout(
-        Duration::from_secs(5),
-        client.do_get(ticket_before_prepared_plans(f.tenant, BY_SERVICE)),
+        patience,
+        client.do_get(ticket_before_prepared_plans(tenant, BY_SERVICE)),
     )
     .await
-    .unwrap()
+    .expect("DoGet: the deadline, not the test, ends the wait")
     .unwrap_err();
     assert!(
         matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::DeadlineExceeded),
         "DoGet: {err}"
     );
     let body = serde_json::json!({ "trace_id": "02".repeat(16) }).to_string();
-    let err = tokio::time::timeout(Duration::from_secs(5), lookup(&mut client, &body))
+    let err = tokio::time::timeout(patience, lookup(client, &body))
         .await
-        .unwrap()
+        .expect("DoAction: the deadline, not the test, ends the wait")
         .unwrap_err();
     assert_eq!(err.code(), Code::DeadlineExceeded, "DoAction: {err}");
+}
+
+fn querier_over(f: &Fixture, catalog: Catalog, timeout: Duration) -> Querier {
+    Querier::new(
+        catalog,
+        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
+        None,
+        QueryLimits {
+            timeout,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Authentication runs under the deadline: with a catalog that never
+/// answers the token lookup, every entry point ends in `DEADLINE_EXCEEDED`
+/// instead of waiting for as long as the lookup.
+#[tokio::test]
+async fn authentication_runs_under_the_deadline() {
+    let Some(mut f) = fixture().await else { return };
+    f.querier = querier_over(&f, f.db.catalog.clone(), Duration::from_millis(200));
+    let (silent, catalog) = silent_catalog().await;
+    let (addr, shutdown) = serve(&f, catalog).await;
+    let mut client = sql_client(addr, &format!("fst_{}", "a".repeat(43))).await;
+
+    every_entry_point_exceeds_its_deadline(&mut client, f.tenant).await;
 
     shutdown.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), server)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
     drop(silent);
     f.db.finish().await;
 }
 
-/// The query deadline is born when the request arrives and covers planning
-/// and preparation, not only the batches: with no time at all, every entry
-/// point answers `DEADLINE_EXCEEDED` before it reaches the store.
+/// The deadline covers planning and preparation, not only the batches:
+/// with the token resolved but the querier's catalog never answering the
+/// tenant lookup that planning starts with, every entry point ends in
+/// `DEADLINE_EXCEEDED` before it reaches the store.
 #[tokio::test]
 async fn the_deadline_covers_planning_on_every_entry_point() {
     let Some(mut f) = fixture().await else { return };
-    f.querier = Querier::new(
-        f.db.catalog.clone(),
-        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
-        None,
-        QueryLimits {
-            timeout: Duration::ZERO,
-            ..QueryLimits::default()
-        },
-    )
-    .unwrap();
+    let (silent, catalog) = silent_catalog().await;
+    f.querier = querier_over(&f, catalog, Duration::from_millis(200));
     let (token, _) =
         f.db.catalog
             .create_token(f.tenant, "backend", TokenScope::Query)
             .await
             .unwrap();
-    let (addr, shutdown, server) = serve_flight(&f).await;
+    let (addr, shutdown) = serve(&f, f.db.catalog.clone()).await;
     let mut client = sql_client(addr, &token).await;
 
-    let err = client.execute(BY_SERVICE.into(), None).await.unwrap_err();
-    assert!(
-        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::DeadlineExceeded),
-        "GetFlightInfo: {err}"
-    );
-    let err = client
-        .do_get(ticket_before_prepared_plans(f.tenant, BY_SERVICE))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::DeadlineExceeded),
-        "DoGet: {err}"
-    );
-    let body = serde_json::json!({ "trace_id": "02".repeat(16) }).to_string();
-    let err = lookup(&mut client, &body).await.unwrap_err();
-    assert_eq!(err.code(), Code::DeadlineExceeded, "DoAction: {err}");
+    every_entry_point_exceeds_its_deadline(&mut client, f.tenant).await;
 
     shutdown.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), server)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    drop(silent);
     f.db.finish().await;
 }
 
