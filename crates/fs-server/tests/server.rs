@@ -578,6 +578,66 @@ async fn a_health_listener_that_cannot_bind_stops_the_process() {
     db.finish().await;
 }
 
+/// A role whose server cannot bind its port returns at once with the
+/// error, taking its heartbeat or follower with it, so the process ends
+/// instead of beating or following for a server that is gone.
+#[tokio::test]
+async fn a_role_that_cannot_bind_ends_the_process_at_once() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = taken.local_addr().unwrap().to_string();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+
+    // The ingester's OTLP port.
+    let dir = tempfile::tempdir().unwrap();
+    let ingest = fs_ingest::IngestConfig {
+        listen: addr.parse().unwrap(),
+        hot_listen: Some("127.0.0.1:0".parse().unwrap()),
+        ..fs_ingest::IngestConfig::default()
+    };
+    let (_tx, rx) = watch::channel(false);
+    let started = tokio::time::Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        server::run_with(
+            config(dir.path()),
+            secrets.clone(),
+            Role::All,
+            "n".into(),
+            rx,
+            Some(ingest),
+        ),
+    )
+    .await
+    .expect("the ingester's bind failure ends the process")
+    .unwrap_err();
+    assert!(err.to_string().contains(&addr), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(8));
+
+    // The querier's Flight port.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.server.flight_addr.clone_from(&addr);
+    let (_tx, rx) = watch::channel(false);
+    let started = tokio::time::Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        server::run(cfg, secrets, Role::All, "n".into(), rx),
+    )
+    .await
+    .expect("the querier's bind failure ends the process")
+    .unwrap_err();
+    assert!(err.to_string().contains(&addr), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(8));
+    drop(taken);
+    db.finish().await;
+}
+
 /// A drain that does not end by `server.drain_timeout_secs` is abandoned:
 /// the roles are aborted and the process reports it.
 #[tokio::test]

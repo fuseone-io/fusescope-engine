@@ -104,22 +104,29 @@ pub async fn ingester(
     };
     ctx.health.wal(true);
     let (otlp_tx, otlp_rx) = tokio::sync::oneshot::channel();
-    let up = {
+    let came_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let up = tokio::spawn({
         let health = Arc::clone(&ctx.health);
+        let came_up = Arc::clone(&came_up);
         async move {
-            let bound = otlp_rx.await.is_ok();
-            if bound {
+            if otlp_rx.await.is_ok() {
                 health.role_up();
+                came_up.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            bound
         }
+    });
+    // The server ending, by the stop or by a failure such as a port it
+    // cannot bind, ends the heartbeat with it: the role returns at once
+    // instead of beating for a server that is gone.
+    let served = tokio::select! {
+        served = ingester.run(shutdown.clone(), Some(otlp_tx), None) => served,
+        () = async {
+            heartbeat.await;
+            std::future::pending::<()>().await;
+        } => Ok(()),
     };
-    let (served, (), came_up) = tokio::join!(
-        ingester.run(shutdown.clone(), Some(otlp_tx), None),
-        heartbeat,
-        up
-    );
-    if came_up {
+    up.abort();
+    if came_up.load(std::sync::atomic::Ordering::SeqCst) {
         ctx.health.role_down();
     }
     ctx.health.wal(false);
@@ -153,22 +160,28 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     let service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
     info!(role = "querier", %listen, "ready");
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-    let up = {
+    let came_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let up = tokio::spawn({
         let health = Arc::clone(&ctx.health);
+        let came_up = Arc::clone(&came_up);
         async move {
-            let bound = bound_rx.await.is_ok();
-            if bound {
+            if bound_rx.await.is_ok() {
                 health.role_up();
+                came_up.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            bound
         }
+    });
+    // The server ending ends the follower with it, so a port that cannot
+    // be bound returns the error at once.
+    let served = tokio::select! {
+        served = service.serve(listen, shutdown, Some(bound_tx)) => served,
+        () = async {
+            follower.await;
+            std::future::pending::<()>().await;
+        } => Ok(()),
     };
-    let (served, (), came_up) = tokio::join!(
-        service.serve(listen, shutdown, Some(bound_tx)),
-        follower,
-        up
-    );
-    if came_up {
+    up.abort();
+    if came_up.load(std::sync::atomic::Ordering::SeqCst) {
         ctx.health.role_down();
     }
     served?;

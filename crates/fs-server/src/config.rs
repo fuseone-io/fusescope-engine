@@ -1453,6 +1453,34 @@ mod tests {
     }
 
     #[test]
+    fn server_clocks_are_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        for key in ["health_interval_secs", "drain_timeout_secs"] {
+            for bad in [0, 86_401] {
+                let err = Config::parse(&format!(
+                    "[bucket]\nkind = \"local\"\npath = \"/x\"\n[server]\n{key} = {bad}\n"
+                ))
+                .unwrap()
+                .validate(&secrets)
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("server."), "{key} = {bad}: {err}");
+            }
+            for good in [1, 86_400] {
+                Config::parse(&format!(
+                    "[bucket]\nkind = \"local\"\npath = \"/x\"\n[server]\n{key} = {good}\n"
+                ))
+                .unwrap()
+                .validate(&secrets)
+                .unwrap_or_else(|e| panic!("{key} = {good}: {e}"));
+            }
+        }
+    }
+
+    #[test]
     fn hour_limits_are_validated() {
         let secrets = Secrets {
             catalog_url: Some("postgres://x".into()),

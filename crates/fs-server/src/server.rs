@@ -339,9 +339,14 @@ async fn supervise(
             }
             // The health listener and the prober are watched like a role:
             // a process whose /readyz died must not run on unwatched.
+            // Nothing of the health side ends before the stop, so any end
+            // here, clean or not, is a failure.
             Some(joined) = http.join_next(), if !http.is_empty() => {
                 let failure = match joined {
-                    Ok(Ok(())) => None,
+                    Ok(Ok(())) => Some(ServerError::RoleStopped {
+                        role: "health",
+                        reason: "ended before the stop".into(),
+                    }),
                     Ok(Err(e)) => Some(e),
                     Err(join) if join.is_cancelled() => None,
                     Err(join) => Some(ServerError::RoleStopped {
