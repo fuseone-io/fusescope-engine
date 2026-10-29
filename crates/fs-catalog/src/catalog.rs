@@ -218,14 +218,17 @@ impl Catalog {
         inputs: &[FileId],
         outputs: &[NewFile],
     ) -> Result<Compaction, CatalogError> {
-        self.swap_files_fenced(tenant, signal, inputs, outputs, None)
+        self.swap_files_fenced(tenant, signal, inputs, &[], outputs, None)
             .await
     }
 
     /// [`swap_files`](Self::swap_files) that first checks, in the same
     /// transaction, that `fence` still names the unexpired holder and
     /// generation of its lease; otherwise nothing changes and
-    /// [`CatalogError::LeaseLost`] is returned.
+    /// [`CatalogError::LeaseLost`] is returned. `replaced` names rows of
+    /// other signals the outputs supersede, derived tables rebuilt from the
+    /// inputs; they are quarantined with the inputs under the same rule and
+    /// recorded with them.
     ///
     /// # Errors
     /// Lease lost, conflict, or database failure.
@@ -234,6 +237,7 @@ impl Catalog {
         tenant: TenantId,
         signal: Signal,
         inputs: &[FileId],
+        replaced: &[(Signal, FileId)],
         outputs: &[NewFile],
         fence: Option<&crate::LeaseFence>,
     ) -> Result<Compaction, CatalogError> {
@@ -248,25 +252,23 @@ impl Catalog {
                 });
             }
         }
-        let quarantined: Vec<(FileId,)> = sqlx::query_as(
-            "update engine_file set state = $4, quarantined_at = now()
-             where id = any($1) and tenant_id = $2 and signal = $3 and state = $5
-             returning id",
-        )
-        .bind(inputs)
-        .bind(tenant)
-        .bind(signal.code())
-        .bind(FileState::Quarantined.code())
-        .bind(FileState::Visible.code())
-        .fetch_all(&mut *tx)
-        .await?;
-        if quarantined.len() != inputs.len() {
+        let mut quarantined = quarantine(&mut tx, tenant, signal, inputs).await?;
+        for (signal, id) in replaced {
+            quarantined += quarantine(&mut tx, tenant, *signal, std::slice::from_ref(id)).await?;
+        }
+        let expected = inputs.len() + replaced.len();
+        if quarantined != expected {
             tx.rollback().await?;
             return Err(CatalogError::CompactionConflict {
-                expected: inputs.len(),
-                found: quarantined.len(),
+                expected,
+                found: quarantined,
             });
         }
+        let inputs: Vec<FileId> = inputs
+            .iter()
+            .copied()
+            .chain(replaced.iter().map(|(_, id)| *id))
+            .collect();
         let mut output_ids = Vec::with_capacity(outputs.len());
         for file in outputs {
             output_ids.push(insert_file(&mut tx, file, Confirm::OnInsert).await?.id);
@@ -278,14 +280,14 @@ impl Catalog {
         .bind(id)
         .bind(tenant)
         .bind(signal.code())
-        .bind(inputs)
+        .bind(&inputs)
         .bind(&output_ids)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(Compaction {
             id,
-            inputs: inputs.to_vec(),
+            inputs,
             outputs: output_ids,
         })
     }
@@ -452,6 +454,28 @@ enum Confirm {
     OnInsert,
     /// After the commit, by the writer, once its hot retention has begun.
     ByWriter,
+}
+
+/// Quarantines the visible `ids` of `tenant` and `signal`; how many were.
+async fn quarantine(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: TenantId,
+    signal: Signal,
+    ids: &[FileId],
+) -> Result<usize, CatalogError> {
+    let quarantined: Vec<(FileId,)> = sqlx::query_as(
+        "update engine_file set state = $4, quarantined_at = now()
+         where id = any($1) and tenant_id = $2 and signal = $3 and state = $5
+         returning id",
+    )
+    .bind(ids)
+    .bind(tenant)
+    .bind(signal.code())
+    .bind(FileState::Quarantined.code())
+    .bind(FileState::Visible.code())
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(quarantined.len())
 }
 
 async fn insert_file(

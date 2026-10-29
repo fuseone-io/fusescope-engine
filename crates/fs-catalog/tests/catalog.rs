@@ -554,6 +554,7 @@ async fn a_fenced_swap_is_refused_once_the_lease_changed_hands() {
             t,
             Signal::Logs,
             &[input.id],
+            &[],
             &[file(t, Signal::Logs, 0, 1, &[])],
             Some(&fence),
         )
@@ -593,6 +594,7 @@ async fn a_fenced_swap_is_refused_once_the_lease_changed_hands() {
             t,
             Signal::Logs,
             &[input.id],
+            &[],
             &[file(t, Signal::Logs, 0, 1, &[])],
             Some(&fence),
         )
@@ -671,7 +673,7 @@ async fn a_fenced_swap_is_serialised_with_takeovers() {
         let output = file(t, Signal::Logs, 0, 1, &[]);
         async move {
             catalog
-                .swap_files_fenced(t, Signal::Logs, &[input.id], &[output], Some(&fence))
+                .swap_files_fenced(t, Signal::Logs, &[input.id], &[], &[output], Some(&fence))
                 .await
         }
     });
@@ -694,6 +696,94 @@ async fn a_fenced_swap_is_serialised_with_takeovers() {
         .unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id, input.id, "nothing published");
+    db.finish().await;
+}
+
+/// A swap also quarantines the derived rows its outputs supersede, under
+/// the same rule: one already quarantined makes the whole swap a conflict
+/// that changes nothing, and the compaction records every row it took.
+#[tokio::test]
+async fn a_swap_replaces_the_derived_rows_its_outputs_supersede() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("swap-derived"))
+        .await
+        .unwrap()
+        .id;
+    let input = db
+        .catalog
+        .register_file(&file(t, Signal::Traces, 0, 1, &["api"]))
+        .await
+        .unwrap();
+    let keys = db
+        .catalog
+        .register_file(&file(t, Signal::AttributeKeys, 0, 1, &[]))
+        .await
+        .unwrap();
+    let l1 = file(t, Signal::Traces, 0, 1, &["api"]);
+    let rebuilt = file(t, Signal::AttributeKeys, 0, 1, &[]);
+    let done = db
+        .catalog
+        .swap_files_fenced(
+            t,
+            Signal::Traces,
+            &[input.id],
+            &[(Signal::AttributeKeys, keys.id)],
+            &[l1.clone(), rebuilt.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.inputs, vec![input.id, keys.id]);
+    assert_eq!(done.outputs, vec![l1.id, rebuilt.id]);
+    let range = TimeRange {
+        start: hour(0),
+        end: hour(1),
+    };
+    let derived = db
+        .catalog
+        .visible_files(t, Signal::AttributeKeys, range)
+        .await
+        .unwrap();
+    assert_eq!(derived.len(), 1);
+    assert_eq!(derived[0].id, rebuilt.id, "the old derived row is gone");
+
+    // The superseded row is already quarantined: conflict, nothing changes.
+    let err = db
+        .catalog
+        .swap_files_fenced(
+            t,
+            Signal::Traces,
+            &[l1.id],
+            &[(Signal::AttributeKeys, keys.id)],
+            &[file(t, Signal::Traces, 0, 1, &["api"])],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CatalogError::CompactionConflict {
+                expected: 2,
+                found: 1
+            }
+        ),
+        "{err}"
+    );
+    let traces = db
+        .catalog
+        .visible_files(t, Signal::Traces, range)
+        .await
+        .unwrap();
+    assert_eq!(traces.len(), 1);
+    assert_eq!(
+        traces[0].id, l1.id,
+        "the input of the refused swap stays visible"
+    );
     db.finish().await;
 }
 

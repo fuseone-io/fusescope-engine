@@ -273,7 +273,7 @@ impl Compactor {
         let files: Vec<NewFile> = outputs.iter().map(|o| o.file.clone()).collect();
         Ok(self
             .catalog
-            .swap_files_fenced(tenant, Signal::Traces, &ids, &files, Some(fence))
+            .swap_files_fenced(tenant, Signal::Traces, &ids, &[], &files, Some(fence))
             .await?)
     }
 
