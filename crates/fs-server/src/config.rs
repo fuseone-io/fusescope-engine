@@ -765,6 +765,7 @@ impl CompactorConfig {
                 rebuilds_per_tick: self.rebuilds_per_tick,
                 rebuild_backoff: std::time::Duration::from_secs(self.rebuild_backoff_secs),
                 inject_swap_failures: 0,
+                inject_list_failures: 0,
             },
         }
     }
