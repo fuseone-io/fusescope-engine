@@ -433,38 +433,19 @@ impl Metrics {
                 load(&c.skipped),
             ),
             (
-                "fusescope_orphan_sweeps_total",
-                "Orphan sweeps completed",
-                load(&o.sweeps),
+                "fusescope_compaction_derived_total",
+                "attribute_keys tables rebuilt by completed passes",
+                load(&c.derived),
             ),
             (
-                "fusescope_orphan_listed_total",
-                "Objects listed by completed sweeps",
-                load(&o.listed),
-            ),
-            (
-                "fusescope_orphan_seen_total",
-                "Objects seen without a catalog row",
-                load(&o.seen),
-            ),
-            (
-                "fusescope_orphan_deleted_total",
-                "Objects deleted after a TTL without a row",
-                load(&o.deleted),
-            ),
-            (
-                "fusescope_orphan_forgotten_total",
-                "Remembered orphans found with a row, or gone, before their TTL",
-                load(&o.forgotten),
-            ),
-            (
-                "fusescope_orphan_delete_failures_total",
-                "Deletes that failed and wait their backoff",
-                load(&o.delete_failures),
+                "fusescope_compaction_derived_unreadable_total",
+                "Previous attribute_keys tables that could not be read and were replaced",
+                load(&c.derived_unreadable),
             ),
         ] {
             counter(out, name, help, value);
         }
+        render_orphans(out, o);
     }
 
     fn render_query(&self, out: &mut String) {
@@ -525,6 +506,12 @@ impl Metrics {
             );
             counter(
                 out,
+                "fusescope_query_metadata_lookups_total",
+                "metadata.* actions served",
+                q.metadata_lookups.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
                 "fusescope_query_plannings_total",
                 "Times a statement went through the planner",
                 q.plannings.load(Ordering::Relaxed),
@@ -554,6 +541,44 @@ impl Metrics {
                 q.prepared_bytes.load(Ordering::Relaxed),
             );
         }
+    }
+}
+
+fn render_orphans(out: &mut String, o: &fs_compactor::OrphanStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    for (name, help, value) in [
+        (
+            "fusescope_orphan_sweeps_total",
+            "Orphan sweeps completed",
+            load(&o.sweeps),
+        ),
+        (
+            "fusescope_orphan_listed_total",
+            "Objects listed by completed sweeps",
+            load(&o.listed),
+        ),
+        (
+            "fusescope_orphan_seen_total",
+            "Objects seen without a catalog row",
+            load(&o.seen),
+        ),
+        (
+            "fusescope_orphan_deleted_total",
+            "Objects deleted after a TTL without a row",
+            load(&o.deleted),
+        ),
+        (
+            "fusescope_orphan_forgotten_total",
+            "Remembered orphans found with a row, or gone, before their TTL",
+            load(&o.forgotten),
+        ),
+        (
+            "fusescope_orphan_delete_failures_total",
+            "Deletes that failed and wait their backoff",
+            load(&o.delete_failures),
+        ),
+    ] {
+        counter(out, name, help, value);
     }
 }
 
@@ -696,6 +721,11 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("fusescope_buffer_live_bytes 77\n"), "{page}");
+    }
+
+    #[test]
+    fn renders_compactor_and_query_counters_in_exposition_format() {
+        let metrics = Metrics::default();
         let compactor = Arc::new(fs_compactor::Stats::default());
         compactor.compaction.passes.fetch_add(4, Ordering::Relaxed);
         compactor
@@ -703,6 +733,10 @@ mod tests {
             .orphaned
             .fetch_add(3, Ordering::Relaxed);
         compactor.compaction.skipped.fetch_add(1, Ordering::Relaxed);
+        compactor
+            .compaction
+            .derived_unreadable
+            .fetch_add(2, Ordering::Relaxed);
         compactor.orphans.deleted.fetch_add(6, Ordering::Relaxed);
         metrics.register_compactor(compactor);
         let page = metrics.render();
@@ -722,9 +756,14 @@ mod tests {
             page.contains("fusescope_compaction_skipped_total 1\n"),
             "{page}"
         );
+        assert!(
+            page.contains("fusescope_compaction_derived_unreadable_total 2\n"),
+            "{page}"
+        );
         let query = Arc::new(fs_query::QueryStats::default());
         query.plannings.fetch_add(2, Ordering::Relaxed);
         query.trace_lookups.fetch_add(3, Ordering::Relaxed);
+        query.metadata_lookups.fetch_add(4, Ordering::Relaxed);
         query.prepared.store(5, Ordering::Relaxed);
         query.prepared_bytes.store(9, Ordering::Relaxed);
         metrics.register_query(query);
@@ -735,6 +774,10 @@ mod tests {
         );
         assert!(
             page.contains("fusescope_query_trace_lookups_total 3\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_query_metadata_lookups_total 4\n"),
             "{page}"
         );
         assert!(
