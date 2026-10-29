@@ -18,8 +18,10 @@ use crate::QueryError;
 /// Action type of a trace lookup.
 pub const TRACE_LOOKUP: &str = "trace.lookup";
 
-/// Body of a [`TRACE_LOOKUP`] action.
+/// Body of a [`TRACE_LOOKUP`] action. A field the action does not know is
+/// refused, so a misspelt bound cannot widen the lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceLookup {
     /// The trace id as 32 hex digits.
     pub trace_id: String,
@@ -125,9 +127,14 @@ mod tests {
             let err = TraceLookup::parse(bad).unwrap().query().unwrap_err();
             assert!(matches!(err, QueryError::InvalidAction(_)), "{err}");
         }
-        assert!(matches!(
-            TraceLookup::parse(b"not json").unwrap_err(),
-            QueryError::InvalidAction(_)
-        ));
+        for bad in [
+            &b"not json"[..],
+            br#"{"trace_id":"00000000000000000000000000000000","end_unix_nanos":1}"#,
+        ] {
+            assert!(matches!(
+                TraceLookup::parse(bad).unwrap_err(),
+                QueryError::InvalidAction(_)
+            ));
+        }
     }
 }

@@ -1049,6 +1049,7 @@ async fn trace_lookup_action_returns_the_spans_of_one_trace() {
         r#"{"trace_id": "zz".repeat(16)}"#,
         &serde_json::json!({ "trace_id": trace, "start_unix_nano": first + 1, "end_unix_nano": first })
             .to_string(),
+        &serde_json::json!({ "trace_id": trace, "end_unix_nanos": first }).to_string(),
     ] {
         let err = lookup(&mut client, bad).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument, "{bad}: {err}");
@@ -1068,6 +1069,17 @@ async fn trace_lookup_action_returns_the_spans_of_one_trace() {
     let mut anon = sql_client(addr, "nope").await;
     let err = lookup(&mut anon, &body).await.unwrap_err();
     assert_eq!(err.code(), Code::Unauthenticated);
+    let err = anon
+        .do_action(Action {
+            r#type: "trace.delete".into(),
+            body: body.clone().into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::Unauthenticated),
+        "authentication comes before the action type: {err}"
+    );
 
     let mut raw = FlightServiceClient::new(
         Channel::from_shared(format!("http://{addr}"))
@@ -1088,6 +1100,56 @@ async fn trace_lookup_action_returns_the_spans_of_one_trace() {
         listed.iter().any(|a| a.r#type == TRACE_LOOKUP),
         "{listed:?}"
     );
+
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
+/// The query deadline is born when the request arrives and covers planning
+/// and preparation, not only the batches: with no time at all, every entry
+/// point answers `DEADLINE_EXCEEDED` before it reaches the store.
+#[tokio::test]
+async fn the_deadline_covers_planning_on_every_entry_point() {
+    let Some(mut f) = fixture().await else { return };
+    f.querier = Querier::new(
+        f.db.catalog.clone(),
+        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
+        None,
+        QueryLimits {
+            timeout: Duration::ZERO,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+
+    let err = client.execute(BY_SERVICE.into(), None).await.unwrap_err();
+    assert!(
+        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::DeadlineExceeded),
+        "GetFlightInfo: {err}"
+    );
+    let err = client
+        .do_get(ticket_before_prepared_plans(f.tenant, BY_SERVICE))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, arrow_flight::error::FlightError::Tonic(ref status) if status.code() == Code::DeadlineExceeded),
+        "DoGet: {err}"
+    );
+    let body = serde_json::json!({ "trace_id": "02".repeat(16) }).to_string();
+    let err = lookup(&mut client, &body).await.unwrap_err();
+    assert_eq!(err.code(), Code::DeadlineExceeded, "DoAction: {err}");
 
     shutdown.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)

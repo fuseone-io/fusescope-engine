@@ -694,9 +694,12 @@ across the `Result` bodies: concatenated, they are the stream, the schema
 in the first body, the end-of-stream marker in the last, which is how the
 Go `Do` hands back an `arrow.RecordReader`. The row cap, the timeout and
 the `x-fusescope-partial` header apply as for `DoGet`; `ListActions` names
-the actions served. `trace.lookup` takes `{"trace_id": "<32 hex digits>",
-"start_unix_nano": n, "end_unix_nano": n}`, the bounds optional and
-inclusive, and answers every column of the spans table for that trace in
+the actions served. The timeout runs from the request's arrival, over
+authentication, planning and every wait for a batch, so a stalled store
+or a slow plan ends in `DEADLINE_EXCEEDED` too. `trace.lookup` takes
+`{"trace_id": "<32 hex digits>", "start_unix_nano": n, "end_unix_nano": n}`,
+the bounds optional and inclusive, any other field refused, and answers
+every column of the spans table for that trace in
 `timestamp` order; it goes through the spans table like SQL would, so the
 `trace_id` sidecars, the hot window and the byte budget apply, without
 parsing or planning SQL (`fusescope_query_trace_lookups_total`). An unknown

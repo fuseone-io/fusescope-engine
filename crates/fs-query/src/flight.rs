@@ -22,7 +22,7 @@ use arrow_flight::sql::{CommandStatementQuery, SqlInfo, TicketStatementQuery};
 use arrow_flight::{Action, ActionType, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use datafusion::execution::SendableRecordBatchStream;
 use fs_catalog::{Catalog, TenantId, TokenScope};
-use futures_util::{Stream, StreamExt, TryStreamExt};
+use futures_util::{Future, Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use tokio::sync::watch;
 use tonic::metadata::MetadataMap;
@@ -118,23 +118,43 @@ fn decode_ticket(handle: &[u8]) -> Result<(TenantId, String), Status> {
     Ok((TenantId(tenant), sql.to_owned()))
 }
 
-/// Applies the row cap and the deadline to `stream`.
+/// When a request that arrives now must be done, by `limits.timeout`.
+fn deadline_of(limits: QueryLimits) -> tokio::time::Instant {
+    tokio::time::Instant::now() + limits.timeout
+}
+
+/// Runs `work`, a step of a request, against its `deadline`.
+async fn within<T>(
+    deadline: tokio::time::Instant,
+    limits: QueryLimits,
+    work: impl Future<Output = Result<T, QueryError>>,
+) -> Result<T, Status> {
+    tokio::time::timeout_at(deadline, work)
+        .await
+        .unwrap_or_else(|_| Err(QueryError::Timeout(limits.timeout)))
+        .map_err(|e| status_of(&e))
+}
+
+/// Applies the row cap to `stream` and races every wait for a batch
+/// against `deadline`, so a stalled upstream ends in `Timeout` too.
 fn bound_rows(
     stream: SendableRecordBatchStream,
     limits: QueryLimits,
+    deadline: tokio::time::Instant,
 ) -> impl Stream<Item = Result<RecordBatch, QueryError>> + Send + 'static {
-    let mut rows = 0usize;
-    let deadline = tokio::time::Instant::now() + limits.timeout;
-    stream.map(move |batch| {
+    futures_util::stream::try_unfold((stream, 0usize), move |(mut stream, rows)| async move {
+        let next = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| QueryError::Timeout(limits.timeout))?;
+        let Some(batch) = next else {
+            return Ok(None);
+        };
         let batch = batch?;
-        rows += batch.num_rows();
+        let rows = rows + batch.num_rows();
         if rows > limits.max_rows {
             return Err(QueryError::TooManyRows(limits.max_rows));
         }
-        if tokio::time::Instant::now() > deadline {
-            return Err(QueryError::Timeout(limits.timeout));
-        }
-        Ok(batch)
+        Ok(Some((batch, (stream, rows))))
     })
 }
 
@@ -212,12 +232,11 @@ impl FlightSqlService for FlightSql {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        let limits = self.querier.limits();
+        let deadline = deadline_of(limits);
         let tenant = self.authenticate(request.metadata()).await?;
-        let schema: SchemaRef = self
-            .querier
-            .prepare(tenant, &query.query)
-            .await
-            .map_err(|e| status_of(&e))?;
+        let schema: SchemaRef =
+            within(deadline, limits, self.querier.prepare(tenant, &query.query)).await?;
         let ticket = TicketStatementQuery {
             statement_handle: encode_ticket(tenant, &query.query),
         };
@@ -240,6 +259,8 @@ impl FlightSqlService for FlightSql {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let limits = self.querier.limits();
+        let deadline = deadline_of(limits);
         let tenant = self.authenticate(request.metadata()).await?;
         let (ticket_tenant, sql) = decode_ticket(&ticket.statement_handle)?;
         if ticket_tenant != tenant {
@@ -248,23 +269,19 @@ impl FlightSqlService for FlightSql {
                 "ticket does not belong to this tenant",
             ));
         }
-        let limits = self.querier.limits();
-        let kept = self
-            .querier
-            .execute_prepared(tenant, &sql)
-            .await
-            .map_err(|e| status_of(&e))?;
+        let kept = within(
+            deadline,
+            limits,
+            self.querier.execute_prepared(tenant, &sql),
+        )
+        .await?;
         let (stream, warnings) = match kept {
             Some(kept) => kept,
-            None => self
-                .querier
-                .execute(tenant, &sql)
-                .await
-                .map_err(|e| status_of(&e))?,
+            None => within(deadline, limits, self.querier.execute(tenant, &sql)).await?,
         };
         let schema = stream.schema();
-        let limited =
-            bound_rows(stream, limits).map_err(|e| FlightError::ExternalError(Box::new(e)));
+        let limited = bound_rows(stream, limits, deadline)
+            .map_err(|e| FlightError::ExternalError(Box::new(e)));
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(limited)
@@ -285,6 +302,9 @@ impl FlightSqlService for FlightSql {
         &self,
         request: Request<Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let limits = self.querier.limits();
+        let deadline = deadline_of(limits);
+        let tenant = self.authenticate(request.metadata()).await?;
         let action = request.get_ref();
         if action.r#type != TRACE_LOOKUP {
             return Err(Status::unimplemented(format!(
@@ -292,17 +312,13 @@ impl FlightSqlService for FlightSql {
                 action.r#type
             )));
         }
-        let tenant = self.authenticate(request.metadata()).await?;
         let query = TraceLookup::parse(&action.body)
             .and_then(|lookup| lookup.query())
             .map_err(|e| status_of(&e))?;
-        let (stream, warnings) = self
-            .querier
-            .trace_lookup(tenant, query)
-            .await
-            .map_err(|e| status_of(&e))?;
+        let (stream, warnings) =
+            within(deadline, limits, self.querier.trace_lookup(tenant, query)).await?;
         let schema = stream.schema();
-        let results = ipc_results(&schema, bound_rows(stream, self.querier.limits()))?;
+        let results = ipc_results(&schema, bound_rows(stream, limits, deadline))?;
         let mut response = Response::new(Box::pin(results)
             as Pin<
                 Box<
@@ -329,6 +345,8 @@ impl FlightSqlService for FlightSql {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -345,5 +363,70 @@ mod tests {
             "nothing but tenant and SQL"
         );
         assert!(decode_ticket(b"short").is_err());
+    }
+
+    fn batch_stream(
+        batches: Vec<RecordBatch>,
+        then_stall: bool,
+    ) -> (SendableRecordBatchStream, usize) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let count = batches.len();
+        let ready = futures_util::stream::iter(batches.into_iter().map(Ok));
+        let stream: Pin<Box<dyn Stream<Item = datafusion::error::Result<RecordBatch>> + Send>> =
+            if then_stall {
+                Box::pin(ready.chain(futures_util::stream::pending()))
+            } else {
+                Box::pin(ready)
+            };
+        (
+            Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream),
+            ),
+            count,
+        )
+    }
+
+    fn one_row() -> RecordBatch {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stream_ends_in_timeout_at_the_deadline() {
+        let limits = QueryLimits {
+            timeout: std::time::Duration::from_millis(50),
+            ..QueryLimits::default()
+        };
+        let (stream, _) = batch_stream(vec![one_row()], true);
+        let mut bounded = Box::pin(bound_rows(stream, limits, deadline_of(limits)));
+        assert!(
+            bounded.next().await.unwrap().is_ok(),
+            "the ready batch flows"
+        );
+        let started = tokio::time::Instant::now();
+        let stalled = tokio::time::timeout(std::time::Duration::from_secs(5), bounded.next())
+            .await
+            .expect("the deadline, not the test, ends the wait")
+            .unwrap();
+        assert!(
+            matches!(stalled, Err(QueryError::Timeout(_))),
+            "{stalled:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let (stream, count) = batch_stream(vec![one_row(), one_row()], false);
+        let drained: Vec<_> = bound_rows(stream, limits, deadline_of(limits))
+            .collect()
+            .await;
+        assert_eq!(drained.len(), count);
+        assert!(drained.iter().all(Result::is_ok));
     }
 }
