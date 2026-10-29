@@ -934,7 +934,13 @@ fusescope-engine/
                      UDFs, Flight SQL, DoAction, budget, SQL sandbox
     fs-compactor/    levels, derived tables, promotions, retention, leases
     fs-auth/         mTLS, tenant JWT, per-role identity
-    fs-server/       single binary, --role ingester|querier|compactor|all
+    fs-server/       single binary, --role ingester|querier|compactor|all;
+                     /metrics, /healthz (alive) and /readyz (every role up,
+                     catalog and bucket answering the last probe, the WAL
+                     open, no drain under way) on server.metrics_addr; a
+                     stop drops readiness at once, lets the roles finish
+                     what they hold and abandons it after
+                     server.drain_timeout_secs
   docs/
     adr/             recorded decisions
 ```
