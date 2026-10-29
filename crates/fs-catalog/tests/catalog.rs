@@ -1724,3 +1724,261 @@ async fn register_is_idempotent_on_id() {
     assert_eq!(visible.len(), 1);
     db.finish().await;
 }
+
+/// A file to register with an explicit time span and level.
+fn file_spanning(tenant: TenantId, signal: Signal, level: Level, range: TimeRange) -> NewFile {
+    let id = FileId::new();
+    NewFile {
+        id,
+        origin: id,
+        tenant_id: tenant,
+        signal,
+        level,
+        path: format!("t/{}/{}/{}.parquet", tenant.0, signal.path_name(), id.0),
+        size_bytes: 1 << 20,
+        row_count: 1_000,
+        range,
+        services: Vec::new(),
+        summary: None,
+    }
+}
+
+/// The start of yesterday on the database clock, in UTC: the cut of a
+/// tenant keeping one day.
+async fn yesterday(catalog: &Catalog) -> chrono::DateTime<Utc> {
+    let (cut,): (chrono::DateTime<Utc>,) = sqlx::query_as(
+        "select date_bin('1 day', now(), timestamptz '1970-01-01 00:00:00+00') - interval '1 day'",
+    )
+    .fetch_one(catalog.pool())
+    .await
+    .unwrap();
+    cut
+}
+
+/// Retention expires the files whose rows all ended before the start of
+/// the current UTC day on the database clock minus the tenant's
+/// `retention_days`, under the fence, so many files of one tenant per
+/// call, oldest first, and the calls resume where they stopped; once a
+/// tenant has no expired file left, a derived table of its that still
+/// lists earlier sightings is stale, and the files that remain are the
+/// ones at or after the cut.
+#[tokio::test]
+async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_table() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let c = &db.catalog;
+    let t = c
+        .create_tenant(&NewTenant {
+            retention_days: 1,
+            ..NewTenant::with_defaults("short")
+        })
+        .await
+        .unwrap()
+        .id;
+    let other = c
+        .create_tenant(&NewTenant::with_defaults("long"))
+        .await
+        .unwrap()
+        .id;
+    let cut = yesterday(c).await;
+    let span = |from: i64, to: i64| TimeRange {
+        start: cut + Duration::microseconds(from),
+        end: cut + Duration::microseconds(to),
+    };
+    let hour = 3_600_000_000i64;
+    let old1 = c
+        .register_file(&file_spanning(
+            t,
+            Signal::Traces,
+            Level::L0,
+            span(-3 * hour, -2 * hour),
+        ))
+        .await
+        .unwrap();
+    let old2 = c
+        .register_file(&file_spanning(
+            t,
+            Signal::Traces,
+            Level::L1,
+            span(-2 * hour, -hour),
+        ))
+        .await
+        .unwrap();
+    let edge = c
+        .register_file(&file_spanning(
+            t,
+            Signal::Traces,
+            Level::L0,
+            span(-hour, -1),
+        ))
+        .await
+        .unwrap();
+    let kept_l1 = c
+        .register_file(&file_spanning(t, Signal::Traces, Level::L1, span(0, hour)))
+        .await
+        .unwrap();
+    let kept_l0 = c
+        .register_file(&file_spanning(
+            t,
+            Signal::Traces,
+            Level::L0,
+            span(hour, 2 * hour),
+        ))
+        .await
+        .unwrap();
+    let table = c
+        .register_file(&file_spanning(
+            t,
+            Signal::AttributeKeys,
+            Level::L1,
+            span(-3 * hour, 2 * hour),
+        ))
+        .await
+        .unwrap();
+    let others = c
+        .register_file(&file_spanning(
+            other,
+            Signal::Traces,
+            Level::L0,
+            span(-3 * hour, -2 * hour),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "a table is not stale while expired files of its tenant remain"
+    );
+    let generation = c
+        .acquire_lease(
+            fs_catalog::COMPACTOR_LEASE,
+            "me",
+            StdDuration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = LeaseFence {
+        name: fs_catalog::COMPACTOR_LEASE.into(),
+        holder: "me".into(),
+        generation,
+    };
+    let old_fence = LeaseFence {
+        generation: generation - 1,
+        ..fence.clone()
+    };
+    let err = c
+        .expire_files_fenced(Signal::Traces, 2, &old_fence)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err}");
+    assert_eq!(
+        c.all_visible_files(t, Signal::Traces).await.unwrap().len(),
+        5,
+        "a stale fence expires nothing"
+    );
+
+    let first = c
+        .expire_files_fenced(Signal::Traces, 2, &fence)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.tenant_id, t);
+    assert_eq!(first.cutoff, cut);
+    assert_eq!(
+        first.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![old1.id, old2.id],
+        "oldest first, as many as asked"
+    );
+    assert_eq!(first.files[0].path, old1.path);
+    let second = c
+        .expire_files_fenced(Signal::Traces, 2, &fence)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![edge.id],
+        "a file ending a microsecond before the cut is beyond it"
+    );
+    assert!(
+        c.expire_files_fenced(Signal::Traces, 2, &fence)
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing left: the file starting at the cut stays"
+    );
+    let visible: Vec<_> = c
+        .all_visible_files(t, Signal::Traces)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(visible, vec![kept_l1.id, kept_l0.id]);
+    assert_eq!(
+        c.all_visible_files(other, Signal::Traces).await.unwrap()[0].id,
+        others.id,
+        "the other tenant keeps fifteen days"
+    );
+    let (state, quarantined_at): (i16, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("select state, quarantined_at from engine_file where id = $1")
+            .bind(edge.id)
+            .fetch_one(c.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, FileState::Quarantined.code());
+    assert!(quarantined_at.is_some(), "quarantined, for the purge");
+
+    let stale_table = c
+        .stale_derived_table(Signal::AttributeKeys, Signal::Traces, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale_table.tenant_id, t);
+    assert_eq!(stale_table.table.id, table.id);
+    assert_eq!(stale_table.cutoff, cut);
+    assert!(
+        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "one stale table"
+    );
+    let remaining: Vec<_> = c
+        .visible_files_from(t, Signal::Traces, Level::L1, cut)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![kept_l1.id],
+        "the L1 files at or after the cut"
+    );
+
+    // Rebuilt from what remains, the table is no longer stale.
+    let rebuilt = file_spanning(t, Signal::AttributeKeys, Level::L1, span(0, hour));
+    c.swap_files_fenced(
+        t,
+        Signal::Traces,
+        &[],
+        &[(Signal::AttributeKeys, table.id)],
+        &[rebuilt],
+        Some(&fence),
+    )
+    .await
+    .unwrap();
+    assert!(
+        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.finish().await;
+}
