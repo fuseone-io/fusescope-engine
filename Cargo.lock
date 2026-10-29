@@ -1679,6 +1679,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "async-trait",
  "bytes",
  "chrono",
  "fs-catalog",
