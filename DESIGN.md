@@ -641,13 +641,19 @@ before is swapped out alone, without being read, when nothing remains. A
 rebuild that does not commit, for a lost lease, a conflict, an unreadable
 table before or L1 file, or a crash, leaves the table before in place and
 the new table an orphan (`fusescope_retention_rebuild_*`). A tick
-attempts at most `compactor.rebuilds_per_tick` rebuilds. A failure on the
-tenant's own files, the table before or an L1 unreadable, holds the
-tenant back for `compactor.rebuild_backoff_secs` times its failures so
-far, up to six times, and the leader's loop goes on to the next tenant:
-the backoff outlives the tick, so however many damaged tenants sort
-ahead of a healthy one, they stop taking the tick's rebuilds and the
-healthy one gets its turn; a success clears the count. A lost lease ends
+attempts at most `compactor.rebuilds_per_tick` rebuilds, 256 at most, so
+the leader's purge, compaction and sweep are never long behind them.
+The stale tables are walked by earliest sighting with a keyset cursor
+that outlives calls and ticks and wraps around at the end
+(`stale_derived_table`), each table once a round whether its rebuild
+went or not, so a round costs one query per table and however many
+damaged tenants sort ahead of a healthy one, the tick's rebuilds reach
+it in turn; a lost lease or a catalog failure, not the tenant's, leaves
+the walk where it was. A failure on the tenant's own files, the table before or an
+L1 unreadable, also holds the tenant back for
+`compactor.rebuild_backoff_secs` times its failures so far, up to six
+times, so a broken tenant is not read again every round while few tables
+are stale; a success clears the count. A lost lease ends
 the tick's work and a catalog failure ends the rebuilds for the tick. A
 rebuild is admitted by what it reads and by what it holds: a tenant
 whose remaining L1 files exceed `compactor.rebuild_max_input_bytes`, or
