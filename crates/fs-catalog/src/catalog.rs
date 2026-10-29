@@ -55,6 +55,18 @@ impl Catalog {
         Ok(())
     }
 
+    /// The identity this catalog was given once, when it was created; an
+    /// engine marks the bucket prefix it writes with it.
+    ///
+    /// # Errors
+    /// Database failure, or a catalog not migrated to carry an identity.
+    pub async fn identity(&self) -> Result<Uuid, CatalogError> {
+        let row: (Uuid,) = sqlx::query_as("select id from engine_catalog")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     /// Creates a tenant.
     ///
     /// # Errors

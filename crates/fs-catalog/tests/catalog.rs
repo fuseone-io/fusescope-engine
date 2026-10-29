@@ -787,6 +787,24 @@ async fn a_swap_replaces_the_derived_rows_its_outputs_supersede() {
     db.finish().await;
 }
 
+/// A catalog is given one identity when it is created and keeps it over
+/// migration runs; another catalog has another.
+#[tokio::test]
+async fn a_catalog_keeps_the_identity_it_was_given() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let first = db.catalog.identity().await.unwrap();
+    db.catalog.migrate().await.unwrap();
+    assert_eq!(db.catalog.identity().await.unwrap(), first);
+    let Some(other) = TestDb::new().await else {
+        return;
+    };
+    assert_ne!(other.catalog.identity().await.unwrap(), first);
+    other.finish().await;
+    db.finish().await;
+}
+
 /// Waits until some backend is blocked on a lock while holding a lock on
 /// this schema's `engine_lease` or `engine_orphan`, so the test knows the task reached the
 /// row rather than assuming it from a sleep. Panics after five seconds:
