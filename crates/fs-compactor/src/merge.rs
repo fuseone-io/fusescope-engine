@@ -23,6 +23,7 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, FileRecord, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_index::TraceIndex;
+use fs_schema::attribute_keys::KeyStats;
 use fs_schema::parquet::{gather, writer_properties};
 use fs_schema::spans::{TRACE_ID_BYTES, col, span_schema_v1, trace_ids};
 use futures_util::future::BoxFuture;
@@ -68,6 +69,7 @@ pub struct L1Merger {
     config: MergeConfig,
     /// Set once the inputs are spent.
     done: bool,
+    keys: KeyStats,
 }
 
 impl L1Merger {
@@ -94,7 +96,15 @@ impl L1Merger {
             hour,
             config,
             done: false,
+            keys: KeyStats::default(),
         })
+    }
+
+    /// The attribute keys of every row merged so far, with their counts
+    /// and sightings; taken once the inputs are spent, for the derived
+    /// table.
+    pub fn take_keys(&mut self) -> KeyStats {
+        std::mem::take(&mut self.keys)
     }
 
     /// The next output, closed at the target size or at the end of the
@@ -114,6 +124,7 @@ impl L1Merger {
             .next_group(&self.schema, self.config.row_group_rows)
             .await?
         {
+            self.keys.absorb(&group)?;
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
                 return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
@@ -129,8 +140,24 @@ impl L1Merger {
 
 /// `{root}/t/{tenant}/traces/l1/dt=YYYY-MM-DD/hr=HH/{id}.parquet`
 pub fn l1_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
+    partitioned_path(root, tenant, "traces/l1", hour, id)
+}
+
+/// `{root}/t/{tenant}/derived/attribute_keys/dt=YYYY-MM-DD/hr=HH/{id}.parquet`,
+/// partitioned by the hour of the pass that rebuilt the table.
+pub fn attribute_keys_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
+    partitioned_path(root, tenant, "derived/attribute_keys", hour, id)
+}
+
+fn partitioned_path(
+    root: &Path,
+    tenant: TenantId,
+    kind: &str,
+    hour: DateTime<Utc>,
+    id: FileId,
+) -> Path {
     let relative = format!(
-        "t/{}/traces/l1/dt={}/hr={:02}/{}.parquet",
+        "t/{}/{kind}/dt={}/hr={:02}/{}.parquet",
         tenant.0,
         hour.format("%Y-%m-%d"),
         hour.format("%H"),

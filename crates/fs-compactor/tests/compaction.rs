@@ -337,7 +337,11 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     let c = compactor(&f, config(4));
     let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert_eq!(done.inputs.len(), 3);
-    assert_eq!(done.outputs.len(), 1);
+    assert_eq!(
+        done.outputs.len(),
+        2,
+        "the L1 file and the attribute_keys table"
+    );
 
     let now = visible(&f).await;
     assert_eq!(now.len(), 2, "one L1 and the open-hour L0");
@@ -422,7 +426,11 @@ async fn outputs_close_at_the_target_size() {
         done.outputs.len()
     );
     let now = visible(&f).await;
-    assert_eq!(now.len(), done.outputs.len());
+    assert_eq!(
+        now.len(),
+        done.outputs.len() - 1,
+        "every L1 output; the other output is the attribute_keys table"
+    );
     assert_eq!(now.iter().map(|x| x.row_count).sum::<i64>(), 18);
     let mut all_rows = Vec::new();
     for file in &now {
@@ -500,7 +508,17 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
             .is_ok(),
         "and its sidecar"
     );
-    assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        derived_objects(&f).await.len(),
+        1,
+        "the attribute_keys table went up before the swap"
+    );
+    assert_eq!(attribute_keys_files(&f).await.len(), 0, "and has no row");
+    assert_eq!(
+        c.stats().orphaned.load(Ordering::Relaxed),
+        2,
+        "the L1 object and the attribute_keys table"
+    );
     assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
 
     let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
@@ -508,6 +526,7 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     let now = visible(&f).await;
     assert_eq!(now.len(), 1);
     assert!(orphans.iter().all(|o| o != &now[0].path), "fresh ids");
+    assert_eq!(attribute_keys_files(&f).await.len(), 1);
     f.db.finish().await;
 }
 
@@ -537,7 +556,11 @@ async fn a_stale_fence_publishes_nothing() {
     assert_eq!(now.len(), inputs.len());
     assert!(now.iter().all(|x| x.level == Level::L0));
     assert_eq!(c.stats().lease_lost.load(Ordering::Relaxed), 1);
-    assert_eq!(c.stats().orphaned.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        c.stats().orphaned.load(Ordering::Relaxed),
+        2,
+        "the L1 object and the attribute_keys table"
+    );
 
     // The real holder's fence works.
     let real = LeaseFence {
@@ -929,15 +952,19 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let mut sweeper = sweeper(&f, 1000);
     let stats = sweeper.stats();
 
+    let orphan_keys = derived_objects(&f).await.remove(0);
     let first = sweeper.sweep_once().await.unwrap();
-    assert_eq!(first.prefixes, 3, "the tenant's l0, l1 and sidecar days");
     assert_eq!(
-        first.listed, 9,
+        first.prefixes, 4,
+        "the tenant's l0, l1, sidecar and attribute_keys days"
+    );
+    assert_eq!(
+        first.listed, 10,
         "the objects of those partitions, foreign levels and signals not walked"
     );
     assert_eq!(
-        first.seen, 3,
-        "the L1, its sidecar and the stray; nothing foreign"
+        first.seen, 4,
+        "the L1, its sidecar, the attribute_keys table and the stray; nothing foreign"
     );
     assert_eq!(first.deleted, 0, "first sight: nothing deleted");
     assert!(first.wrapped);
@@ -947,7 +974,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let again = sweeper.sweep_once().await.unwrap();
     assert_eq!(
         (again.seen, again.deleted),
-        (3, 0),
+        (4, 0),
         "seen twice within the TTL: still nothing"
     );
 
@@ -969,10 +996,14 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;
     let second = sweeper.sweep_once().await.unwrap();
-    assert_eq!(second.seen, 2, "the stray has a row now");
-    assert_eq!(second.deleted, 2, "the L1 and its sidecar");
+    assert_eq!(second.seen, 3, "the stray has a row now");
+    assert_eq!(
+        second.deleted, 3,
+        "the L1, its sidecar and the attribute_keys table"
+    );
     assert_eq!(second.forgotten, 1, "the stray");
     assert!(!present(&f, &orphan_l1).await);
+    assert!(!present(&f, &orphan_keys).await);
     assert!(!present(&f, &fs_index::sidecar_path(&orphan_l1).unwrap()).await);
     assert!(present(&f, &stray).await);
     for path in &foreign {
@@ -988,7 +1019,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         Vec::<String>::new()
     );
     assert_eq!(stats.sweeps.load(Ordering::Relaxed), 3);
-    assert_eq!(stats.deleted.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.deleted.load(Ordering::Relaxed), 3);
     assert_eq!(stats.forgotten.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }
@@ -1276,6 +1307,14 @@ async fn an_object_written_behind_a_tombstone_is_deleted_again() {
 
 /// L1 objects under the bucket, by path relative to it.
 async fn l1_objects(f: &Fixture) -> Vec<String> {
+    objects_under(f, "/l1/").await
+}
+
+async fn derived_objects(f: &Fixture) -> Vec<String> {
+    objects_under(f, "/derived/attribute_keys/").await
+}
+
+async fn objects_under(f: &Fixture, part: &str) -> Vec<String> {
     use futures_util::TryStreamExt;
     let mut out: Vec<String> = f
         .store
@@ -1285,8 +1324,167 @@ async fn l1_objects(f: &Fixture) -> Vec<String> {
         .await
         .unwrap()
         .into_iter()
-        .filter(|p| p.contains("/l1/"))
+        .filter(|p| p.contains(part))
         .collect();
     out.sort();
     out
+}
+
+async fn attribute_keys_files(f: &Fixture) -> Vec<FileRecord> {
+    f.db.catalog
+        .all_visible_files(f.tenant, Signal::AttributeKeys)
+        .await
+        .unwrap()
+}
+
+fn attribute_keys_of(f: &Fixture, file: &FileRecord) -> fs_schema::attribute_keys::KeyStats {
+    let bytes = std::fs::read(f.dir.path().join(&file.path)).unwrap();
+    fs_schema::attribute_keys::decode(bytes.into()).unwrap()
+}
+
+fn request_with_attribute(
+    service: &str,
+    trace: u8,
+    start: u64,
+    spans: u8,
+    key: &str,
+    value: &str,
+) -> ExportTraceServiceRequest {
+    let mut request = request(service, trace, start, spans);
+    for span in &mut request.resource_spans[0].scope_spans[0].spans {
+        span.attributes.push(kv(key, value));
+    }
+    request
+}
+
+/// A pass rebuilds the tenant's `attribute_keys` table from the rows it
+/// merged and the table before it, which it quarantines in the same swap:
+/// counts add up across passes, sightings widen, and a key seen by one
+/// pass only is kept.
+#[tokio::test]
+async fn a_pass_rebuilds_the_attribute_keys_table_from_its_inputs_and_the_table_before() {
+    use fs_schema::attribute_keys::{KeySource, KeyType};
+    let Some(f) = fixture().await else { return };
+    three_closed_l0(&f, 4).await;
+    let c = compactor(&f, config(4));
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+
+    let tables = attribute_keys_files(&f).await;
+    assert_eq!(tables.len(), 1);
+    let first = &tables[0];
+    assert_eq!(first.signal, Signal::AttributeKeys);
+    assert!(
+        first
+            .path
+            .contains("/derived/attribute_keys/dt=2026-10-24/hr=14/"),
+        "{}",
+        first.path
+    );
+    let keys = attribute_keys_of(&f, first);
+    let rows: Vec<_> = keys
+        .iter()
+        .map(|(source, key, kind, seen)| (source, key.to_owned(), kind, seen.count))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                KeySource::Resource,
+                "service.name".to_owned(),
+                KeyType::String,
+                18
+            ),
+            (
+                KeySource::Span,
+                "http.request.method".to_owned(),
+                KeyType::String,
+                18
+            ),
+        ]
+    );
+    let h = nanos(closed_hour());
+    let minute = 60_000_000_000u64;
+    let (start, end) = keys.range().unwrap();
+    assert_eq!(
+        start,
+        i64::try_from(h + minute).unwrap(),
+        "api's first span"
+    );
+    assert_eq!(
+        end,
+        i64::try_from(h + 5 * minute + 5_000_000).unwrap(),
+        "web's last span"
+    );
+    assert_eq!(first.row_count, 2);
+    assert_eq!(c.stats().derived.load(Ordering::Relaxed), 1);
+
+    // The next hour brings a key the first pass never saw.
+    let later = nanos(closed_hour() + chrono::Duration::hours(1));
+    let mut files = Vec::new();
+    for trace in [7u8, 8] {
+        let req = request_with_attribute(
+            "api",
+            trace,
+            later + u64::from(trace) * minute,
+            3,
+            "db.system",
+            "pg",
+        );
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    assert!(
+        done.inputs.contains(&first.id),
+        "the table before is quarantined with the inputs"
+    );
+
+    let tables = attribute_keys_files(&f).await;
+    assert_eq!(tables.len(), 1, "one table per tenant");
+    let second = &tables[0];
+    assert_ne!(second.id, first.id);
+    assert!(second.path.contains("/hr=15/"), "{}", second.path);
+    let keys = attribute_keys_of(&f, second);
+    let count_of = |key: &str| {
+        keys.iter()
+            .find(|(_, k, _, _)| *k == key)
+            .map(|(_, _, _, seen)| seen)
+            .unwrap()
+    };
+    assert_eq!(count_of("service.name").count, 24);
+    assert_eq!(count_of("http.request.method").count, 24);
+    assert_eq!(count_of("db.system").count, 6);
+    assert_eq!(
+        count_of("http.request.method").first_seen,
+        i64::try_from(h + minute).unwrap(),
+        "kept from the table before"
+    );
+    assert_eq!(
+        count_of("db.system").first_seen,
+        i64::try_from(later + 7 * minute).unwrap()
+    );
+    assert_eq!(
+        keys.range().unwrap().1,
+        i64::try_from(later + 8 * minute + 2_000_000).unwrap()
+    );
+    assert_eq!(c.stats().derived.load(Ordering::Relaxed), 2);
+    assert_eq!(c.stats().derived_unreadable.load(Ordering::Relaxed), 0);
+
+    // A table before that cannot be read is replaced, not fatal.
+    std::fs::write(f.dir.path().join(&second.path), b"not parquet").unwrap();
+    let hour_after = nanos(closed_hour() + chrono::Duration::hours(2));
+    let mut files = Vec::new();
+    for trace in [11u8, 12] {
+        let req = request("web", trace, hour_after + u64::from(trace) * minute, 2);
+        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], 4).await);
+    }
+    registered_an_hour_ago(&f, &files).await;
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let tables = attribute_keys_files(&f).await;
+    assert_eq!(tables.len(), 1);
+    assert_ne!(tables[0].id, second.id);
+    let keys = attribute_keys_of(&f, &tables[0]);
+    assert_eq!(keys.len(), 2, "only what the pass saw");
+    assert_eq!(c.stats().derived_unreadable.load(Ordering::Relaxed), 1);
+    f.db.finish().await;
 }

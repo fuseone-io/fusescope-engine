@@ -48,8 +48,14 @@ use crate::CompactError;
 /// Objects per membership query and sighting insert.
 const CHUNK: usize = 1000;
 
-/// The kinds of partition under a tenant's traces, in walk order.
-const KINDS: [&str; 4] = ["l0", "l1", "l2", "index/trace_id"];
+/// The kinds of partition under a tenant, in walk order.
+const KINDS: [&str; 5] = [
+    "traces/l0",
+    "traces/l1",
+    "traces/l2",
+    "traces/index/trace_id",
+    "derived/attribute_keys",
+];
 
 /// Bounds of the sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +267,7 @@ impl Sweeper {
                 continue;
             };
             if self.inventory.days.is_none() {
-                let level = Path::from(format!("{tenant}/traces/{kind}"));
+                let level = Path::from(format!("{tenant}/{kind}"));
                 let listed = self.store.list_with_delimiter(Some(&level)).await?;
                 let mut days: Vec<Path> = listed
                     .common_prefixes

@@ -13,13 +13,18 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use fs_catalog::{Catalog, CatalogError, Compaction, FileRecord, LeaseFence, NewFile, Signal};
+use chrono::TimeZone;
+use fs_catalog::{
+    Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, Level, NewFile, Signal,
+    TimeRange,
+};
+use fs_schema::attribute_keys::KeyStats;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use tracing::{info, warn};
 
 use crate::CompactError;
-use crate::merge::{L1Merger, MergeConfig};
+use crate::merge::{L1Merger, MergeConfig, attribute_keys_path};
 
 /// What one pass is allowed to take on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +78,11 @@ pub struct CompactorStats {
     pub orphaned: AtomicU64,
     /// Hours skipped because their two oldest files exceed the input cap.
     pub skipped: AtomicU64,
+    /// `attribute_keys` tables rebuilt by completed passes.
+    pub derived: AtomicU64,
+    /// Previous `attribute_keys` tables that could not be read; the pass
+    /// replaced them with what it saw and reported it.
+    pub derived_unreadable: AtomicU64,
 }
 
 /// The compaction side of the compactor.
@@ -244,36 +254,119 @@ impl Compactor {
                 file: output.file,
             });
         }
+        let keys = merger.take_keys();
         drop(merger);
-        let compaction = self.swap(tenant, &owned, &outputs, fence).await?;
+        let (derived, replaced) = self
+            .rebuild_attribute_keys(tenant, hour, keys, &mut guard, &mut puts)
+            .await?;
+        let compaction = self
+            .swap(tenant, &owned, &replaced, &outputs, derived.as_ref(), fence)
+            .await?;
         guard.armed = false;
         self.count(&owned, &outputs);
+        if derived.is_some() {
+            self.stats.derived.fetch_add(1, Ordering::Relaxed);
+        }
         info!(
             role = "compactor",
             tenant = %tenant.0,
             hour = %hour,
             inputs = owned.len(),
             outputs = outputs.len(),
+            derived = derived.is_some(),
             "compacted"
         );
         Ok(compaction)
+    }
+
+    /// The tenant's `attribute_keys` table rebuilt from `keys`, what the
+    /// pass merged, and the table before it, which the swap then replaces:
+    /// the new file, uploaded, and the rows it supersedes. A previous table
+    /// that cannot be read is replaced by what the pass saw and counted.
+    async fn rebuild_attribute_keys(
+        &self,
+        tenant: fs_catalog::TenantId,
+        hour: chrono::DateTime<chrono::Utc>,
+        mut keys: KeyStats,
+        guard: &mut OrphanGuard,
+        puts: &mut usize,
+    ) -> Result<(Option<NewFile>, Vec<(Signal, FileId)>), CompactError> {
+        let previous = self
+            .catalog
+            .all_visible_files(tenant, Signal::AttributeKeys)
+            .await?;
+        let mut replaced = Vec::with_capacity(previous.len());
+        for file in &previous {
+            replaced.push((Signal::AttributeKeys, file.id));
+            match self.read_attribute_keys(&file.path).await {
+                Ok(known) => keys.merge(known),
+                Err(e) => {
+                    self.stats
+                        .derived_unreadable
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        role = "compactor",
+                        tenant = %tenant.0,
+                        path = %file.path,
+                        error = %e,
+                        "attribute_keys table unreadable; replaced by what this pass saw"
+                    );
+                }
+            }
+        }
+        let Some((first, last)) = keys.range() else {
+            return Ok((None, replaced));
+        };
+        let bytes = Bytes::from(fs_schema::attribute_keys::encode(&keys)?);
+        let id = FileId::new();
+        let path = attribute_keys_path(&self.root, tenant, hour, id);
+        self.put_once(path.as_ref(), bytes.clone(), puts).await?;
+        guard.created += 1;
+        let file = NewFile {
+            id,
+            origin: id,
+            tenant_id: tenant,
+            signal: Signal::AttributeKeys,
+            level: Level::L1,
+            path: path.to_string(),
+            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            row_count: i64::try_from(keys.len()).unwrap_or(i64::MAX),
+            range: TimeRange {
+                start: chrono::Utc.timestamp_nanos(first),
+                end: chrono::Utc.timestamp_nanos(last),
+            },
+            services: Vec::new(),
+            summary: None,
+        };
+        Ok((Some(file), replaced))
+    }
+
+    async fn read_attribute_keys(&self, path: &str) -> Result<KeyStats, CompactError> {
+        let bytes = self.store.get(&Path::from(path)).await?.bytes().await?;
+        Ok(fs_schema::attribute_keys::decode(bytes)?)
     }
 
     async fn swap(
         &self,
         tenant: fs_catalog::TenantId,
         inputs: &[FileRecord],
+        replaced: &[(Signal, FileId)],
         outputs: &[Published],
+        derived: Option<&NewFile>,
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         if take_injected(&self.inject_swap_failures) {
             return Err(CompactError::Injected("swap"));
         }
         let ids: Vec<_> = inputs.iter().map(|f| f.id).collect();
-        let files: Vec<NewFile> = outputs.iter().map(|o| o.file.clone()).collect();
+        let files: Vec<NewFile> = outputs
+            .iter()
+            .map(|o| o.file.clone())
+            .chain(derived.cloned())
+            .collect();
         Ok(self
             .catalog
-            .swap_files_fenced(tenant, Signal::Traces, &ids, &[], &files, Some(fence))
+            .swap_files_fenced(tenant, Signal::Traces, &ids, replaced, &files, Some(fence))
             .await?)
     }
 
