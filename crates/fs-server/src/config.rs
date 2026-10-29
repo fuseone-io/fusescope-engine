@@ -690,6 +690,13 @@ pub struct CompactorConfig {
     /// a tenant above it keeps its table.
     #[serde(default = "default_rebuild_max_bytes")]
     pub rebuild_max_bytes: u64,
+    /// Most `attribute_keys` rebuilds one retention tick attempts.
+    #[serde(default = "default_rebuilds_per_tick")]
+    pub rebuilds_per_tick: usize,
+    /// How long a tenant whose rebuild failed waits before it is tried
+    /// again, times its failures so far, up to six times.
+    #[serde(default = "default_rebuild_backoff")]
+    pub rebuild_backoff_secs: u64,
 }
 
 impl Default for CompactorConfig {
@@ -713,6 +720,8 @@ impl Default for CompactorConfig {
             retention_files_per_pass: default_retention_files_per_pass(),
             rebuild_max_input_bytes: default_rebuild_max_input_bytes(),
             rebuild_max_bytes: default_rebuild_max_bytes(),
+            rebuilds_per_tick: default_rebuilds_per_tick(),
+            rebuild_backoff_secs: default_rebuild_backoff(),
         }
     }
 }
@@ -752,6 +761,8 @@ impl CompactorConfig {
                 rebuild_max_bytes: self.rebuild_max_bytes,
                 batch_rows: fs_compactor::retention::REBUILD_BATCH_ROWS,
                 limits: fs_schema::limits::Limits::default(),
+                rebuilds_per_tick: self.rebuilds_per_tick,
+                rebuild_backoff: std::time::Duration::from_secs(self.rebuild_backoff_secs),
                 inject_swap_failures: 0,
             },
         }
@@ -772,6 +783,14 @@ fn default_rebuild_max_input_bytes() -> u64 {
 
 fn default_rebuild_max_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
+}
+
+fn default_rebuilds_per_tick() -> usize {
+    64
+}
+
+fn default_rebuild_backoff() -> u64 {
+    3600
 }
 
 fn default_orphan_interval() -> u64 {
@@ -1002,9 +1021,11 @@ impl Config {
         if self.compactor.retention_interval_secs == 0
             || self.compactor.retention_files_per_pass <= 0
             || self.compactor.rebuild_max_input_bytes == 0
+            || self.compactor.rebuilds_per_tick == 0
+            || self.compactor.rebuild_backoff_secs == 0
         {
             return invalid(
-                "compactor.retention_interval_secs, retention_files_per_pass and rebuild_max_input_bytes must be positive",
+                "compactor.retention_interval_secs, retention_files_per_pass, rebuild_max_input_bytes, rebuilds_per_tick and rebuild_backoff_secs must be positive",
             );
         }
         let smallest_rebuild = fs_compactor::retention::rebuild_footprint(
@@ -1601,6 +1622,8 @@ mod tests {
             fs_schema::limits::Limits::default()
         );
         assert_eq!(compactor.retention.inject_swap_failures, 0);
+        assert_eq!(compactor.retention.rebuilds_per_tick, 64);
+        assert_eq!(compactor.retention.rebuild_backoff.as_secs(), 3600);
         let floor = fs_compactor::retention::rebuild_footprint(
             0,
             0,
@@ -1617,6 +1640,8 @@ mod tests {
             "retention_files_per_pass = 0",
             "retention_files_per_pass = -1",
             "rebuild_max_input_bytes = 0",
+            "rebuilds_per_tick = 0",
+            "rebuild_backoff_secs = 0",
         ] {
             let err = Config::parse(&format!(
                 "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"
