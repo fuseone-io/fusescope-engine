@@ -15,12 +15,13 @@ use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
+use fs_catalog::Compaction;
 use fs_catalog::{
     COMPACTOR_LEASE, Catalog, CatalogError, FileRecord, LeaseFence, Level, NewTenant, Signal,
     TenantId,
 };
 use fs_compactor::{
-    CompactError, CompactionConfig, Compactor, CompactorStats, Retention, RetentionConfig,
+    CompactError, CompactionConfig, Compactor, CompactorStats, Rebuild, Retention, RetentionConfig,
     RetentionStats,
 };
 use fs_ingest::flush;
@@ -262,6 +263,14 @@ fn retention_config() -> RetentionConfig {
     }
 }
 
+/// The swap of a rebuild that went through.
+fn done(outcome: Rebuild) -> Compaction {
+    match outcome {
+        Rebuild::Done(swap) => swap,
+        other => panic!("expected a rebuild, got {other:?}"),
+    }
+}
+
 fn retention(f: &Fixture, config: RetentionConfig) -> Retention {
     Retention::new(
         f.db.catalog.clone(),
@@ -488,7 +497,7 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
 
     let r = retention(&f, retention_config());
     assert!(
-        r.rebuild_once(&fence).await.unwrap().is_none(),
+        matches!(r.rebuild_once(&fence).await.unwrap(), Rebuild::End),
         "not stale while the tenant has expired files"
     );
     let expired = r.expire_once(&fence).await.unwrap().unwrap();
@@ -559,8 +568,18 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         },
     ] {
         let capped = retention(&f, config);
-        assert!(capped.rebuild_once(&fence).await.unwrap().is_none());
-        assert!(capped.rebuild_once(&fence).await.unwrap().is_none());
+        assert!(matches!(
+            capped.rebuild_once(&fence).await.unwrap(),
+            Rebuild::Skipped
+        ));
+        assert!(matches!(
+            capped.rebuild_once(&fence).await.unwrap(),
+            Rebuild::End
+        ));
+        assert!(matches!(
+            capped.rebuild_once(&fence).await.unwrap(),
+            Rebuild::Skipped
+        ));
         assert_eq!(
             capped.stats().rebuild_skipped.load(Ordering::Relaxed),
             1,
@@ -617,15 +636,23 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         "nothing created"
     );
     assert_eq!(r.stats().rebuild_failures.load(Ordering::Relaxed), 1);
-    let done = r.rebuild_once(&fence).await.unwrap().unwrap();
-    assert_eq!(done.inputs, vec![others_table[0].id]);
-    assert_eq!(done.outputs.len(), 0);
+    let swap = done(r.rebuild_once(&fence).await.unwrap());
+    assert_eq!(swap.inputs, vec![others_table[0].id]);
+    assert_eq!(swap.outputs.len(), 0);
     assert_eq!(tables_of(&f, other).await.len(), 0);
     assert!(
-        r.rebuild_once(&fence).await.unwrap().is_none(),
-        "the walk comes back round to the failed tenant, held back"
+        matches!(r.rebuild_once(&fence).await.unwrap(), Rebuild::End),
+        "the round is over"
+    );
+    assert!(
+        matches!(r.rebuild_once(&fence).await.unwrap(), Rebuild::Skipped),
+        "the next round comes to the failed tenant, held back"
     );
     tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert!(matches!(
+        r.rebuild_once(&fence).await.unwrap(),
+        Rebuild::End
+    ));
     let err = r.rebuild_once(&fence).await.unwrap_err();
     assert!(
         matches!(err, CompactError::Parquet(_)),
@@ -643,7 +670,7 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
             ..retention_config()
         },
     );
-    let done = exact.rebuild_once(&fence).await.unwrap().unwrap();
+    let done = done(exact.rebuild_once(&fence).await.unwrap());
     assert_eq!(
         done.inputs,
         vec![before[0].id],
@@ -684,7 +711,7 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
     assert_eq!(exact.stats().rebuilds.load(Ordering::Relaxed), 1);
     assert_eq!(exact.stats().rebuild_skipped.load(Ordering::Relaxed), 0);
     assert!(
-        exact.rebuild_once(&fence).await.unwrap().is_none(),
+        matches!(exact.rebuild_once(&fence).await.unwrap(), Rebuild::End),
         "rebuilt once"
     );
     assert_eq!(rows(&f, "select count(*) from attribute_keys").await, 2);
@@ -728,7 +755,7 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
         .execute(f.db.catalog.pool())
         .await
         .unwrap();
-    let done = r.rebuild_once(&fence).await.unwrap().unwrap();
+    let done = done(r.rebuild_once(&fence).await.unwrap());
     assert_eq!(done.inputs, vec![before[0].id]);
     assert_eq!(
         r.stats().rebuild_skipped.load(Ordering::Relaxed),
@@ -738,7 +765,10 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
     assert_eq!(done.outputs.len(), 0, "nothing to list");
     assert_eq!(tables(&f).await.len(), 0);
     assert_eq!(rows(&f, "select count(*) from attribute_keys").await, 0);
-    assert!(r.rebuild_once(&fence).await.unwrap().is_none());
+    assert!(matches!(
+        r.rebuild_once(&fence).await.unwrap(),
+        Rebuild::End
+    ));
     assert_eq!(r.stats().rebuilds.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }

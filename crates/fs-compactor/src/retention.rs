@@ -65,9 +65,21 @@ const INPUT_PAGE: i64 = 1000;
 /// configured one.
 const MAX_BACKOFF_STEPS: u32 = 6;
 
-/// Most rebuilds a tick may be configured to attempt, so the leader's
-/// other passes are never long behind them.
+/// Most stale tables a tick may be configured to examine, so the leader's
+/// other passes are never long behind the rebuilds; a configuration
+/// outside `1..=MAX_REBUILDS_PER_TICK` is clamped into it.
 pub const MAX_REBUILDS_PER_TICK: usize = 256;
+
+/// What one [`Retention::rebuild_once`] did with the next stale table.
+#[derive(Debug)]
+pub enum Rebuild {
+    /// Rebuilt and swapped in, or swapped out with nothing left.
+    Done(Compaction),
+    /// Passed over: its tenant is held back or over a cap.
+    Skipped,
+    /// The round is over; the next call starts another.
+    End,
+}
 
 /// Bounds of retention.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,8 +97,8 @@ pub struct RetentionConfig {
     pub batch_rows: usize,
     /// The limits the rows were written under, which bound a row.
     pub limits: Limits,
-    /// Most rebuilds one tick of the leader's loop attempts, at most
-    /// [`MAX_REBUILDS_PER_TICK`].
+    /// Most stale tables one tick of the leader's loop examines, a
+    /// passed-over one counting; clamped into `1..=MAX_REBUILDS_PER_TICK`.
     pub rebuilds_per_tick: usize,
     /// How long a tenant whose rebuild failed waits before it is tried
     /// again, times its failures so far, up to six times.
@@ -254,6 +266,8 @@ impl Retention {
         stats: Arc<RetentionStats>,
     ) -> Self {
         let inject = config.inject_swap_failures;
+        let mut config = config;
+        config.rebuilds_per_tick = config.rebuilds_per_tick.clamp(1, MAX_REBUILDS_PER_TICK);
         Self {
             catalog,
             store,
@@ -272,7 +286,7 @@ impl Retention {
         Arc::clone(&self.stats)
     }
 
-    /// Most rebuilds one tick attempts.
+    /// Most stale tables one tick examines, within `1..=MAX_REBUILDS_PER_TICK`.
     pub fn rebuilds_per_tick(&self) -> usize {
         self.config.rebuilds_per_tick
     }
@@ -316,61 +330,50 @@ impl Retention {
         Ok(result?)
     }
 
-    /// Rebuilds the next stale `attribute_keys` table after the one last
-    /// tried, by earliest sighting, from the L1 files that remain at or
-    /// after the tenant's cut, and swaps it in under `fence`; the walk
-    /// wraps around at the end. A tenant whose remaining L1 files exceed
-    /// the input cap or whose rebuild would exceed the memory budget is
-    /// passed over, reported once, and the next is tried; so is one whose
-    /// backoff has not ended. A lost lease or a catalog failure, not the
-    /// tenant's, leaves the walk where it was. `None` when a round found
-    /// nothing to rebuild.
+    /// Examines the next stale `attribute_keys` table after the one last
+    /// examined, by earliest sighting: rebuilds it from the L1 files that
+    /// remain at or after the tenant's cut and swaps it in under `fence`,
+    /// or passes it over when its tenant is held back, its remaining L1
+    /// files exceed the input cap or its rebuild would exceed the memory
+    /// budget, reported once. One table per call, so a caller's budget
+    /// bounds the work; at the end of the round the walk goes back to the
+    /// start for the next call. A lost lease or a catalog failure, not
+    /// the tenant's, leaves the walk where it was.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
     /// catalog failure, the table before or an L1 file unreadable
     /// included. The counters record which, and the tenant is held back.
-    pub async fn rebuild_once(
-        &self,
-        fence: &LeaseFence,
-    ) -> Result<Option<Compaction>, CompactError> {
-        let mut wrapped = false;
-        let (stale, inputs, before) = loop {
-            let after = self.cursor();
-            let found = self
-                .catalog
-                .stale_derived_table(Signal::AttributeKeys, Signal::Traces, after)
-                .await?;
-            let Some(stale) = found else {
-                if after.is_none() || wrapped {
-                    return Ok(None);
-                }
-                wrapped = true;
-                self.set_cursor(None);
-                continue;
-            };
-            self.set_cursor(Some(stale.key()));
-            if self.held_back(stale.tenant_id) {
-                continue;
-            }
-            let mut budget = Budget::new(&self.config, &stale.table);
-            let inputs = self
-                .catalog
-                .rebuild_inputs(
-                    stale.tenant_id,
-                    Signal::Traces,
-                    Level::L1,
-                    stale.cutoff,
-                    INPUT_PAGE,
-                    |page| budget.admit(page),
-                )
-                .await?;
-            let Some(inputs) = inputs else {
-                let (what, bytes, cap) = budget.over.unwrap_or(("memory", 0, 0));
-                self.report_over_cap(stale.tenant_id, what, bytes, cap);
-                continue;
-            };
-            break (stale, inputs, after);
+    pub async fn rebuild_once(&self, fence: &LeaseFence) -> Result<Rebuild, CompactError> {
+        let before = self.cursor();
+        let found = self
+            .catalog
+            .stale_derived_table(Signal::AttributeKeys, Signal::Traces, before)
+            .await?;
+        let Some(stale) = found else {
+            self.set_cursor(None);
+            return Ok(Rebuild::End);
+        };
+        self.set_cursor(Some(stale.key()));
+        if self.held_back(stale.tenant_id) {
+            return Ok(Rebuild::Skipped);
+        }
+        let mut budget = Budget::new(&self.config, &stale.table);
+        let inputs = self
+            .catalog
+            .rebuild_inputs(
+                stale.tenant_id,
+                Signal::Traces,
+                Level::L1,
+                stale.cutoff,
+                INPUT_PAGE,
+                |page| budget.admit(page),
+            )
+            .await?;
+        let Some(inputs) = inputs else {
+            let (what, bytes, cap) = budget.over.unwrap_or(("memory", 0, 0));
+            self.report_over_cap(stale.tenant_id, what, bytes, cap);
+            return Ok(Rebuild::Skipped);
         };
         let result = self.rebuild(&stale, &inputs, fence).await;
         match &result {
@@ -399,7 +402,7 @@ impl Retention {
                 self.hold_back(stale.tenant_id);
             }
         }
-        result.map(Some)
+        result.map(Rebuild::Done)
     }
 
     fn cursor(&self) -> Option<StaleKey> {
@@ -598,6 +601,32 @@ mod tests {
             rebuild_backoff: Duration::from_secs(1),
             inject_swap_failures: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn rebuilds_per_tick_is_bounded_inside_the_crate() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@localhost/none")
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let with = |rebuilds_per_tick: usize| {
+            Retention::new(
+                Catalog::from_pool(pool.clone()),
+                Arc::clone(&store),
+                Path::from(""),
+                RetentionConfig {
+                    rebuilds_per_tick,
+                    ..config(1)
+                },
+                Arc::new(RetentionStats::default()),
+            )
+            .rebuilds_per_tick()
+        };
+        assert_eq!(with(0), 1);
+        assert_eq!(with(7), 7);
+        assert_eq!(with(MAX_REBUILDS_PER_TICK), MAX_REBUILDS_PER_TICK);
+        assert_eq!(with(MAX_REBUILDS_PER_TICK + 1), MAX_REBUILDS_PER_TICK);
+        assert_eq!(with(usize::MAX), MAX_REBUILDS_PER_TICK);
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub mod retention;
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
 pub use lease::Leadership;
 pub use orphans::{OrphanStats, SweepConfig, Sweeper};
-pub use retention::{Retention, RetentionConfig, RetentionStats};
+pub use retention::{Rebuild, Retention, RetentionConfig, RetentionStats};
 
 /// Why a compaction pass failed.
 #[derive(Debug, thiserror::Error)]
@@ -257,11 +257,12 @@ async fn work_loop(
     }
 }
 
-/// Expiry passes until nothing is beyond its cut, then rebuilds until no
-/// table is left to rebuild, each kind bounded per tick. A rebuild that
-/// fails on its own tenant's files holds that tenant back for its backoff
-/// and the next is tried; a lost lease ends the tick's work and a catalog
-/// failure ends its kind for the tick.
+/// Expiry passes until nothing is beyond its cut, then stale tables
+/// examined until the round ends, each kind bounded per tick, a table
+/// passed over counting like one rebuilt. A rebuild that fails on its
+/// own tenant's files holds that tenant back for its backoff and the next
+/// is tried; a lost lease ends the tick's work and a catalog failure ends
+/// its kind for the tick.
 async fn retention_passes(retention: &Retention, leadership: &Leadership) {
     for _ in 0..PASSES_PER_TICK {
         let Some(fence) = leadership.fence() else {
@@ -285,8 +286,8 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
             return;
         };
         match retention.rebuild_once(&fence).await {
-            Ok(Some(_)) => {}
-            Ok(None) => break,
+            Ok(Rebuild::Done(_) | Rebuild::Skipped) => {}
+            Ok(Rebuild::End) => break,
             Err(e @ CompactError::Catalog(fs_catalog::CatalogError::LeaseLost { .. })) => {
                 warn!(role = "compactor", error = %e, "attribute_keys rebuild refused");
                 return;
