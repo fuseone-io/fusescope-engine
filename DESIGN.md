@@ -592,10 +592,11 @@ budget (`fusescope_compaction_derived_keys_dropped_total`); which keys an
 hour admits depends on how its files were split into passes, the total
 does not. Keys of rows not yet compacted are not listed: the table lags
 ingestion by the hour close delay. The format carries its signal and
-version in the schema metadata and each version has one exact layout (v2
-the seven columns with `admitted_hour` never null; v1 the six, read with
-the hour of `first_seen` in its place); the compactor and the querier
-both check signal, version and layout before reading a file, the querier
+version in the schema metadata and each version has one exact physical
+layout, every column required (v2 the seven columns, `admitted_hour`
+always the start of an hour; v1 the six, read with the hour of
+`first_seen` in its place); the compactor and the querier both check
+signal, version and layout before reading a file, the querier
 from the footer alone, fetched by ranges once per path and shared by the
 queries that meet a new path at the same time, since an object is never
 rewritten, and refuse anything else, so an older engine never rewrites a

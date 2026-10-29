@@ -1679,7 +1679,43 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         .swap_files(f.tenant, Signal::AttributeKeys, &[v3], &[])
         .await
         .unwrap();
-    register(file_of("2", 6), "hr=17").await;
+    let without = register(file_of("2", 6), "hr=17").await;
+    f.querier
+        .cache()
+        .invalidate(f.tenant, Signal::AttributeKeys)
+        .await;
+    let err = action(&mut client, METADATA_KEYS, r#"{"signal": "traces"}"#)
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("not readable by this version"),
+        "v2 without admitted_hour: {err}"
+    );
+    f.db.catalog
+        .swap_files(f.tenant, Signal::AttributeKeys, &[without], &[])
+        .await
+        .unwrap();
+    // A v2 file whose admitted_hour is a nullable column: the physical
+    // layout is wrong even with no null in it, and the footer tells.
+    let nullable = {
+        let mut fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
+        let last = fields.pop().unwrap();
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            last.name(),
+            last.data_type().clone(),
+            true,
+        )));
+        let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            batch.schema().metadata().clone(),
+        ));
+        let loose = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&loose).unwrap();
+        writer.into_inner().unwrap()
+    };
+    register(nullable, "hr=18").await;
     f.querier
         .cache()
         .invalidate(f.tenant, Signal::AttributeKeys)
