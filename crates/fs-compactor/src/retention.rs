@@ -11,10 +11,12 @@
 //! admissions of the table before, and swapped in under the fence, the
 //! table before quarantined with it. A rebuild that does not commit, for
 //! any reason, leaves the table before in place and the new table an
-//! orphan, and the tenant is held back, for longer each time it fails, so
-//! the others are tried: a tick's rebuilds are bounded, and without the
-//! backoff enough broken tenants ahead of a healthy one would take every
-//! pass of every tick. A tenant whose remaining L1 files exceed the input
+//! orphan. The stale tables are walked in rounds by a cursor that outlives
+//! calls and ticks, each table once a round whether its rebuild went or
+//! not, so a tick's bounded rebuilds reach every tenant in turn however
+//! many broken ones sort ahead; a tenant that failed is also held back,
+//! for longer each time, so a broken one is not retried every round
+//! while few tables are stale. A tenant whose remaining L1 files exceed the input
 //! cap, or whose rebuild would hold more than the memory budget by the
 //! worst case the limits allow, keeps its table and is reported once; a
 //! tenant with no L1 file left loses its table whatever the caps, since
@@ -28,7 +30,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{
     Catalog, CatalogError, Compaction, ExpiredFiles, FileRecord, LeaseFence, Level, RebuildInput,
-    Signal, StaleTable, TenantId,
+    Signal, StaleKey, StaleTable, TenantId,
 };
 use fs_schema::attribute_keys::{KeyStats, READ_COLUMNS};
 use fs_schema::limits::Limits;
@@ -63,6 +65,10 @@ const INPUT_PAGE: i64 = 1000;
 /// configured one.
 const MAX_BACKOFF_STEPS: u32 = 6;
 
+/// Most rebuilds a tick may be configured to attempt, so the leader's
+/// other passes are never long behind them.
+pub const MAX_REBUILDS_PER_TICK: usize = 256;
+
 /// Bounds of retention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionConfig {
@@ -79,7 +85,8 @@ pub struct RetentionConfig {
     pub batch_rows: usize,
     /// The limits the rows were written under, which bound a row.
     pub limits: Limits,
-    /// Most rebuilds one tick of the leader's loop attempts.
+    /// Most rebuilds one tick of the leader's loop attempts, at most
+    /// [`MAX_REBUILDS_PER_TICK`].
     pub rebuilds_per_tick: usize,
     /// How long a tenant whose rebuild failed waits before it is tried
     /// again, times its failures so far, up to six times.
@@ -135,6 +142,9 @@ pub struct Retention {
     reported: Mutex<HashSet<TenantId>>,
     /// Tenants whose rebuild failed, passed over until their backoff ends.
     failed: Mutex<HashMap<TenantId, Failure>>,
+    /// Where the walk of the stale tables is; `None` at the start of a
+    /// round.
+    cursor: Mutex<Option<StaleKey>>,
 }
 
 /// A tenant's failed rebuilds and when the next try is due.
@@ -253,6 +263,7 @@ impl Retention {
             inject_swap_failures: AtomicU32::new(inject),
             reported: Mutex::new(HashSet::new()),
             failed: Mutex::new(HashMap::new()),
+            cursor: Mutex::new(None),
         }
     }
 
@@ -305,14 +316,15 @@ impl Retention {
         Ok(result?)
     }
 
-    /// Rebuilds the `attribute_keys` table of the tenant whose table lists
-    /// the earliest sighting before its cut, from the L1 files that remain
-    /// at or after it, and swaps it in under `fence`. A tenant whose
-    /// remaining L1 files exceed the input cap or whose rebuild would
-    /// exceed the memory budget is passed over, reported once, and the
-    /// next is tried; so is one whose rebuild failed since the last
-    /// [`forget_failures`](Self::forget_failures). `None` when no table
-    /// is left to rebuild.
+    /// Rebuilds the next stale `attribute_keys` table after the one last
+    /// tried, by earliest sighting, from the L1 files that remain at or
+    /// after the tenant's cut, and swaps it in under `fence`; the walk
+    /// wraps around at the end. A tenant whose remaining L1 files exceed
+    /// the input cap or whose rebuild would exceed the memory budget is
+    /// passed over, reported once, and the next is tried; so is one whose
+    /// backoff has not ended. A lost lease or a catalog failure, not the
+    /// tenant's, leaves the walk where it was. `None` when a round found
+    /// nothing to rebuild.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
@@ -322,16 +334,22 @@ impl Retention {
         &self,
         fence: &LeaseFence,
     ) -> Result<Option<Compaction>, CompactError> {
-        let mut skip = 0;
-        let (stale, inputs) = loop {
-            let Some(stale) = self
+        let mut wrapped = false;
+        let (stale, inputs, before) = loop {
+            let after = self.cursor();
+            let found = self
                 .catalog
-                .stale_derived_table(Signal::AttributeKeys, Signal::Traces, skip)
-                .await?
-            else {
-                return Ok(None);
+                .stale_derived_table(Signal::AttributeKeys, Signal::Traces, after)
+                .await?;
+            let Some(stale) = found else {
+                if after.is_none() || wrapped {
+                    return Ok(None);
+                }
+                wrapped = true;
+                self.set_cursor(None);
+                continue;
             };
-            skip += 1;
+            self.set_cursor(Some(stale.key()));
             if self.held_back(stale.tenant_id) {
                 continue;
             }
@@ -352,7 +370,7 @@ impl Retention {
                 self.report_over_cap(stale.tenant_id, what, bytes, cap);
                 continue;
             };
-            break (stale, inputs);
+            break (stale, inputs, after);
         };
         let result = self.rebuild(&stale, &inputs, fence).await;
         match &result {
@@ -367,9 +385,14 @@ impl Retention {
                 self.stats
                     .rebuild_lease_lost
                     .fetch_add(1, Ordering::Relaxed);
+                self.set_cursor(before);
             }
             Err(CompactError::Catalog(CatalogError::CompactionConflict { .. })) => {
                 self.stats.rebuild_conflicts.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(CompactError::Catalog(_)) => {
+                self.stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
+                self.set_cursor(before);
             }
             Err(_) => {
                 self.stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
@@ -377,6 +400,20 @@ impl Retention {
             }
         }
         result.map(Some)
+    }
+
+    fn cursor(&self) -> Option<StaleKey> {
+        *self
+            .cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_cursor(&self, at: Option<StaleKey>) {
+        *self
+            .cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = at;
     }
 
     fn held_back(&self, tenant: TenantId) -> bool {

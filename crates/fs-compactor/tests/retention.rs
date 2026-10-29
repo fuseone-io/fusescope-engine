@@ -623,7 +623,7 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
     assert_eq!(tables_of(&f, other).await.len(), 0);
     assert!(
         r.rebuild_once(&fence).await.unwrap().is_none(),
-        "the failed tenant is held back"
+        "the walk comes back round to the failed tenant, held back"
     );
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     let err = r.rebuild_once(&fence).await.unwrap_err();
@@ -745,8 +745,8 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
 
 /// The leader's loop expires files and rebuilds the tables on its own
 /// interval, one rebuild per tick here, and a tenant whose rebuild fails
-/// does not keep the others from theirs: held back for its backoff, it
-/// leaves the tick's one rebuild to the next tenant.
+/// does not keep the others from theirs even when its backoff has ended
+/// by the next tick: the walk goes on past it to the next tenant.
 #[tokio::test]
 async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
     let Some(f) = fixture().await else { return };
@@ -843,7 +843,7 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
             retention_interval: Duration::from_secs(1),
             retention: RetentionConfig {
                 rebuilds_per_tick: 1,
-                rebuild_backoff: Duration::from_secs(3600),
+                rebuild_backoff: Duration::ZERO,
                 ..retention_config()
             },
         },
@@ -874,10 +874,9 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
         table_before,
         "the failed tenant's stays"
     );
-    assert_eq!(
-        stats.retention.rebuild_failures.load(Ordering::Relaxed),
-        1,
-        "failed once, then held back"
+    assert!(
+        stats.retention.rebuild_failures.load(Ordering::Relaxed) >= 1,
+        "the broken tenant failed, the walk went on"
     );
     assert_eq!(stats.retention.expired.load(Ordering::Relaxed), 2);
     assert_eq!(visible(&f).await.len(), 1, "the L1 of the hour kept");
