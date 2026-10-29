@@ -11,8 +11,11 @@
 //! the last the start of the hour whose `max_keys_hour` admitted the key,
 //! rows sorted by (source, type, key). v1 lacked `admitted_hour`; a v1
 //! file reads with the hour of `first_seen` in its place. The schema
-//! metadata names the signal and the version; every reader checks both
-//! with [`check_schema`] and refuses anything else.
+//! metadata names the signal and the version, and each version has one
+//! layout: v1 the six columns, v2 the seven with `admitted_hour` never
+//! null. Every reader checks signal, version and layout with
+//! [`check_schema`] and refuses anything else, so a file is never read as
+//! a version it is not.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -112,6 +115,9 @@ pub struct KeySeen {
     /// Latest `timestamp` of a span carrying it, nanoseconds.
     pub last_seen: i64,
     /// Start of the hour whose budget admitted the key, nanoseconds.
+    /// Fixed once admitted: late data of an earlier hour widens the count
+    /// and the sightings, never the admission, so an hour's budget is
+    /// never charged after the fact.
     pub admitted_hour: i64,
 }
 
@@ -120,7 +126,6 @@ impl KeySeen {
         self.count = self.count.saturating_add(other.count);
         self.first_seen = self.first_seen.min(other.first_seen);
         self.last_seen = self.last_seen.max(other.last_seen);
-        self.admitted_hour = self.admitted_hour.min(other.admitted_hour);
     }
 }
 
@@ -318,12 +323,14 @@ impl KeyStats {
         )?)
     }
 
-    /// Reads a batch of the table, v1 or v2; nothing read counts as new.
+    /// Reads a batch of the table at `version`, exactly as that version
+    /// lays it out; nothing read counts as new.
     ///
     /// # Errors
-    /// A batch missing a column or with a source or type the version does
-    /// not know.
-    pub fn from_batch(batch: &RecordBatch) -> Result<Self, SchemaError> {
+    /// A batch missing a column of its version, carrying one it does not
+    /// have, with a null `admitted_hour`, or with a source or type the
+    /// version does not know.
+    pub fn from_batch(batch: &RecordBatch, version: u32) -> Result<Self, SchemaError> {
         let schema = batch.schema();
         let column = |name: &str| -> Result<&arrow::array::ArrayRef, SchemaError> {
             Ok(batch.column(schema.index_of(name)?))
@@ -346,14 +353,21 @@ impl KeyStats {
         let lasts = column(col_names::LAST_SEEN)?
             .as_primitive_opt::<TimestampNanosecondType>()
             .ok_or(SchemaError::Layout("last_seen"))?;
-        let admitted = match schema.index_of(col_names::ADMITTED_HOUR) {
-            Ok(index) => Some(
-                batch
+        let admitted = match (version, schema.index_of(col_names::ADMITTED_HOUR).ok()) {
+            (1, None) => None,
+            (1, Some(_)) => return Err(SchemaError::Layout("admitted_hour in a v1 table")),
+            (2, None) => return Err(SchemaError::Layout("admitted_hour missing from a v2 table")),
+            (2, Some(index)) => {
+                let admitted = batch
                     .column(index)
                     .as_primitive_opt::<TimestampNanosecondType>()
-                    .ok_or(SchemaError::Layout("admitted_hour"))?,
-            ),
-            Err(_) => None,
+                    .ok_or(SchemaError::Layout("admitted_hour"))?;
+                if admitted.null_count() > 0 {
+                    return Err(SchemaError::Layout("null admitted_hour in a v2 table"));
+                }
+                Some(admitted)
+            }
+            _ => return Err(SchemaError::Layout("attribute_keys schema version")),
         };
         let mut out = KeyStats::default();
         for row in 0..batch.num_rows() {
@@ -365,9 +379,7 @@ impl KeyStats {
                 count: counts.value(row),
                 first_seen,
                 last_seen: lasts.value(row),
-                admitted_hour: admitted
-                    .filter(|a| a.is_valid(row))
-                    .map_or_else(|| hour_of(first_seen), |a| a.value(row)),
+                admitted_hour: admitted.map_or_else(|| hour_of(first_seen), |a| a.value(row)),
             };
             out.keys
                 .entry((source, kind))
@@ -406,48 +418,84 @@ pub mod col_names {
 /// Name of the table in a query session.
 pub const TABLE: &str = "attribute_keys";
 
-/// Schema of the table, version 2. `admitted_hour` is nullable so a v1
-/// file, which lacks it, reads through this schema with it null.
+/// Schema of the table, version 2, as written: `admitted_hour` is never
+/// null.
 pub fn attribute_keys_schema_v2() -> SchemaRef {
+    with_metadata(SCHEMA_VERSION, false)
+}
+
+/// The table as a query session reads it: v2, with `admitted_hour`
+/// nullable so a v1 file, which lacks it, reads with it null.
+pub fn table_schema() -> SchemaRef {
+    with_metadata(SCHEMA_VERSION, true)
+}
+
+/// The columns of `version`, in order, as (name, type).
+fn layout(version: u32) -> Vec<(&'static str, DataType)> {
     let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+    let mut columns = vec![
+        (col_names::KEY, DataType::Utf8),
+        (col_names::SOURCE, DataType::Utf8),
+        (col_names::TYPE, DataType::Utf8),
+        (col_names::COUNT, DataType::UInt64),
+        (col_names::FIRST_SEEN, timestamp.clone()),
+        (col_names::LAST_SEEN, timestamp.clone()),
+    ];
+    if version >= 2 {
+        columns.push((col_names::ADMITTED_HOUR, timestamp));
+    }
+    columns
+}
+
+fn with_metadata(version: u32, admission_nullable: bool) -> SchemaRef {
     let metadata = [
         ("fusescope.signal".to_owned(), SIGNAL.to_owned()),
-        (
-            "fusescope.schema_version".to_owned(),
-            SCHEMA_VERSION.to_string(),
-        ),
+        ("fusescope.schema_version".to_owned(), version.to_string()),
     ];
+    let fields = layout(version)
+        .into_iter()
+        .map(|(name, data_type)| {
+            let nullable = name == col_names::ADMITTED_HOUR && admission_nullable;
+            Field::new(name, data_type, nullable)
+        })
+        .collect::<Vec<_>>();
     Arc::new(Schema::new_with_metadata(
-        vec![
-            Field::new(col_names::KEY, DataType::Utf8, false),
-            Field::new(col_names::SOURCE, DataType::Utf8, false),
-            Field::new(col_names::TYPE, DataType::Utf8, false),
-            Field::new(col_names::COUNT, DataType::UInt64, false),
-            Field::new(col_names::FIRST_SEEN, timestamp.clone(), false),
-            Field::new(col_names::LAST_SEEN, timestamp.clone(), false),
-            Field::new(col_names::ADMITTED_HOUR, timestamp, true),
-        ],
+        fields,
         metadata.into_iter().collect(),
     ))
 }
 
 /// Refuses a file schema that is not this table at a version this engine
-/// reads.
+/// reads, laid out exactly as that version is; returns the version.
 ///
 /// # Errors
-/// Another signal, a version this engine does not read, or no version.
-pub fn check_schema(schema: &Schema) -> Result<(), SchemaError> {
+/// Another signal, a version this engine does not read, no version, or
+/// columns other than the version's, by name, order or type.
+pub fn check_schema(schema: &Schema) -> Result<u32, SchemaError> {
     let metadata = schema.metadata();
     if metadata.get("fusescope.signal").map(String::as_str) != Some(SIGNAL) {
         return Err(SchemaError::Layout("attribute_keys signal"));
     }
     let version = metadata
         .get("fusescope.schema_version")
-        .and_then(|v| v.parse::<u32>().ok());
-    if !version.is_some_and(|v| READABLE_VERSIONS.contains(&v)) {
-        return Err(SchemaError::Layout("attribute_keys schema version"));
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| READABLE_VERSIONS.contains(v))
+        .ok_or(SchemaError::Layout("attribute_keys schema version"))?;
+    let expected = layout(version);
+    let same = schema.fields().len() == expected.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(&expected)
+            .all(|(field, (name, data_type))| {
+                field.name() == name && field.data_type() == data_type
+            });
+    if !same {
+        return Err(SchemaError::Layout(
+            "attribute_keys columns for the version",
+        ));
     }
-    Ok(())
+    Ok(version)
 }
 
 /// Encodes `stats` as one Parquet file of the table.
@@ -473,10 +521,10 @@ pub fn encode(stats: &KeyStats) -> Result<Vec<u8>, SchemaError> {
 /// Not a Parquet file of this table at a readable version.
 pub fn decode(bytes: bytes::Bytes) -> Result<KeyStats, SchemaError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
-    check_schema(builder.schema())?;
+    let version = check_schema(builder.schema())?;
     let mut out = KeyStats::default();
     for batch in builder.build()? {
-        out.merge(KeyStats::from_batch(&batch?)?);
+        out.merge(KeyStats::from_batch(&batch?, version)?);
     }
     Ok(out.settled())
 }
@@ -765,13 +813,149 @@ mod tests {
             let err = decode(bytes::Bytes::from(bytes)).unwrap_err();
             assert!(matches!(err, SchemaError::Layout(_)), "{err}");
         }
-        assert!(check_schema(&attribute_keys_schema_v2()).is_ok());
+        assert_eq!(check_schema(&attribute_keys_schema_v2()).unwrap(), 2);
+        assert_eq!(check_schema(&table_schema()).unwrap(), 2);
         assert!(
             matches!(
-                KeyStats::from_batch(&batch_with(Vec::new())).unwrap_err(),
+                KeyStats::from_batch(&batch_with(Vec::new()), 2).unwrap_err(),
                 SchemaError::Arrow(_)
             ),
             "a span batch is not the table"
         );
+    }
+
+    /// A file of `version` with the first `fields` columns of v2 and
+    /// `admission` in place of the seventh, when kept.
+    fn file_of(version: &str, fields: usize, admission: Option<Vec<Option<i64>>>) -> Vec<u8> {
+        let mut stats = KeyStats::default();
+        stats
+            .absorb(
+                &batch_with(vec![span(H14 + 7, vec![kv("a", string("1"))])]),
+                H14,
+                usize::MAX,
+            )
+            .unwrap();
+        let v2 = stats.to_batch().unwrap();
+        let mut columns = v2.columns().get(..fields).unwrap().to_vec();
+        let mut metadata = v2.schema().metadata().clone();
+        metadata.insert("fusescope.schema_version".into(), version.into());
+        let mut fields_kept: Vec<_> = v2.schema().fields().iter().take(fields).cloned().collect();
+        if let Some(admission) = admission {
+            columns.pop();
+            fields_kept.pop();
+            fields_kept.push(Arc::new(Field::new(
+                col_names::ADMITTED_HOUR,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            )));
+            columns.push(Arc::new(
+                TimestampNanosecondArray::from(admission).with_timezone("UTC"),
+            ));
+        }
+        let schema = Arc::new(Schema::new_with_metadata(fields_kept, metadata));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.into_inner().unwrap()
+    }
+
+    #[test]
+    fn each_version_reads_only_its_own_layout() {
+        assert_eq!(
+            decode(bytes::Bytes::from(file_of("1", 6, None)))
+                .unwrap()
+                .len(),
+            4,
+            "v1: six columns"
+        );
+        assert_eq!(
+            decode(bytes::Bytes::from(file_of("2", 7, None)))
+                .unwrap()
+                .len(),
+            4,
+            "v2: seven columns"
+        );
+        for (what, bytes) in [
+            ("v1 with admitted_hour", file_of("1", 7, None)),
+            ("v2 without admitted_hour", file_of("2", 6, None)),
+            (
+                "v2 with a null admitted_hour",
+                file_of("2", 7, Some(vec![Some(H14), None, Some(H14), Some(H14)])),
+            ),
+        ] {
+            let bytes = bytes::Bytes::from(bytes);
+            let footer = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+            if what != "v2 with a null admitted_hour" {
+                assert!(
+                    matches!(check_schema(footer.schema()), Err(SchemaError::Layout(_))),
+                    "{what}: the footer alone tells"
+                );
+            }
+            let err = decode(bytes).unwrap_err();
+            assert!(matches!(err, SchemaError::Layout(_)), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_known_key_keeps_the_hour_that_admitted_it_when_late_data_arrives() {
+        // Hour 15 is compacted first and admits one key.
+        let mut stats = KeyStats::default();
+        stats
+            .absorb(
+                &batch_with(vec![span(H15 + 1, vec![kv("a", string("1"))])]),
+                H15,
+                1,
+            )
+            .unwrap();
+        let admitted: Vec<_> = stats
+            .iter()
+            .map(|(_, key, _, seen)| (key, seen.admitted_hour))
+            .collect();
+        assert_eq!(admitted, [("service.name", H15)]);
+
+        // Late data of hour 14, in a later pass, carries the same key and
+        // a new one: the known key stays charged to 15, the new one takes
+        // 14's budget.
+        let mut stats = stats.settled();
+        stats
+            .absorb(
+                &batch_with(vec![span(H14 + 1, vec![kv("a", string("2"))])]),
+                H14,
+                1,
+            )
+            .unwrap();
+        let rows: Vec<_> = stats
+            .iter()
+            .map(|(_, key, _, seen)| (key, seen.count, seen.first_seen, seen.admitted_hour))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("host.name", 1, H14 + 1, H14),
+                ("service.name", 2, H14 + 1, H15),
+            ],
+            "sightings widen, the admission does not"
+        );
+        assert_eq!((stats.admitted_in(H14), stats.admitted_in(H15)), (1, 1));
+
+        // Hour 14 is full: more late data counts known keys and admits none.
+        let before = stats.clone();
+        let mut stats = stats.settled();
+        stats
+            .absorb(
+                &batch_with(vec![span(H14 + 2, vec![kv("b", string("3"))])]),
+                H14,
+                0,
+            )
+            .unwrap();
+        assert_eq!(stats.len(), before.len());
+        assert_eq!((stats.admitted_in(H14), stats.admitted_in(H15)), (1, 1));
+        assert_eq!(stats.dropped(), before.dropped() + 2, "b and the scope key");
+        let service = stats
+            .iter()
+            .find(|(_, key, _, _)| *key == "service.name")
+            .unwrap()
+            .3;
+        assert_eq!((service.count, service.admitted_hour), (3, H15));
     }
 }
