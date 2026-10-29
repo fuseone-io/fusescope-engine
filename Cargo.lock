@@ -1646,6 +1646,7 @@ name = "fs-compactor"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "chrono",
  "fs-catalog",

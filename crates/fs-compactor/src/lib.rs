@@ -221,7 +221,14 @@ async fn work_loop(
                 }
             }
             _ = purge.tick() => {
-                purge_once(&catalog, store.as_ref(), config.quarantine_ttl, config.purge_batch).await;
+                purge_once(
+                    &catalog,
+                    store.as_ref(),
+                    config.quarantine_ttl,
+                    config.purge_batch,
+                    config.sweep.delete_backoff,
+                )
+                .await;
             }
             _ = compact.tick() => {
                 for _ in 0..PASSES_PER_TICK {
@@ -254,6 +261,7 @@ async fn work_loop(
 /// table is stale, each kind bounded per tick; a failure ends its kind
 /// for this tick.
 async fn retention_passes(retention: &Retention, leadership: &Leadership) {
+    retention.forget_failures();
     for _ in 0..PASSES_PER_TICK {
         let Some(fence) = leadership.fence() else {
             return;
@@ -283,14 +291,16 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
 }
 
 /// One purge pass: deletes the catalog rows of quarantined files past
-/// `quarantine_ttl`, then each file's object and its `trace_id` sidecar.
-/// An object that fails to delete is left for the orphan sweep. Returns
-/// how many rows went.
+/// `quarantine_ttl`, each with its paths marked for deletion, then each
+/// file's object and its `trace_id` sidecar under their claims, leaving
+/// tombstones. An object that fails to delete waits `delete_backoff` and
+/// is finished by the orphan sweep. Returns how many rows went.
 pub async fn purge_once(
     catalog: &Catalog,
     store: &dyn ObjectStore,
     quarantine_ttl: Duration,
     batch: i64,
+    delete_backoff: Duration,
 ) -> usize {
     let purged = match catalog.purge_quarantined(quarantine_ttl, batch).await {
         Ok(p) => p,
@@ -304,11 +314,8 @@ pub async fn purge_once(
         let mut paths = vec![file.path.clone()];
         paths.extend(fs_index::sidecar_path(&file.path));
         for path in paths {
-            match store.delete(&Path::from(path.as_str())).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted += 1,
-                Err(e) => {
-                    warn!(role = "compactor", path = %path, error = %e, "object delete failed; orphan sweep will retry");
-                }
+            if delete_claimed(catalog, store, &path, delete_backoff).await {
+                deleted += 1;
             }
         }
     }
@@ -321,6 +328,35 @@ pub async fn purge_once(
         );
     }
     purged.len()
+}
+
+/// Deletes `path` under its claim and leaves the tombstone; true when the
+/// object is gone. A path no longer claimable was finished by a sweeper.
+async fn delete_claimed(
+    catalog: &Catalog,
+    store: &dyn ObjectStore,
+    path: &str,
+    delete_backoff: Duration,
+) -> bool {
+    let claim = match catalog.orphan_claim(path).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return false,
+        Err(e) => {
+            warn!(role = "compactor", path = %path, error = %e, "purge claim failed; orphan sweep will retry");
+            return false;
+        }
+    };
+    let outcome = match store.delete(&Path::from(path)).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => claim.deleted().await.map(|()| true),
+        Err(e) => {
+            warn!(role = "compactor", path = %path, error = %e, "object delete failed; orphan sweep will retry");
+            claim.retry_later(delete_backoff).await.map(|()| false)
+        }
+    };
+    outcome.unwrap_or_else(|e| {
+        warn!(role = "compactor", path = %path, error = %e, "purge claim could not be settled");
+        false
+    })
 }
 
 #[cfg(test)]

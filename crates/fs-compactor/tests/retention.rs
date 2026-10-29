@@ -193,13 +193,25 @@ async fn write_l0(
     spans: u8,
     attribute: (&str, &str),
 ) -> FileRecord {
+    write_l0_for(f, f.tenant, service, trace, start, spans, attribute).await
+}
+
+async fn write_l0_for(
+    f: &Fixture,
+    tenant: TenantId,
+    service: &str,
+    trace: u8,
+    start: u64,
+    spans: u8,
+    attribute: (&str, &str),
+) -> FileRecord {
     let mut builder = SpanBatchBuilder::new(Limits::default());
     builder
         .append_request(&request(service, trace, start, spans, attribute))
         .unwrap();
     let batch = builder.finish().unwrap();
     let prepared = flush::prepare(
-        f.tenant,
+        tenant,
         &Path::from(""),
         fs_catalog::FileId::new(),
         &[batch],
@@ -240,8 +252,10 @@ async fn fence(f: &Fixture) -> LeaseFence {
 fn retention_config() -> RetentionConfig {
     RetentionConfig {
         files_per_pass: 2,
+        rebuild_max_input_bytes: 1 << 30,
         rebuild_max_bytes: 1 << 30,
         batch_rows: 4,
+        limits: Limits::default(),
         inject_swap_failures: 0,
     }
 }
@@ -307,8 +321,12 @@ async fn visible(f: &Fixture) -> Vec<FileRecord> {
 }
 
 async fn tables(f: &Fixture) -> Vec<FileRecord> {
+    tables_of(f, f.tenant).await
+}
+
+async fn tables_of(f: &Fixture, tenant: TenantId) -> Vec<FileRecord> {
     f.db.catalog
-        .all_visible_files(f.tenant, Signal::AttributeKeys)
+        .all_visible_files(tenant, Signal::AttributeKeys)
         .await
         .unwrap()
 }
@@ -399,8 +417,14 @@ async fn expired_days_leave_the_catalog_first_and_the_bucket_at_the_purge() {
     );
     assert_eq!(rows(&f, "select count(*) from spans").await, 5);
 
-    let purged =
-        fs_compactor::purge_once(&f.db.catalog, f.store.as_ref(), Duration::ZERO, 100).await;
+    let purged = fs_compactor::purge_once(
+        &f.db.catalog,
+        f.store.as_ref(),
+        Duration::ZERO,
+        100,
+        Duration::from_secs(600),
+    )
+    .await;
     assert_eq!(purged, 3);
     for file in [&a1, &a2, &edge] {
         assert!(!present(&f, &file.path).await, "{}", file.path);
@@ -510,26 +534,74 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
     assert_eq!(tables(&f).await[0].id, before[0].id);
     assert_eq!(r.stats().rebuild_lease_lost.load(Ordering::Relaxed), 1);
 
-    // A tenant whose remaining L1 files exceed the read cap is passed over.
-    let capped = retention(
-        &f,
-        RetentionConfig {
-            rebuild_max_bytes: 1,
-            ..retention_config()
-        },
-    );
-    assert!(capped.rebuild_once(&fence).await.unwrap().is_none());
-    assert!(capped.rebuild_once(&fence).await.unwrap().is_none());
-    assert_eq!(
-        capped.stats().rebuild_skipped.load(Ordering::Relaxed),
-        1,
-        "reported once"
-    );
-    assert_eq!(tables(&f).await[0].id, before[0].id);
-
-    // An L1 that cannot be read ends the rebuild before anything is created.
+    // A tenant whose remaining L1 files exceed the input cap, or whose
+    // rebuild would hold more than the memory budget, is passed over.
     let remaining = visible(&f).await;
     assert_eq!(remaining.len(), 1);
+    let largest = u64::try_from(remaining[0].size_bytes).unwrap();
+    let footprint = fs_compactor::retention::rebuild_footprint(
+        u64::try_from(before[0].size_bytes).unwrap(),
+        u64::try_from(before[0].row_count).unwrap(),
+        largest,
+        &retention_config(),
+    );
+    for config in [
+        RetentionConfig {
+            rebuild_max_input_bytes: largest - 1,
+            ..retention_config()
+        },
+        RetentionConfig {
+            rebuild_max_bytes: footprint - 1,
+            ..retention_config()
+        },
+    ] {
+        let capped = retention(&f, config);
+        assert!(capped.rebuild_once(&fence).await.unwrap().is_none());
+        assert!(capped.rebuild_once(&fence).await.unwrap().is_none());
+        assert_eq!(
+            capped.stats().rebuild_skipped.load(Ordering::Relaxed),
+            1,
+            "reported once"
+        );
+        assert_eq!(tables(&f).await[0].id, before[0].id);
+    }
+
+    // A second tenant whose only hour is beyond retention, compacted and
+    // expired: its table is stale too, with nothing left to read.
+    let other =
+        f.db.catalog
+            .create_tenant(&NewTenant {
+                retention_days: 1,
+                ..NewTenant::with_defaults("other")
+            })
+            .await
+            .unwrap()
+            .id;
+    let half = 30 * 60_000_000_000;
+    write_l0_for(&f, other, "api", 5, f.at(-2) + half, 3, ("db.system", "pg")).await;
+    write_l0_for(
+        &f,
+        other,
+        "api",
+        6,
+        f.at(-2) + half + 60_000_000_000,
+        3,
+        ("db.system", "pg"),
+    )
+    .await;
+    c.compact_once(&fence).await.unwrap().unwrap();
+    let others_table = tables_of(&f, other).await;
+    assert_eq!(others_table.len(), 1);
+    assert_eq!(
+        r.expire_once(&fence).await.unwrap().unwrap().tenant_id,
+        other
+    );
+    assert!(r.expire_once(&fence).await.unwrap().is_none());
+    std::fs::write(f.dir.path().join(&others_table[0].path), b"not parquet").unwrap();
+
+    // An L1 that cannot be read ends the rebuild before anything is
+    // created and holds the tenant back for the tick, so the next tenant
+    // is tried: the other one, whose table goes without being decoded.
     let good = std::fs::read(f.dir.path().join(&remaining[0].path)).unwrap();
     std::fs::write(f.dir.path().join(&remaining[0].path), b"not parquet").unwrap();
     let derived_before = objects_under(&f, "/derived/attribute_keys/").await.len();
@@ -542,10 +614,33 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         "nothing created"
     );
     assert_eq!(r.stats().rebuild_failures.load(Ordering::Relaxed), 1);
+    let done = r.rebuild_once(&fence).await.unwrap().unwrap();
+    assert_eq!(done.inputs, vec![others_table[0].id]);
+    assert_eq!(done.outputs.len(), 0);
+    assert_eq!(tables_of(&f, other).await.len(), 0);
+    assert!(
+        r.rebuild_once(&fence).await.unwrap().is_none(),
+        "the failed tenant is held back for the tick"
+    );
+    r.forget_failures();
+    let err = r.rebuild_once(&fence).await.unwrap_err();
+    assert!(
+        matches!(err, CompactError::Parquet(_)),
+        "tried again next tick: {err}"
+    );
+    assert_eq!(r.stats().rebuild_failures.load(Ordering::Relaxed), 2);
     std::fs::write(f.dir.path().join(&remaining[0].path), good).unwrap();
 
-    // Repaired, the rebuild goes through, from the L1 that remains alone.
-    let done = r.rebuild_once(&fence).await.unwrap().unwrap();
+    // Repaired, and within the budget to the byte, the rebuild goes
+    // through, from the L1 that remains alone.
+    let exact = retention(
+        &f,
+        RetentionConfig {
+            rebuild_max_bytes: footprint,
+            ..retention_config()
+        },
+    );
+    let done = exact.rebuild_once(&fence).await.unwrap().unwrap();
     assert_eq!(
         done.inputs,
         vec![before[0].id],
@@ -583,9 +678,10 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         "no sighting before the cut"
     );
     assert_eq!(after[0].range.start, f.cut + chrono::Duration::hours(1));
-    assert_eq!(r.stats().rebuilds.load(Ordering::Relaxed), 1);
+    assert_eq!(exact.stats().rebuilds.load(Ordering::Relaxed), 1);
+    assert_eq!(exact.stats().rebuild_skipped.load(Ordering::Relaxed), 0);
     assert!(
-        r.rebuild_once(&fence).await.unwrap().is_none(),
+        exact.rebuild_once(&fence).await.unwrap().is_none(),
         "rebuilt once"
     );
     assert_eq!(rows(&f, "select count(*) from attribute_keys").await, 2);
@@ -594,7 +690,7 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
 }
 
 /// A tenant whose every L1 file is beyond retention ends with no table
-/// at all.
+/// at all, whatever state the table is in: nothing remains to count.
 #[tokio::test]
 async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
     let Some(f) = fixture().await else { return };
@@ -615,6 +711,7 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
 
     let r = retention(&f, retention_config());
     r.expire_once(&fence).await.unwrap().unwrap();
+    std::fs::write(f.dir.path().join(&before[0].path), b"not parquet").unwrap();
     let done = r.rebuild_once(&fence).await.unwrap().unwrap();
     assert_eq!(done.inputs, vec![before[0].id]);
     assert_eq!(done.outputs.len(), 0, "nothing to list");

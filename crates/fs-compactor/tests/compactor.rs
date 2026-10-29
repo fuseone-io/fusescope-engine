@@ -12,13 +12,18 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use fs_catalog::{
-    COMPACTOR_LEASE, Catalog, FileId, Level, NewFile, NewTenant, Signal, TenantId, TimeRange,
+    COMPACTOR_LEASE, Catalog, CatalogError, FileId, Level, NewFile, NewTenant, Signal, TenantId,
+    TimeRange,
 };
 use fs_compactor::{CompactorConfig, Leadership};
+use futures_util::StreamExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::throttle::{ThrottleConfig, ThrottledStore};
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
 
@@ -94,6 +99,11 @@ fn file(tenant: TenantId) -> NewFile {
 /// A quarantined file past its TTL whose object and sidecar are in the
 /// bucket; returns its path.
 async fn quarantined(catalog: &Catalog, store: &dyn ObjectStore) -> String {
+    quarantined_file(catalog, store).await.path
+}
+
+/// As [`quarantined`], returning the registration so it can be replayed.
+async fn quarantined_file(catalog: &Catalog, store: &dyn ObjectStore) -> NewFile {
     let tenant = catalog
         .create_tenant(&NewTenant::with_defaults(format!(
             "t{}",
@@ -102,7 +112,8 @@ async fn quarantined(catalog: &Catalog, store: &dyn ObjectStore) -> String {
         .await
         .unwrap()
         .id;
-    let old = catalog.register_file(&file(tenant)).await.unwrap();
+    let registration = file(tenant);
+    let old = catalog.register_file(&registration).await.unwrap();
     store
         .put(&Path::from(old.path.as_str()), b"old".to_vec().into())
         .await
@@ -118,7 +129,95 @@ async fn quarantined(catalog: &Catalog, store: &dyn ObjectStore) -> String {
         .swap_files(tenant, Signal::Traces, &[old.id], &[file(tenant)])
         .await
         .unwrap();
-    old.path
+    registration
+}
+
+/// A store that holds every delete until the gate opens and wakes whoever
+/// waits for the first one, so a test runs between the purge's catalog
+/// step and its bucket step.
+#[derive(Debug)]
+struct HeldDeletes {
+    inner: Arc<dyn ObjectStore>,
+    gate: tokio::sync::watch::Receiver<bool>,
+    arrived: Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Display for HeldDeletes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldDeletes")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for HeldDeletes {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Path>> {
+        let gate = self.gate.clone();
+        let arrived = Arc::clone(&self.arrived);
+        let held = locations.then(move |location| {
+            let mut gate = gate.clone();
+            let arrived = Arc::clone(&arrived);
+            async move {
+                if !*gate.borrow() {
+                    arrived.notify_one();
+                    while !*gate.borrow() {
+                        if gate.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                location
+            }
+        });
+        self.inner.delete_stream(held.boxed())
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
 }
 
 #[tokio::test]
@@ -188,7 +287,14 @@ async fn a_purge_removes_the_object_and_its_sidecar() {
     let without_sidecar = Path::from(fs_index::sidecar_path(&without).unwrap().as_str());
     store.delete(&without_sidecar).await.unwrap();
 
-    let purged = fs_compactor::purge_once(&db.catalog, &store, Duration::ZERO, 10).await;
+    let purged = fs_compactor::purge_once(
+        &db.catalog,
+        &store,
+        Duration::ZERO,
+        10,
+        Duration::from_secs(600),
+    )
+    .await;
     assert_eq!(purged, 2);
     for path in [
         with.clone(),
@@ -200,6 +306,98 @@ async fn a_purge_removes_the_object_and_its_sidecar() {
             "{path} is gone"
         );
     }
+    assert_eq!(
+        db.catalog.orphans_doomed(10).await.unwrap().len(),
+        0,
+        "every path deleted under its claim, tombstones left"
+    );
+    assert_eq!(
+        db.catalog.object_refused(&with).await.unwrap().as_deref(),
+        Some(with.as_str())
+    );
+    db.finish().await;
+}
+
+/// Between the purge's catalog step and its bucket step a writer replaying
+/// the file finds no row; its registration waits behind the claim that
+/// holds the path while the object is deleted and is refused once the
+/// claim ends, and an upload is refused before it starts, so no row ever
+/// points at an object the purge deletes.
+#[tokio::test]
+async fn a_replay_during_the_purge_is_refused_and_never_leaves_a_row_without_an_object() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let replayed = quarantined_file(&db.catalog, inner.as_ref()).await;
+    let path = replayed.path.clone();
+    let (open, gate) = tokio::sync::watch::channel(false);
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let held = Arc::new(HeldDeletes {
+        inner: Arc::clone(&inner),
+        gate,
+        arrived: Arc::clone(&arrived),
+    });
+    let catalog = db.catalog.clone();
+    let purge = tokio::spawn(async move {
+        fs_compactor::purge_once(
+            &catalog,
+            held.as_ref(),
+            Duration::ZERO,
+            10,
+            Duration::from_secs(600),
+        )
+        .await
+    });
+    arrived.notified().await;
+
+    assert_eq!(
+        db.catalog
+            .registered_paths(std::slice::from_ref(&path))
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "the row is gone while the delete is held"
+    );
+    assert!(
+        inner.head(&Path::from(path.as_str())).await.is_ok(),
+        "the object is still there"
+    );
+    assert!(
+        db.catalog.object_refused(&path).await.unwrap().is_some(),
+        "an upload is refused before it starts"
+    );
+    let catalog = db.catalog.clone();
+    let again = replayed.clone();
+    let registration = tokio::spawn(async move { catalog.register_file(&again).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !registration.is_finished(),
+        "the registration waits behind the claim"
+    );
+
+    open.send(true).unwrap();
+    assert_eq!(purge.await.unwrap(), 1);
+    assert!(inner.head(&Path::from(path.as_str())).await.is_err());
+    let sidecar = fs_index::sidecar_path(&path).unwrap();
+    let err = registration.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { ref path } if *path == replayed.path || *path == sidecar),
+        "refused for the file or its sidecar, both doomed: {err}"
+    );
+    let err = db.catalog.register_file(&replayed).await.unwrap_err();
+    assert!(matches!(err, CatalogError::ObjectDoomed { .. }), "{err}");
+    assert_eq!(
+        db.catalog
+            .registered_paths(std::slice::from_ref(&path))
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
     db.finish().await;
 }
 
@@ -245,8 +443,10 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
         retention_interval: Duration::from_secs(3600),
         retention: fs_compactor::RetentionConfig {
             files_per_pass: 100,
+            rebuild_max_input_bytes: 1 << 30,
             rebuild_max_bytes: 1 << 30,
-            batch_rows: 1024,
+            batch_rows: 16,
+            limits: fs_schema::limits::Limits::default(),
             inject_swap_failures: 0,
         },
     };
@@ -426,8 +626,10 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
         retention_interval: Duration::from_secs(3600),
         retention: fs_compactor::RetentionConfig {
             files_per_pass: 100,
+            rebuild_max_input_bytes: 1 << 30,
             rebuild_max_bytes: 1 << 30,
-            batch_rows: 1024,
+            batch_rows: 16,
+            limits: fs_schema::limits::Limits::default(),
             inject_swap_failures: 0,
         },
     };

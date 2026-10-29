@@ -25,6 +25,7 @@ fs-index = { path = "../fs-index" }
 fs-schema = { path = "../fs-schema" }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry-proto = { workspace = true }
