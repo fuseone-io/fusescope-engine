@@ -480,6 +480,7 @@ async fn slow_work_neither_lapses_nor_outlives_the_lease() {
             rebuilds_per_tick: 64,
             rebuild_backoff: Duration::from_secs(3600),
             inject_swap_failures: 0,
+            inject_list_failures: 0,
         },
     };
     let task = tokio::spawn(fs_compactor::run(
@@ -665,6 +666,7 @@ async fn the_loop_purges_only_while_it_holds_the_lease() {
             rebuilds_per_tick: 64,
             rebuild_backoff: Duration::from_secs(3600),
             inject_swap_failures: 0,
+            inject_list_failures: 0,
         },
     };
     let task = tokio::spawn(fs_compactor::run(

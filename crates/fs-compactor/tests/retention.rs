@@ -260,6 +260,7 @@ fn retention_config() -> RetentionConfig {
         rebuilds_per_tick: 64,
         rebuild_backoff: Duration::from_secs(2),
         inject_swap_failures: 0,
+        inject_list_failures: 0,
     }
 }
 
@@ -770,6 +771,80 @@ async fn a_tenant_whose_days_are_all_gone_loses_its_table() {
         Rebuild::End
     ));
     assert_eq!(r.stats().rebuilds.load(Ordering::Relaxed), 1);
+    f.db.finish().await;
+}
+
+/// A failure of the catalog while the inputs of a table are listed, after
+/// the table was chosen, leaves the walk on that table: the next call
+/// examines the same one, not the one after it.
+#[tokio::test]
+async fn a_failed_listing_leaves_the_walk_on_the_same_table() {
+    let Some(f) = fixture().await else { return };
+    write_l0(&f, "api", 1, f.at(-2), 3, ("db.system", "pg")).await;
+    write_l0(
+        &f,
+        "api",
+        2,
+        f.at(-2) + 60_000_000_000,
+        3,
+        ("db.system", "pg"),
+    )
+    .await;
+    let other =
+        f.db.catalog
+            .create_tenant(&NewTenant {
+                retention_days: 1,
+                ..NewTenant::with_defaults("other")
+            })
+            .await
+            .unwrap()
+            .id;
+    let half = 30 * 60_000_000_000;
+    write_l0_for(&f, other, "api", 5, f.at(-2) + half, 3, ("db.system", "pg")).await;
+    write_l0_for(
+        &f,
+        other,
+        "api",
+        6,
+        f.at(-2) + half + 60_000_000_000,
+        3,
+        ("db.system", "pg"),
+    )
+    .await;
+    let c = compactor(&f);
+    let fence = fence(&f).await;
+    c.compact_once(&fence).await.unwrap().unwrap();
+    c.compact_once(&fence).await.unwrap().unwrap();
+    let first = tables(&f).await[0].id;
+    let second = tables_of(&f, other).await[0].id;
+
+    let r = retention(
+        &f,
+        RetentionConfig {
+            inject_list_failures: 1,
+            ..retention_config()
+        },
+    );
+    r.expire_once(&fence).await.unwrap().unwrap();
+    r.expire_once(&fence).await.unwrap().unwrap();
+    let err = r.rebuild_once(&fence).await.unwrap_err();
+    assert!(
+        matches!(err, CompactError::Injected("input listing")),
+        "{err}"
+    );
+    assert_eq!(
+        done(r.rebuild_once(&fence).await.unwrap()).inputs,
+        vec![first],
+        "the same table, not the one after it"
+    );
+    assert_eq!(
+        done(r.rebuild_once(&fence).await.unwrap()).inputs,
+        vec![second]
+    );
+    assert!(matches!(
+        r.rebuild_once(&fence).await.unwrap(),
+        Rebuild::End
+    ));
     f.db.finish().await;
 }
 

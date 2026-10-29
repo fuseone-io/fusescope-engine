@@ -106,6 +106,9 @@ pub struct RetentionConfig {
     /// Make this many rebuild swaps fail artificially after the table is
     /// uploaded. Zero in production; tests use it to crash before the swap.
     pub inject_swap_failures: u32,
+    /// Make this many input listings fail artificially after the table
+    /// was chosen. Zero in production; tests use it as a catalog failure.
+    pub inject_list_failures: u32,
 }
 
 /// Counters of retention.
@@ -150,6 +153,7 @@ pub struct Retention {
     config: RetentionConfig,
     stats: Arc<RetentionStats>,
     inject_swap_failures: AtomicU32,
+    inject_list_failures: AtomicU32,
     /// Tenants already reported as exceeding a cap.
     reported: Mutex<HashSet<TenantId>>,
     /// Tenants whose rebuild failed, passed over until their backoff ends.
@@ -163,6 +167,30 @@ pub struct Retention {
 struct Failure {
     count: u32,
     until: Instant,
+}
+
+/// The walk's step past the table being examined, confirmed once the
+/// table was dealt with, rebuilt, passed over or failed on its own files;
+/// dropped unconfirmed, on a lost lease or a catalog failure anywhere in
+/// the call, it puts the walk back where it was.
+struct Advance<'a> {
+    retention: &'a Retention,
+    before: Option<StaleKey>,
+    confirmed: bool,
+}
+
+impl Advance<'_> {
+    fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+}
+
+impl Drop for Advance<'_> {
+    fn drop(&mut self) {
+        if !self.confirmed {
+            self.retention.set_cursor(self.before);
+        }
+    }
 }
 
 /// Bytes a rebuild of a table of `table_bytes` and `table_rows` from L1
@@ -266,6 +294,7 @@ impl Retention {
         stats: Arc<RetentionStats>,
     ) -> Self {
         let inject = config.inject_swap_failures;
+        let inject_list = config.inject_list_failures;
         let mut config = config;
         config.rebuilds_per_tick = config.rebuilds_per_tick.clamp(1, MAX_REBUILDS_PER_TICK);
         Self {
@@ -275,6 +304,7 @@ impl Retention {
             config,
             stats,
             inject_swap_failures: AtomicU32::new(inject),
+            inject_list_failures: AtomicU32::new(inject_list),
             reported: Mutex::new(HashSet::new()),
             failed: Mutex::new(HashMap::new()),
             cursor: Mutex::new(None),
@@ -355,8 +385,17 @@ impl Retention {
             return Ok(Rebuild::End);
         };
         self.set_cursor(Some(stale.key()));
+        let mut advance = Advance {
+            retention: self,
+            before,
+            confirmed: false,
+        };
         if self.held_back(stale.tenant_id) {
+            advance.confirm();
             return Ok(Rebuild::Skipped);
+        }
+        if take_injected(&self.inject_list_failures) {
+            return Err(CompactError::Injected("input listing"));
         }
         let mut budget = Budget::new(&self.config, &stale.table);
         let inputs = self
@@ -373,6 +412,7 @@ impl Retention {
         let Some(inputs) = inputs else {
             let (what, bytes, cap) = budget.over.unwrap_or(("memory", 0, 0));
             self.report_over_cap(stale.tenant_id, what, bytes, cap);
+            advance.confirm();
             return Ok(Rebuild::Skipped);
         };
         let result = self.rebuild(&stale, &inputs, fence).await;
@@ -383,23 +423,24 @@ impl Retention {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&stale.tenant_id);
+                advance.confirm();
             }
             Err(CompactError::Catalog(CatalogError::LeaseLost { .. })) => {
                 self.stats
                     .rebuild_lease_lost
                     .fetch_add(1, Ordering::Relaxed);
-                self.set_cursor(before);
             }
             Err(CompactError::Catalog(CatalogError::CompactionConflict { .. })) => {
                 self.stats.rebuild_conflicts.fetch_add(1, Ordering::Relaxed);
+                advance.confirm();
             }
             Err(CompactError::Catalog(_)) => {
                 self.stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
-                self.set_cursor(before);
             }
             Err(_) => {
                 self.stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
                 self.hold_back(stale.tenant_id);
+                advance.confirm();
             }
         }
         result.map(Rebuild::Done)
@@ -600,6 +641,7 @@ mod tests {
             rebuilds_per_tick: 64,
             rebuild_backoff: Duration::from_secs(1),
             inject_swap_failures: 0,
+            inject_list_failures: 0,
         }
     }
 
