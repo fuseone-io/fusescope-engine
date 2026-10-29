@@ -640,17 +640,22 @@ in under the fence, the table before quarantined with it, or the table
 before is swapped out alone, without being read, when nothing remains. A
 rebuild that does not commit, for a lost lease, a conflict, an unreadable
 table before or L1 file, or a crash, leaves the table before in place and
-the new table an orphan (`fusescope_retention_rebuild_*`). A failure on
-the tenant's own files, the table before or an L1 unreadable, holds the
-tenant back for the rest of the tick and the leader's loop goes on to the
-next tenant, so one damaged tenant never keeps the others' tables stale;
-it is tried again on the next tick. A lost lease ends the tick's work and
-a catalog failure ends the rebuilds for the tick. A rebuild is admitted
-by what it reads and by what it holds: a tenant whose remaining L1 files
-exceed `compactor.rebuild_max_input_bytes`, or whose rebuild would hold
-more than `compactor.rebuild_max_bytes` at its peak, keeps its table and
-is reported once, and the operator raises the cap or waits for retention
-to shrink the set. The peak is counted by the worst case the ingest
+the new table an orphan (`fusescope_retention_rebuild_*`). A tick
+attempts at most `compactor.rebuilds_per_tick` rebuilds. A failure on the
+tenant's own files, the table before or an L1 unreadable, holds the
+tenant back for `compactor.rebuild_backoff_secs` times its failures so
+far, up to six times, and the leader's loop goes on to the next tenant:
+the backoff outlives the tick, so however many damaged tenants sort
+ahead of a healthy one, they stop taking the tick's rebuilds and the
+healthy one gets its turn; a success clears the count. A lost lease ends
+the tick's work and a catalog failure ends the rebuilds for the tick. A
+rebuild is admitted by what it reads and by what it holds: a tenant
+whose remaining L1 files exceed `compactor.rebuild_max_input_bytes`, or
+whose rebuild would hold more than `compactor.rebuild_max_bytes` at its
+peak, keeps its table and is reported once, and the operator raises the
+cap or waits for retention to shrink the set; a tenant with no L1 file
+left is under no cap, since its table goes unread and nothing is
+written. The peak is counted by the worst case the ingest
 limits allow (`rebuild_footprint`): the list of inputs, the table before
 as fetched and as decoded, by its row count, the rebuilt table, its
 arrays and its Parquet bytes, the column chunks of the largest L1 file,
