@@ -40,6 +40,7 @@ fs-auth = { path = "../fs-auth" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+opentelemetry-proto = { workspace = true }
 
 [lints]
 workspace = true

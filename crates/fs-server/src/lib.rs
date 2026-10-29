@@ -6,6 +6,7 @@
 pub mod bucket;
 pub mod client;
 pub mod config;
+pub mod health;
 pub mod metrics;
 pub mod role;
 pub mod roles;
@@ -78,6 +79,10 @@ pub enum ServerError {
         /// Why.
         reason: String,
     },
+    /// The roles did not finish within `server.drain_timeout_secs` of the
+    /// stop; what they still held was abandoned.
+    #[error("drain exceeded {0:?}; roles were aborted")]
+    DrainTimeout(std::time::Duration),
 }
 
 #[cfg(test)]

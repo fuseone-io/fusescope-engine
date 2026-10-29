@@ -15,6 +15,12 @@ use fs_catalog::Catalog;
 use fs_server::config::{Config, Secrets};
 use fs_server::role::Role;
 use fs_server::server;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use sqlx::{Connection, Executor, PgConnection};
 use tokio::sync::watch;
 
@@ -320,6 +326,269 @@ async fn a_bucket_prefix_belongs_to_one_catalog() {
         "marked, no adoption needed again"
     );
     other.finish().await;
+    db.finish().await;
+}
+
+/// A port nobody listens on right now, for a server whose address a test
+/// must know before it starts.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `GET path` on the metrics listener: status code and body.
+async fn http_get(addr: &str, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or(String::new(), |(_, b)| b.to_owned());
+    (status, body)
+}
+
+/// The held request has appended to the WAL: it is in flight.
+async fn wait_for_wal_bytes(addr: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, body) = http_get(addr, "/metrics").await;
+        let bytes = body
+            .lines()
+            .find_map(|l| l.strip_prefix("fusescope_ingest_wal_bytes "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if bytes > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the request never reached the WAL"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_ready(addr: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+            drop(stream);
+            let (status, body) = http_get(addr, "/readyz").await;
+            if status == 200 {
+                assert!(body.starts_with("ready\n"), "{body}");
+                return;
+            }
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never ready");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn one_span(service: &str) -> ExportTraceServiceRequest {
+    let now = u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap()).unwrap();
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".into(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue(service.into())),
+                    }),
+                    ..KeyValue::default()
+                }],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    name: "op".into(),
+                    kind: 2,
+                    start_time_unix_nano: now,
+                    end_time_unix_nano: now + 1,
+                    ..Span::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Starts every role with the metrics listener and the OTLP listener on
+/// known ports and `ingest` in place of the file's ingester configuration.
+fn start_all(
+    db: &TestDb,
+    dir: &std::path::Path,
+    ingest: fs_ingest::IngestConfig,
+    drain_timeout_secs: u64,
+) -> (
+    String,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<(), fs_server::ServerError>>,
+) {
+    let metrics_addr = format!("127.0.0.1:{}", free_port());
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let mut cfg = config(dir);
+    cfg.server.metrics_addr.clone_from(&metrics_addr);
+    cfg.server.health_interval_secs = 1;
+    cfg.server.drain_timeout_secs = drain_timeout_secs;
+    let (tx, rx) = watch::channel(false);
+    let server = tokio::spawn(server::run_with(
+        cfg,
+        secrets,
+        Role::All,
+        "test-node".into(),
+        rx,
+        Some(ingest),
+    ));
+    (metrics_addr, tx, server)
+}
+
+/// `/healthz` answers as long as the process does; `/readyz` turns 200
+/// once every role is up and the probes answered, and 503 the moment a
+/// stop is asked for, for the whole drain, while the roles finish what
+/// they hold.
+#[tokio::test]
+async fn readiness_follows_the_roles_and_the_drain() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let otlp_port = free_port();
+    // The first request is held three seconds between its WAL append and
+    // its buffer push: a request in flight the stop has to wait for.
+    let ingest = fs_ingest::IngestConfig {
+        listen: format!("127.0.0.1:{otlp_port}").parse().unwrap(),
+        hot_listen: Some("127.0.0.1:0".parse().unwrap()),
+        flush_interval: Duration::from_secs(3600),
+        inject_push_delay: Some(Duration::from_secs(3)),
+        ..fs_ingest::IngestConfig::default()
+    };
+    let (metrics_addr, tx, server) = start_all(&db, dir.path(), ingest, 30);
+    wait_for_ready(&metrics_addr).await;
+    let (status, body) = http_get(&metrics_addr, "/healthz").await;
+    assert_eq!((status, body.as_str()), (200, "ok\n"));
+    let (_, body) = http_get(&metrics_addr, "/readyz").await;
+    assert!(
+        body.contains("roles=3/3\n") && body.contains("wal=open\n"),
+        "{body}"
+    );
+
+    // A request the stop will have to let finish.
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    let tenant = catalog
+        .create_tenant(&fs_catalog::NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = catalog
+        .create_token(tenant, "collector", fs_catalog::TokenScope::Ingest)
+        .await
+        .unwrap();
+    let mut client = TraceServiceClient::connect(format!("http://127.0.0.1:{otlp_port}"))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(one_span("api"));
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    let export = tokio::spawn(async move { client.export(request).await });
+    wait_for_wal_bytes(&metrics_addr).await;
+
+    tx.send(true).unwrap();
+    let (status, body) = http_get(&metrics_addr, "/readyz").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("draining=true\n"), "{body}");
+    let (status, _) = http_get(&metrics_addr, "/healthz").await;
+    assert_eq!(status, 200, "alive while draining");
+    assert!(!server.is_finished(), "the drain is still going");
+    tokio::time::timeout(Duration::from_secs(15), server)
+        .await
+        .expect("the drain ends once the held request returns")
+        .unwrap()
+        .unwrap();
+    export.await.unwrap().unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(&metrics_addr).await.is_err(),
+        "the health listener stops with the process"
+    );
+    catalog.pool().close().await;
+    db.finish().await;
+}
+
+/// A drain that does not end by `server.drain_timeout_secs` is abandoned:
+/// the roles are aborted and the process reports it.
+#[tokio::test]
+async fn the_drain_has_a_deadline() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let otlp_port = free_port();
+    let ingest = fs_ingest::IngestConfig {
+        listen: format!("127.0.0.1:{otlp_port}").parse().unwrap(),
+        hot_listen: Some("127.0.0.1:0".parse().unwrap()),
+        flush_interval: Duration::from_secs(3600),
+        inject_push_delay: Some(Duration::from_secs(60)),
+        ..fs_ingest::IngestConfig::default()
+    };
+    let (metrics_addr, tx, server) = start_all(&db, dir.path(), ingest, 1);
+    wait_for_ready(&metrics_addr).await;
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    let tenant = catalog
+        .create_tenant(&fs_catalog::NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = catalog
+        .create_token(tenant, "collector", fs_catalog::TokenScope::Ingest)
+        .await
+        .unwrap();
+    let mut client = TraceServiceClient::connect(format!("http://127.0.0.1:{otlp_port}"))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(one_span("api"));
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    let export = tokio::spawn(async move { client.export(request).await });
+    wait_for_wal_bytes(&metrics_addr).await;
+
+    let stopped_at = tokio::time::Instant::now();
+    tx.send(true).unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the deadline, not the held request, ends the drain")
+        .unwrap()
+        .unwrap_err();
+    export.abort();
+    assert!(
+        matches!(err, fs_server::ServerError::DrainTimeout(d) if d == Duration::from_secs(1)),
+        "{err}"
+    );
+    assert!(stopped_at.elapsed() < Duration::from_secs(8));
+    catalog.pool().close().await;
     db.finish().await;
 }
 

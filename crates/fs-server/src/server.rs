@@ -1,6 +1,7 @@
 //! Bootstrap and role supervision.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use fs_catalog::Catalog;
 use tokio::sync::watch;
@@ -80,6 +81,8 @@ pub async fn bootstrap(
         node_id,
         metrics: Arc::new(crate::metrics::Metrics::default()),
         ownership,
+        health: Arc::new(crate::health::Health::default()),
+        ingest_override: None,
     })
 }
 
@@ -184,19 +187,44 @@ pub async fn run(
     node_id: String,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
-    let write_probe = role != Role::Querier;
-    let ctx = bootstrap(config, &secrets, node_id, write_probe).await?;
-    info!(version = crate::VERSION, role = %role, node_id = %ctx.node_id, "fusescope-engine starting");
+    run_with(config, secrets, role, node_id, shutdown, None).await
+}
 
+/// [`run`] with an ingester configuration in place of the file's, for
+/// tests that need the ingester's own knobs.
+///
+/// # Errors
+/// See [`run`].
+pub async fn run_with(
+    config: Config,
+    secrets: Secrets,
+    role: Role,
+    node_id: String,
+    shutdown: watch::Receiver<bool>,
+    ingest_override: Option<fs_ingest::IngestConfig>,
+) -> Result<(), ServerError> {
+    let write_probe = role != Role::Querier;
+    let mut ctx = bootstrap(config, &secrets, node_id, write_probe).await?;
+    ctx.ingest_override = ingest_override;
+    info!(version = crate::VERSION, role = %role, node_id = %ctx.node_id, "fusescope-engine starting");
+    let roles = role.expand();
+    ctx.health
+        .expect(roles.len(), roles.contains(&Role::Ingester));
+
+    // The roles stop on `stop`; the HTTP server and the prober outlive them
+    // until `http_stop`, so `/readyz` answers 503 for the whole drain.
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (http_stop_tx, http_stop_rx) = watch::channel(false);
     let mut forward = shutdown.clone();
+    let health = Arc::clone(&ctx.health);
     let forwarder = tokio::spawn(async move {
         if forward.changed().await.is_ok() {
+            health.draining();
             let _ = stop_tx.send(true);
         }
     });
 
-    let mut tasks: JoinSet<(&'static str, Result<(), ServerError>)> = JoinSet::new();
+    let mut http: JoinSet<Result<(), ServerError>> = JoinSet::new();
     if !ctx.config.server.metrics_addr.is_empty() {
         let listen: std::net::SocketAddr = ctx.config.server.metrics_addr.parse().map_err(|e| {
             ServerError::InvalidConfig(format!(
@@ -205,14 +233,13 @@ pub async fn run(
             ))
         })?;
         let metrics = Arc::clone(&ctx.metrics);
-        let rx = stop_rx.clone();
-        tasks.spawn(async move {
-            (
-                "metrics",
-                crate::metrics::serve(listen, metrics, rx, None).await,
-            )
-        });
+        let health = Arc::clone(&ctx.health);
+        let rx = http_stop_rx.clone();
+        http.spawn(async move { crate::metrics::serve(listen, metrics, health, rx, None).await });
     }
+    http.spawn(probe(ctx.clone(), http_stop_rx));
+
+    let mut tasks: JoinSet<(&'static str, Result<(), ServerError>)> = JoinSet::new();
     for r in role.expand() {
         let ctx = ctx.clone();
         let rx = stop_rx.clone();
@@ -228,8 +255,27 @@ pub async fn run(
         };
     }
 
+    let drain = Duration::from_secs(ctx.config.server.drain_timeout_secs);
     let mut first_error: Option<ServerError> = None;
-    while let Some(joined) = tasks.join_next().await {
+    let mut draining_since: Option<tokio::time::Instant> = None;
+    let mut stop_rx = stop_rx;
+    loop {
+        let deadline = draining_since.map(|since| since + drain);
+        let joined = tokio::select! {
+            joined = tasks.join_next() => joined,
+            _ = stop_rx.changed(), if draining_since.is_none() => {
+                draining_since = Some(tokio::time::Instant::now());
+                continue;
+            }
+            () = async { tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)).await }, if deadline.is_some() => {
+                error!(after = ?drain, "drain deadline passed; abandoning what the roles still hold");
+                first_error.get_or_insert(ServerError::DrainTimeout(drain));
+                tasks.abort_all();
+                draining_since = None;
+                continue;
+            }
+        };
+        let Some(joined) = joined else { break };
         match joined {
             Ok((_, Ok(()))) => {}
             Ok((name, Err(e))) => {
@@ -238,6 +284,7 @@ pub async fn run(
                 forwarder.abort();
                 tasks.abort_all();
             }
+            Err(join) if join.is_cancelled() => {}
             Err(join) => {
                 let e = ServerError::RoleStopped {
                     role: "unknown",
@@ -249,6 +296,36 @@ pub async fn run(
         }
     }
     forwarder.abort();
+    let _ = http_stop_tx.send(true);
+    while let Some(joined) = http.join_next().await {
+        if let Ok(Err(e)) = joined {
+            error!(error = %e, "health server failed");
+            first_error.get_or_insert(e);
+        }
+    }
     info!("fusescope-engine stopped");
     first_error.map_or(Ok(()), Err)
+}
+
+/// Probes the catalog and the bucket every `health_interval_secs`, for
+/// `/readyz`, until `stop` flips. Each probe has two seconds.
+async fn probe(ctx: Context, mut stop: watch::Receiver<bool>) -> Result<(), ServerError> {
+    let every = Duration::from_secs(ctx.config.server.health_interval_secs);
+    let mut tick = tokio::time::interval(every);
+    let patience = Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let catalog = tokio::time::timeout(patience, sqlx::query("select 1").execute(ctx.catalog.pool()))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                let bucket = tokio::time::timeout(patience, bucket::reachable(ctx.store.as_ref(), &ctx.root))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                ctx.health.catalog(catalog);
+                ctx.health.bucket(bucket);
+            }
+            _ = stop.changed() => return Ok(()),
+        }
+    }
 }

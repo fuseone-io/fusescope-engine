@@ -32,6 +32,11 @@ pub struct Context {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// What the start found under the bucket prefix.
     pub ownership: crate::bucket::Ownership,
+    /// What `/readyz` answers from; every role reports into it.
+    pub health: Arc<crate::health::Health>,
+    /// An ingester configuration in place of the file's, for tests that
+    /// need the ingester's own knobs.
+    pub ingest_override: Option<fs_ingest::IngestConfig>,
 }
 
 /// Heartbeat period of the ingester. The querier treats 10 s of silence as down.
@@ -61,7 +66,10 @@ pub async fn ingester(
         damage = ?recovery.damage,
         "wal opened"
     );
-    let ingest_config = ctx.config.ingest.to_ingest_config()?;
+    let ingest_config = match ctx.ingest_override.clone() {
+        Some(config) => config,
+        None => ctx.config.ingest.to_ingest_config()?,
+    };
     let ingester = Arc::new(fs_ingest::Ingester::new(
         ingest_config,
         ctx.catalog.clone(),
@@ -94,7 +102,23 @@ pub async fn ingester(
             }
         }
     };
-    let (served, ()) = tokio::join!(ingester.run(shutdown.clone(), None, None), heartbeat);
+    ctx.health.wal(true);
+    let (otlp_tx, otlp_rx) = tokio::sync::oneshot::channel();
+    let up = {
+        let health = Arc::clone(&ctx.health);
+        async move {
+            if otlp_rx.await.is_ok() {
+                health.role_up();
+            }
+        }
+    };
+    let (served, (), ()) = tokio::join!(
+        ingester.run(shutdown.clone(), Some(otlp_tx), None),
+        heartbeat,
+        up
+    );
+    ctx.health.role_down();
+    ctx.health.wal(false);
     served?;
     let _ = shutdown.borrow_and_update();
     info!(role = "ingester", "stopped");
@@ -124,7 +148,21 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     let follower = cache.follow(shutdown.clone());
     let service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
     info!(role = "querier", %listen, "ready");
-    let (served, ()) = tokio::join!(service.serve(listen, shutdown, None), follower);
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let up = {
+        let health = Arc::clone(&ctx.health);
+        async move {
+            if bound_rx.await.is_ok() {
+                health.role_up();
+            }
+        }
+    };
+    let (served, (), ()) = tokio::join!(
+        service.serve(listen, shutdown, Some(bound_tx)),
+        follower,
+        up
+    );
+    ctx.health.role_down();
     served?;
     info!(role = "querier", "stopped");
     Ok(())
@@ -140,6 +178,7 @@ pub async fn compactor(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<
     info!(role = "compactor", holder = %ctx.node_id, "ready");
     let stats = Arc::new(fs_compactor::Stats::default());
     ctx.metrics.register_compactor(Arc::clone(&stats));
+    ctx.health.role_up();
     fs_compactor::run(
         ctx.catalog.clone(),
         ctx.store.clone(),
@@ -152,6 +191,7 @@ pub async fn compactor(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<
         shutdown,
     )
     .await;
+    ctx.health.role_down();
     info!(role = "compactor", "stopped");
     Ok(())
 }

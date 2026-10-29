@@ -1768,6 +1768,7 @@ dependencies = [
  "fs-wal",
  "futures-util",
  "object_store",
+ "opentelemetry-proto",
  "serde",
  "sqlx",
  "tempfile",

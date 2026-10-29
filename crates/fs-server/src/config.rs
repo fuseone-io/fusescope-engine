@@ -53,9 +53,17 @@ pub struct ServerConfig {
     /// Address advertised to the catalog for hot-window scans.
     #[serde(default = "default_flight_addr")]
     pub flight_addr: String,
-    /// Prometheus `/metrics` listener. Empty string disables it.
+    /// Prometheus `/metrics`, `/healthz` and `/readyz` listener. Empty
+    /// string disables it.
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: String,
+    /// Seconds between probes of the catalog and the bucket for `/readyz`.
+    #[serde(default = "default_health_interval")]
+    pub health_interval_secs: u64,
+    /// Seconds a stop waits for the roles to finish what they hold before
+    /// abandoning it.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -65,12 +73,22 @@ impl Default for ServerConfig {
             node_id: None,
             flight_addr: default_flight_addr(),
             metrics_addr: default_metrics_addr(),
+            health_interval_secs: default_health_interval(),
+            drain_timeout_secs: default_drain_timeout(),
         }
     }
 }
 
 fn default_metrics_addr() -> String {
     "0.0.0.0:9464".to_owned()
+}
+
+fn default_health_interval() -> u64 {
+    10
+}
+
+fn default_drain_timeout() -> u64 {
+    30
 }
 
 fn default_role() -> Role {
@@ -969,6 +987,15 @@ impl Config {
     }
 
     /// The ingest bounds the runtime or the cut enforces as hard ceilings.
+    fn validate_server(&self) -> Result<(), ServerError> {
+        if self.server.health_interval_secs == 0 || self.server.drain_timeout_secs == 0 {
+            return Err(ServerError::InvalidConfig(
+                "server.health_interval_secs and server.drain_timeout_secs must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_ingest_bounds(&self) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
         if self.ingest.wal_batch_records == 0
@@ -1080,6 +1107,7 @@ impl Config {
             );
         }
         self.validate_ingest_bounds()?;
+        self.validate_server()?;
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
             || self.query.memory_bytes < 64 * 1024 * 1024

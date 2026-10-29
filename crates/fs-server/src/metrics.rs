@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::ServerError;
+use crate::health::Health;
 
 /// Counters registered by the roles as they start.
 pub struct Metrics {
@@ -616,14 +617,17 @@ fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
     );
 }
 
-/// Serves `GET /metrics` on `listen` until `shutdown` flips. Any other path
-/// gets 404; anything that is not a GET gets 405.
+/// Serves `GET /metrics`, `GET /healthz` (200 while the process answers)
+/// and `GET /readyz` (200 when [`Health`] says ready, 503 otherwise, the
+/// facts in the body either way) on `listen` until `shutdown` flips. Any
+/// other path gets 404; anything that is not a GET gets 405.
 ///
 /// # Errors
 /// Bind failure.
 pub async fn serve(
     listen: std::net::SocketAddr,
     metrics: Arc<Metrics>,
+    health: Arc<Health>,
     mut shutdown: watch::Receiver<bool>,
     bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 ) -> Result<(), ServerError> {
@@ -648,8 +652,9 @@ pub async fn serve(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let metrics = Arc::clone(&metrics);
+                    let health = Arc::clone(&health);
                     tokio::spawn(async move {
-                        if let Err(e) = respond(stream, &metrics).await {
+                        if let Err(e) = respond(stream, &metrics, &health).await {
                             debug!(error = %e, "metrics connection failed");
                         }
                     });
@@ -663,7 +668,11 @@ pub async fn serve(
     Ok(())
 }
 
-async fn respond(mut stream: tokio::net::TcpStream, metrics: &Metrics) -> std::io::Result<()> {
+async fn respond(
+    mut stream: tokio::net::TcpStream,
+    metrics: &Metrics,
+    health: &Health,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; 4096];
     let n =
         tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await??;
@@ -672,6 +681,16 @@ async fn respond(mut stream: tokio::net::TcpStream, metrics: &Metrics) -> std::i
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let (status, body) = match (method, path) {
         ("GET", "/metrics") => ("200 OK", metrics.render()),
+        ("GET", "/healthz") => ("200 OK", "ok\n".to_owned()),
+        ("GET", "/readyz") => {
+            let verdict = health.readiness();
+            let status = if verdict.ready {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            };
+            (status, verdict.render())
+        }
         ("GET", _) => ("404 Not Found", "not found\n".to_owned()),
         _ => ("405 Method Not Allowed", "method not allowed\n".to_owned()),
     };
