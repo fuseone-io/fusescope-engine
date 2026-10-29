@@ -467,9 +467,17 @@ on renewal counts as losing the lease, so a partitioned or stuck instance
 stops working before the TTL rather than racing the next holder. Release lets the
 lease expire at once, keeping the generation. A purge deletes the catalog
 rows of files quarantined for `compactor.quarantine_ttl_secs` on the database
-clock, then each object and its `trace_id` sidecar; the server refuses a TTL
-shorter than the querier's file cache TTL plus one query timeout, since a
-querier may still read a quarantined file that long.
+clock, each in a transaction that holds the locks of its path and sidecar
+and marks both for deletion, then each object and its `trace_id` sidecar
+under the claim protocol of the orphan sweep (section 7.2), leaving
+tombstones: from the row's commit on, a writer replaying the file, before
+the delete or however long after it, is refused with `ObjectDoomed` and
+gives its rows a fresh id, so no row ever points at an object the purge
+deletes, and a replayed file beyond retention is expired again by the
+next retention pass. An object the purge cannot delete keeps its mark and
+is finished by the sweep. The server refuses a TTL shorter than the
+querier's file cache TTL plus one query timeout, since a querier may still
+read a quarantined file that long.
 
 ## 6. Hot window
 
@@ -629,13 +637,25 @@ table before, a key the table before does not list stays out, as it was
 when its files were compacted, and the budgets of the hours gone are not
 re-spent. The new table is uploaded under the create-once rule and swapped
 in under the fence, the table before quarantined with it, or the table
-before is swapped out alone when nothing remains. A rebuild that does not
-commit, for a lost lease, a conflict, an unreadable table before or L1
-file, or a crash, leaves the table before in place and the new table an
-orphan (`fusescope_retention_rebuild_*`). A tenant whose remaining L1
-files exceed `compactor.rebuild_max_bytes` keeps its table and is reported
-once; the operator raises the cap or waits for retention to shrink the
-set.
+before is swapped out alone, without being read, when nothing remains. A
+rebuild that does not commit, for a lost lease, a conflict, an unreadable
+table before or L1 file, or a crash, leaves the table before in place and
+the new table an orphan (`fusescope_retention_rebuild_*`), and holds the
+tenant back for the rest of the tick so the other tenants' tables are
+rebuilt; it is tried again on the next tick. A rebuild is admitted by what
+it reads and by what it holds: a tenant whose remaining L1 files exceed
+`compactor.rebuild_max_input_bytes`, or whose rebuild would hold more
+than `compactor.rebuild_max_bytes` at its peak, keeps its table and is
+reported once, and the operator raises the cap or waits for retention to
+shrink the set. The peak is counted by the worst case the ingest limits
+allow (`rebuild_footprint`): the table before as fetched and as decoded,
+by its row count, the rebuilt table, its arrays and its Parquet bytes,
+the column chunks of the largest L1 file, read one file and one row group
+at a time, and one decoded batch of `REBUILD_BATCH_ROWS` spans with every
+attribute map full, the only part of the peak the row count of the table
+does not bound; the server refuses a budget below one L1 file of
+`l1_target_bytes` plus that batch. The totals are read from the catalog
+before any file is listed.
 
 ### 7.2 Orphan sweep
 
