@@ -937,7 +937,8 @@ fusescope-engine/
     fs-server/       single binary, --role ingester|querier|compactor|all;
                      /metrics, /healthz (alive) and /readyz (every role up,
                      catalog and bucket answering the last probe, the WAL
-                     open, no drain under way) on server.metrics_addr; a
+                     open, no drain under way) on server.metrics_addr,
+                     bound before any role starts and watched like one; a
                      stop drops readiness at once, lets the roles finish
                      what they hold and abandons it after
                      server.drain_timeout_secs
