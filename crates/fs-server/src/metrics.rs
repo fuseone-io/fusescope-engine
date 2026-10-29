@@ -439,8 +439,13 @@ impl Metrics {
             ),
             (
                 "fusescope_compaction_derived_unreadable_total",
-                "Previous attribute_keys tables that could not be read and were replaced",
+                "Passes aborted because the attribute_keys table before could not be read",
                 load(&c.derived_unreadable),
+            ),
+            (
+                "fusescope_compaction_derived_keys_dropped_total",
+                "Entries of attribute keys beyond the tenant's max_keys_hour not counted",
+                load(&c.derived_keys_dropped),
             ),
         ] {
             counter(out, name, help, value);
@@ -737,6 +742,10 @@ mod tests {
             .compaction
             .derived_unreadable
             .fetch_add(2, Ordering::Relaxed);
+        compactor
+            .compaction
+            .derived_keys_dropped
+            .fetch_add(7, Ordering::Relaxed);
         compactor.orphans.deleted.fetch_add(6, Ordering::Relaxed);
         metrics.register_compactor(compactor);
         let page = metrics.render();
@@ -758,6 +767,10 @@ mod tests {
         );
         assert!(
             page.contains("fusescope_compaction_derived_unreadable_total 2\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_compaction_derived_keys_dropped_total 7\n"),
             "{page}"
         );
         let query = Arc::new(fs_query::QueryStats::default());
