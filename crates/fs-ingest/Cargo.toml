@@ -36,6 +36,7 @@ fs-index = { path = "../fs-index" }
 tempfile = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

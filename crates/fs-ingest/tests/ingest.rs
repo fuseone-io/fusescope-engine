@@ -20,6 +20,10 @@ use fs_ingest::{IngestConfig, Ingester};
 use fs_wal::{Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -140,6 +144,16 @@ async fn start_with_wal(
 ) -> Harness {
     std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    start_with_store(catalog, dir, config, wal_config, store).await
+}
+
+async fn start_with_store(
+    catalog: &Catalog,
+    dir: tempfile::TempDir,
+    config: IngestConfig,
+    wal_config: WalConfig,
+    store: Arc<dyn ObjectStore>,
+) -> Harness {
     let wal = Wal::open(wal_config).unwrap();
     let ingester =
         Arc::new(Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap());
@@ -183,6 +197,84 @@ impl Harness {
             .unwrap()
             .unwrap();
         self.dir
+    }
+}
+
+/// A store that holds every put under `held` until the gate opens, so one
+/// tenant's flush is as slow as the test wants and nothing else is.
+#[derive(Debug)]
+struct HeldStore {
+    inner: Arc<dyn ObjectStore>,
+    held: String,
+    gate: tokio::sync::watch::Receiver<bool>,
+}
+
+impl std::fmt::Display for HeldStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeldStore({})", self.held)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for HeldStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if location.as_ref().starts_with(&self.held) {
+            let mut gate = self.gate.clone();
+            while !*gate.borrow() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -888,6 +980,203 @@ async fn a_failed_confirmation_is_retried_after_its_backoff() {
 /// flushes get the only flush permit, and the stop cancels the held
 /// attempt, waits for it to give its entry back, and confirms everything
 /// due in its last pass, refilling the single confirmation permit.
+/// One tenant's flush stuck in its upload holds one permit and nothing
+/// else: the other tenants keep flushing through the permits left, again
+/// and again, and the stuck tenant's file lands once its upload returns.
+#[tokio::test]
+async fn a_slow_tenants_flush_does_not_hold_the_others() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let mut tenants = Vec::new();
+    for name in ["slow", "b", "c"] {
+        let tenant = db
+            .catalog
+            .create_tenant(&NewTenant::with_defaults(name))
+            .await
+            .unwrap()
+            .id;
+        let (token, _) = db
+            .catalog
+            .create_token(tenant, "collector", TokenScope::Ingest)
+            .await
+            .unwrap();
+        tenants.push((tenant, token));
+    }
+    let (slow, slow_token) = tenants[0].clone();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let (open, gate) = tokio::sync::watch::channel(false);
+    let store: Arc<dyn ObjectStore> = Arc::new(HeldStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap()),
+        held: format!("t/{}/", slow.0),
+        gate,
+    });
+    let config = IngestConfig {
+        max_flushes: 2,
+        flush_interval: Duration::from_millis(200),
+        ..test_config()
+    };
+    let wal_config = WalConfig::new(dir.path().join("wal"));
+    let h = start_with_store(&db.catalog, dir, config, wal_config, store).await;
+    let mut client = h.client().await;
+    let registered = |tenant: TenantId| {
+        let catalog = db.catalog.clone();
+        async move {
+            catalog
+                .all_visible_files(tenant, Signal::Traces)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    let wait_for = |tenant: TenantId, files: usize, what: &'static str| async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while registered(tenant).await < files {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+
+    // Everyone exports; the slow tenant's upload is held from here on.
+    for (i, (_, token)) in tenants.iter().enumerate() {
+        client
+            .export(authed(
+                request("api", u8::try_from(i).unwrap() + 1, 5),
+                token,
+            ))
+            .await
+            .unwrap();
+    }
+    wait_for(tenants[1].0, 1, "b flushed beside the held upload").await;
+    wait_for(tenants[2].0, 1, "c flushed beside the held upload").await;
+    assert_eq!(
+        registered(slow).await,
+        0,
+        "the slow tenant is still uploading"
+    );
+
+    // And again: the permit the slow tenant holds is the only one it holds.
+    client
+        .export(authed(request("api", 9, 5), &tenants[1].1))
+        .await
+        .unwrap();
+    client
+        .export(authed(request("api", 8, 5), &tenants[2].1))
+        .await
+        .unwrap();
+    wait_for(tenants[1].0, 2, "b flushed a second time").await;
+    wait_for(tenants[2].0, 2, "c flushed a second time").await;
+    assert_eq!(registered(slow).await, 0);
+    assert!(
+        h.ingester
+            .flush_stats()
+            .flushing_bytes
+            .load(Ordering::Relaxed)
+            > 0,
+        "the held flush is still accounted as flushing"
+    );
+
+    // The upload returns: the slow tenant's file lands like any other.
+    open.send(true).unwrap();
+    wait_for(slow, 1, "the slow tenant flushed once released").await;
+    let _ = slow_token;
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The bound is real: with a single permit the held upload is the only
+/// flush there is, and the other tenant waits for it. The test above
+/// would see the same if the permits were ever shared by mistake.
+#[tokio::test]
+async fn one_flush_permit_makes_the_slow_tenant_hold_the_others() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let mut tenants = Vec::new();
+    for name in ["slow", "b"] {
+        let tenant = db
+            .catalog
+            .create_tenant(&NewTenant::with_defaults(name))
+            .await
+            .unwrap()
+            .id;
+        let (token, _) = db
+            .catalog
+            .create_token(tenant, "collector", TokenScope::Ingest)
+            .await
+            .unwrap();
+        tenants.push((tenant, token));
+    }
+    let slow = tenants[0].0;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let (open, gate) = tokio::sync::watch::channel(false);
+    let store: Arc<dyn ObjectStore> = Arc::new(HeldStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap()),
+        held: format!("t/{}/", slow.0),
+        gate,
+    });
+    let config = IngestConfig {
+        max_flushes: 1,
+        flush_interval: Duration::from_millis(200),
+        ..test_config()
+    };
+    let wal_config = WalConfig::new(dir.path().join("wal"));
+    let h = start_with_store(&db.catalog, dir, config, wal_config, store).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 5), &tenants[0].1))
+        .await
+        .unwrap();
+    // The slow tenant is cut first: it is the only one due.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while h
+        .ingester
+        .flush_stats()
+        .flushing_bytes
+        .load(Ordering::Relaxed)
+        == 0
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slow tenant was never cut"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client
+        .export(authed(request("api", 2, 5), &tenants[1].1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let registered = |tenant: TenantId| {
+        let catalog = db.catalog.clone();
+        async move {
+            catalog
+                .all_visible_files(tenant, Signal::Traces)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(
+        registered(tenants[1].0).await,
+        0,
+        "b waits behind the only permit"
+    );
+    open.send(true).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while registered(tenants[1].0).await < 1 || registered(slow).await < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both flushed once released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.stop().await;
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn a_held_confirmation_holds_neither_a_flush_permit_nor_the_stop() {
     let Some(db) = TestDb::new().await else {
