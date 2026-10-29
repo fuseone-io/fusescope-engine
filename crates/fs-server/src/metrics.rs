@@ -519,6 +519,12 @@ impl Metrics {
             );
             counter(
                 out,
+                "fusescope_query_trace_lookups_total",
+                "trace.lookup actions served",
+                q.trace_lookups.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
                 "fusescope_query_plannings_total",
                 "Times a statement went through the planner",
                 q.plannings.load(Ordering::Relaxed),
@@ -718,12 +724,17 @@ mod tests {
         );
         let query = Arc::new(fs_query::QueryStats::default());
         query.plannings.fetch_add(2, Ordering::Relaxed);
+        query.trace_lookups.fetch_add(3, Ordering::Relaxed);
         query.prepared.store(5, Ordering::Relaxed);
         query.prepared_bytes.store(9, Ordering::Relaxed);
         metrics.register_query(query);
         let page = metrics.render();
         assert!(
             page.contains("fusescope_query_plannings_total 2\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_query_trace_lookups_total 3\n"),
             "{page}"
         );
         assert!(
