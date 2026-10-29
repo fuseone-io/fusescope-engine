@@ -13,8 +13,9 @@
 //! "end_unix_nano": n}`; the spans of that trace ordered by `timestamp`,
 //! every column of the spans table.
 //!
-//! `metadata.services`: `{"start_unix_nano": n, "end_unix_nano": n}`;
-//! the distinct `service_name` of the tenant's spans, sorted.
+//! `metadata.services`: `{"start_unix_nano": n, "end_unix_nano": n,
+//! "limit": n}`; the distinct `service_name` of the tenant's spans,
+//! sorted; more services than the limit is an error, not a truncation.
 //!
 //! `metadata.operations`: `{"service_name": "api", "start_unix_nano": n,
 //! "end_unix_nano": n, "limit": n}`; the span `name`s of that service with
@@ -111,6 +112,29 @@ pub struct ServicesLookup {
     /// Inclusive upper bound on `timestamp`, nanoseconds since the epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_unix_nano: Option<u64>,
+    /// Most services to answer; [`DEFAULT_LIST_LIMIT`] when absent. More
+    /// than that is refused, not truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// A service listing with its fields checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServicesQuery {
+    /// The bounds.
+    pub range: Range,
+    /// Most services to answer.
+    pub limit: usize,
+}
+
+impl ServicesQuery {
+    /// Every service within `range`, up to the default limit.
+    pub fn within(range: Range) -> Self {
+        Self {
+            range,
+            limit: DEFAULT_LIST_LIMIT,
+        }
+    }
 }
 
 impl ServicesLookup {
@@ -123,12 +147,15 @@ impl ServicesLookup {
         parse(body)
     }
 
-    /// Checks the range.
+    /// Checks the range and the limit.
     ///
     /// # Errors
-    /// A bound beyond `i64`, or a start after the end.
-    pub fn query(&self) -> Result<Range, QueryError> {
-        range_of(self.start_unix_nano, self.end_unix_nano)
+    /// A bound beyond `i64`, a start after the end, or a limit of zero.
+    pub fn query(&self) -> Result<ServicesQuery, QueryError> {
+        Ok(ServicesQuery {
+            range: range_of(self.start_unix_nano, self.end_unix_nano)?,
+            limit: limit_of(self.limit)?,
+        })
     }
 }
 
@@ -325,12 +352,19 @@ mod tests {
 
     #[test]
     fn the_listings_check_their_fields_and_default_their_limit() {
-        let services = ServicesLookup::parse(br#"{"end_unix_nano":9}"#).unwrap();
-        assert_eq!(services.query().unwrap().end_ns, Some(9));
+        let services = ServicesLookup::parse(br#"{"end_unix_nano":9,"limit":2}"#).unwrap();
+        let query = services.query().unwrap();
+        assert_eq!((query.range.end_ns, query.limit), (Some(9), 2));
         assert!(ServicesLookup::parse(br#"{"end_unix_nanos":9}"#).is_err());
         assert_eq!(
             ServicesLookup::parse(b"{}").unwrap().query().unwrap(),
-            Range::default()
+            ServicesQuery::within(Range::default())
+        );
+        assert!(
+            ServicesLookup::parse(br#"{"limit":0}"#)
+                .unwrap()
+                .query()
+                .is_err()
         );
 
         let operations = OperationsLookup::parse(br#"{"service_name":"api","limit":3}"#).unwrap();

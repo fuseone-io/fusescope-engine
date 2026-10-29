@@ -34,6 +34,15 @@ pub enum QueryError {
     /// Arrow refused an answer built outside DataFusion.
     #[error("arrow: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+    /// A derived table file this version does not read: another signal
+    /// or version in its schema metadata.
+    #[error("derived table {path} is not readable by this version: {source}")]
+    DerivedTable {
+        /// The file.
+        path: String,
+        /// What the check refused.
+        source: fs_schema::SchemaError,
+    },
     /// Catalog failure.
     #[error("catalog: {0}")]
     Catalog(#[from] fs_catalog::CatalogError),

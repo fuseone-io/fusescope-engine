@@ -24,7 +24,7 @@ use object_store::ObjectStore;
 use tracing::info;
 
 use crate::QueryError;
-use crate::actions::{KeysQuery, OperationsQuery, Range, TraceQuery};
+use crate::actions::{KeysQuery, OperationsQuery, ServicesQuery, TraceQuery};
 use crate::files::FileCache;
 use crate::prune::Pruning;
 use crate::session::{SPANS_TABLE, plan_read_only, tenant_session};
@@ -333,19 +333,24 @@ impl Querier {
         Ok((stream, warnings))
     }
 
-    /// The distinct `service_name` of `tenant`'s spans within `range`,
-    /// sorted, as one batch of one `service_name` column: the services of
-    /// every file the catalog holds that overlaps the range, so a range
-    /// answers at file granularity, and the services the ingesters still
-    /// hold when the range touches the recent window. No file is read.
+    /// The distinct `service_name` of `tenant`'s spans within the query's
+    /// range, sorted, as one batch of one `service_name` column: the
+    /// services of every file the catalog holds that overlaps the range,
+    /// so a range answers at file granularity, and the services the
+    /// ingesters still hold when the range touches the recent window. No
+    /// file is read. More services than the query's limit, or than
+    /// `max_rows`, is [`QueryError::TooManyRows`] as soon as it is known,
+    /// so the answer never holds more than that.
     ///
     /// # Errors
-    /// Unknown tenant, or catalog failure.
+    /// Unknown tenant, catalog failure, or too many services.
     pub async fn metadata_services(
         &self,
         tenant: TenantId,
-        range: Range,
+        query: ServicesQuery,
     ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        let range = query.range;
+        let limit = query.limit.min(self.limits.max_rows);
         self.catalog
             .tenant(tenant)
             .await?
@@ -365,7 +370,9 @@ impl Querier {
                     .end_ns
                     .is_none_or(|to| start.is_none_or(|start| start <= to));
             if overlaps {
-                services.extend(file.services.iter().cloned());
+                for service in &file.services {
+                    admit(&mut services, service, limit)?;
+                }
             }
         }
         let pruning = Pruning {
@@ -388,7 +395,9 @@ impl Querier {
                 ));
             }
             for batch in &hot.batches {
-                services.extend(service_names(batch)?);
+                for service in service_names(batch)? {
+                    admit(&mut services, &service, limit)?;
+                }
             }
         }
         let batch = RecordBatch::try_new(
@@ -757,6 +766,18 @@ fn service_names(batch: &RecordBatch) -> Result<Vec<String>, QueryError> {
         .flatten()
         .map(str::to_owned)
         .collect())
+}
+
+/// Adds `service` to `services` unless that would exceed `limit`.
+fn admit(services: &mut BTreeSet<String>, service: &str, limit: usize) -> Result<(), QueryError> {
+    if services.contains(service) {
+        return Ok(());
+    }
+    if services.len() >= limit {
+        return Err(QueryError::TooManyRows(limit));
+    }
+    services.insert(service.to_owned());
+    Ok(())
 }
 
 fn one_batch(batch: RecordBatch) -> SendableRecordBatchStream {

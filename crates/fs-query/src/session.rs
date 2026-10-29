@@ -80,6 +80,7 @@ pub fn tenant_session(
             store_url.clone(),
             Signal::AttributeKeys,
             attribute_keys::attribute_keys_schema_v1(),
+            attribute_keys::check_schema,
         )),
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());

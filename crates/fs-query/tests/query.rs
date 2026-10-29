@@ -1373,7 +1373,19 @@ async fn metadata_services_action_lists_the_services_of_the_tenant() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
-    assert_eq!(counters.metadata_lookups.load(Ordering::Relaxed), 2);
+    let err = action(&mut client, METADATA_SERVICES, r#"{"limit": 1}"#)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Code::ResourceExhausted,
+        "two services, one allowed: {err}"
+    );
+    let two = action(&mut client, METADATA_SERVICES, r#"{"limit": 2}"#)
+        .await
+        .unwrap();
+    assert_eq!(strings(&two, "service_name"), ["api", "worker"]);
+    assert_eq!(counters.metadata_lookups.load(Ordering::Relaxed), 4);
     assert_eq!(
         counters.plannings.load(Ordering::Relaxed),
         0,
@@ -1468,7 +1480,9 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
     let mut stats = fs_schema::attribute_keys::KeyStats::default();
     let mut builder = SpanBatchBuilder::new(Limits::default());
     builder.append_request(&request("api", 1, T0, 3)).unwrap();
-    stats.absorb(&builder.finish().unwrap()).unwrap();
+    stats
+        .absorb(&builder.finish().unwrap(), usize::MAX)
+        .unwrap();
     let bytes = fs_schema::attribute_keys::encode(&stats).unwrap();
     let id = FileId::new();
     let path = format!(
@@ -1480,6 +1494,7 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         .put(&Path::from(path.as_str()), bytes.clone().into())
         .await
         .unwrap();
+    let all_path = path.clone();
     let (first, last) = stats.range().unwrap();
     f.db.catalog
         .register_file(&NewFile {
@@ -1554,6 +1569,38 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         theirs.iter().map(RecordBatch::num_rows).sum::<usize>(),
         0,
         "no table of their own, nothing of ours"
+    );
+
+    // A table of a version this reader does not know fails the query,
+    // over the action and over SQL alike, instead of being read as v1.
+    let batch = stats.to_batch().unwrap();
+    let mut metadata = batch.schema().metadata().clone();
+    metadata.insert("fusescope.schema_version".into(), "2".into());
+    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        batch.schema().fields().clone(),
+        metadata,
+    ));
+    let foreign = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+    let mut writer =
+        datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+    writer.write(&foreign).unwrap();
+    let v2 = writer.into_inner().unwrap();
+    std::fs::write(f.dir.path().join("bucket").join(&all_path), v2).unwrap();
+    let err = action(&mut client, METADATA_KEYS, r#"{"signal": "traces"}"#)
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("not readable by this version"),
+        "{err}"
+    );
+    let err = f
+        .querier
+        .collect(f.tenant, "select key from attribute_keys")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not readable by this version"),
+        "{err}"
     );
 
     stop(shutdown, server).await;
@@ -1740,7 +1787,10 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
     assert_eq!(count(&rows), 12);
     assert!(warnings.is_empty(), "{warnings:?}");
     let (stream, _) = querier
-        .metadata_services(tenant, fs_query::actions::Range::default())
+        .metadata_services(
+            tenant,
+            fs_query::actions::ServicesQuery::within(fs_query::actions::Range::default()),
+        )
         .await
         .unwrap();
     let listed: Vec<RecordBatch> = stream.try_collect().await.unwrap();

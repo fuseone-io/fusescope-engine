@@ -108,13 +108,13 @@ impl FlightSql {
                 within(deadline, limits, self.querier.trace_lookup(tenant, query)).await
             }
             METADATA_SERVICES => {
-                let range = ServicesLookup::parse(&action.body)
+                let query = ServicesLookup::parse(&action.body)
                     .and_then(|lookup| lookup.query())
                     .map_err(invalid)?;
                 within(
                     deadline,
                     limits,
-                    self.querier.metadata_services(tenant, range),
+                    self.querier.metadata_services(tenant, query),
                 )
                 .await
             }

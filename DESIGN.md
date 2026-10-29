@@ -571,16 +571,26 @@ Derived tables replacing the ClickHouse materialized views:
 `t/{tenant}/derived/attribute_keys/dt=…/hr=…/{id}.parquet`, partitioned by
 the hour of the pass that rebuilt it, with `key`, `source` (`resource`,
 `span`, `scope`), `type` (`string`, `number`, `bool`), `count` of spans
-carrying the key, `first_seen` and `last_seen`. Every L0 to L1 pass counts
-the keys of the rows it merges, folds in the tenant's table before, uploads
-the new table under the create-once rule and swaps it in with the L1
-outputs, quarantining the table before, so a crash before the swap leaves
-the new table an orphan and the table before in place; a table before that
-cannot be read is replaced by what the pass saw and counted
-(`fusescope_compaction_derived_unreadable_total`). Keys of rows not yet
+carrying the key, counted once per span however often a span repeats a
+key, `first_seen` and `last_seen`. Every L0 to L1 pass reads the tenant's
+table before, counts the keys of the rows it merges into it, uploads the
+new table under the create-once rule and swaps it in with the L1 outputs,
+quarantining the table before, so a crash before the swap leaves the new
+table an orphan and the table before in place. Any failure to read the
+table before, transient or not, ends the pass before anything is created
+(`fusescope_compaction_derived_unreadable_total`): the history is never
+replaced by one pass's view, and a table damaged for good is repaired by an
+operator, by rebuilding it from the L1 files, which is not automated yet.
+A pass admits at most the tenant's `max_keys_hour` keys new to the table,
+in merge order, so which keys an hour adds is the same for the same rows,
+and never allocates for a key beyond that
+(`fusescope_compaction_derived_keys_dropped_total`); an hour merged over
+several passes may admit that many per pass. Keys of rows not yet
 compacted are not listed: the table lags ingestion by the hour close delay.
-The format carries its version in the schema metadata and a reader that
-meets another refuses the file.
+The format carries its signal and version in the schema metadata; the
+compactor and the querier both check them before reading a file and refuse
+anything else, so an older engine never rewrites a newer table and a
+newer table is never read as an older one.
 
 Retention: the compactor deletes day prefixes beyond the tenant's
 `retention_days`, first in the catalog, then in the bucket. Bucket lifecycle
@@ -720,11 +730,13 @@ every column of the spans table for that trace in
 `timestamp` order; it goes through the spans table like SQL would, so the
 `trace_id` sidecars, the hot window and the byte budget apply, without
 parsing or planning SQL (`fusescope_query_trace_lookups_total`).
-`metadata.services` takes `{"start_unix_nano": n, "end_unix_nano": n}` and
-answers the distinct `service_name` of the tenant, sorted, from the
-catalog alone: the services of every file overlapping the range, so a
-range answers at file granularity, plus what the ingesters still hold when
-the range touches the recent window; no file is read.
+`metadata.services` takes `{"start_unix_nano": n, "end_unix_nano": n,
+"limit": n}` and answers the distinct `service_name` of the tenant, sorted,
+from the catalog alone: the services of every file overlapping the range,
+so a range answers at file granularity, plus what the ingesters still hold
+when the range touches the recent window; no file is read, and more
+services than the limit is `RESOURCE_EXHAUSTED` as soon as it is known,
+so the answer never holds more than that.
 `metadata.operations` takes `{"service_name": s, "start_unix_nano": n,
 "end_unix_nano": n, "limit": n}` and answers the span `name`s of that
 service with their span counts, most frequent first, through the spans
