@@ -12,7 +12,7 @@ services:
       POSTGRES_PASSWORD: fusescope
       POSTGRES_DB: fusescope
     ports:
-      - "55432:5432"
+      - "${FS_DEV_POSTGRES_PORT:-55432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fusescope -d fusescope"]
       interval: 2s

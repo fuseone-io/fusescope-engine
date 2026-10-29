@@ -1,6 +1,7 @@
 # Developer entry points. CI runs the same commands.
 
-export FS_TEST_DATABASE_URL ?= postgres://fusescope:fusescope@localhost:55432/fusescope
+export FS_DEV_POSTGRES_PORT ?= 55432
+export FS_TEST_DATABASE_URL ?= postgres://fusescope:fusescope@localhost:$(FS_DEV_POSTGRES_PORT)/fusescope
 export FS_TEST_S3_ENDPOINT  ?= http://localhost:9100
 
 # Builds and tests are throttled so a developer machine stays usable:

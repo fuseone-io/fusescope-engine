@@ -11,7 +11,8 @@ not part of CI.
 
 ## Services
 
-`make dev-up` starts Postgres on `localhost:55432` and an S3-compatible
+`make dev-up` starts Postgres on `localhost:55432` (`FS_DEV_POSTGRES_PORT`
+changes it, in compose and in every make target) and an S3-compatible
 store on `localhost:9100`, and creates the `fusescope` bucket. A prefix
 belongs to one catalog: the engine marks it with the catalog's identity on
 first start and refuses a prefix marked for another, since the orphan sweep

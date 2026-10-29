@@ -40,7 +40,7 @@ shutdown). What comes next, in order, is in [docs/ROADMAP.md](docs/ROADMAP.md).
 ## Development
 
 ```sh
-make dev-up               # Postgres on :55432 and an S3 store (RustFS) on :9100 via Docker
+make dev-up               # Postgres on :55432 (FS_DEV_POSTGRES_PORT) and an S3 store (RustFS) on :9100 via Docker
 make test                 # cargo test, throttled (JOBS, TEST_THREADS, nice), with FS_TEST_DATABASE_URL pointing at that Postgres
 make test-full            # the same suite with every core
 make lint                 # fmt and clippy
