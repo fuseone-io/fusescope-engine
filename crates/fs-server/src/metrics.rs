@@ -452,6 +452,7 @@ impl Metrics {
             counter(out, name, help, value);
         }
         render_orphans(out, o);
+        render_retention(out, &stats.retention);
     }
 
     fn render_query(&self, out: &mut String) {
@@ -582,6 +583,64 @@ fn render_orphans(out: &mut String, o: &fs_compactor::OrphanStats) {
             "fusescope_orphan_delete_failures_total",
             "Deletes that failed and wait their backoff",
             load(&o.delete_failures),
+        ),
+    ] {
+        counter(out, name, help, value);
+    }
+}
+
+fn render_retention(out: &mut String, r: &fs_compactor::RetentionStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    for (name, help, value) in [
+        (
+            "fusescope_retention_passes_total",
+            "Retention passes that quarantined files beyond their tenant's cut",
+            load(&r.passes),
+        ),
+        (
+            "fusescope_retention_expired_total",
+            "Files quarantined by retention",
+            load(&r.expired),
+        ),
+        (
+            "fusescope_retention_lease_lost_total",
+            "Retention passes refused because the lease had changed hands",
+            load(&r.lease_lost),
+        ),
+        (
+            "fusescope_retention_failures_total",
+            "Retention passes that failed for any other reason",
+            load(&r.failures),
+        ),
+        (
+            "fusescope_retention_rebuilds_total",
+            "attribute_keys tables rebuilt from the L1 files that remain, or removed",
+            load(&r.rebuilds),
+        ),
+        (
+            "fusescope_retention_rebuild_skipped_total",
+            "Tenants whose remaining L1 files exceed the rebuild cap, reported once",
+            load(&r.rebuild_skipped),
+        ),
+        (
+            "fusescope_retention_rebuild_lease_lost_total",
+            "Rebuild swaps refused because the lease had changed hands",
+            load(&r.rebuild_lease_lost),
+        ),
+        (
+            "fusescope_retention_rebuild_conflicts_total",
+            "Rebuild swaps refused because the table before was no longer visible",
+            load(&r.rebuild_conflicts),
+        ),
+        (
+            "fusescope_retention_rebuild_failures_total",
+            "Rebuilds that failed before or at the swap for any other reason",
+            load(&r.rebuild_failures),
+        ),
+        (
+            "fusescope_retention_rebuild_orphaned_total",
+            "Tables uploaded by rebuilds that did not publish them",
+            load(&r.rebuild_orphaned),
         ),
     ] {
         counter(out, name, help, value);
@@ -766,6 +825,11 @@ mod tests {
             .derived_keys_dropped
             .fetch_add(7, Ordering::Relaxed);
         compactor.orphans.deleted.fetch_add(6, Ordering::Relaxed);
+        compactor.retention.expired.fetch_add(5, Ordering::Relaxed);
+        compactor
+            .retention
+            .rebuild_orphaned
+            .fetch_add(2, Ordering::Relaxed);
         metrics.register_compactor(compactor);
         let page = metrics.render();
         assert!(
@@ -790,6 +854,18 @@ mod tests {
         );
         assert!(
             page.contains("fusescope_compaction_derived_keys_dropped_total 7\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_retention_expired_total 5\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_retention_rebuild_orphaned_total 2\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_retention_rebuilds_total 0\n"),
             "{page}"
         );
         let query = Arc::new(fs_query::QueryStats::default());

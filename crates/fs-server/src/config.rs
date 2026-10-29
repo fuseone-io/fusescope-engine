@@ -673,6 +673,17 @@ pub struct CompactorConfig {
     /// try, times the number of failures so far, up to six times.
     #[serde(default = "default_sweep_delete_backoff")]
     pub sweep_delete_backoff_secs: u64,
+    /// How often files beyond their tenant's `retention_days` are looked
+    /// for; the cut is a UTC day boundary on the catalog's clock.
+    #[serde(default = "default_retention_interval")]
+    pub retention_interval_secs: u64,
+    /// Most files one retention pass quarantines.
+    #[serde(default = "default_retention_files_per_pass")]
+    pub retention_files_per_pass: i64,
+    /// Most bytes of L1 files one `attribute_keys` rebuild reads after
+    /// retention; a tenant above it keeps its table.
+    #[serde(default = "default_rebuild_max_bytes")]
+    pub rebuild_max_bytes: u64,
 }
 
 impl Default for CompactorConfig {
@@ -692,6 +703,9 @@ impl Default for CompactorConfig {
             sweep_objects_per_pass: default_sweep_objects(),
             sweep_deletes_per_pass: default_sweep_deletes(),
             sweep_delete_backoff_secs: default_sweep_delete_backoff(),
+            retention_interval_secs: default_retention_interval(),
+            retention_files_per_pass: default_retention_files_per_pass(),
+            rebuild_max_bytes: default_rebuild_max_bytes(),
         }
     }
 }
@@ -724,8 +738,27 @@ impl CompactorConfig {
                 delete_backoff: std::time::Duration::from_secs(self.sweep_delete_backoff_secs),
                 inject_delete_failure: None,
             },
+            retention_interval: std::time::Duration::from_secs(self.retention_interval_secs),
+            retention: fs_compactor::RetentionConfig {
+                files_per_pass: self.retention_files_per_pass,
+                rebuild_max_bytes: self.rebuild_max_bytes,
+                batch_rows: row_group_rows,
+                inject_swap_failures: 0,
+            },
         }
     }
+}
+
+fn default_retention_interval() -> u64 {
+    3600
+}
+
+fn default_retention_files_per_pass() -> i64 {
+    1000
+}
+
+fn default_rebuild_max_bytes() -> u64 {
+    256 * 1024 * 1024 * 1024
 }
 
 fn default_orphan_interval() -> u64 {
@@ -951,6 +984,14 @@ impl Config {
         {
             return invalid(
                 "compactor.orphan_ttl_secs must be at least 60 and orphan_interval_secs, sweep_objects_per_pass, sweep_deletes_per_pass and sweep_delete_backoff_secs positive",
+            );
+        }
+        if self.compactor.retention_interval_secs == 0
+            || self.compactor.retention_files_per_pass <= 0
+            || self.compactor.rebuild_max_bytes == 0
+        {
+            return invalid(
+                "compactor.retention_interval_secs, retention_files_per_pass and rebuild_max_bytes must be positive",
             );
         }
 
@@ -1509,6 +1550,39 @@ mod tests {
         )
         .unwrap();
         assert!(edge.validate(&secrets).is_ok());
+    }
+
+    #[test]
+    fn retention_knobs_convert_and_validate() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let config = Config::parse(MINIMAL).unwrap();
+        let compactor = config.compactor.to_compactor(config.ingest.row_group_rows);
+        assert_eq!(compactor.retention_interval.as_secs(), 3600);
+        assert_eq!(compactor.retention.files_per_pass, 1000);
+        assert_eq!(compactor.retention.rebuild_max_bytes, 256 << 30);
+        assert_eq!(compactor.retention.batch_rows, config.ingest.row_group_rows);
+        assert_eq!(compactor.retention.inject_swap_failures, 0);
+        for bad in [
+            "retention_interval_secs = 0",
+            "retention_files_per_pass = 0",
+            "retention_files_per_pass = -1",
+            "rebuild_max_bytes = 0",
+        ] {
+            let err = Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"
+            ))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("compactor.retention_interval_secs"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

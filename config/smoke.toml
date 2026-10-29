@@ -49,6 +49,7 @@ max_inputs_per_pass = 16
 max_input_bytes = 2147483648
 orphan_interval_secs = 3600
 orphan_ttl_secs = 3600
+retention_interval_secs = 15
 
 [log]
 level = "info"
