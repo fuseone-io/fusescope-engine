@@ -580,7 +580,9 @@ table an orphan and the table before in place. Any failure to read the
 table before, transient or not, ends the pass before anything is created
 (`fusescope_compaction_derived_unreadable_total`): the history is never
 replaced by one pass's view, and a table damaged for good is repaired by an
-operator, by rebuilding it from the L1 files, which is not automated yet.
+operator, by rebuilding it from the L1 files, which is not automated: the
+rebuild retention runs takes its admissions from the table before, so it
+needs one it can read.
 Every key records the hour whose budget admitted it (`admitted_hour`),
 fixed once admitted, so late data of an earlier hour widens a known
 key's count and sightings and never moves its charge, and an hour admits
@@ -602,10 +604,38 @@ queries that meet a new path at the same time, since an object is never
 rewritten, and refuse anything else, so an older engine never rewrites a
 newer table and a file is never read as a version it is not.
 
-Retention: the compactor deletes day prefixes beyond the tenant's
-`retention_days`, first in the catalog, then in the bucket. Bucket lifecycle
-rules are the safety net, never the primary mechanism, because the catalog
-must never point at files that do not exist.
+Retention: every `compactor.retention_interval_secs` the leader quarantines
+the files beyond their tenant's `retention_days`, first in the catalog,
+then in the bucket. The cut is a UTC day boundary on the catalog's clock,
+the start of the current day minus `retention_days`, and a file is beyond
+it when every row of it ended before, so whole hour partitions of whole
+days go and a file at the boundary stays. A pass takes the tenant whose
+expired file is the oldest and quarantines up to
+`compactor.retention_files_per_pass` of its files, oldest first, under the
+fence (`expire_files_fenced`); the objects follow at the purge after
+`compactor.quarantine_ttl_secs`, with their sidecars, as after a swap, so
+a reader that opened one finishes. A crash anywhere leaves the catalog
+ahead of the bucket, never behind it, queries right, and the next pass
+continues with what is left; the orphan sweep removes whatever a day
+prefix keeps beyond that. Bucket lifecycle rules are the safety net, never
+the primary mechanism, because the catalog must never point at files that
+do not exist. The `attribute_keys` table is a count over every row ever
+compacted, with no per-day contribution to subtract, so once a tenant has
+no expired file left and its table still lists a sighting before the cut
+(`stale_derived_table`), the table is rebuilt from the L1 files that remain
+at or after the cut, reading the timestamp and attribute columns only, one
+batch at a time: a key is listed with the hour that admitted it in the
+table before, a key the table before does not list stays out, as it was
+when its files were compacted, and the budgets of the hours gone are not
+re-spent. The new table is uploaded under the create-once rule and swapped
+in under the fence, the table before quarantined with it, or the table
+before is swapped out alone when nothing remains. A rebuild that does not
+commit, for a lost lease, a conflict, an unreadable table before or L1
+file, or a crash, leaves the table before in place and the new table an
+orphan (`fusescope_retention_rebuild_*`). A tenant whose remaining L1
+files exceed `compactor.rebuild_max_bytes` keeps its table and is reported
+once; the operator raises the cap or waits for retention to shrink the
+set.
 
 ### 7.2 Orphan sweep
 

@@ -98,7 +98,9 @@ Then read back, in this order, and compare with what was exported:
 `not ready` with `draining=true` from the moment of the `SIGTERM`.
 `curl 127.0.0.1:9464/metrics` shows each step: `fusescope_ingest_requests_total`,
 `fusescope_flush_total`, `fusescope_compaction_passes_total`,
-`fusescope_compaction_derived_total`, `fusescope_query_*`.
+`fusescope_compaction_derived_total`, `fusescope_query_*`; the
+`fusescope_retention_*` counters stay at zero, since nothing the run
+ingests is a day old.
 
 Last run: 2026-10-29, every step as described, no warning or error in the
 log across both runs.
