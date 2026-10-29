@@ -658,15 +658,21 @@ Arrow Flight over gRPC with mTLS between backend and queriers. Two kinds of
 operation:
 
 **Flight SQL** for everything that is generated SQL in the `statementbuilder`
-packages today. A statement is planned once: `GetFlightInfo` plans it,
-returns its schema and keeps the plan under a random handle bound to the
-tenant, and the ticket carries the tenant, the handle and the SQL; `DoGet`
-re-authenticates, refuses a ticket of another tenant, executes the kept
-plan and drops it, and only plans the SQL again when the plan is gone,
-which happens after `query.prepared_ttl_secs` (60), beyond
-`query.prepared_plans` kept at once (1024, oldest dropped first), on a
-second `DoGet` of the same ticket, or on another querier than the one that
-prepared it. Dialect: DataFusion, close to PostgreSQL. Functions registered
+packages today. The ticket is the tenant id followed by the SQL, and has
+been since the first version, so a ticket issued by any engine version
+executes on any other. A statement is planned once: `GetFlightInfo` plans
+it, returns its schema and keeps the plan, keyed by tenant and SQL, oldest
+first; `DoGet` re-authenticates, refuses a ticket of another tenant,
+executes the oldest kept plan for its tenant and SQL and drops it, and only
+plans the SQL again when no plan waits: after `query.prepared_ttl_secs`
+(60; a reaper drops expired plans as they come due, whether or not anything
+else happens), beyond `query.prepared_plans` kept at once (1024) or
+`query.prepared_bytes` retained together (64 MiB, estimated as SQL plus
+displayed plan plus a 64 KiB allowance per session state; a plan over the
+budget on its own is not kept), oldest dropped first, on a second `DoGet`
+of the same ticket, or on another querier than the one that prepared it.
+`fusescope_query_prepared_plans` and `fusescope_query_prepared_bytes` show
+what waits. Dialect: DataFusion, close to PostgreSQL. Functions registered
 by the engine: `attr_string(attributes, 'http.method')`, `attr_number(...)`,
 `attr_bool(...)`, `has_attr(...)`, `body_contains(body, 'text')`,
 `time_bucket(interval, ts)`, `quantile_tdigest(col, 0.99)`.

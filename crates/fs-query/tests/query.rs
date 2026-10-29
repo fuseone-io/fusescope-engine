@@ -17,11 +17,13 @@ use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::Ticket;
 use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::sql::{Any, TicketStatementQuery};
 use datafusion::logical_expr::{col, lit};
 use datafusion::scalar::ScalarValue;
 use fs_catalog::{Catalog, NewTenant, TenantId, TokenScope};
 use fs_ingest::flush;
 use fs_query::flight::FlightSql;
+use fs_query::querier::PREPARED_PLAN_OVERHEAD;
 use fs_query::{Querier, QueryError, QueryLimits};
 use fs_schema::limits::Limits;
 use fs_schema::spans::SpanBatchBuilder;
@@ -33,6 +35,7 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use prost::Message;
 use sqlx::{Connection, Executor, PgConnection};
 use tonic::Code;
 use tonic::transport::Channel;
@@ -734,10 +737,32 @@ async fn rows_of(client: &mut FlightSqlServiceClient<Channel>, ticket: Ticket) -
 
 const BY_SERVICE: &str =
     "select service_name, count(*) as n from spans group by service_name order by n desc";
+const COUNT_ALL: &str = "select count(*) as n from spans";
+const SERVICES: &str = "select distinct service_name from spans";
+
+/// The ticket as the engine issued it before plans were kept: the tenant id
+/// followed by the SQL.
+fn ticket_before_prepared_plans(tenant: TenantId, sql: &str) -> Ticket {
+    let mut handle = tenant.0.as_bytes().to_vec();
+    handle.extend_from_slice(sql.as_bytes());
+    let statement = TicketStatementQuery {
+        statement_handle: handle.into(),
+    };
+    Ticket::new(Any::pack(&statement).unwrap().encode_to_vec())
+}
+
+async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// `GetFlightInfo` plans the statement once and `DoGet` executes that plan;
 /// the plan is consumed, so the same ticket presented again plans its SQL
-/// again and still answers.
+/// again and still answers. The ticket is the one the previous version
+/// issued and read, byte for byte, so either version serves the other's.
 #[tokio::test]
 async fn a_statement_is_planned_once_between_get_flight_info_and_do_get() {
     let Some(f) = fixture().await else { return };
@@ -754,6 +779,11 @@ async fn a_statement_is_planned_once_between_get_flight_info_and_do_get() {
     assert_eq!(stats.plannings.load(Ordering::Relaxed), 1);
     assert_eq!(f.querier.prepared_count(), 1);
     let ticket = info.endpoint[0].ticket.clone().unwrap();
+    assert_eq!(
+        ticket,
+        ticket_before_prepared_plans(f.tenant, BY_SERVICE),
+        "the previous version reads this ticket"
+    );
     assert_eq!(rows_of(&mut client, ticket.clone()).await, 2);
     assert_eq!(
         stats.plannings.load(Ordering::Relaxed),
@@ -771,6 +801,14 @@ async fn a_statement_is_planned_once_between_get_flight_info_and_do_get() {
     assert_eq!(stats.plannings.load(Ordering::Relaxed), 2);
     assert_eq!(stats.prepared_misses.load(Ordering::Relaxed), 1);
 
+    let previous = ticket_before_prepared_plans(f.tenant, COUNT_ALL);
+    assert_eq!(
+        rows_of(&mut client, previous).await,
+        1,
+        "a ticket issued by the previous version executes"
+    );
+    assert_eq!(stats.prepared_misses.load(Ordering::Relaxed), 2);
+
     shutdown.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)
         .await
@@ -780,9 +818,11 @@ async fn a_statement_is_planned_once_between_get_flight_info_and_do_get() {
     f.db.finish().await;
 }
 
-/// A prepared plan is dropped after its TTL or to make room beyond the cap,
-/// oldest first; its ticket plans the SQL again. A ticket of one tenant
-/// presented with another tenant's token is refused and consumes nothing.
+/// A prepared plan is dropped when its TTL passes, by the reaper and not by
+/// a later `prepare`, or to make room beyond the cap, oldest first; its
+/// ticket plans the SQL again. A ticket of one tenant presented with another
+/// tenant's token is refused and consumes nothing. Identical statements
+/// prepared twice are kept twice.
 #[tokio::test]
 async fn a_ticket_whose_plan_is_gone_plans_again() {
     let Some(mut f) = fixture().await else { return };
@@ -812,9 +852,15 @@ async fn a_ticket_whose_plan_is_gone_plans_again() {
     let mut client = sql_client(addr, &token).await;
     let counters = f.querier.stats();
 
-    // Expired.
+    // Expired: the reaper drops it with nothing else going on.
     let info = client.execute(BY_SERVICE.into(), None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(f.querier.prepared_count(), 1);
+    wait_until("the expired plan is reaped", || {
+        f.querier.prepared_count() == 0
+    })
+    .await;
+    assert_eq!(f.querier.prepared_bytes(), 0);
+    assert_eq!(counters.prepared.load(Ordering::Relaxed), 0);
     let ticket = info.endpoint[0].ticket.clone().unwrap();
     assert_eq!(rows_of(&mut client, ticket).await, 2);
     assert_eq!(counters.prepared_misses.load(Ordering::Relaxed), 1);
@@ -822,8 +868,8 @@ async fn a_ticket_whose_plan_is_gone_plans_again() {
 
     // Beyond the cap: the oldest of three is dropped.
     let first = client.execute(BY_SERVICE.into(), None).await.unwrap();
-    let second = client.execute(BY_SERVICE.into(), None).await.unwrap();
-    let third = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    let second = client.execute(COUNT_ALL.into(), None).await.unwrap();
+    let third = client.execute(SERVICES.into(), None).await.unwrap();
     assert_eq!(f.querier.prepared_count(), 2);
     let plannings = counters.plannings.load(Ordering::Relaxed);
     assert_eq!(
@@ -832,7 +878,7 @@ async fn a_ticket_whose_plan_is_gone_plans_again() {
     );
     assert_eq!(
         rows_of(&mut client, second.endpoint[0].ticket.clone().unwrap()).await,
-        2
+        1
     );
     assert_eq!(
         counters.plannings.load(Ordering::Relaxed),
@@ -863,12 +909,95 @@ async fn a_ticket_whose_plan_is_gone_plans_again() {
     assert_eq!(rows_of(&mut client, ticket).await, 2);
     assert_eq!(counters.prepared_hits.load(Ordering::Relaxed), hits + 1);
 
+    // The same statement prepared twice: both plans wait, both are hit.
+    let twice = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    let again = client.execute(BY_SERVICE.into(), None).await.unwrap();
+    assert_eq!(f.querier.prepared_count(), 2);
+    assert_eq!(
+        rows_of(&mut client, twice.endpoint[0].ticket.clone().unwrap()).await,
+        2
+    );
+    assert_eq!(
+        rows_of(&mut client, again.endpoint[0].ticket.clone().unwrap()).await,
+        2
+    );
+    assert_eq!(counters.prepared_hits.load(Ordering::Relaxed), hits + 3);
+    assert_eq!(f.querier.prepared_count(), 0);
+
     shutdown.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    f.db.finish().await;
+}
+
+/// The plans kept are bounded by the bytes they are estimated to retain,
+/// oldest dropped first; a plan over the budget on its own is not kept and
+/// drops nothing. The gauges follow.
+#[tokio::test]
+async fn prepared_plans_are_bounded_by_the_bytes_they_retain() {
+    let Some(f) = fixture().await else { return };
+    let querier = |prepared_bytes| {
+        Querier::new(
+            f.db.catalog.clone(),
+            Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
+            None,
+            QueryLimits {
+                prepared_bytes,
+                ..QueryLimits::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let probe = querier(usize::MAX);
+    probe.prepare(f.tenant, BY_SERVICE).await.unwrap();
+    let one = probe.prepared_bytes();
+    assert!(one >= PREPARED_PLAN_OVERHEAD + BY_SERVICE.len(), "{one}");
+    assert_eq!(
+        probe.stats().prepared_bytes.load(Ordering::Relaxed),
+        one as u64
+    );
+
+    let q = querier(one + one / 2);
+    let counters = q.stats();
+    q.prepare(f.tenant, BY_SERVICE).await.unwrap();
+    q.prepare(f.tenant, COUNT_ALL).await.unwrap();
+    assert_eq!(q.prepared_count(), 1, "the oldest made room");
+    assert!(q.prepared_bytes() <= one + one / 2);
+    assert_eq!(counters.prepared.load(Ordering::Relaxed), 1);
+    assert!(
+        q.execute_prepared(f.tenant, BY_SERVICE)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        q.execute_prepared(f.tenant, COUNT_ALL)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(q.prepared_count(), 0);
+    assert_eq!(q.prepared_bytes(), 0);
+
+    q.prepare(f.tenant, COUNT_ALL).await.unwrap();
+    let padding = "x".repeat(2 * one);
+    let huge = format!("{BY_SERVICE} /* {padding} */");
+    q.prepare(f.tenant, &huge).await.unwrap();
+    assert_eq!(q.prepared_count(), 1, "the one over budget was not kept");
+    assert!(q.execute_prepared(f.tenant, &huge).await.unwrap().is_none());
+    assert!(
+        q.execute_prepared(f.tenant, COUNT_ALL)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(counters.prepared_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.prepared_hits.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.prepared_bytes.load(Ordering::Relaxed), 0);
     f.db.finish().await;
 }
 

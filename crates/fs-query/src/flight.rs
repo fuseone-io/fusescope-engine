@@ -2,10 +2,11 @@
 //!
 //! Clients authenticate with `authorization: Bearer <query token>`. A
 //! statement is planned on `GetFlightInfo` (so schema and errors surface
-//! early), kept under a handle, and executed on `DoGet` from that plan.
-//! The ticket carries the tenant id, the handle and the SQL: `DoGet`
-//! re-authenticates, refuses a ticket from another tenant, and plans the
-//! SQL again only when the kept plan is gone.
+//! early), kept by the querier, and executed on `DoGet` from that plan.
+//! The ticket is the tenant id followed by the SQL, unchanged since before
+//! plans were kept, so a ticket issued by either version executes on the
+//! other: `DoGet` re-authenticates, refuses a ticket from another tenant,
+//! and plans the SQL again only when no kept plan matches it.
 
 use std::pin::Pin;
 
@@ -25,7 +26,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use crate::QueryError;
-use crate::querier::{PreparedHandle, Querier};
+use crate::querier::Querier;
 
 /// Response header set when the result may be incomplete, with the reasons.
 pub const PARTIAL_HEADER: &str = "x-fusescope-partial";
@@ -96,23 +97,20 @@ impl FlightSql {
     }
 }
 
-/// Ticket payload: tenant id, prepared plan handle, then SQL text.
-fn encode_handle(tenant: TenantId, prepared: PreparedHandle, sql: &str) -> bytes::Bytes {
-    let mut out = Vec::with_capacity(32 + sql.len());
+/// Ticket payload: tenant id then SQL text.
+fn encode_ticket(tenant: TenantId, sql: &str) -> bytes::Bytes {
+    let mut out = Vec::with_capacity(16 + sql.len());
     out.extend_from_slice(tenant.0.as_bytes());
-    out.extend_from_slice(prepared.as_bytes());
     out.extend_from_slice(sql.as_bytes());
     bytes::Bytes::from(out)
 }
 
-fn decode_handle(handle: &[u8]) -> Result<(TenantId, PreparedHandle, String), Status> {
+fn decode_ticket(handle: &[u8]) -> Result<(TenantId, String), Status> {
     let bad = || Status::invalid_argument("bad ticket");
-    let (id, rest) = handle.split_at_checked(16).ok_or_else(bad)?;
-    let (prepared, sql) = rest.split_at_checked(16).ok_or_else(bad)?;
+    let (id, sql) = handle.split_at_checked(16).ok_or_else(bad)?;
     let tenant = uuid::Uuid::from_slice(id).map_err(|_| bad())?;
-    let prepared = uuid::Uuid::from_slice(prepared).map_err(|_| bad())?;
     let sql = std::str::from_utf8(sql).map_err(|_| bad())?;
-    Ok((TenantId(tenant), prepared, sql.to_owned()))
+    Ok((TenantId(tenant), sql.to_owned()))
 }
 
 fn status_of(error: &QueryError) -> Status {
@@ -148,13 +146,13 @@ impl FlightSqlService for FlightSql {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let tenant = self.authenticate(request.metadata()).await?;
-        let (prepared, schema): (PreparedHandle, SchemaRef) = self
+        let schema: SchemaRef = self
             .querier
             .prepare(tenant, &query.query)
             .await
             .map_err(|e| status_of(&e))?;
         let ticket = TicketStatementQuery {
-            statement_handle: encode_handle(tenant, prepared, &query.query),
+            statement_handle: encode_ticket(tenant, &query.query),
         };
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -176,7 +174,7 @@ impl FlightSqlService for FlightSql {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let tenant = self.authenticate(request.metadata()).await?;
-        let (ticket_tenant, prepared, sql) = decode_handle(&ticket.statement_handle)?;
+        let (ticket_tenant, sql) = decode_ticket(&ticket.statement_handle)?;
         if ticket_tenant != tenant {
             warn!(tenant = %tenant.0, "ticket from another tenant refused");
             return Err(Status::permission_denied(
@@ -186,7 +184,7 @@ impl FlightSqlService for FlightSql {
         let limits = self.querier.limits();
         let kept = self
             .querier
-            .execute_prepared(tenant, prepared)
+            .execute_prepared(tenant, &sql)
             .await
             .map_err(|e| status_of(&e))?;
         let (stream, warnings) = match kept {
@@ -247,18 +245,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn handle_round_trip_and_rejects_garbage() {
+    fn ticket_round_trip_and_rejects_garbage() {
         let tenant = TenantId::new();
-        let prepared = uuid::Uuid::new_v4();
-        let handle = encode_handle(tenant, prepared, "select 1");
+        let ticket = encode_ticket(tenant, "select 1");
         assert_eq!(
-            decode_handle(&handle).unwrap(),
-            (tenant, prepared, "select 1".to_owned())
+            decode_ticket(&ticket).unwrap(),
+            (tenant, "select 1".to_owned())
         );
-        assert!(decode_handle(b"short").is_err());
-        assert!(
-            decode_handle(handle.get(..20).unwrap()).is_err(),
-            "no handle"
+        assert_eq!(
+            ticket.len(),
+            16 + "select 1".len(),
+            "nothing but tenant and SQL"
         );
+        assert!(decode_ticket(b"short").is_err());
     }
 }

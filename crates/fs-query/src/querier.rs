@@ -1,7 +1,7 @@
 //! The querier facade: sessions, limits and execution.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
@@ -56,6 +56,10 @@ pub struct QueryStats {
     /// Tickets whose prepared plan was gone: expired, evicted, consumed, or
     /// prepared by another querier; their SQL was planned again.
     pub prepared_misses: std::sync::atomic::AtomicU64,
+    /// Plans waiting for their `DoGet` right now.
+    pub prepared: std::sync::atomic::AtomicU64,
+    /// Bytes the waiting plans are estimated to retain.
+    pub prepared_bytes: std::sync::atomic::AtomicU64,
     /// Statements that failed to plan or were refused.
     pub errors: std::sync::atomic::AtomicU64,
     /// Rows returned by `collect`.
@@ -91,6 +95,10 @@ pub struct QueryLimits {
     /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
     /// oldest is dropped and its ticket plans again.
     pub prepared_plans: usize,
+    /// Most bytes the kept plans may retain together, as estimated by
+    /// [`retained_bytes`]; the oldest are dropped to make room, and a plan
+    /// that does not fit on its own is not kept at all.
+    pub prepared_bytes: usize,
     /// How long a prepared plan waits for its `DoGet` before it is dropped.
     pub prepared_ttl: Duration,
 }
@@ -105,25 +113,25 @@ impl Default for QueryLimits {
             hot_window: crate::hot::HotWindowConfig::default(),
             trace_index_cache_bytes: 256 * 1024 * 1024,
             prepared_plans: 1024,
+            prepared_bytes: 64 * 1024 * 1024,
             prepared_ttl: Duration::from_secs(60),
         }
     }
 }
 
-/// A statement planned on `GetFlightInfo`, waiting for its `DoGet`.
-struct Prepared {
-    tenant: TenantId,
-    ctx: datafusion::execution::context::SessionContext,
-    plan: LogicalPlan,
-    warnings: Arc<QueryWarnings>,
-    at: std::time::Instant,
-}
-
-/// Opaque handle of a prepared plan, carried by the ticket.
-pub type PreparedHandle = uuid::Uuid;
-
 /// URL under which the engine bucket is registered with DataFusion.
 pub const STORE_URL: &str = "fusescope://bucket/";
+
+/// Allowance for the session state a prepared plan keeps alongside its SQL
+/// and plan text, in bytes.
+pub const PREPARED_PLAN_OVERHEAD: usize = 64 * 1024;
+
+/// Estimate of what a plan kept for `sql` retains: the SQL, the plan with
+/// its schemas as displayed, and [`PREPARED_PLAN_OVERHEAD`]. The heap is not
+/// measured; this is the figure `prepared_bytes` bounds.
+pub fn retained_bytes(sql: &str, plan: &LogicalPlan) -> usize {
+    PREPARED_PLAN_OVERHEAD + sql.len() + plan.display_indent_schema().to_string().len()
+}
 
 /// Shared query engine. Cheap to clone.
 #[derive(Clone)]
@@ -136,7 +144,7 @@ pub struct Querier {
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
     stats: Arc<QueryStats>,
-    prepared: Arc<std::sync::Mutex<HashMap<PreparedHandle, Prepared>>>,
+    prepared: Arc<std::sync::Mutex<PreparedPlans>>,
 }
 
 impl Querier {
@@ -183,8 +191,10 @@ impl Querier {
             runtime,
             store_url,
             limits,
+            prepared: Arc::new(std::sync::Mutex::new(PreparedPlans::new(Arc::clone(
+                &stats,
+            )))),
             stats,
-            prepared: Arc::default(),
         })
     }
 
@@ -262,10 +272,12 @@ impl Querier {
         Ok((ctx, plan, warnings))
     }
 
-    /// Plans `sql` for `tenant` and keeps the plan for one execution under
-    /// the returned handle, for `prepared_ttl` at most. Returns the handle
-    /// and the result schema. When `prepared_plans` plans wait already, the
-    /// oldest is dropped: its ticket plans again when executed.
+    /// Plans `sql` for `tenant`, returns the result schema and keeps the
+    /// plan for one execution of the same `sql` by the same tenant, for
+    /// `prepared_ttl` at most. Beyond `prepared_plans` or `prepared_bytes`
+    /// the oldest plans are dropped and their tickets plan again; a plan
+    /// over `prepared_bytes` on its own is not kept. Identical statements
+    /// prepared concurrently are kept apart and executed oldest first.
     ///
     /// # Errors
     /// See [`Querier::plan`].
@@ -273,52 +285,47 @@ impl Querier {
         &self,
         tenant: TenantId,
         sql: &str,
-    ) -> Result<(PreparedHandle, arrow::datatypes::SchemaRef), QueryError> {
+    ) -> Result<arrow::datatypes::SchemaRef, QueryError> {
         let (ctx, plan, warnings) = self.plan(tenant, sql).await?;
         let schema: arrow::datatypes::SchemaRef = Arc::new(plan.schema().as_arrow().clone());
-        let handle = uuid::Uuid::new_v4();
         let now = std::time::Instant::now();
-        let mut prepared = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
-        prepared.retain(|_, p| now.duration_since(p.at) < self.limits.prepared_ttl);
-        while prepared.len() >= self.limits.prepared_plans.max(1) {
-            let Some(oldest) = prepared.iter().min_by_key(|(_, p)| p.at).map(|(h, _)| *h) else {
-                break;
-            };
-            prepared.remove(&oldest);
+        let prepared = Prepared {
+            tenant,
+            sql: sql.to_owned(),
+            bytes: retained_bytes(sql, &plan),
+            ctx,
+            plan,
+            warnings,
+            at: now,
+        };
+        let mut plans = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
+        plans.drop_expired(now, self.limits.prepared_ttl);
+        if plans.keep(prepared, &self.limits) && !plans.reaping {
+            plans.reaping = true;
+            tokio::spawn(reap_expired(
+                Arc::downgrade(&self.prepared),
+                self.limits.prepared_ttl,
+            ));
         }
-        prepared.insert(
-            handle,
-            Prepared {
-                tenant,
-                ctx,
-                plan,
-                warnings,
-                at: now,
-            },
-        );
-        Ok((handle, schema))
+        Ok(schema)
     }
 
-    /// Executes the plan prepared under `handle` for `tenant`, consuming
-    /// it, or `None` when it is gone: expired, dropped for room, executed
-    /// already, prepared by another querier, or prepared for another
-    /// tenant, which is never served across tenants.
+    /// Executes the oldest plan kept for `sql` by `tenant`, consuming it,
+    /// or `None` when none waits: expired, dropped for room, executed
+    /// already or prepared by another querier. A plan is only ever served
+    /// to the tenant that prepared it.
     ///
     /// # Errors
     /// Physical planning or execution failure.
     pub async fn execute_prepared(
         &self,
         tenant: TenantId,
-        handle: PreparedHandle,
+        sql: &str,
     ) -> Result<Option<(SendableRecordBatchStream, Arc<QueryWarnings>)>, QueryError> {
         let taken = {
-            let mut prepared = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
-            match prepared.get(&handle) {
-                Some(p) if p.tenant == tenant && p.at.elapsed() < self.limits.prepared_ttl => {
-                    prepared.remove(&handle)
-                }
-                _ => None,
-            }
+            let mut plans = self.prepared.lock().map_err(|_| QueryError::Poisoned)?;
+            plans.drop_expired(std::time::Instant::now(), self.limits.prepared_ttl);
+            plans.take(tenant, sql)
         };
         let Some(Prepared {
             ctx,
@@ -342,7 +349,12 @@ impl Querier {
 
     /// Prepared plans waiting for their `DoGet`.
     pub fn prepared_count(&self) -> usize {
-        self.prepared.lock().map_or(0, |p| p.len())
+        self.prepared.lock().map_or(0, |p| p.queue.len())
+    }
+
+    /// Bytes the waiting plans are estimated to retain.
+    pub fn prepared_bytes(&self) -> usize {
+        self.prepared.lock().map_or(0, |p| p.bytes)
     }
 
     /// Executes `sql` for `tenant` as a stream of batches. The stream enforces
@@ -408,5 +420,112 @@ impl Querier {
         tokio::time::timeout(limits.timeout, run)
             .await
             .map_err(|_| QueryError::Timeout(limits.timeout))?
+    }
+}
+
+/// A statement planned on `GetFlightInfo`, waiting for its `DoGet`.
+struct Prepared {
+    tenant: TenantId,
+    sql: String,
+    bytes: usize,
+    ctx: datafusion::execution::context::SessionContext,
+    plan: LogicalPlan,
+    warnings: Arc<QueryWarnings>,
+    at: std::time::Instant,
+}
+
+/// Plans waiting for their `DoGet`, oldest first, so the expired and the
+/// ones dropped for room both leave from the front. `reaping` says a
+/// [`reap_expired`] task is alive for the queue.
+struct PreparedPlans {
+    queue: VecDeque<Prepared>,
+    bytes: usize,
+    reaping: bool,
+    stats: Arc<QueryStats>,
+}
+
+impl PreparedPlans {
+    fn new(stats: Arc<QueryStats>) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            bytes: 0,
+            reaping: false,
+            stats,
+        }
+    }
+
+    fn drop_expired(&mut self, now: std::time::Instant, ttl: Duration) {
+        while self
+            .queue
+            .front()
+            .is_some_and(|p| now.duration_since(p.at) >= ttl)
+        {
+            self.pop_front();
+        }
+        self.publish();
+    }
+
+    /// Keeps `plan`, dropping the oldest until it fits; `false` when it does
+    /// not fit on its own.
+    fn keep(&mut self, plan: Prepared, limits: &QueryLimits) -> bool {
+        if plan.bytes > limits.prepared_bytes {
+            self.publish();
+            return false;
+        }
+        while self.queue.len() >= limits.prepared_plans.max(1)
+            || self.bytes + plan.bytes > limits.prepared_bytes
+        {
+            self.pop_front();
+        }
+        self.bytes += plan.bytes;
+        self.queue.push_back(plan);
+        self.publish();
+        true
+    }
+
+    fn take(&mut self, tenant: TenantId, sql: &str) -> Option<Prepared> {
+        let index = self
+            .queue
+            .iter()
+            .position(|p| p.tenant == tenant && p.sql == sql)?;
+        let plan = self.queue.remove(index)?;
+        self.bytes -= plan.bytes;
+        self.publish();
+        Some(plan)
+    }
+
+    fn pop_front(&mut self) {
+        if let Some(plan) = self.queue.pop_front() {
+            self.bytes -= plan.bytes;
+        }
+    }
+
+    fn next_expiry(&self, ttl: Duration) -> Option<std::time::Instant> {
+        self.queue.front().map(|p| p.at + ttl)
+    }
+
+    fn publish(&self) {
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        self.stats.prepared.store(self.queue.len() as u64, relaxed);
+        self.stats.prepared_bytes.store(self.bytes as u64, relaxed);
+    }
+}
+
+/// Drops the plans of `weak` as they expire, sleeping until the oldest is
+/// due, and ends once nothing waits; the next plan kept starts it again.
+/// Holds no strong reference, so it ends with the querier too.
+async fn reap_expired(weak: Weak<std::sync::Mutex<PreparedPlans>>, ttl: Duration) {
+    loop {
+        let due = {
+            let Some(shared) = weak.upgrade() else { return };
+            let Ok(mut plans) = shared.lock() else { return };
+            plans.drop_expired(std::time::Instant::now(), ttl);
+            let Some(at) = plans.next_expiry(ttl) else {
+                plans.reaping = false;
+                return;
+            };
+            at
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
     }
 }
