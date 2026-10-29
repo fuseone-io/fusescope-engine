@@ -1932,7 +1932,7 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
         .unwrap();
 
     assert!(
-        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, 0)
+        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, None)
             .await
             .unwrap()
             .is_none(),
@@ -2020,19 +2020,33 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
     assert!(quarantined_at.is_some(), "quarantined, for the purge");
 
     let stale_table = c
-        .stale_derived_table(Signal::AttributeKeys, Signal::Traces, 0)
+        .stale_derived_table(Signal::AttributeKeys, Signal::Traces, None)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(stale_table.tenant_id, t);
     assert_eq!(stale_table.table.id, table.id);
     assert_eq!(stale_table.cutoff, cut);
+    assert_eq!(stale_table.key(), (table.range.start, table.id));
     assert!(
-        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, 1)
+        c.stale_derived_table(
+            Signal::AttributeKeys,
+            Signal::Traces,
+            Some(stale_table.key())
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "one stale table: none past it"
+    );
+    let earlier = (table.range.start - Duration::microseconds(1), table.id);
+    assert_eq!(
+        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, Some(earlier))
             .await
             .unwrap()
-            .is_none(),
-        "one stale table"
+            .map(|s| s.table.id),
+        Some(table.id),
+        "past an earlier key it is found again"
     );
     let mut pages = 0;
     let remaining = c
@@ -2083,7 +2097,7 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
     .await
     .unwrap();
     assert!(
-        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, 0)
+        c.stale_derived_table(Signal::AttributeKeys, Signal::Traces, None)
             .await
             .unwrap()
             .is_none()

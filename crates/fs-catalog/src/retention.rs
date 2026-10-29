@@ -24,6 +24,9 @@ pub struct ExpiredFiles {
     pub files: Vec<FileRecord>,
 }
 
+/// Where a stale table sorts: its earliest sighting and id.
+pub type StaleKey = (DateTime<Utc>, crate::FileId);
+
 /// A derived table whose earliest sighting is before its tenant's cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleTable {
@@ -33,6 +36,13 @@ pub struct StaleTable {
     pub table: FileRecord,
     /// The tenant's cut when the table was found.
     pub cutoff: DateTime<Utc>,
+}
+
+impl StaleTable {
+    /// Where this table sorts, to ask for the next one.
+    pub fn key(&self) -> StaleKey {
+        (self.table.range.start, self.table.id)
+    }
 }
 
 /// One file a rebuild reads: what the reader needs and nothing more.
@@ -122,10 +132,12 @@ impl Catalog {
         }))
     }
 
-    /// The `skip`-th visible table of `derived` whose earliest sighting is
-    /// before its tenant's cut while no visible file of `data` of the
-    /// tenant is beyond it: a table to rebuild from the files that remain.
-    /// Earliest sighting first.
+    /// The first visible table of `derived`, by earliest sighting and id,
+    /// past `after`, whose earliest sighting is before its tenant's cut
+    /// while no visible file of `data` of the tenant is beyond it: a table
+    /// to rebuild from the files that remain. `after` is the key of the
+    /// last table returned, so a caller walks the stale tables in rounds,
+    /// each once, however many it passes over.
     ///
     /// # Errors
     /// Database failure, or a row with values outside the domain.
@@ -133,7 +145,7 @@ impl Catalog {
         &self,
         derived: Signal,
         data: Signal,
-        skip: i64,
+        after: Option<StaleKey>,
     ) -> Result<Option<StaleTable>, CatalogError> {
         let row: Option<(DateTime<Utc>, FileRow)> = sqlx::query_as::<_, StaleRow>(&format!(
             "select {CUTOFF} as cutoff,
@@ -146,14 +158,15 @@ impl Catalog {
                    where e.tenant_id = f.tenant_id and e.signal = $3 and e.state = $2
                      and e.ts_max < {CUTOFF}
                )
+               and ($4::timestamptz is null or (f.ts_min, f.id) > ($4, $5))
              order by f.ts_min, f.id
-             offset $4
              limit 1"
         ))
         .bind(derived.code())
         .bind(FileState::Visible.code())
         .bind(data.code())
-        .bind(skip)
+        .bind(after.map(|k| k.0))
+        .bind(after.map(|k| k.1))
         .fetch_optional(self.pool())
         .await?
         .map(|r| (r.cutoff, r.file));
