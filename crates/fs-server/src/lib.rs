@@ -4,6 +4,7 @@
 //! [`server::check`] so integration tests can drive the same code in-process.
 
 pub mod bucket;
+pub mod client;
 pub mod config;
 pub mod metrics;
 pub mod role;
@@ -50,6 +51,9 @@ pub enum ServerError {
     /// Query engine failure.
     #[error("query: {0}")]
     Query(#[from] fs_query::QueryError),
+    /// The operator client could not reach the querier or was refused.
+    #[error("flight: {0}")]
+    Flight(String),
     /// A role task panicked or was cancelled.
     #[error("role {role} stopped unexpectedly: {reason}")]
     RoleStopped {

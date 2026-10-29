@@ -155,6 +155,85 @@ async fn all_roles_start_heartbeat_and_stop_cleanly() {
     db.finish().await;
 }
 
+/// The operator client reaches a running querier with the backend's own
+/// ticket and action bodies: a statement answers, an action answers, a bad
+/// token is refused.
+#[tokio::test]
+async fn the_operator_client_queries_a_running_server() {
+    use fs_server::client;
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    // The port is chosen here, not by the server, so the client knows it.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut cfg = config(dir.path());
+    cfg.server.flight_addr = addr.clone();
+    let (tx, rx) = watch::channel(false);
+    let server = tokio::spawn(server::run(cfg, secrets, Role::All, "test-node".into(), rx));
+
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let tenant = loop {
+        match catalog
+            .create_tenant(&fs_catalog::NewTenant::with_defaults("acme"))
+            .await
+        {
+            Ok(tenant) => break tenant.id,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("migrations never landed: {e}"),
+        }
+    };
+    let (token, _) = catalog
+        .create_token(tenant, "operator", fs_catalog::TokenScope::Query)
+        .await
+        .unwrap();
+    let counted = loop {
+        match client::query(&addr, &token, "select count(*) as n from spans").await {
+            Ok(batches) => break batches,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("the querier never answered: {e}"),
+        }
+    };
+    let rendered = client::render(&counted).unwrap();
+    assert!(rendered.contains("| 0 |"), "{rendered}");
+    assert!(rendered.ends_with("1 rows"), "{rendered}");
+
+    let services = client::action(&addr, &token, "metadata.services", "{}")
+        .await
+        .unwrap();
+    assert_eq!(
+        client::render(&services).unwrap().lines().last(),
+        Some("0 rows")
+    );
+    let err = client::query(&addr, "fst_nope", "select 1")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Unauthenticated"), "{err}");
+
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("shutdown in time")
+        .unwrap()
+        .unwrap();
+    catalog.pool().close().await;
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn bootstrap_fails_fast_on_bad_catalog() {
     let dir = tempfile::tempdir().unwrap();

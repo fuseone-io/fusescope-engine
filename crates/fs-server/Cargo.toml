@@ -24,6 +24,10 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+tonic = { workspace = true }
+futures-util = { workspace = true }
 fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
 fs-wal = { path = "../fs-wal" }

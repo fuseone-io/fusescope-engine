@@ -2,6 +2,10 @@
 //!
 //! ```text
 //! fusescope-engine --config <file> [--role ingester|querier|compactor|all] [--check]
+//! fusescope-engine --config <file> admin tenant create <name>
+//! fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
+//! fusescope-engine admin query <addr> <token> <sql>
+//! fusescope-engine admin action <addr> <token> <type> [json]
 //! ```
 
 use std::path::PathBuf;
@@ -10,20 +14,40 @@ use std::process::ExitCode;
 use fs_server::config::{Config, LogFormat, Secrets};
 use fs_server::role::Role;
 use fs_server::server::AdminAction;
-use fs_server::{ServerError, server};
+use fs_server::{ServerError, client, server};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]
        fusescope-engine --config <file> admin tenant create <name>
-       fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]";
+       fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
+       fusescope-engine admin query <addr> <token> <sql>
+       fusescope-engine admin action <addr> <token> <type> [json]";
 
 #[derive(Debug)]
 struct Args {
     config: Option<PathBuf>,
     role: Option<Role>,
     check: bool,
-    admin: Option<AdminAction>,
+    admin: Option<Admin>,
+}
+
+/// What `admin` does: a catalog action through the configuration, or a
+/// client call against a running querier that needs no configuration.
+#[derive(Debug, PartialEq)]
+enum Admin {
+    Catalog(AdminAction),
+    Query {
+        addr: String,
+        token: String,
+        sql: String,
+    },
+    Action {
+        addr: String,
+        token: String,
+        kind: String,
+        body: String,
+    },
 }
 
 #[derive(Debug)]
@@ -67,11 +91,22 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Result<Args, Early>,
     Ok(Ok(out))
 }
 
-fn parse_admin(rest: &[String]) -> Result<AdminAction, String> {
+fn parse_admin(rest: &[String]) -> Result<Admin, String> {
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
     match words.as_slice() {
-        ["tenant", "create", name] => Ok(AdminAction::CreateTenant {
+        ["tenant", "create", name] => Ok(Admin::Catalog(AdminAction::CreateTenant {
             name: (*name).to_owned(),
+        })),
+        ["query", addr, token, sql] => Ok(Admin::Query {
+            addr: (*addr).to_owned(),
+            token: (*token).to_owned(),
+            sql: (*sql).to_owned(),
+        }),
+        ["action", addr, token, kind] | ["action", addr, token, kind, _] => Ok(Admin::Action {
+            addr: (*addr).to_owned(),
+            token: (*token).to_owned(),
+            kind: (*kind).to_owned(),
+            body: words.get(4).map_or("{}", |b| b).to_owned(),
         }),
         ["token", "create", tenant, name] | ["token", "create", tenant, name, _] => {
             let tenant = tenant
@@ -82,11 +117,11 @@ fn parse_admin(rest: &[String]) -> Result<AdminAction, String> {
                 .map_or(Ok(fs_catalog::TokenScope::Ingest), |s| {
                     s.parse().map_err(|e| format!("{e}\n{USAGE}"))
                 })?;
-            Ok(AdminAction::CreateToken {
+            Ok(Admin::Catalog(AdminAction::CreateToken {
                 tenant,
                 name: (*name).to_owned(),
                 scope,
-            })
+            }))
         }
         _ => Err(format!("unknown admin command\n{USAGE}")),
     }
@@ -134,6 +169,25 @@ async fn shutdown_signal(tx: watch::Sender<bool>) {
 }
 
 async fn real_main(args: Args) -> Result<(), ServerError> {
+    let admin = match args.admin {
+        Some(Admin::Query { addr, token, sql }) => {
+            let batches = client::query(&addr, &token, &sql).await?;
+            println!("{}", client::render(&batches)?);
+            return Ok(());
+        }
+        Some(Admin::Action {
+            addr,
+            token,
+            kind,
+            body,
+        }) => {
+            let batches = client::action(&addr, &token, &kind, &body).await?;
+            println!("{}", client::render(&batches)?);
+            return Ok(());
+        }
+        Some(Admin::Catalog(action)) => Some(action),
+        None => None,
+    };
     let path = args
         .config
         .ok_or_else(|| ServerError::InvalidConfig(format!("--config is required\n{USAGE}")))?;
@@ -144,7 +198,7 @@ async fn real_main(args: Args) -> Result<(), ServerError> {
     let node_id = config.node_id(&env);
     let role = args.role.unwrap_or(config.server.role);
 
-    if let Some(action) = args.admin {
+    if let Some(action) = admin {
         for line in server::admin(config, secrets, action).await? {
             println!("{line}");
         }
@@ -249,9 +303,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             parsed.admin,
-            Some(AdminAction::CreateTenant {
+            Some(Admin::Catalog(AdminAction::CreateTenant {
                 name: "acme".into()
-            })
+            }))
         );
         let id = "00000000-0000-0000-0000-000000000001";
         let parsed = parse_args(args(&[
@@ -267,8 +321,37 @@ mod tests {
         .ok()
         .unwrap();
         assert!(
-            matches!(parsed.admin, Some(AdminAction::CreateToken { name, .. }) if name == "collector")
+            matches!(parsed.admin, Some(Admin::Catalog(AdminAction::CreateToken { name, .. })) if name == "collector")
         );
+        let parsed = parse_args(args(&[
+            "admin",
+            "query",
+            "127.0.0.1:8815",
+            "fst_x",
+            "select 1",
+        ]))
+        .unwrap()
+        .ok()
+        .unwrap();
+        assert_eq!(
+            parsed.admin,
+            Some(Admin::Query {
+                addr: "127.0.0.1:8815".into(),
+                token: "fst_x".into(),
+                sql: "select 1".into(),
+            })
+        );
+        let parsed = parse_args(args(&[
+            "admin",
+            "action",
+            "127.0.0.1:8815",
+            "fst_x",
+            "metadata.services",
+        ]))
+        .unwrap()
+        .ok()
+        .unwrap();
+        assert!(matches!(parsed.admin, Some(Admin::Action { ref body, .. }) if body == "{}"));
         assert!(
             parse_args(args(&["admin", "token", "create", "not-a-uuid", "x"]))
                 .unwrap_err()

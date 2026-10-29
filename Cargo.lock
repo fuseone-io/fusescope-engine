@@ -1753,6 +1753,8 @@ dependencies = [
 name = "fs-server"
 version = "0.0.1"
 dependencies = [
+ "arrow",
+ "arrow-flight",
  "chrono",
  "fs-auth",
  "fs-cache",
@@ -1763,6 +1765,7 @@ dependencies = [
  "fs-query",
  "fs-schema",
  "fs-wal",
+ "futures-util",
  "object_store",
  "serde",
  "sqlx",
@@ -1770,6 +1773,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
