@@ -12,10 +12,10 @@
 //! rows sorted by (source, type, key). v1 lacked `admitted_hour`; a v1
 //! file reads with the hour of `first_seen` in its place. The schema
 //! metadata names the signal and the version, and each version has one
-//! layout: v1 the six columns, v2 the seven with `admitted_hour` never
-//! null. Every reader checks signal, version and layout with
-//! [`check_schema`] and refuses anything else, so a file is never read as
-//! a version it is not.
+//! physical layout: v1 the six columns, v2 the seven, every column
+//! required, `admitted_hour` always the start of an hour. Every reader
+//! checks signal, version and layout with [`check_schema`] and refuses
+//! anything else, so a file is never read as a version it is not.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -168,6 +168,9 @@ impl KeyStats {
         hour: i64,
         max_new_keys: usize,
     ) -> Result<(), SchemaError> {
+        if hour.rem_euclid(HOUR_NS) != 0 {
+            return Err(SchemaError::Layout("hour is not the start of an hour"));
+        }
         let schema = batch.schema();
         let timestamps = batch
             .column(schema.index_of(col::TIMESTAMP)?)
@@ -328,8 +331,8 @@ impl KeyStats {
     ///
     /// # Errors
     /// A batch missing a column of its version, carrying one it does not
-    /// have, with a null `admitted_hour`, or with a source or type the
-    /// version does not know.
+    /// have, with a null `admitted_hour` or one that is not the start of
+    /// an hour, or with a source or type the version does not know.
     pub fn from_batch(batch: &RecordBatch, version: u32) -> Result<Self, SchemaError> {
         let schema = batch.schema();
         let column = |name: &str| -> Result<&arrow::array::ArrayRef, SchemaError> {
@@ -364,6 +367,11 @@ impl KeyStats {
                     .ok_or(SchemaError::Layout("admitted_hour"))?;
                 if admitted.null_count() > 0 {
                     return Err(SchemaError::Layout("null admitted_hour in a v2 table"));
+                }
+                if admitted.values().iter().any(|a| a.rem_euclid(HOUR_NS) != 0) {
+                    return Err(SchemaError::Layout(
+                        "admitted_hour that is not the start of an hour",
+                    ));
                 }
                 Some(admitted)
             }
@@ -425,7 +433,8 @@ pub fn attribute_keys_schema_v2() -> SchemaRef {
 }
 
 /// The table as a query session reads it: v2, with `admitted_hour`
-/// nullable so a v1 file, which lacks it, reads with it null.
+/// nullable so a v1 file, which lacks it, reads with it null. A logical
+/// schema only: a file laid out like it is refused by [`check_schema`].
 pub fn table_schema() -> SchemaRef {
     with_metadata(SCHEMA_VERSION, true)
 }
@@ -466,11 +475,12 @@ fn with_metadata(version: u32, admission_nullable: bool) -> SchemaRef {
 }
 
 /// Refuses a file schema that is not this table at a version this engine
-/// reads, laid out exactly as that version is; returns the version.
+/// reads, laid out exactly as that version is, every column required;
+/// returns the version.
 ///
 /// # Errors
 /// Another signal, a version this engine does not read, no version, or
-/// columns other than the version's, by name, order or type.
+/// columns other than the version's, by name, order, type or nullability.
 pub fn check_schema(schema: &Schema) -> Result<u32, SchemaError> {
     let metadata = schema.metadata();
     if metadata.get("fusescope.signal").map(String::as_str) != Some(SIGNAL) {
@@ -488,7 +498,7 @@ pub fn check_schema(schema: &Schema) -> Result<u32, SchemaError> {
             .iter()
             .zip(&expected)
             .all(|(field, (name, data_type))| {
-                field.name() == name && field.data_type() == data_type
+                field.name() == name && field.data_type() == data_type && !field.is_nullable()
             });
     if !same {
         return Err(SchemaError::Layout(
@@ -814,7 +824,10 @@ mod tests {
             assert!(matches!(err, SchemaError::Layout(_)), "{err}");
         }
         assert_eq!(check_schema(&attribute_keys_schema_v2()).unwrap(), 2);
-        assert_eq!(check_schema(&table_schema()).unwrap(), 2);
+        assert!(
+            matches!(check_schema(&table_schema()), Err(SchemaError::Layout(_))),
+            "the logical schema of a session is not a physical layout"
+        );
         assert!(
             matches!(
                 KeyStats::from_batch(&batch_with(Vec::new()), 2).unwrap_err(),
@@ -824,9 +837,14 @@ mod tests {
         );
     }
 
-    /// A file of `version` with the first `fields` columns of v2 and
-    /// `admission` in place of the seventh, when kept.
-    fn file_of(version: &str, fields: usize, admission: Option<Vec<Option<i64>>>) -> Vec<u8> {
+    /// A file of `version` with the first `fields` columns of v2 and, when
+    /// given, `admission` in place of the seventh, as a nullable column
+    /// when `nullable`.
+    fn file_of(
+        version: &str,
+        fields: usize,
+        admission: Option<(Vec<Option<i64>>, bool)>,
+    ) -> Vec<u8> {
         let mut stats = KeyStats::default();
         stats
             .absorb(
@@ -840,13 +858,13 @@ mod tests {
         let mut metadata = v2.schema().metadata().clone();
         metadata.insert("fusescope.schema_version".into(), version.into());
         let mut fields_kept: Vec<_> = v2.schema().fields().iter().take(fields).cloned().collect();
-        if let Some(admission) = admission {
+        if let Some((admission, nullable)) = admission {
             columns.pop();
             fields_kept.pop();
             fields_kept.push(Arc::new(Field::new(
                 col_names::ADMITTED_HOUR,
                 DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
+                nullable,
             )));
             columns.push(Arc::new(
                 TimestampNanosecondArray::from(admission).with_timezone("UTC"),
@@ -875,25 +893,59 @@ mod tests {
             4,
             "v2: seven columns"
         );
+        let aligned = vec![Some(H14); 4];
         for (what, bytes) in [
             ("v1 with admitted_hour", file_of("1", 7, None)),
             ("v2 without admitted_hour", file_of("2", 6, None)),
             (
+                "v2 with a nullable admitted_hour",
+                file_of("2", 7, Some((aligned.clone(), true))),
+            ),
+            (
                 "v2 with a null admitted_hour",
-                file_of("2", 7, Some(vec![Some(H14), None, Some(H14), Some(H14)])),
+                file_of(
+                    "2",
+                    7,
+                    Some((vec![Some(H14), None, Some(H14), Some(H14)], true)),
+                ),
             ),
         ] {
             let bytes = bytes::Bytes::from(bytes);
             let footer = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
-            if what != "v2 with a null admitted_hour" {
-                assert!(
-                    matches!(check_schema(footer.schema()), Err(SchemaError::Layout(_))),
-                    "{what}: the footer alone tells"
-                );
-            }
+            assert!(
+                matches!(check_schema(footer.schema()), Err(SchemaError::Layout(_))),
+                "{what}: the footer alone tells"
+            );
             let err = decode(bytes).unwrap_err();
             assert!(matches!(err, SchemaError::Layout(_)), "{what}: {err}");
         }
+
+        // A required admitted_hour that is not the start of an hour passes
+        // the footer, as it must, and is refused by the reader.
+        let misaligned = bytes::Bytes::from(file_of(
+            "2",
+            7,
+            Some((vec![Some(H14), Some(H14 + 1), Some(H14), Some(H14)], false)),
+        ));
+        let footer = ParquetRecordBatchReaderBuilder::try_new(misaligned.clone()).unwrap();
+        assert_eq!(check_schema(footer.schema()).unwrap(), 2);
+        let err = decode(misaligned).unwrap_err();
+        assert!(matches!(err, SchemaError::Layout(_)), "{err}");
+        let aligned = decode(bytes::Bytes::from(file_of("2", 7, Some((aligned, false))))).unwrap();
+        assert_eq!(
+            (aligned.admitted_in(H14), aligned.new_keys()),
+            (4, 0),
+            "the hour is kept as written and nothing read counts as new"
+        );
+    }
+
+    #[test]
+    fn an_hour_that_is_not_an_hour_start_is_refused_by_absorb() {
+        let mut stats = KeyStats::default();
+        let err = stats
+            .absorb(&batch_with(Vec::new()), H14 + 1, usize::MAX)
+            .unwrap_err();
+        assert!(matches!(err, SchemaError::Layout(_)), "{err}");
     }
 
     #[test]
