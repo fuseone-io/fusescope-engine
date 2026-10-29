@@ -234,6 +234,88 @@ async fn the_operator_client_queries_a_running_server() {
     db.finish().await;
 }
 
+/// A bucket prefix belongs to the catalog that first wrote it: the same
+/// catalog starts again, another catalog is refused, a prefix with objects
+/// and no marker is refused until the operator adopts it.
+#[tokio::test]
+async fn a_bucket_prefix_belongs_to_one_catalog() {
+    use fs_server::bucket::Ownership;
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let report = server::check(config(dir.path()), secrets.clone(), "a".into())
+        .await
+        .unwrap();
+    assert_eq!(report.ownership, Ownership::Claimed);
+    let marker = dir.path().join("bucket").join("_catalog");
+    let written = std::fs::read_to_string(&marker).unwrap();
+    assert!(written.starts_with("fusescope-catalog v1\n"), "{written}");
+    let report = server::check(config(dir.path()), secrets.clone(), "a".into())
+        .await
+        .unwrap();
+    assert_eq!(report.ownership, Ownership::Held);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), written);
+
+    // Another catalog, same prefix: refused before anything runs.
+    let Some(other) = TestDb::new().await else {
+        return;
+    };
+    let other_secrets = Secrets {
+        catalog_url: Some(other.url.clone()),
+        ..Secrets::default()
+    };
+    let err = server::check(config(dir.path()), other_secrets.clone(), "b".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, fs_server::ServerError::PrefixOwnedByAnother { .. }),
+        "{err}"
+    );
+    let (tx, rx) = watch::channel(false);
+    let err = server::run(config(dir.path()), other_secrets, Role::All, "b".into(), rx)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, fs_server::ServerError::PrefixOwnedByAnother { .. }),
+        "{err}"
+    );
+    drop(tx);
+
+    // Objects without a marker: refused, then adopted on the operator's say.
+    let stray = tempfile::tempdir().unwrap();
+    let objects = stray.path().join("bucket").join("t");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join("leftover.parquet"), b"x").unwrap();
+    let err = server::check(config(stray.path()), secrets.clone(), "a".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, fs_server::ServerError::PrefixUnclaimed(_)),
+        "{err}"
+    );
+    let mut adopting = config(stray.path());
+    adopting.bucket.adopt_prefix = true;
+    let report = server::check(adopting, secrets.clone(), "a".into())
+        .await
+        .unwrap();
+    assert_eq!(report.ownership, Ownership::Adopted);
+    let report = server::check(config(stray.path()), secrets, "a".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.ownership,
+        Ownership::Held,
+        "marked, no adoption needed again"
+    );
+    other.finish().await;
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn bootstrap_fails_fast_on_bad_catalog() {
     let dir = tempfile::tempdir().unwrap();

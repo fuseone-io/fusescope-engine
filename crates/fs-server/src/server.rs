@@ -24,6 +24,8 @@ pub struct CheckReport {
     pub catalog_ok: bool,
     /// Ingesters with a fresh heartbeat.
     pub live_ingesters: usize,
+    /// What the start found under the bucket prefix.
+    pub ownership: bucket::Ownership,
 }
 
 /// Connects to the bucket and the catalog, migrating when configured.
@@ -55,6 +57,16 @@ pub async fn bootstrap(
         .await
         .map_err(fs_catalog::CatalogError::from)?;
     info!(url = %redact_url(url), migrate = config.catalog.migrate, "catalog reachable");
+    let identity = catalog.identity().await?;
+    let ownership = bucket::claim(
+        store.as_ref(),
+        &root,
+        identity,
+        write_probe,
+        config.bucket.adopt_prefix,
+    )
+    .await?;
+    info!(catalog = %identity, prefix = %root, ?ownership, "bucket prefix is this catalog's");
 
     Ok(Context {
         config: Arc::new(config),
@@ -63,6 +75,7 @@ pub async fn bootstrap(
         root,
         node_id,
         metrics: Arc::new(crate::metrics::Metrics::default()),
+        ownership,
     })
 }
 
@@ -85,6 +98,7 @@ pub async fn check(
         bucket_ok: true,
         catalog_ok: true,
         live_ingesters: live.len(),
+        ownership: ctx.ownership,
     })
 }
 

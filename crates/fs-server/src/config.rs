@@ -143,6 +143,11 @@ pub struct BucketConfig {
     /// Key prefix inside the bucket, without leading slash.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Mark a prefix that already holds objects but no catalog marker as
+    /// this catalog's, the operator's explicit decision; one start with it
+    /// is enough. Off, such a prefix refuses to start.
+    #[serde(default)]
+    pub adopt_prefix: bool,
 }
 
 /// Write-ahead log.
@@ -806,6 +811,9 @@ pub struct Secrets {
     pub bucket_access_key: Option<String>,
     /// Bucket secret key.
     pub bucket_secret_key: Option<String>,
+    /// Query token for `admin query` and `admin action`, never on the
+    /// command line.
+    pub query_token: Option<String>,
 }
 
 impl fmt::Debug for Secrets {
@@ -820,6 +828,7 @@ impl fmt::Debug for Secrets {
                 "bucket_secret_key",
                 &self.bucket_secret_key.as_ref().map(|_| "***"),
             )
+            .field("query_token", &self.query_token.as_ref().map(|_| "***"))
             .finish()
     }
 }
@@ -831,6 +840,7 @@ impl Secrets {
             catalog_url: get("FS_CATALOG_URL").filter(|s| !s.is_empty()),
             bucket_access_key: get("FS_BUCKET_ACCESS_KEY").filter(|s| !s.is_empty()),
             bucket_secret_key: get("FS_BUCKET_SECRET_KEY").filter(|s| !s.is_empty()),
+            query_token: get("FS_QUERY_TOKEN").filter(|s| !s.is_empty()),
         }
     }
 }

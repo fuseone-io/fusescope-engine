@@ -30,6 +30,8 @@ pub struct Context {
     pub node_id: String,
     /// Counters exposed on `/metrics`.
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// What the start found under the bucket prefix.
+    pub ownership: crate::bucket::Ownership,
 }
 
 /// Heartbeat period of the ingester. The querier treats 10 s of silence as down.

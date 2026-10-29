@@ -54,6 +54,22 @@ pub enum ServerError {
     /// The operator client could not reach the querier or was refused.
     #[error("flight: {0}")]
     Flight(String),
+    /// The bucket prefix is marked for another catalog.
+    #[error("bucket prefix {prefix:?} belongs to catalog {owner}; this is not it")]
+    PrefixOwnedByAnother {
+        /// The prefix.
+        prefix: String,
+        /// The catalog the marker names.
+        owner: uuid::Uuid,
+    },
+    /// The bucket prefix holds objects but no ownership marker.
+    #[error(
+        "bucket prefix {0:?} holds objects but no catalog marker; set bucket.adopt_prefix = true once to adopt them"
+    )]
+    PrefixUnclaimed(String),
+    /// The ownership marker is not one this engine wrote.
+    #[error("bucket marker {0} is not readable by this engine")]
+    PrefixMarkerUnreadable(String),
     /// A role task panicked or was cancelled.
     #[error("role {role} stopped unexpectedly: {reason}")]
     RoleStopped {
