@@ -70,8 +70,8 @@ retention_interval_secs = 3600
 retention_files_per_pass = 1000
 rebuild_max_input_bytes = 274877906944
 rebuild_max_bytes = 2147483648
-# At most 64 rebuilds per tick; a tenant whose rebuild failed waits an hour, times its
-# failures so far, before the next try.
+# At most 64 rebuilds per tick (256 at most); a tenant whose rebuild failed waits an hour,
+# times its failures so far, before the next try.
 rebuilds_per_tick = 64
 rebuild_backoff_secs = 3600
 

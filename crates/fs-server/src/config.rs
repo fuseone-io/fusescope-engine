@@ -690,7 +690,8 @@ pub struct CompactorConfig {
     /// a tenant above it keeps its table.
     #[serde(default = "default_rebuild_max_bytes")]
     pub rebuild_max_bytes: u64,
-    /// Most `attribute_keys` rebuilds one retention tick attempts.
+    /// Most `attribute_keys` rebuilds one retention tick attempts, at
+    /// most 256.
     #[serde(default = "default_rebuilds_per_tick")]
     pub rebuilds_per_tick: usize,
     /// How long a tenant whose rebuild failed waits before it is tried
@@ -1026,6 +1027,11 @@ impl Config {
         {
             return invalid(
                 "compactor.retention_interval_secs, retention_files_per_pass, rebuild_max_input_bytes, rebuilds_per_tick and rebuild_backoff_secs must be positive",
+            );
+        }
+        if self.compactor.rebuilds_per_tick > fs_compactor::retention::MAX_REBUILDS_PER_TICK {
+            return invalid(
+                "compactor.rebuilds_per_tick must be at most 256, so the leader's other passes are never long behind the rebuilds",
             );
         }
         let smallest_rebuild = fs_compactor::retention::rebuild_footprint(
@@ -1665,6 +1671,21 @@ mod tests {
         assert!(
             err.contains("compactor.rebuild_max_bytes must cover one L1 file"),
             "{err}"
+        );
+        let with = |rebuilds: usize| {
+            Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\nrebuilds_per_tick = {rebuilds}\n"
+            ))
+            .unwrap()
+        };
+        let most = fs_compactor::retention::MAX_REBUILDS_PER_TICK;
+        assert!(with(most).validate(&secrets).is_ok());
+        assert!(
+            with(most + 1)
+                .validate(&secrets)
+                .unwrap_err()
+                .to_string()
+                .contains("compactor.rebuilds_per_tick must be at most 256")
         );
     }
 
