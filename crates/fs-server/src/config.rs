@@ -690,8 +690,8 @@ pub struct CompactorConfig {
     /// a tenant above it keeps its table.
     #[serde(default = "default_rebuild_max_bytes")]
     pub rebuild_max_bytes: u64,
-    /// Most `attribute_keys` rebuilds one retention tick attempts, at
-    /// most 256.
+    /// Most stale `attribute_keys` tables one retention tick examines, a
+    /// passed-over one counting as one, at most 256.
     #[serde(default = "default_rebuilds_per_tick")]
     pub rebuilds_per_tick: usize,
     /// How long a tenant whose rebuild failed waits before it is tried
