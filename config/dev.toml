@@ -64,10 +64,12 @@ sweep_delete_backoff_secs = 600
 quarantine_ttl_secs = 3600
 # Files beyond a tenant's retention_days leave the catalog, up to 1000 per pass, and their
 # objects follow at the purge; the tenant's attribute_keys table is then rebuilt from the L1
-# files that remain, up to 256 GiB of them.
+# files that remain, reading up to 256 GiB of them and holding at most 2 GiB by the worst case
+# the ingest limits allow.
 retention_interval_secs = 3600
 retention_files_per_pass = 1000
-rebuild_max_bytes = 274877906944
+rebuild_max_input_bytes = 274877906944
+rebuild_max_bytes = 2147483648
 
 [log]
 level = "info"

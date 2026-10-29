@@ -682,6 +682,12 @@ pub struct CompactorConfig {
     pub retention_files_per_pass: i64,
     /// Most bytes of L1 files one `attribute_keys` rebuild reads after
     /// retention; a tenant above it keeps its table.
+    #[serde(default = "default_rebuild_max_input_bytes")]
+    pub rebuild_max_input_bytes: u64,
+    /// Most bytes one `attribute_keys` rebuild may hold at its peak, by
+    /// the worst case the ingest limits allow for the table before, the
+    /// rebuilt table, one L1 file's column chunks and one decoded batch;
+    /// a tenant above it keeps its table.
     #[serde(default = "default_rebuild_max_bytes")]
     pub rebuild_max_bytes: u64,
 }
@@ -705,6 +711,7 @@ impl Default for CompactorConfig {
             sweep_delete_backoff_secs: default_sweep_delete_backoff(),
             retention_interval_secs: default_retention_interval(),
             retention_files_per_pass: default_retention_files_per_pass(),
+            rebuild_max_input_bytes: default_rebuild_max_input_bytes(),
             rebuild_max_bytes: default_rebuild_max_bytes(),
         }
     }
@@ -741,8 +748,10 @@ impl CompactorConfig {
             retention_interval: std::time::Duration::from_secs(self.retention_interval_secs),
             retention: fs_compactor::RetentionConfig {
                 files_per_pass: self.retention_files_per_pass,
+                rebuild_max_input_bytes: self.rebuild_max_input_bytes,
                 rebuild_max_bytes: self.rebuild_max_bytes,
-                batch_rows: row_group_rows,
+                batch_rows: fs_compactor::retention::REBUILD_BATCH_ROWS,
+                limits: fs_schema::limits::Limits::default(),
                 inject_swap_failures: 0,
             },
         }
@@ -757,8 +766,12 @@ fn default_retention_files_per_pass() -> i64 {
     1000
 }
 
-fn default_rebuild_max_bytes() -> u64 {
+fn default_rebuild_max_input_bytes() -> u64 {
     256 * 1024 * 1024 * 1024
+}
+
+fn default_rebuild_max_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_orphan_interval() -> u64 {
@@ -988,10 +1001,24 @@ impl Config {
         }
         if self.compactor.retention_interval_secs == 0
             || self.compactor.retention_files_per_pass <= 0
-            || self.compactor.rebuild_max_bytes == 0
+            || self.compactor.rebuild_max_input_bytes == 0
         {
             return invalid(
-                "compactor.retention_interval_secs, retention_files_per_pass and rebuild_max_bytes must be positive",
+                "compactor.retention_interval_secs, retention_files_per_pass and rebuild_max_input_bytes must be positive",
+            );
+        }
+        let smallest_rebuild = fs_compactor::retention::rebuild_footprint(
+            0,
+            0,
+            self.compactor.l1_target_bytes as u64,
+            &self
+                .compactor
+                .to_compactor(self.ingest.row_group_rows)
+                .retention,
+        );
+        if self.compactor.rebuild_max_bytes < smallest_rebuild {
+            return invalid(
+                "compactor.rebuild_max_bytes must cover one L1 file of l1_target_bytes plus one decoded batch, or no attribute_keys table would ever be rebuilt after retention",
             );
         }
 
@@ -1562,14 +1589,32 @@ mod tests {
         let compactor = config.compactor.to_compactor(config.ingest.row_group_rows);
         assert_eq!(compactor.retention_interval.as_secs(), 3600);
         assert_eq!(compactor.retention.files_per_pass, 1000);
-        assert_eq!(compactor.retention.rebuild_max_bytes, 256 << 30);
-        assert_eq!(compactor.retention.batch_rows, config.ingest.row_group_rows);
+        assert_eq!(compactor.retention.rebuild_max_input_bytes, 256 << 30);
+        assert_eq!(compactor.retention.rebuild_max_bytes, 2 << 30);
+        assert_eq!(
+            compactor.retention.batch_rows,
+            fs_compactor::retention::REBUILD_BATCH_ROWS
+        );
+        assert_eq!(
+            compactor.retention.limits,
+            fs_schema::limits::Limits::default()
+        );
         assert_eq!(compactor.retention.inject_swap_failures, 0);
+        let floor = fs_compactor::retention::rebuild_footprint(
+            0,
+            0,
+            config.compactor.l1_target_bytes as u64,
+            &compactor.retention,
+        );
+        assert!(
+            floor < 2 << 30,
+            "the default budget admits a rebuild: {floor}"
+        );
         for bad in [
             "retention_interval_secs = 0",
             "retention_files_per_pass = 0",
             "retention_files_per_pass = -1",
-            "rebuild_max_bytes = 0",
+            "rebuild_max_input_bytes = 0",
         ] {
             let err = Config::parse(&format!(
                 "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"
@@ -1583,6 +1628,17 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+        let err = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\nrebuild_max_bytes = 1048576\n",
+        )
+        .unwrap()
+        .validate(&secrets)
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("compactor.rebuild_max_bytes must cover one L1 file"),
+            "{err}"
+        );
     }
 
     #[test]
