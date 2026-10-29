@@ -35,6 +35,18 @@ pub struct StaleTable {
     pub cutoff: DateTime<Utc>,
 }
 
+/// What the files of one tenant, signal and level from a point on add up
+/// to, read before any of them is listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct FilesTotal {
+    /// How many.
+    pub files: i64,
+    /// Their bytes.
+    pub bytes: i64,
+    /// The largest one's bytes.
+    pub largest: i64,
+}
+
 /// The tenant's cut, `t` being `engine_tenant`; UTC whatever the
 /// session's time zone.
 const CUTOFF: &str = "date_bin('1 day', now(), timestamptz '1970-01-01 00:00:00+00') \
@@ -187,6 +199,39 @@ impl Catalog {
         .fetch_all(self.pool())
         .await?;
         rows.into_iter().map(FileRecord::try_from).collect()
+    }
+}
+
+impl Catalog {
+    /// Count, bytes and largest of the files [`visible_files_from`] would
+    /// list, without listing them.
+    ///
+    /// [`visible_files_from`]: Self::visible_files_from
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn files_from_totals(
+        &self,
+        tenant: TenantId,
+        signal: Signal,
+        level: Level,
+        since: DateTime<Utc>,
+    ) -> Result<FilesTotal, CatalogError> {
+        let totals = sqlx::query_as::<_, FilesTotal>(
+            "select count(*) as files,
+                    coalesce(sum(size_bytes), 0)::bigint as bytes,
+                    coalesce(max(size_bytes), 0)::bigint as largest
+             from engine_file
+             where tenant_id = $1 and signal = $2 and level = $3 and state = $4 and ts_max >= $5",
+        )
+        .bind(tenant)
+        .bind(signal.code())
+        .bind(level.code())
+        .bind(FileState::Visible.code())
+        .bind(since)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(totals)
     }
 }
 

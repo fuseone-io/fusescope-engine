@@ -304,9 +304,14 @@ impl Catalog {
         })
     }
 
-    /// Removes up to `limit` files quarantined for longer than `older_than` and
-    /// returns their paths. The caller deletes the objects afterwards; an
-    /// object that outlives its row is an orphan the compactor sweeps later.
+    /// Removes up to `limit` files quarantined for longer than `older_than`,
+    /// on the database clock so a compactor with a skewed clock cannot
+    /// purge early, and returns them. Each row goes in a transaction that
+    /// holds the locks of its path and sidecar and marks both for
+    /// deletion, so from the commit on no registration of the path commits,
+    /// a replay included; the caller deletes the objects under their
+    /// claims, which leave tombstones, and one it cannot delete is
+    /// finished by the orphan sweep.
     ///
     /// # Errors
     /// Database failure.
@@ -315,24 +320,63 @@ impl Catalog {
         older_than: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<PurgedFile>, CatalogError> {
-        // The cutoff is the database's clock, as the quarantine time was,
-        // so a compactor with a skewed clock cannot purge early.
-        let rows = sqlx::query_as::<_, PurgedFile>(
-            "delete from engine_file
-             where id in (
-                 select id from engine_file
-                 where state = $1 and quarantined_at <= now() - make_interval(secs => $2)
-                 order by quarantined_at
-                 limit $3
-             )
-             returning id, path",
+        let due = sqlx::query_as::<_, PurgedFile>(
+            "select id, path from engine_file
+             where state = $1 and quarantined_at <= now() - make_interval(secs => $2)
+             order by quarantined_at, id
+             limit $3",
         )
         .bind(FileState::Quarantined.code())
         .bind(older_than.as_secs_f64())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        let mut purged = Vec::with_capacity(due.len());
+        for file in due {
+            if self.purge_one(&file, older_than).await? {
+                purged.push(file);
+            }
+        }
+        Ok(purged)
+    }
+
+    /// Removes one quarantined row under the locks of its paths and marks
+    /// them; false when the row was no longer there to purge.
+    async fn purge_one(
+        &self,
+        file: &PurgedFile,
+        older_than: std::time::Duration,
+    ) -> Result<bool, CatalogError> {
+        let mut paths = vec![file.path.clone()];
+        paths.extend(fs_index::sidecar_path(&file.path));
+        let mut tx = self.pool.begin().await?;
+        for path in &paths {
+            crate::orphans::lock_path(&mut tx, path).await?;
+        }
+        let removed = sqlx::query(
+            "delete from engine_file
+             where id = $1 and state = $2 and quarantined_at <= now() - make_interval(secs => $3)",
+        )
+        .bind(file.id)
+        .bind(FileState::Quarantined.code())
+        .bind(older_than.as_secs_f64())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if removed == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "insert into engine_orphan (path, deleting) select unnest($1::text[]), true
+             on conflict (path) do update
+             set deleting = true, deleted_at = null, attempts = 0, retry_after = now()",
+        )
+        .bind(&paths)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Records that an ingester is alive at `address`.

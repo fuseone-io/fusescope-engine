@@ -384,6 +384,82 @@ async fn purge_returns_paths_of_old_quarantined_files_only() {
     db.finish().await;
 }
 
+/// A purge removes the row and marks the path and its sidecar for
+/// deletion in the same transaction, so from that moment no registration
+/// of the same path commits, before the objects are deleted or after:
+/// the objects go under the claim protocol and leave tombstones, as an
+/// orphan's do, and a writer replaying the file is refused and gives its
+/// rows a fresh id.
+#[tokio::test]
+async fn a_purge_dooms_the_path_and_its_sidecar_with_the_row() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let c = &db.catalog;
+    let t = c
+        .create_tenant(&NewTenant::with_defaults("purged"))
+        .await
+        .unwrap()
+        .id;
+    let replayed = file(t, Signal::Traces, 0, 1, &["api"]);
+    let sidecar = fs_index::sidecar_path(&replayed.path).unwrap();
+    let old = c.register_file(&replayed).await.unwrap();
+    c.swap_files(
+        t,
+        Signal::Traces,
+        &[old.id],
+        &[file(t, Signal::Traces, 0, 1, &["api"])],
+    )
+    .await
+    .unwrap();
+    let purged = c.purge_quarantined(StdDuration::ZERO, 100).await.unwrap();
+    assert_eq!(purged.len(), 1);
+    assert_eq!(purged[0].path, old.path);
+
+    let err = c.register_file(&replayed).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { ref path } if *path == old.path),
+        "{err}"
+    );
+    assert_eq!(
+        c.object_refused(&old.path).await.unwrap().as_deref(),
+        Some(old.path.as_str()),
+        "refused before an upload too"
+    );
+    let mut doomed = c.orphans_doomed(10).await.unwrap();
+    doomed.sort();
+    let mut both = vec![old.path.clone(), sidecar.clone()];
+    both.sort();
+    assert_eq!(doomed, both, "path and sidecar wait for their delete");
+
+    for path in &both {
+        let claim = c.orphan_claim(path).await.unwrap().unwrap();
+        claim.deleted().await.unwrap();
+    }
+    assert_eq!(c.orphans_doomed(10).await.unwrap().len(), 0);
+    let err = c.register_file(&replayed).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { .. }),
+        "a tombstone refuses the path for good: {err}"
+    );
+    assert_eq!(
+        c.purge_quarantined(StdDuration::ZERO, 100)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        c.registered_paths(std::slice::from_ref(&old.path))
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "no row points at the path"
+    );
+    db.finish().await;
+}
+
 #[tokio::test]
 async fn ingester_heartbeats_expire() {
     let Some(db) = TestDb::new().await else {
@@ -1960,6 +2036,14 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
         remaining,
         vec![kept_l1.id],
         "the L1 files at or after the cut"
+    );
+    let totals = c
+        .files_from_totals(t, Signal::Traces, Level::L1, cut)
+        .await
+        .unwrap();
+    assert_eq!(
+        (totals.files, totals.bytes, totals.largest),
+        (1, 1 << 20, 1 << 20)
     );
 
     // Rebuilt from what remains, the table is no longer stale.

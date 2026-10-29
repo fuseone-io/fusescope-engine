@@ -296,7 +296,7 @@ impl Catalog {
 }
 
 /// Takes the transaction advisory lock of `path`, held until `tx` ends.
-async fn lock_path(
+pub(crate) async fn lock_path(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     path: &str,
 ) -> Result<(), CatalogError> {
