@@ -164,6 +164,7 @@ pub fn prepare(
         },
         services: keys.services,
         summary: None,
+        content_sha256: Some(crate::sha256::digest(&bytes)),
     };
     Ok(Prepared {
         file,
@@ -328,6 +329,29 @@ pub fn reconcile_existing(existing: u64, prepared: u64, legacy: bool) -> Result<
         Err(IngestError::Encode(format!(
             "object already in the bucket has {existing} bytes, this layout gives {prepared}"
         )))
+    }
+}
+
+/// The digest the catalog row carries when an object is already in the
+/// bucket, read back from the object: the bytes a retry produces, or, for
+/// a `legacy` intent, whatever another encoder wrote.
+///
+/// # Errors
+/// The object's bytes differ from `prepared` for a non-legacy intent, or
+/// the bucket fails.
+pub async fn verify_existing(
+    store: &dyn ObjectStore,
+    path: &str,
+    prepared: [u8; 32],
+    legacy: bool,
+) -> Result<[u8; 32], IngestError> {
+    let existing = crate::sha256::of_object(store, path).await?;
+    if existing == prepared || legacy {
+        Ok(existing)
+    } else {
+        Err(IngestError::ObjectMismatch {
+            path: path.to_owned(),
+        })
     }
 }
 

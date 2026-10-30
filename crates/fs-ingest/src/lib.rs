@@ -24,6 +24,7 @@ pub mod ingester;
 pub mod ratelimit;
 pub mod record;
 pub mod server;
+mod sha256;
 pub mod walwriter;
 
 pub use config::IngestConfig;
@@ -57,6 +58,14 @@ pub enum IngestError {
     #[error("trace index at {path} differs from the file's rows")]
     IndexMismatch {
         /// Sidecar path.
+        path: String,
+    },
+    /// The object under the file's path holds other bytes than the file's
+    /// rows produce; the rows take a fresh id and the object is left to
+    /// the orphan sweep.
+    #[error("object at {path} differs from the file's rows")]
+    ObjectMismatch {
+        /// Object path.
         path: String,
     },
     /// A WAL record could not be decoded during replay.

@@ -1498,6 +1498,97 @@ async fn crash_between_the_files_of_a_split_flush_is_resumed() {
     db.finish().await;
 }
 
+/// A retried flush meets its object already in the bucket with other
+/// bytes of the same size: the registration is refused by the digest, the
+/// rows take a fresh id and the next attempt publishes them under it,
+/// leaving the corrupt object to the orphan sweep.
+#[tokio::test]
+async fn a_retried_flush_refuses_an_object_with_other_bytes_and_takes_a_fresh_id() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let config = IngestConfig {
+        inject_register_failures: 1,
+        checkpoint_after_flush: false,
+        ..test_config()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 5), &token))
+        .await
+        .unwrap();
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 1);
+    let bucket = h.dir.path().join("bucket");
+    let written = parquet_files(&bucket);
+    assert_eq!(written.len(), 1);
+    let old = written[0].clone();
+    let good = sha256_of(&old);
+    let mut corrupt = std::fs::read(&old).unwrap();
+    let middle = corrupt.len() / 2;
+    corrupt[middle] ^= 0xff;
+    std::fs::write(&old, &corrupt).unwrap();
+    assert_ne!(sha256_of(&old), good);
+
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        h.ingester
+            .flush_stats()
+            .replay_mismatch
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        h.ingester.flush_stats().superseded.load(Ordering::Relaxed),
+        1
+    );
+    let visible = |catalog: Catalog| async move {
+        catalog
+            .visible_files(
+                tenant,
+                Signal::Traces,
+                TimeRange {
+                    start: chrono::DateTime::UNIX_EPOCH,
+                    end: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(visible(db.catalog.clone()).await.len(), 0);
+
+    h.ingester.flush_all().await;
+    assert_eq!(h.ingester.stats().flush_failures.load(Ordering::Relaxed), 2);
+    let now = parquet_files(&bucket);
+    assert_eq!(now.len(), 2, "the corrupt object and the new one");
+    let new = now.iter().find(|p| **p != old).unwrap().clone();
+    assert_eq!(sha256_of(&new), good, "the rows' bytes under the new id");
+    let registered = visible(db.catalog.clone()).await;
+    assert_eq!(registered.len(), 1);
+    assert_eq!(bucket.join(&registered[0].path), new);
+    assert_eq!(registered[0].content_sha256, Some(good));
+    let old_id = fs_catalog::FileId(
+        uuid::Uuid::parse_str(old.file_stem().unwrap().to_str().unwrap()).unwrap(),
+    );
+    assert_eq!(registered[0].origin, old_id);
+    assert_ne!(registered[0].id, old_id);
+    h.stop().await;
+    db.finish().await;
+}
+
 /// The second hour's intent cannot be logged, so its rows go back live
 /// and are cut later under an intent of their own hour over a range that
 /// also holds the first hour's rows. That intent claims only its hour, so

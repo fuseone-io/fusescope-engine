@@ -139,8 +139,11 @@ pub struct FlushStats {
     pub row_groups: AtomicU64,
     /// Bytes of `trace_id` sidecars created.
     pub trace_index_bytes: AtomicU64,
-    /// Flushes given a fresh id because the orphan sweep marked their path.
+    /// Flushes given a fresh id because the orphan sweep marked their path
+    /// or the object at their path held other bytes.
     pub superseded: AtomicU64,
+    /// Retried flushes that met an object with other bytes at their path.
+    pub replay_mismatch: AtomicU64,
     /// Registration confirmations that failed and wait for a retry.
     pub confirm_failures: AtomicU64,
     /// Registered files whose confirmation has not landed.
@@ -594,6 +597,12 @@ impl Shared {
                     IngestError::Catalog(CatalogError::ObjectDoomed { .. }) => {
                         self.supersede(tenant, file_id).await
                     }
+                    IngestError::ObjectMismatch { .. } => {
+                        self.flush_stats
+                            .replay_mismatch
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.supersede(tenant, file_id).await
+                    }
                     _ => file_id,
                 };
                 {
@@ -701,9 +710,14 @@ impl Shared {
             flush::Upload::Existing { size } => {
                 let ours = u64::try_from(file.size_bytes).unwrap_or(0);
                 let registered = flush::reconcile_existing(size, ours, legacy)?;
-                if registered != ours {
+                let prepared = file.content_sha256.unwrap_or([0; 32]);
+                let digest =
+                    flush::verify_existing(self.store.as_ref(), &file.path, prepared, legacy)
+                        .await?;
+                if registered != ours || digest != prepared {
                     warn!(tenant = %tenant.0, file = %file_id.0, existing = size, prepared = ours, "legacy intent: registering the object another encoder wrote");
                     file.size_bytes = i64::try_from(registered).unwrap_or(i64::MAX);
+                    file.content_sha256 = Some(digest);
                 }
                 false
             }

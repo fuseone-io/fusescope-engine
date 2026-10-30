@@ -347,8 +347,14 @@ impl Metrics {
         counter(
             out,
             "fusescope_flush_superseded_total",
-            "Flushes given a fresh id because the orphan sweep marked their path",
+            "Flushes given a fresh id because the orphan sweep marked their path or the object at it held other bytes",
             ns(&f.superseded),
+        );
+        counter(
+            out,
+            "fusescope_flush_replay_mismatch_total",
+            "Retried flushes that met an object with other bytes at their path",
+            ns(&f.replay_mismatch),
         );
         counter(
             out,
@@ -818,9 +824,14 @@ mod tests {
         let flush = Arc::new(fs_ingest::FlushStats::default());
         flush.flushes.fetch_add(2, Ordering::Relaxed);
         flush.live_bytes.store(77, Ordering::Relaxed);
+        flush.replay_mismatch.fetch_add(3, Ordering::Relaxed);
         metrics.register_flush(flush);
         let page = metrics.render();
         assert!(page.contains("fusescope_flush_total 2\n"), "{page}");
+        assert!(
+            page.contains("fusescope_flush_replay_mismatch_total 3\n"),
+            "{page}"
+        );
         assert!(
             page.contains("# TYPE fusescope_buffer_live_bytes gauge\n"),
             "{page}"

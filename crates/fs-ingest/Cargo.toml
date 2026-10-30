@@ -31,11 +31,11 @@ fs-schema = { path = "../fs-schema" }
 fs-wal = { path = "../fs-wal" }
 fs-catalog = { path = "../fs-catalog" }
 fs-index = { path = "../fs-index" }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 sqlx = { workspace = true }
-sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [lints]
