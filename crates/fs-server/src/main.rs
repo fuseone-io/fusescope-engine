@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check | --validate] [--version]
+       fusescope-engine --config <file> admin migrate
        fusescope-engine --config <file> admin tenant create <name>
        fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
        fusescope-engine --config <file> admin token list <tenant-id>
@@ -99,6 +100,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Result<Args, Early>,
 fn parse_admin(rest: &[String]) -> Result<Admin, String> {
     let words: Vec<&str> = rest.iter().map(String::as_str).collect();
     match words.as_slice() {
+        ["migrate"] => Ok(Admin::Catalog(AdminAction::Migrate)),
         ["tenant", "create", name] => Ok(Admin::Catalog(AdminAction::CreateTenant {
             name: (*name).to_owned(),
         })),

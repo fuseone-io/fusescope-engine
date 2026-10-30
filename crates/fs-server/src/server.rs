@@ -142,6 +142,9 @@ pub async fn check(
 /// Administrative actions that need the catalog but no roles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminAction {
+    /// Apply the catalog's migrations and nothing else: no bucket is
+    /// touched, so a deployment runs it with the one user allowed DDL.
+    Migrate,
     /// Create a tenant with default limits.
     CreateTenant {
         /// Unique name.
@@ -193,6 +196,11 @@ pub async fn admin(
         catalog.migrate().await?;
     }
     match action {
+        AdminAction::Migrate => {
+            catalog.migrate().await?;
+            info!(target: "fusescope::audit", action = "catalog.migrate", "catalog");
+            Ok(vec!["ok: catalog migrated".to_owned()])
+        }
         AdminAction::CreateTenant { name } => {
             let tenant = catalog
                 .create_tenant(&fs_catalog::NewTenant::with_defaults(name))

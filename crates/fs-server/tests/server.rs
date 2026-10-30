@@ -1096,3 +1096,47 @@ async fn admin_rotates_and_revokes_tokens_by_id() {
     catalog.pool().close().await;
     db.finish().await;
 }
+
+/// `admin migrate` applies the catalog's migrations even when the
+/// configuration does not migrate on start, and touches no bucket: the
+/// configured bucket does not exist.
+#[tokio::test]
+async fn admin_migrate_migrates_the_catalog_alone() {
+    use fs_server::server::AdminAction;
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let mut cfg = config(dir.path());
+    cfg.catalog.migrate = false;
+    cfg.bucket.path = Some(dir.path().join("never-created"));
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    assert!(
+        catalog
+            .create_tenant(&fs_catalog::NewTenant::with_defaults("before"))
+            .await
+            .is_err(),
+        "no schema yet"
+    );
+    let lines = server::admin(cfg.clone(), secrets.clone(), AdminAction::Migrate)
+        .await
+        .unwrap();
+    assert_eq!(lines, ["ok: catalog migrated"]);
+    catalog
+        .create_tenant(&fs_catalog::NewTenant::with_defaults("after"))
+        .await
+        .unwrap();
+    assert!(
+        !dir.path().join("never-created").exists(),
+        "no bucket was touched"
+    );
+    server::admin(cfg, secrets, AdminAction::Migrate)
+        .await
+        .unwrap();
+    catalog.pool().close().await;
+    db.finish().await;
+}
