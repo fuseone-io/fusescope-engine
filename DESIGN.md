@@ -241,8 +241,8 @@ s3://fusescope/
       l0/dt=2026-10-24/hr=14/{ulid}.idx          # sidecar: filters + summary
       l1/dt=2026-10-24/hr=14/{ulid}.parquet      # ~512 MB, closed hour
       l2/dt=2026-10-24/{ulid}.parquet            # ~1 GB, closed day
-      derived/trace_summary/dt=.../{ulid}.parquet
-      derived/service_graph_1m/dt=.../{ulid}.parquet
+      derived/trace_summary/dt=.../hr=.../{ulid}.parquet
+      derived/service_graph_1m/dt=.../hr=.../{ulid}.parquet
       derived/duration_sort/dt=.../{ulid}.parquet
       index/trace_id/dt=2026-10-24/hr=14/{ulid}.tix   # trace_id → files
     logs/
@@ -568,12 +568,63 @@ Derived tables replacing the ClickHouse materialized views:
 
 | Derived | Replaces | Key |
 |---|---|---|
-| trace_summary | signoz_traces.trace_summary | trace_id, start, end, num_spans, services |
-| service_graph_1m | dependency_graph_minutes | (src, dst, minute): count, error_count, p50/p99 via t-digest |
+| trace_summary | signoz_traces.trace_summary | trace_id, start, end, num_spans, services, has_error |
+| service_graph_1m | dependency_graph_minutes | (src, dst, dst_kind, minute): count, error_count, quantiles via t-digest |
 | duration_sort | durationSort | top-k per service and operation, per hour |
 | usage_1h | usage | bytes and rows per tenant, signal, service, hour |
 | attribute_keys | tag_attributes, span_attributes_keys | key, type, count, first and last seen |
 | rollup_5m, rollup_30m | samples_v4_agg_5m, samples_v4_agg_30m | fingerprint, window: min, max, sum, count, last |
+
+`trace_summary` and `service_graph_1m` are immutable contributions of one
+L0-to-L1 pass, not global tables. The pass builds them while it streams the
+same rows into L1, uploads at most one file of each, and publishes them in
+the same fenced catalog swap as the L1 outputs and `attribute_keys`. A crash
+or refused swap therefore publishes none of them and leaves every created
+object to the orphan collector. If an hour needs several passes, it has
+several partial files and the query combines them: trace summaries use
+`min(start)`, `max(end)`, `sum(num_spans)`, unioned services and
+`bool_or(has_error)`; graph rows use `sum(count)`, `sum(error_count)` and
+`quantile_tdigest(digest, q)`.
+
+The summary file's catalog range is the minimum and maximum **span start**
+in the pass, which is already confined to one hour. `end` stays in the rows
+for trace-overlap filtering, but never extends retention because a bad end or
+a legitimately long span can be arbitrarily distant. Consequently catalog
+pruning of this table uses `start` only; predicates on `end` are applied after
+the file is opened. The range therefore expires with the L1 trace files made
+from the same pass.
+
+The summary has one row per trace in the pass. The service graph resolves a
+direct CLIENT-to-SERVER or PRODUCER-to-CONSUMER edge by
+`(trace_id, parent_span_id)` after all rows of the pass arrived. An unmatched
+CLIENT or PRODUCER may instead name a database, queue, service or external
+endpoint from `db.system`, `messaging.system`, `peer.service`,
+`server.address` or `net.peer.name`, in that order. `dst_kind` records which.
+The child, or the unmatched outbound span, supplies the minute, error and
+latency. Parent-child pairs split across an hour or pass are deliberately
+absent; hot data is likewise absent until its closed hour compacts, and the
+Go layer reads `spans` for that recent interval.
+
+Both formats carry signal and version metadata and have an exact, non-null
+physical layout. The graph digest has its own versioned binary envelope over
+DataFusion's t-digest centroids, count, min, max and sum. A pass whose trace
+map crosses `compactor.trace_summary_max_traces` or
+`compactor.trace_summary_max_bytes`, or whose span map crosses
+`compactor.service_graph_max_spans` or `compactor.service_graph_max_bytes`,
+skips that whole contribution and increments the corresponding
+`_skipped_total`; it never publishes a partial derived file. Service and
+destination names are interned once per builder. The charged footprint is
+conservative and is reserved before retaining a row: 512 bytes per trace,
+64 bytes plus two copies of its UTF-8 length per trace/service link, 512 bytes
+plus six copies of its service/destination lengths per span, and 96 bytes plus
+UTF-8 length per interned name. These charges include finalization and writer
+scratch, not only the maps. The two byte caps together may not exceed 1 GiB;
+their defaults are 256 MiB each. Graph resolution and all derived Parquet
+encoding run on the blocking pool, not on an async executor thread.
+
+The format fixtures under `crates/fs-schema/tests/fixtures` are bytes emitted
+by the first v1 writer and are decoded by every current test run. They pin
+reader compatibility without pinning incidental Parquet writer metadata.
 
 `attribute_keys` is the first of them: one Parquet file per tenant under
 `t/{tenant}/derived/attribute_keys/dt=…/hr=…/{id}.parquet`, partitioned by
@@ -627,7 +678,9 @@ ahead of the bucket, never behind it, queries right, and the next pass
 continues with what is left; the orphan sweep removes whatever a day
 prefix keeps beyond that. Bucket lifecycle rules are the safety net, never
 the primary mechanism, because the catalog must never point at files that
-do not exist. The `attribute_keys` table is a count over every row ever
+do not exist. The immutable `trace_summary` and `service_graph_1m`
+contributions expire by the same rule as their trace files and need no
+rebuild. The `attribute_keys` table is a count over every row ever
 compacted, with no per-day contribution to subtract, so once a tenant has
 no expired file left and its table still lists a sighting before the cut
 (`stale_derived_table`), the table is rebuilt from the L1 files that remain
