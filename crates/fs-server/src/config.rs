@@ -1287,11 +1287,11 @@ impl Config {
         self.validate_server()?;
         self.validate_access()?;
         if self.query.max_rows == 0
-            || self.query.timeout_secs == 0
+            || !(1..=fs_query::querier::MAX_TIMEOUT_SECS).contains(&self.query.timeout_secs)
             || self.query.memory_bytes < 64 * 1024 * 1024
         {
             return invalid(
-                "query.max_rows and query.timeout_secs must be positive and query.memory_bytes at least 64 MiB",
+                "query.max_rows must be positive, query.timeout_secs between 1 and 300, and query.memory_bytes at least 64 MiB",
             );
         }
         if self.query.prepared_plans == 0
@@ -1706,6 +1706,25 @@ mod tests {
             .unwrap()
             .validate(&secrets)
             .unwrap();
+    }
+
+    #[test]
+    fn the_query_timeout_stays_within_the_latency_buckets() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let last = fs_query::querier::LATENCY_BOUNDS.last().copied().unwrap();
+        assert!(
+            last >= std::time::Duration::from_secs(fs_query::querier::MAX_TIMEOUT_SECS)
+                .as_secs_f64(),
+            "the largest bucket covers the longest timeout"
+        );
+        for (secs, ok) in [(0, false), (1, true), (300, true), (301, false)] {
+            let config =
+                Config::parse(&format!("{MINIMAL}[query]\ntimeout_secs = {secs}\n")).unwrap();
+            assert_eq!(config.validate(&secrets).is_ok(), ok, "{secs}");
+        }
     }
 
     #[test]

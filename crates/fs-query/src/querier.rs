@@ -53,10 +53,14 @@ impl QueryWarnings {
     }
 }
 
+/// Longest query timeout a deployment may configure, seconds: the largest
+/// latency bucket, so no execution outlives the buckets.
+pub const MAX_TIMEOUT_SECS: u64 = 300;
+
 /// Upper bounds of the query latency buckets, in seconds: a statement
-/// runs from milliseconds up to the query timeout, 60 s by default, so the
-/// last bounds sit past it and a slow quantile is never clipped to a bound
-/// below the time it took.
+/// runs from milliseconds up to the query timeout, at most
+/// [`MAX_TIMEOUT_SECS`], so the last bound covers every timeout and a slow
+/// quantile is never clipped to a bound below the time it took.
 pub const LATENCY_BOUNDS: [f64; 15] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
@@ -97,7 +101,7 @@ pub struct QueryStats {
     pub trace_lookups: std::sync::atomic::AtomicU64,
     /// `metadata.*` actions served.
     pub metadata_lookups: std::sync::atomic::AtomicU64,
-    /// Rows returned by `collect`.
+    /// Rows sent: by Flight executions and by queries collected in process.
     pub rows: std::sync::atomic::AtomicU64,
     /// Hot-window fan-outs performed.
     pub hot_fanouts: std::sync::atomic::AtomicU64,

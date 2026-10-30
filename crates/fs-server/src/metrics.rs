@@ -434,7 +434,7 @@ impl Metrics {
             counter(
                 out,
                 "fusescope_query_rows_total",
-                "Rows returned by collected queries",
+                "Rows sent by Flight executions and in-process queries",
                 q.rows.load(Ordering::Relaxed),
             );
             counter(
