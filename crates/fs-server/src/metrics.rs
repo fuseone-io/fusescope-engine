@@ -96,6 +96,7 @@ impl Metrics {
         self.render_ingest(&mut out);
         self.render_flush(&mut out);
         self.render_query(&mut out);
+        self.render_query_latency(&mut out);
         self.render_compactor(&mut out);
         if let Some(stats) = self.tls.get() {
             crate::tls::render(&mut out, stats);
@@ -405,6 +406,17 @@ impl Metrics {
         render_retention(out, &stats.retention);
     }
 
+    fn render_query_latency(&self, out: &mut String) {
+        if let Some(q) = self.query.get() {
+            histogram(
+                out,
+                "fusescope_query_seconds",
+                "Flight executions of an authenticated caller, request to end of stream",
+                &q.latency.0,
+            );
+        }
+    }
+
     fn render_query(&self, out: &mut String) {
         if let Some(q) = self.query.get() {
             counter(
@@ -711,13 +723,13 @@ pub(crate) fn counter(out: &mut String, name: &str, help: &str, value: u64) {
 fn histogram(out: &mut String, name: &str, help: &str, h: &fs_ingest::histogram::Histogram) {
     let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
     let cumulative = h.cumulative();
-    for (bound, count) in fs_ingest::histogram::BOUNDS.iter().zip(cumulative) {
+    for (bound, count) in h.bounds().iter().zip(&cumulative) {
         let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {count}");
     }
     let _ = writeln!(
         out,
         "{name}_bucket{{le=\"+Inf\"}} {}\n{name}_sum {}\n{name}_count {}",
-        cumulative[10],
+        cumulative.last().copied().unwrap_or(0),
         std::time::Duration::from_nanos(h.sum_nanos()).as_secs_f64(),
         h.count()
     );
@@ -818,6 +830,66 @@ async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every metric the dashboard in docs/ops/grafana queries is one the
+    /// engine renders, with every component registered.
+    #[test]
+    fn the_dashboard_queries_only_rendered_metrics() {
+        let metrics = Metrics::default();
+        metrics.register_ingest(Arc::new(fs_ingest::IngestStats::default()), Arc::new(|| 0));
+        metrics.register_writer(Arc::new(fs_ingest::walwriter::WriterStats::default()));
+        metrics.register_flush(Arc::new(fs_ingest::FlushStats::default()));
+        metrics.register_query(Arc::new(fs_query::QueryStats::default()));
+        metrics.register_compactor(Arc::new(fs_compactor::Stats::default()));
+        metrics.register_tls(Arc::new(fs_auth::TlsStats::default()));
+        metrics.register_jwks(Arc::new(fs_auth::JwksStats::default()));
+        let page = metrics.render();
+        let rendered: std::collections::BTreeSet<&str> = page
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split(['{', ' ']).next())
+            .collect();
+
+        let dashboard: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/ops/grafana/fusescope-engine.json"
+        ))
+        .unwrap();
+        let mut exprs = Vec::new();
+        let mut stack = vec![&dashboard];
+        while let Some(value) = stack.pop() {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::String(expr)) = map.get("expr") {
+                        exprs.push(expr.clone());
+                    }
+                    stack.extend(map.values());
+                }
+                serde_json::Value::Array(items) => stack.extend(items),
+                _ => {}
+            }
+        }
+        assert!(exprs.len() > 30, "{} queries", exprs.len());
+        let mut queried = std::collections::BTreeSet::new();
+        for expr in &exprs {
+            let mut rest = expr.as_str();
+            while let Some(at) = rest.find("fusescope_") {
+                let name: String = rest[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                rest = &rest[at + name.len()..];
+                queried.insert(name);
+            }
+        }
+        let missing: Vec<_> = queried
+            .iter()
+            .filter(|name| !rendered.contains(name.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the dashboard queries metrics the engine does not render: {missing:?}"
+        );
+    }
 
     #[test]
     fn renders_registered_counters_in_exposition_format() {

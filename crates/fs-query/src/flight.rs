@@ -340,7 +340,7 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let mut audit = Audit::begin("statement");
+        let mut audit = Audit::begin("statement", self.querier.stats());
         let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await
@@ -389,7 +389,7 @@ impl FlightSqlService for FlightSql {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
         let action = request.get_ref();
-        let mut audit = Audit::begin(&action.r#type);
+        let mut audit = Audit::begin(&action.r#type, self.querier.stats());
         audit.text(&action.body);
         let caller = self
             .authenticate_by(request.metadata(), deadline, limits)

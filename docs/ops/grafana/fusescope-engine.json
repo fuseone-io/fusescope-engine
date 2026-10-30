@@ -1,0 +1,2103 @@
+{
+  "title": "FuseScope engine",
+  "uid": "fusescope-engine",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "fusescope"
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "timezone": "utc",
+  "description": "Ingest, flush, hot window, query and compactor of the FuseScope engine, from its /metrics.",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Data source"
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "label": "Instance",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(fusescope_uptime_seconds, instance)",
+          "refId": "instances"
+        },
+        "definition": "label_values(fusescope_uptime_seconds, instance)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Ingest",
+      "id": 1,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests and spans",
+      "id": 2,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_ingest_requests_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "requests/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_ingest_spans_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "spans/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Refusals",
+      "id": 3,
+      "description": "Every refusal the ingest path makes; any sustained value is worth a look.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_ingest_spans_rejected_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "spans rejected/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_ingest_rate_limited_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "rate limited/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_ingest_over_capacity_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "over capacity/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_wal_backpressure_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "WAL backpressure/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Write-ahead log",
+      "id": 4,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(fusescope_ingest_wal_bytes{instance=~\"$instance\"})",
+          "legendFormat": "bytes on disk",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL group commits",
+      "id": 5,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_wal_batches_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "batches/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_wal_records_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "records/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL sync time share",
+      "id": 6,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_wal_sync_seconds_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "seconds syncing per second",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Buffers",
+      "id": 7,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(fusescope_buffer_live_bytes{instance=~\"$instance\"})",
+          "legendFormat": "live",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(fusescope_buffer_flushing_bytes{instance=~\"$instance\"})",
+          "legendFormat": "flushing",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(fusescope_buffer_persisted_bytes{instance=~\"$instance\"})",
+          "legendFormat": "persisted (hot window)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(fusescope_buffer_scratch_bytes{instance=~\"$instance\"})",
+          "legendFormat": "scratch",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      }
+    },
+    {
+      "type": "row",
+      "title": "Flush and coalescer",
+      "id": 8,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Flushes",
+      "id": 9,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "flushes/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_ingest_flush_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_ingest_flush_retries_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "retries/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_flush_superseded_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "superseded/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(fusescope_flush_replay_mismatch_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "replay mismatches/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Flush stages, per flush",
+      "id": 10,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_flush_concat_nanoseconds_total{instance=~\"$instance\"}[$__rate_interval])) / 1e9 / sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "concat",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_flush_sort_nanoseconds_total{instance=~\"$instance\"}[$__rate_interval])) / 1e9 / sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "sort",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_flush_encode_nanoseconds_total{instance=~\"$instance\"}[$__rate_interval])) / 1e9 / sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "encode",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_flush_upload_nanoseconds_total{instance=~\"$instance\"}[$__rate_interval])) / 1e9 / sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "upload",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(fusescope_flush_register_nanoseconds_total{instance=~\"$instance\"}[$__rate_interval])) / 1e9 / sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "register",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "F",
+          "expr": "sum(rate(fusescope_flush_nanoseconds_total{instance=~\"$instance\"}[$__rate_interval])) / 1e9 / sum(rate(fusescope_flush_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "total",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Flush output",
+      "id": 11,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_flush_parquet_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "Parquet bytes/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_flush_rows_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "rows/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(fusescope_flush_writer_peak_bytes{instance=~\"$instance\"})",
+          "legendFormat": "writer peak bytes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Unconfirmed files",
+      "id": 12,
+      "description": "Registered files whose confirmation has not landed hold their hour open.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(fusescope_flush_unconfirmed{instance=~\"$instance\"})",
+          "legendFormat": "unconfirmed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_flush_confirm_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "confirm failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 26
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Coalescer",
+      "id": 13,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(fusescope_coalesce_active{instance=~\"$instance\"})",
+          "legendFormat": "active",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_coalesce_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "coalesces/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_coalesce_batches_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "batches/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 26
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Coalesce latency",
+      "id": 14,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(fusescope_coalesce_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fusescope_coalesce_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 26
+      }
+    },
+    {
+      "type": "row",
+      "title": "Hot window and checkpoint",
+      "id": 15,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Hot scan latency",
+      "id": 16,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(fusescope_hot_scan_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fusescope_hot_scan_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Hot scans",
+      "id": 17,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_hot_scan_seconds_count{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "scans/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_hot_scan_batches_skipped_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "batches skipped by trace index/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_query_hot_fanouts_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "querier fan-outs/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_query_hot_unavailable_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "ingesters unavailable/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint latency",
+      "id": 18,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(fusescope_checkpoint_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fusescope_checkpoint_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      }
+    },
+    {
+      "type": "row",
+      "title": "Query",
+      "id": 19,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Query latency",
+      "id": 20,
+      "description": "DoGet and DoAction of an authenticated caller, request to end of stream.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(fusescope_query_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(fusescope_query_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fusescope_query_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Statements",
+      "id": 21,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_query_statements_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "statements/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_query_errors_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "errors/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_query_auth_refused_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "auth refused/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_query_trace_lookups_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "trace lookups/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(fusescope_query_metadata_lookups_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "metadata lookups/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Prepared plans",
+      "id": 22,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_query_prepared_hits_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "hits/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_query_prepared_misses_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "misses/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(fusescope_query_prepared_plans{instance=~\"$instance\"})",
+          "legendFormat": "kept",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Trace index",
+      "id": 23,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_query_trace_index_fetches_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "sidecars fetched/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_query_trace_index_misses_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "misses/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_query_trace_index_pruned_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "files pruned/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 52
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rows returned",
+      "id": 24,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_query_rows_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "rows/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 52
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Prepared plan bytes",
+      "id": 25,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(fusescope_query_prepared_bytes{instance=~\"$instance\"})",
+          "legendFormat": "retained",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 52
+      }
+    },
+    {
+      "type": "row",
+      "title": "Compactor",
+      "id": 26,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Compaction passes",
+      "id": 27,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_compaction_passes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "passes/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_compaction_inputs_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "inputs/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_compaction_outputs_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "outputs/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 61
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Compaction bytes",
+      "id": 28,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_compaction_input_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "in",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_compaction_output_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "out",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 61
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Compaction trouble",
+      "id": 29,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_compaction_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_compaction_conflicts_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "conflicts/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_compaction_lease_lost_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "lease lost/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_compaction_skipped_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "hours over the input cap/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(fusescope_compaction_orphaned_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "outputs orphaned/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 61
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Derived tables",
+      "id": 30,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_compaction_derived_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "attribute_keys/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_compaction_trace_summary_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "trace_summary/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_compaction_service_graph_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "service_graph/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 69
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Derived tables skipped",
+      "id": 31,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_compaction_trace_summary_skipped_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "trace_summary over cap/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_compaction_service_graph_skipped_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "service_graph over cap/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_compaction_derived_keys_dropped_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "attribute keys dropped/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_compaction_derived_unreadable_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "attribute_keys unreadable/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 69
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Retention",
+      "id": 32,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_retention_expired_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "files expired/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_retention_rebuilds_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "rebuilds/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_retention_rebuild_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "rebuild failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_retention_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "expiry failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 69
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Orphan collector",
+      "id": 33,
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_orphan_seen_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "seen/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_orphan_deleted_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "deleted/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_orphan_delete_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "delete failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_orphan_forgotten_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "forgotten/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 77
+      }
+    },
+    {
+      "type": "row",
+      "title": "Security",
+      "id": 34,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 85
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "TLS handshakes",
+      "id": 35,
+      "description": "A refused client certificate counts as a failed handshake.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(fusescope_tls_handshake_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "failed/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(fusescope_tls_handshakes_refused_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "refused at the limit/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 86
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Stale TLS or JWT keys",
+      "id": 36,
+      "description": "Non-zero means the last reload failed and the last good files still serve.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(fusescope_tls_stale{instance=~\"$instance\"})",
+          "legendFormat": "TLS stale",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(fusescope_jwt_keys_stale{instance=~\"$instance\"})",
+          "legendFormat": "JWT keys stale",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(fusescope_tls_reload_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "TLS reload failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(fusescope_jwt_key_reload_failures_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "JWT key reload failures/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 86
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Uptime",
+      "id": 37,
+      "description": "A drop is a restart.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min(fusescope_uptime_seconds{instance=~\"$instance\"})",
+          "legendFormat": "shortest uptime",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 86
+      }
+    }
+  ]
+}

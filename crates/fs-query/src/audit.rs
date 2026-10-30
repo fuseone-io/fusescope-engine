@@ -30,6 +30,7 @@ enum Outcome {
 
 /// The audit record of one request, logged when dropped.
 pub(crate) struct Audit {
+    stats: std::sync::Arc<crate::querier::QueryStats>,
     tenant: Option<fs_catalog::TenantId>,
     subject: Option<String>,
     kind: String,
@@ -40,9 +41,11 @@ pub(crate) struct Audit {
 }
 
 impl Audit {
-    /// A record for a request of `kind`, before anything about it is known.
-    pub(crate) fn begin(kind: &str) -> Self {
+    /// A record for a request of `kind`, before anything about it is known;
+    /// an authenticated one's duration lands in `stats`' latency.
+    pub(crate) fn begin(kind: &str, stats: std::sync::Arc<crate::querier::QueryStats>) -> Self {
         Self {
+            stats,
             tenant: None,
             subject: None,
             kind: kind.to_owned(),
@@ -107,6 +110,9 @@ impl Drop for Audit {
             Outcome::Cancelled => "cancelled",
             Outcome::Ok => "ok",
         };
+        if self.tenant.is_some() {
+            self.stats.latency.0.observe(self.started.elapsed());
+        }
         let tenant = self
             .tenant
             .map_or_else(|| "-".to_owned(), |t| t.0.to_string());
@@ -183,7 +189,7 @@ mod tests {
             tenant: fs_catalog::TenantId(uuid::Uuid::from_u128(1)),
             subject: Some("user:alice".into()),
         };
-        let mut audit = Audit::begin("statement");
+        let mut audit = Audit::begin("statement", std::sync::Arc::default());
         audit.caller(&caller);
         audit.text(b"select 1");
         audit
@@ -193,7 +199,7 @@ mod tests {
     async fn the_outcome_follows_how_the_stream_ends() {
         assert_eq!(audit().outcome, Outcome::Failed, "failed before streaming");
         assert_eq!(audit().hash.as_deref().map(str::len), Some(16));
-        let mut refused = Audit::begin("metadata.services\nforged=line");
+        let mut refused = Audit::begin("metadata.services\nforged=line", std::sync::Arc::default());
         refused.ended_with(&tonic::Status::unauthenticated("bad signature"));
         assert_eq!((refused.outcome, refused.tenant), (Outcome::Refused, None));
         for (status, outcome) in [
@@ -205,7 +211,7 @@ mod tests {
                 Outcome::Failed,
             ),
         ] {
-            let mut audit = Audit::begin("statement");
+            let mut audit = Audit::begin("statement", std::sync::Arc::default());
             audit.ended_with(&status);
             assert_eq!(audit.outcome, outcome, "{status:?}");
         }
@@ -239,5 +245,19 @@ mod tests {
             Outcome::Cancelled,
             "dropped mid-stream"
         );
+
+        let stats = std::sync::Arc::new(crate::querier::QueryStats::default());
+        let mut refused = Audit::begin("statement", std::sync::Arc::clone(&stats));
+        refused.ended_with(&tonic::Status::unauthenticated("bad token"));
+        drop(refused);
+        assert_eq!(stats.latency.0.count(), 0, "a refusal is not an execution");
+        let mut ran = Audit::begin("statement", std::sync::Arc::clone(&stats));
+        ran.caller(&Caller {
+            tenant: fs_catalog::TenantId(uuid::Uuid::from_u128(1)),
+            subject: None,
+        });
+        drop(ran);
+        assert_eq!(stats.latency.0.count(), 1);
+        assert_eq!(stats.latency.0.bounds().last(), Some(&30.0));
     }
 }

@@ -53,6 +53,24 @@ impl QueryWarnings {
     }
 }
 
+/// Upper bounds of the query latency buckets, in seconds: a statement
+/// runs from milliseconds up to the query timeout.
+pub const LATENCY_BOUNDS: [f64; 12] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Latency of executions, from the request to the end of its stream.
+#[derive(Debug)]
+pub struct QueryLatency(pub fs_ingest::histogram::Histogram);
+
+impl Default for QueryLatency {
+    fn default() -> Self {
+        Self(fs_ingest::histogram::Histogram::with_bounds(
+            &LATENCY_BOUNDS,
+        ))
+    }
+}
+
 /// Counters exposed for metrics.
 #[derive(Debug, Default)]
 pub struct QueryStats {
@@ -85,6 +103,9 @@ pub struct QueryStats {
     pub hot_unavailable: std::sync::atomic::AtomicU64,
     /// Flight requests refused for a missing, unknown or invalid token.
     pub auth_refused: std::sync::atomic::AtomicU64,
+    /// `DoGet` and `DoAction` executions of an authenticated caller, from
+    /// the request to the end of its stream, however it ended.
+    pub latency: QueryLatency,
     /// `trace_id` sidecars fetched from the bucket.
     pub trace_index_fetches: std::sync::atomic::AtomicU64,
     /// Sidecars missing, unreadable or unreachable; their files were scanned.
