@@ -1,8 +1,12 @@
 #!/bin/sh
 # Checks the Helm chart: it lints strictly and renders valid Kubernetes
-# objects for every values file under ci/, the configuration it renders
-# passes the engine's own --validate, and the releases it must refuse
-# fail to render.
+# objects for every values file under ci/; each role's rendered
+# configuration passes the engine's own --validate; the rendered workloads
+# keep the roles apart (their own Secret, ServiceAccount and TLS identity,
+# none for the compactor, no API token) and wait for a startup probe; and
+# the releases it must refuse fail to render. --validate reads no
+# certificate and connects nowhere, so the separation is checked here, on
+# the manifests.
 #
 # usage: scripts/chart-check.sh --binary <path>
 #        scripts/chart-check.sh --image <image>
@@ -36,15 +40,44 @@ for values in "$chart"/ci/*-values.yaml; do
     helm lint --strict "$chart" -f "$values" >/dev/null
     helm template check "$chart" -f "$values" --namespace fusescope > "$work/$name.yaml"
     kubeconform -strict -summary "$work/$name.yaml"
-    helm template check "$chart" -f "$values" --namespace fusescope \
-        --show-only templates/configmap.yaml \
-        | python3 -c 'import sys, yaml; sys.stdout.write(yaml.safe_load(sys.stdin)["data"]["config.toml"])' \
-        > "$work/$name.toml"
-    chmod 644 "$work/$name.toml"
+    python3 - "$work/$name.yaml" "$work" "$name" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+work, name = sys.argv[2], sys.argv[3]
+fail = lambda why: sys.exit(f"chart with {name} values: {why}")
+config = next(d for d in docs if d["kind"] == "ConfigMap")["data"]
+for role in ("ingester", "querier", "compactor"):
+    with open(f"{work}/{name}-{role}.toml", "w") as out:
+        out.write(config[f"{role}.toml"])
+pods = {d["metadata"]["labels"]["app.kubernetes.io/component"]: d["spec"]["template"]["spec"]
+        for d in docs if d["kind"] in ("StatefulSet", "Deployment")}
+if set(pods) != {"ingester", "querier", "compactor"}:
+    fail(f"workloads {sorted(pods)}")
+secrets, accounts, identities = {}, {}, {}
+for role, pod in pods.items():
+    if pod.get("automountServiceAccountToken") is not False:
+        fail(f"{role} mounts its ServiceAccount token")
+    accounts[role] = pod["serviceAccountName"]
+    container = pod["containers"][0]
+    if "startupProbe" not in container or "livenessProbe" not in container:
+        fail(f"{role} has no startup probe before its liveness")
+    secrets[role] = container["envFrom"][0]["secretRef"]["name"]
+    identity = [v["secret"]["secretName"] for v in pod["volumes"] if v["name"] == "tls"]
+    identities[role] = identity[0] if identity else None
+for what, by_role in (("Secret", secrets), ("ServiceAccount", accounts)):
+    if len(set(by_role.values())) != 3:
+        fail(f"roles share a {what}: {by_role}")
+if identities["compactor"] is not None:
+    fail("the compactor has a TLS identity")
+tls_on = "enabled = true" in config["querier.toml"]
+if tls_on and (identities["ingester"] is None or identities["ingester"] == identities["querier"]):
+    fail(f"ingester and querier TLS identities {identities}")
+PY
     for role in ingester querier compactor; do
-        validate --config "$work/$name.toml" --role "$role" --validate >/dev/null
+        chmod 644 "$work/$name-$role.toml"
+        validate --config "$work/$name-$role.toml" --validate >/dev/null
     done
-    echo "chart with $name values: lints, renders valid objects, configuration valid for every role"
+    echo "chart with $name values: lints, renders valid objects, each role's configuration valid, roles kept apart, startup probed"
 done
 
 refuse() {
@@ -56,5 +89,7 @@ refuse() {
 refuse
 refuse -f "$chart/ci/staging-values.yaml" --set tls.enabled=false
 refuse -f "$chart/ci/staging-values.yaml" --set auth.mode=oauth
-refuse -f "$chart/ci/staging-values.yaml" --set tls.secretName=
-echo "chart refuses a release without its secrets, jwt without tls, or an unknown auth mode"
+refuse -f "$chart/ci/staging-values.yaml" --set tls.clientCASecret=
+refuse -f "$chart/ci/staging-values.yaml" --set secrets.querier=fusescope-engine-ingester
+refuse -f "$chart/ci/staging-values.yaml" --set tls.identities.querier=fusescope-engine-ingester-tls
+echo "chart refuses a release without its secrets, roles sharing a Secret or a TLS identity, jwt without tls, or an unknown auth mode"

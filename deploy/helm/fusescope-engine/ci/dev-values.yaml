@@ -1,6 +1,9 @@
 # A development release: plain text and static query tokens, against an
 # S3-compatible store over http.
-secretName: fusescope-engine-secrets
+secrets:
+  ingester: fusescope-engine-ingester
+  querier: fusescope-engine-querier
+  compactor: fusescope-engine-compactor
 bucket:
   name: fusescope
   endpoint: http://minio:9000

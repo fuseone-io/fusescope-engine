@@ -51,7 +51,7 @@ spec:
         {{- include "fse.labels" . | nindent 8 }}
         app.kubernetes.io/component: ingester
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- include "fse.podAnnotations" $ctx | nindent 8 }}
     spec:
       {{- include "fse.pod" $ctx | nindent 6 }}
   # The WAL holds rows not yet flushed: it outlives the pod.

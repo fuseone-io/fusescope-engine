@@ -17,6 +17,6 @@ spec:
         {{- include "fse.labels" . | nindent 8 }}
         app.kubernetes.io/component: compactor
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- include "fse.podAnnotations" $ctx | nindent 8 }}
     spec:
       {{- include "fse.pod" $ctx | nindent 6 }}

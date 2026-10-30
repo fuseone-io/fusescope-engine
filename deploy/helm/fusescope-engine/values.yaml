@@ -10,10 +10,35 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
-# Secret, created outside the chart, whose keys are the environment the
-# engine reads its secrets from: FS_CATALOG_URL, FS_BUCKET_ACCESS_KEY and
-# FS_BUCKET_SECRET_KEY. Required.
-secretName: ""
+# Secrets, created outside the chart, one per role, whose keys are the
+# environment the engine reads its secrets from: FS_CATALOG_URL,
+# FS_BUCKET_ACCESS_KEY and FS_BUCKET_SECRET_KEY. Each role has its own
+# Postgres user and bucket identity (DESIGN.md 10.4): the ingester writes
+# L0, the querier only reads, the compactor reads, writes and deletes. With
+# workload identity, leave the bucket keys out and annotate the role's
+# ServiceAccount instead. The three must differ.
+secrets:
+  ingester: ""
+  querier: ""
+  compactor: ""
+
+# One ServiceAccount per role; annotations bind workload identity, for
+# example eks.amazonaws.com/role-arn. Pods never mount its API token.
+serviceAccounts:
+  ingester:
+    annotations: {}
+  querier:
+    annotations: {}
+  compactor:
+    annotations: {}
+
+# Changing a role's value rolls its pods: environment from Secrets is read
+# at start, so a rotated credential needs a new value here or
+# `kubectl rollout restart`.
+rolloutTokens:
+  ingester: ""
+  querier: ""
+  compactor: ""
 
 catalog:
   maxConnections: 16
@@ -30,11 +55,19 @@ bucket:
 
 tls:
   enabled: true
-  # Secret with tls.crt and tls.key (the identity, with serverAuth and
-  # clientAuth; ingesters' must name *.<release>-ingester-hot.<namespace>.svc
-  # and the querier's <release>-flight), public-ca.crt (the backend's client
-  # CAs) and hot-ca.crt (the queriers'), two disjoint sets of roots.
-  secretName: ""
+  # Secret with public-ca.crt (the backend's client CAs, Flight SQL) and
+  # hot-ca.crt (the queriers' client CAs, the hot window): roots sharing no
+  # key. Shared by the roles; it holds no private key.
+  clientCASecret: ""
+  # Each role's identity, a Secret with tls.crt and tls.key. The ingester's
+  # serves the hot window and names *.<release>-ingester-hot.<namespace>.svc;
+  # it must not chain to hot-ca.crt, or an ingester could scan the others.
+  # The querier's serves Flight SQL, names <release>-flight, and is the one
+  # identity issued under hot-ca.crt, with both serverAuth and clientAuth.
+  # The compactor serves and dials no Flight and gets none.
+  identities:
+    ingester: ""
+    querier: ""
   reloadIntervalSecs: 60
 
 auth:
@@ -50,6 +83,9 @@ log:
 
 # A stop drains in flight work for this long; the pod gets more.
 drainTimeoutSecs: 30
+# Longest a start may take, migrations and the bucket's ownership check
+# included, before the pod is restarted; liveness waits for it.
+startupTimeoutSecs: 600
 
 ingester:
   replicas: 2

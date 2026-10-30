@@ -6,59 +6,7 @@ metadata:
   labels:
     {{- include "fse.labels" . | nindent 4 }}
 data:
-  config.toml: |
-    # Rendered by the chart; each workload picks its role with --role and
-    # its identity from the pod. Secrets come from the environment.
-    [server]
-    flight_addr = "0.0.0.0:8815"
-    metrics_addr = "0.0.0.0:9464"
-    drain_timeout_secs = {{ .Values.drainTimeoutSecs }}
-
-    [catalog]
-    max_connections = {{ .Values.catalog.maxConnections }}
-    migrate = {{ .Values.catalog.migrate }}
-
-    [bucket]
-    kind = "s3"
-    name = {{ .Values.bucket.name | quote }}
-    {{- with .Values.bucket.prefix }}
-    prefix = {{ . | quote }}
-    {{- end }}
-    {{- with .Values.bucket.endpoint }}
-    endpoint = {{ . | quote }}
-    {{- end }}
-    {{- with .Values.bucket.region }}
-    region = {{ . | quote }}
-    {{- end }}
-    allow_http = {{ .Values.bucket.allowHttp }}
-
-    [wal]
-    dir = "/var/lib/fusescope/wal"
-
-    [ingest]
-    listen = "0.0.0.0:4317"
-    hot_listen = "0.0.0.0:8816"
-
-    [query]
-    spill_dir = "/var/lib/fusescope/spill"
-
-    [tls]
-    enabled = {{ .Values.tls.enabled }}
-    {{- if .Values.tls.enabled }}
-    cert = "/etc/fusescope/tls/tls.crt"
-    key = "/etc/fusescope/tls/tls.key"
-    public_client_ca = "/etc/fusescope/tls/public-ca.crt"
-    hot_client_ca = "/etc/fusescope/tls/hot-ca.crt"
-    reload_interval_secs = {{ .Values.tls.reloadIntervalSecs }}
-    {{- end }}
-
-    [auth]
-    mode = {{ .Values.auth.mode | quote }}
-    {{- if eq .Values.auth.mode "jwt" }}
-    jwt_keys = "/etc/fusescope/jwt/jwks.json"
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-
-    [log]
-    level = {{ .Values.log.level | quote }}
-    format = {{ .Values.log.format | quote }}
+  {{- range $role := list "ingester" "querier" "compactor" }}
+  {{ $role }}.toml: |
+    {{- include "fse.config" (dict "Values" $.Values "Release" $.Release "Chart" $.Chart "role" $role) | nindent 4 }}
+  {{- end }}
