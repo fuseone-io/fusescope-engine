@@ -58,3 +58,23 @@ copied into the image readable by every user and published by the CI
 checks it is CycloneDX 1.5 JSON whose root is the binary, with a non-empty
 graph naming the engine's runtime crates. It lists crates only: the
 distroless base's Debian packages are recorded by the base image itself.
+
+## Releases
+
+A tag `v<version>`, equal to the workspace version, publishes the image
+as `ghcr.io/fuseone-io/fusescope-engine:<version>` (`.github/workflows/release.yml`).
+The workflow builds it, runs the same `scripts/image-check.sh` as CI and
+publishes nothing if that fails; then it pushes, signs the digest with
+cosign keyless, attests the build provenance and the CycloneDX SBOM by
+digest, and creates a GitHub pre-release with the SBOM attached. Images are
+`linux/amd64` only for now. The engine is experimental and its releases
+are pre-releases.
+
+Verify an image before running it:
+
+```sh
+cosign verify ghcr.io/fuseone-io/fusescope-engine:<version> \
+  --certificate-identity-regexp '^https://github.com/fuseone-io/fusescope-engine/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://ghcr.io/fuseone-io/fusescope-engine:<version> --owner fuseone-io
+```
