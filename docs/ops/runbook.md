@@ -43,10 +43,14 @@ from the checkpoint, rebuilding the rows not yet flushed;
 A replayed flush produces the same file under the same id, so nothing is
 written twice. Expect a start to take longer the more the WAL holds.
 
-- **The WAL refuses to open** with damage before its last commit marker:
-  acknowledged records are corrupt and the engine will not cut them. Keep
-  the volume, do not delete segments, and escalate: the records are the
-  only copy of rows the clients were told were stored.
+- **The WAL refuses to open** with damage recovery cannot prove
+  unacknowledged: damage before the last commit marker, or a read failure
+  that keeps recovery from proving the damage lies after it. The suffix of
+  `wal: damage at segment … that recovery must not cut (…)` says which:
+  corrupt bytes, or an I/O error while reading. Either way the records may
+  be acknowledged and the engine will not cut them: keep the volume, do not
+  delete segments, and escalate, since they are the only copy of rows the
+  clients were told were stored.
 - **Replay stops at damage anywhere else**, in an earlier segment or in a
   record, and the ingester refuses to start with
   `ingest: wal record: wal damage at …`: the records past it may hold a
@@ -180,7 +184,7 @@ hot window did not answer.
 | `tls: …`, `jwt keys …` | a certificate, key, CA bundle or key set that does not load |
 | `bucket prefix … belongs to catalog …` | another deployment's prefix |
 | `… holds objects but no catalog marker` | see the orphan collector above |
-| `wal: damage at segment … that recovery must not cut` | damage before the WAL's last commit marker; keep the volume and escalate |
+| `wal: damage at segment … that recovery must not cut (…)` | damage recovery cannot prove unacknowledged, corrupt bytes or a read failure as the suffix says; keep the volume and escalate |
 | `wal: io at …` | the WAL directory cannot be read or written: the volume is missing, read-only or not the pod's to write |
 | `wal: …`, any other | the WAL cannot open; the message names why |
 | `ingest: wal record: wal damage at …` | replay met damage it will not skip; keep the volume and escalate |
