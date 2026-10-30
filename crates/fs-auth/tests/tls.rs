@@ -39,23 +39,31 @@ fn limits() -> TlsLimits {
     }
 }
 
-/// The files copied under `dir`, so a test can rewrite them.
-fn files_in(dir: &Path, cert: &str, key: &str, public_ca: &str, hot_ca: &str) -> TlsFiles {
+/// The files written under `dir`, so a test can rewrite them; each client
+/// CA bundle is the concatenation of the named fixtures.
+fn files_in(dir: &Path, cert: &str, key: &str, public: &[&str], hot: &[&str]) -> TlsFiles {
     let files = TlsFiles {
         cert: dir.join("tls.crt"),
         key: dir.join("tls.key"),
         public_client_ca: dir.join("public-ca.crt"),
         hot_client_ca: dir.join("hot-ca.crt"),
     };
-    install(&files, cert, key, public_ca, hot_ca);
+    install(&files, cert, key, public, hot);
     files
 }
 
-fn install(files: &TlsFiles, cert: &str, key: &str, public_ca: &str, hot_ca: &str) {
+fn install(files: &TlsFiles, cert: &str, key: &str, public: &[&str], hot: &[&str]) {
     std::fs::copy(fixture(cert), &files.cert).unwrap();
     std::fs::copy(fixture(key), &files.key).unwrap();
-    std::fs::copy(fixture(public_ca), &files.public_client_ca).unwrap();
-    std::fs::copy(fixture(hot_ca), &files.hot_client_ca).unwrap();
+    std::fs::write(&files.public_client_ca, bundle(public)).unwrap();
+    std::fs::write(&files.hot_client_ca, bundle(hot)).unwrap();
+}
+
+fn bundle(names: &[&str]) -> Vec<u8> {
+    names
+        .iter()
+        .flat_map(|name| std::fs::read(fixture(name)).unwrap())
+        .collect()
 }
 
 /// The backend's clients come from CA b, the queriers' from CA a, which
@@ -71,6 +79,8 @@ fn fixtures() -> TlsFiles {
 
 const BACKEND: Option<(&str, &str)> = Some(("client-b.pem", "client-b.key"));
 const QUERIER: Option<(&str, &str)> = Some(("client-a.pem", "client-a.key"));
+const BACKEND2: Option<(&str, &str)> = Some(("client-b2.pem", "client-b2.key"));
+const QUERIER2: Option<(&str, &str)> = Some(("client-a2.pem", "client-a2.key"));
 
 /// Binds a listener whose accepted connections echo what they read.
 async fn echo_server(tls: &ServerTls) -> SocketAddr {
@@ -172,9 +182,13 @@ fn invalid_mismatched_or_overlapping_files_refuse_the_load() {
     std::fs::write(&empty, b"").unwrap();
     let missing = dir.path().join("missing.pem");
     let both = dir.path().join("both.pem");
-    let mut bundle = std::fs::read(fixture("ca-b.pem")).unwrap();
-    bundle.extend(std::fs::read(fixture("ca-a.pem")).unwrap());
-    std::fs::write(&both, bundle).unwrap();
+    std::fs::write(&both, bundle(&["ca-b.pem", "ca-a.pem"])).unwrap();
+    let with_intermediate = dir.path().join("with-intermediate.pem");
+    std::fs::write(
+        &with_intermediate,
+        bundle(&["ca-b.pem", "ca-a-intermediate.pem"]),
+    )
+    .unwrap();
     let cases = [
         (
             TlsFiles {
@@ -231,6 +245,42 @@ fn invalid_mismatched_or_overlapping_files_refuse_the_load() {
                 ..good()
             },
             fixture("ca-a.pem"),
+        ),
+        (
+            TlsFiles {
+                public_client_ca: fixture("ca-a-reissued.pem"),
+                ..good()
+            },
+            fixture("ca-a.pem"),
+        ),
+        (
+            TlsFiles {
+                public_client_ca: fixture("ca-a-renamed.pem"),
+                ..good()
+            },
+            fixture("ca-a.pem"),
+        ),
+        (
+            TlsFiles {
+                public_client_ca: with_intermediate.clone(),
+                ..good()
+            },
+            with_intermediate.clone(),
+        ),
+        (
+            TlsFiles {
+                public_client_ca: fixture("ca-a.pem"),
+                hot_client_ca: fixture("ca-a-intermediate.pem"),
+                ..good()
+            },
+            fixture("ca-a-intermediate.pem"),
+        ),
+        (
+            TlsFiles {
+                public_client_ca: fixture("ca-a-lookalike.pem"),
+                ..good()
+            },
+            fixture("ca-a-lookalike.pem"),
         ),
     ];
     for (files, culprit) in cases {
@@ -316,6 +366,40 @@ async fn the_public_and_hot_listeners_admit_disjoint_clients() {
     assert!(tls.stats().handshake_failures.load(Ordering::Relaxed) >= 6);
 }
 
+/// A CA issued again under the same key is the same trust domain whatever
+/// its serial and validity: a client of the first opens a listener that
+/// trusts only the second, so the two may never split across the bundles.
+#[tokio::test]
+async fn a_ca_reissued_under_the_same_key_is_the_same_trust_domain() {
+    let same_key = Tls::load(
+        TlsFiles {
+            public_client_ca: fixture("ca-a-reissued.pem"),
+            hot_client_ca: fixture("ca-b.pem"),
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap();
+    let public = echo_server(&same_key.public_server()).await;
+    assert!(
+        accepted(public, "ca-a.pem", QUERIER).await,
+        "a client of ca-a opens a listener trusting only its reissue"
+    );
+    let err = Tls::load(
+        TlsFiles {
+            public_client_ca: fixture("ca-a-reissued.pem"),
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("shares a CA key"), "{err}");
+}
+
+/// A rotation as operated: each bundle goes from its CA to old and new
+/// together, then to the new alone, and no CA ever changes listener. New
+/// connections follow each step on the same listeners; an open connection
+/// keeps the config it began with.
 #[tokio::test]
 async fn a_reload_serves_new_connections_and_leaves_open_ones() {
     let dir = tempfile::tempdir().unwrap();
@@ -323,36 +407,69 @@ async fn a_reload_serves_new_connections_and_leaves_open_ones() {
         dir.path(),
         "server-a.pem",
         "server-a.key",
-        "ca-b.pem",
-        "ca-a.pem",
+        &["ca-b.pem"],
+        &["ca-a.pem"],
     );
     let tls = Tls::load(files.clone(), limits()).unwrap();
-    let addr = echo_server(&tls.hot_server()).await;
-    let mut open = connect(addr, "localhost", "ca-a.pem", QUERIER)
+    let public = echo_server(&tls.public_server()).await;
+    let hot = echo_server(&tls.hot_server()).await;
+    let mut open = connect(hot, "localhost", "ca-a.pem", QUERIER)
         .await
         .unwrap();
     round_trip(&mut open).await.unwrap();
     assert_eq!(leaf(&open), fixture_leaf("server-a.pem"));
+    assert!(!accepted(hot, "ca-a.pem", QUERIER2).await);
+    assert!(!accepted(public, "ca-a.pem", BACKEND2).await);
+
+    install(
+        &files,
+        "server-a.pem",
+        "server-a.key",
+        &["ca-b.pem", "ca-b2.pem"],
+        &["ca-a.pem", "ca-a2.pem"],
+    );
+    assert_eq!(tls.reload().unwrap(), Reload::Reloaded);
+    assert_eq!(tls.reload().unwrap(), Reload::Unchanged);
+    for client in [QUERIER, QUERIER2] {
+        assert!(
+            accepted(hot, "ca-a.pem", client).await,
+            "{client:?} during the overlap"
+        );
+    }
+    for client in [BACKEND, BACKEND2] {
+        assert!(
+            accepted(public, "ca-a.pem", client).await,
+            "{client:?} during the overlap"
+        );
+        assert!(
+            !accepted(hot, "ca-a.pem", client).await,
+            "{client:?} on the hot window"
+        );
+    }
 
     install(
         &files,
         "server-a2.pem",
         "server-a2.key",
-        "ca-a.pem",
-        "ca-b.pem",
+        &["ca-b2.pem"],
+        &["ca-a2.pem"],
     );
     assert_eq!(tls.reload().unwrap(), Reload::Reloaded);
-    assert_eq!(tls.reload().unwrap(), Reload::Unchanged);
-    assert_eq!(tls.stats().reloads.load(Ordering::Relaxed), 1);
-
+    assert_eq!(tls.stats().reloads.load(Ordering::Relaxed), 2);
     round_trip(&mut open)
         .await
         .expect("an open connection keeps the config it began with");
     assert!(
-        !accepted(addr, "ca-a.pem", QUERIER).await,
-        "the old client CA no longer admits new connections"
+        !accepted(hot, "ca-a.pem", QUERIER).await,
+        "the retired querier CA"
     );
-    let mut rotated = connect(addr, "localhost", "ca-a.pem", BACKEND)
+    assert!(
+        !accepted(public, "ca-a.pem", BACKEND).await,
+        "the retired backend CA"
+    );
+    assert!(accepted(public, "ca-a.pem", BACKEND2).await);
+    assert!(!accepted(hot, "ca-a.pem", BACKEND2).await);
+    let mut rotated = connect(hot, "localhost", "ca-a.pem", QUERIER2)
         .await
         .unwrap();
     round_trip(&mut rotated).await.unwrap();
@@ -370,8 +487,8 @@ async fn a_failed_reload_keeps_the_last_good_config_and_marks_it_stale() {
         dir.path(),
         "server-a.pem",
         "server-a.key",
-        "ca-b.pem",
-        "ca-a.pem",
+        &["ca-b.pem"],
+        &["ca-a.pem"],
     );
     let tls = Tls::load(files.clone(), limits()).unwrap();
     let addr = echo_server(&tls.hot_server()).await;
@@ -414,8 +531,8 @@ async fn a_failed_reload_keeps_the_last_good_config_and_marks_it_stale() {
         &files,
         "server-a.pem",
         "server-a.key",
-        "ca-b.pem",
-        "ca-a.pem",
+        &["ca-b.pem"],
+        &["ca-a.pem"],
     );
     assert_eq!(tls.reload().unwrap(), Reload::Reloaded);
     assert!(!stats.stale.load(Ordering::Relaxed));
@@ -428,8 +545,8 @@ async fn the_reload_task_follows_the_files_until_shutdown() {
         dir.path(),
         "server-a.pem",
         "server-a.key",
-        "ca-b.pem",
-        "ca-a.pem",
+        &["ca-b.pem"],
+        &["ca-a.pem"],
     );
     let tls = Tls::load(
         files.clone(),
@@ -445,8 +562,8 @@ async fn the_reload_task_follows_the_files_until_shutdown() {
         &files,
         "server-a2.pem",
         "server-a2.key",
-        "ca-b.pem",
-        "ca-a.pem",
+        &["ca-b.pem"],
+        &["ca-a.pem"],
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tls.stats().reloads.load(Ordering::Relaxed) == 0 {

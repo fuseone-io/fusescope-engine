@@ -4435,9 +4435,10 @@ fn tls_in(
 }
 
 /// With mTLS on, the hot window answers a querier presenting a certificate
-/// from the client CA at the name its certificate carries, and refuses
-/// plain text, another CA's client and another name; a reload of the
-/// client CA applies to the next scan on the same listener.
+/// from the querier CA at the name its certificate carries, and refuses
+/// plain text, the backend's client and another name; a rotation of the
+/// querier CA through an overlapping bundle applies to the next scan on
+/// the same listener.
 #[tokio::test]
 async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
     let Some(db) = TestDb::new().await else {
@@ -4501,13 +4502,13 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
     )
     .client()
     .trusting_only(&ca_a);
-    let other_dir = tempfile::tempdir().unwrap();
-    let other = tls_in(
-        other_dir.path(),
+    let backend_dir = tempfile::tempdir().unwrap();
+    let backend = tls_in(
+        backend_dir.path(),
         "client-b.pem",
         "client-b.key",
-        "ca-a.pem",
         "ca-b.pem",
+        "ca-a.pem",
     )
     .client()
     .trusting_only(&ca_a);
@@ -4532,10 +4533,10 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         "plain text"
     );
     assert!(
-        fs_ingest::hot::scan_with(&named, &request, timeout, Some(&other))
+        fs_ingest::hot::scan_with(&named, &request, timeout, Some(&backend))
             .await
             .is_err(),
-        "a client certificate from another CA"
+        "the backend's certificate"
     );
     let err = fs_ingest::hot::scan_with(&h.hot_addr.to_string(), &request, timeout, Some(&querier))
         .await
@@ -4545,30 +4546,52 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         "the address is not the name in the certificate: {err}"
     );
 
-    std::fs::copy(
-        tls_fixture("ca-a.pem"),
-        server_dir.path().join("public-ca.crt"),
+    // The querier CA rotates as operated, ca-a to ca-a and ca-a2 to ca-a2,
+    // on the same listener; the backend's CA never moves to it.
+    let renewed_dir = tempfile::tempdir().unwrap();
+    let renewed = tls_in(
+        renewed_dir.path(),
+        "client-a2.pem",
+        "client-a2.key",
+        "ca-b.pem",
+        "ca-a2.pem",
     )
-    .unwrap();
-    std::fs::copy(
-        tls_fixture("ca-b.pem"),
-        server_dir.path().join("hot-ca.crt"),
-    )
-    .unwrap();
+    .client()
+    .trusting_only(&ca_a);
+    let hot_ca = server_dir.path().join("hot-ca.crt");
+    let both: Vec<u8> = ["ca-a.pem", "ca-a2.pem"]
+        .iter()
+        .flat_map(|name| std::fs::read(tls_fixture(name)).unwrap())
+        .collect();
+    std::fs::write(&hot_ca, both).unwrap();
+    assert_eq!(server.reload().unwrap(), fs_auth::Reload::Reloaded);
+    for client in [&querier, &renewed] {
+        let scanned = fs_ingest::hot::scan_with(&named, &request, timeout, Some(client))
+            .await
+            .unwrap();
+        assert_eq!(rows(scanned), 3, "{client:?} during the overlap");
+    }
+    std::fs::copy(tls_fixture("ca-a2.pem"), &hot_ca).unwrap();
     assert_eq!(server.reload().unwrap(), fs_auth::Reload::Reloaded);
     assert!(
         fs_ingest::hot::scan_with(&named, &request, timeout, Some(&querier))
             .await
             .is_err(),
-        "the old client CA no longer admits the querier"
+        "the retired querier CA no longer admits new scans"
     );
-    let scanned = fs_ingest::hot::scan_with(&named, &request, timeout, Some(&other))
+    let scanned = fs_ingest::hot::scan_with(&named, &request, timeout, Some(&renewed))
         .await
         .unwrap();
     assert_eq!(
         rows(scanned),
         3,
-        "the same listener admits the new CA's client"
+        "the same listener admits the new CA's querier"
+    );
+    assert!(
+        fs_ingest::hot::scan_with(&named, &request, timeout, Some(&backend))
+            .await
+            .is_err(),
+        "the backend's certificate at every step"
     );
     h.stop().await;
     db.finish().await;
