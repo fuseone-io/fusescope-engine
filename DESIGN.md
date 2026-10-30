@@ -1053,6 +1053,20 @@ surface and is handled as follows:
 
 - mTLS between collector and ingester, or a per-tenant bearer token where the
   collector runs on the customer side.
+- Tokens, ingest or query, are random `fst_` secrets stored as their sha256
+  and shown once. An operator names one by its id, the first 8 bytes of
+  that hash in hex, never by the secret: `admin token list` shows ids,
+  names, scopes and state, `admin token revoke <id>` stops a token at once,
+  and `admin token rotate <id> [overlap]` issues a successor with the same
+  tenant, name and scope while the old one keeps working for the overlap
+  (3600 s by default, at most seven days, never later than it was already
+  due). `revoked_at` in the future is that scheduled end; an engine older
+  than this reads it as revoked already, failing closed. A querier in
+  `token` mode looks a token up on every request; an ingester caches a live
+  answer for `ingest.token_cache_secs` (60, 1 to 3600), never past a scheduled end, so a
+  revocation takes effect within that TTL without a restart. Every issue,
+  rotation and revocation logs a `fusescope::audit` event with the
+  tenant, the token's id, name and scope.
 - Limits: gRPC message size (default 16 MB), attributes per record, key and
   value size, nesting depth, and new attribute keys per tenant per hour.
   Above those, the record is accepted with the excess attributes dropped and
