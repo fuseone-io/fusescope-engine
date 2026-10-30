@@ -16,11 +16,14 @@ imagePullSecrets: []
 # Postgres user and bucket identity (DESIGN.md 10.4): the ingester writes
 # L0, the querier only reads, the compactor reads, writes and deletes. With
 # workload identity, leave the bucket keys out and annotate the role's
-# ServiceAccount instead. The three must differ.
+# ServiceAccount instead. Every Secret name in this file must differ.
 secrets:
   ingester: ""
   querier: ""
   compactor: ""
+  # The one user allowed DDL, for the migration Job; its Secret needs only
+  # FS_CATALOG_URL.
+  migrator: ""
 
 # One ServiceAccount per role; annotations bind workload identity, for
 # example eks.amazonaws.com/role-arn. Pods never mount its API token.
@@ -42,8 +45,14 @@ rolloutTokens:
 
 catalog:
   maxConnections: 16
-  # Every pod migrates on start; migrations serialise on a Postgres lock.
-  migrate: true
+
+# The catalog's migrations run once per install and upgrade, in a Job
+# before the workloads roll, as secrets.migrator; the roles never migrate,
+# so their users need no DDL. Disabled, the operator migrates beforehand
+# with `fusescope-engine admin migrate`.
+migration:
+  enabled: true
+  backoffLimit: 3
 
 bucket:
   name: ""
@@ -83,8 +92,8 @@ log:
 
 # A stop drains in flight work for this long; the pod gets more.
 drainTimeoutSecs: 30
-# Longest a start may take, migrations and the bucket's ownership check
-# included, before the pod is restarted; liveness waits for it.
+# Longest a start may take, the bucket's ownership check included, before
+# the pod is restarted; liveness waits for it. 1 to 86400.
 startupTimeoutSecs: 600
 
 ingester:

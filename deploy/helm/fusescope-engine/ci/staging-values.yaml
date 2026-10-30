@@ -4,6 +4,7 @@ secrets:
   ingester: fusescope-engine-ingester
   querier: fusescope-engine-querier
   compactor: fusescope-engine-compactor
+  migrator: fusescope-engine-migrator
 bucket:
   name: fusescope-staging
   region: us-east-1

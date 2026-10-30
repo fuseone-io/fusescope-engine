@@ -3,7 +3,8 @@
 # objects for every values file under ci/; each role's rendered
 # configuration passes the engine's own --validate; the rendered workloads
 # keep the roles apart (their own Secret, ServiceAccount and TLS identity,
-# none for the compactor, no API token) and wait for a startup probe; and
+# none for the compactor, no API token, no DDL: a Job migrates as its own
+# user) and wait for a startup probe; and
 # the releases it must refuse fail to render. --validate reads no
 # certificate and connects nowhere, so the separation is checked here, on
 # the manifests.
@@ -45,7 +46,19 @@ import sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 work, name = sys.argv[2], sys.argv[3]
 fail = lambda why: sys.exit(f"chart with {name} values: {why}")
-config = next(d for d in docs if d["kind"] == "ConfigMap")["data"]
+config = next(d for d in docs if d["kind"] == "ConfigMap"
+              and d["metadata"]["name"].endswith("-config")
+              and not d["metadata"]["name"].endswith("-migrate-config"))["data"]
+for role in ("ingester", "querier", "compactor"):
+    if "migrate = false" not in config[f"{role}.toml"]:
+        fail(f"{role} migrates on start, so its user needs DDL")
+jobs = [d for d in docs if d["kind"] == "Job"]
+if len(jobs) != 1:
+    fail(f"{len(jobs)} migration Jobs")
+job = jobs[0]["spec"]["template"]["spec"]
+migrate = job["containers"][0]
+if migrate["args"][-2:] != ["admin", "migrate"] or job.get("automountServiceAccountToken") is not False:
+    fail(f"the migration Job runs {migrate['args']}")
 for role in ("ingester", "querier", "compactor"):
     with open(f"{work}/{name}-{role}.toml", "w") as out:
         out.write(config[f"{role}.toml"])
@@ -64,14 +77,20 @@ for role, pod in pods.items():
     secrets[role] = container["envFrom"][0]["secretRef"]["name"]
     identity = [v["secret"]["secretName"] for v in pod["volumes"] if v["name"] == "tls"]
     identities[role] = identity[0] if identity else None
-for what, by_role in (("Secret", secrets), ("ServiceAccount", accounts)):
-    if len(set(by_role.values())) != 3:
-        fail(f"roles share a {what}: {by_role}")
+secrets["migrator"] = migrate["envFrom"][0]["secretRef"]["name"]
+accounts["migrator"] = job.get("serviceAccountName", "default")
+if len(set(secrets.values())) != 4:
+    fail(f"roles share a Secret: {secrets}")
+if len(set(v for k, v in accounts.items() if k != "migrator")) != 3:
+    fail(f"roles share a ServiceAccount: {accounts}")
 if identities["compactor"] is not None:
     fail("the compactor has a TLS identity")
 tls_on = "enabled = true" in config["querier.toml"]
-if tls_on and (identities["ingester"] is None or identities["ingester"] == identities["querier"]):
-    fail(f"ingester and querier TLS identities {identities}")
+if tls_on:
+    cas = {v["secret"]["secretName"] for pod in pods.values() for v in pod["volumes"] if v["name"] == "client-ca"}
+    named = [identities["ingester"], identities["querier"], *cas, *secrets.values()]
+    if None in named or len(named) != len(set(named)):
+        fail(f"identities, client CAs and Secrets overlap: {named}")
 PY
     for role in ingester querier compactor; do
         chmod 644 "$work/$name-$role.toml"
@@ -92,4 +111,14 @@ refuse -f "$chart/ci/staging-values.yaml" --set auth.mode=oauth
 refuse -f "$chart/ci/staging-values.yaml" --set tls.clientCASecret=
 refuse -f "$chart/ci/staging-values.yaml" --set secrets.querier=fusescope-engine-ingester
 refuse -f "$chart/ci/staging-values.yaml" --set tls.identities.querier=fusescope-engine-ingester-tls
-echo "chart refuses a release without its secrets, roles sharing a Secret or a TLS identity, jwt without tls, or an unknown auth mode"
+refuse -f "$chart/ci/staging-values.yaml" --set tls.clientCASecret=fusescope-engine-querier-tls
+refuse -f "$chart/ci/staging-values.yaml" --set tls.clientCASecret=fusescope-engine-ingester-tls
+refuse -f "$chart/ci/staging-values.yaml" --set tls.clientCASecret=fusescope-engine-compactor
+refuse -f "$chart/ci/staging-values.yaml" --set secrets.migrator=fusescope-engine-querier
+refuse -f "$chart/ci/staging-values.yaml" --set secrets.migrator=
+refuse -f "$chart/ci/staging-values.yaml" --set startupTimeoutSecs=0
+refuse -f "$chart/ci/staging-values.yaml" --set startupTimeoutSecs=86401
+for bound in 1 86400; do
+    helm template check "$chart" -f "$chart/ci/staging-values.yaml" --set startupTimeoutSecs=$bound >/dev/null
+done
+echo "chart refuses a release without its secrets, any two Secrets alike (roles, migrator, client CAs, identities), a startup budget outside 1..86400, jwt without tls, or an unknown auth mode"

@@ -4,6 +4,7 @@ secrets:
   ingester: fusescope-engine-ingester
   querier: fusescope-engine-querier
   compactor: fusescope-engine-compactor
+  migrator: fusescope-engine-migrator
 bucket:
   name: fusescope
   endpoint: http://minio:9000

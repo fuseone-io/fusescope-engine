@@ -19,20 +19,24 @@ app.kubernetes.io/component: {{ .role }}
 {{/* Refuses a release that would run half-configured or insecurely. */}}
 {{- define "fse.validate" -}}
 {{- $v := .Values -}}
-{{- range $role := list "ingester" "querier" "compactor" -}}
-{{- $_ := required (printf "secrets.%s: the role's Secret with FS_CATALOG_URL and the bucket credentials" $role) (index $v.secrets $role) -}}
+{{- range $role := list "ingester" "querier" "compactor" "migrator" -}}
+{{- $_ := required (printf "secrets.%s: the Secret with FS_CATALOG_URL and, for the roles, the bucket credentials" $role) (index $v.secrets $role) -}}
 {{- end -}}
-{{- if or (eq $v.secrets.ingester $v.secrets.querier) (eq $v.secrets.ingester $v.secrets.compactor) (eq $v.secrets.querier $v.secrets.compactor) -}}
-{{- fail "secrets: each role needs its own Secret, its own Postgres user and bucket identity" -}}
+{{- $names := list $v.secrets.ingester $v.secrets.querier $v.secrets.compactor $v.secrets.migrator -}}
+{{- if $v.tls.enabled -}}
+{{- $names = concat $names (list $v.tls.clientCASecret $v.tls.identities.ingester $v.tls.identities.querier) -}}
+{{- end -}}
+{{- if ne (len $names) (len (uniq $names)) -}}
+{{- fail (printf "every Secret must differ: each role's environment, the migrator's, the client CAs and each identity, since a shared one hands a role another's credentials or key: %v" $names) -}}
+{{- end -}}
+{{- if or (lt (int $v.startupTimeoutSecs) 1) (gt (int $v.startupTimeoutSecs) 86400) -}}
+{{- fail (printf "startupTimeoutSecs must be between 1 and 86400, not %v" $v.startupTimeoutSecs) -}}
 {{- end -}}
 {{- $_ := required "bucket.name" $v.bucket.name -}}
 {{- if $v.tls.enabled -}}
 {{- $_ := required "tls.clientCASecret: the Secret with public-ca.crt and hot-ca.crt" $v.tls.clientCASecret -}}
 {{- $_ := required "tls.identities.ingester: the ingester's Secret with tls.crt and tls.key" $v.tls.identities.ingester -}}
 {{- $_ := required "tls.identities.querier: the querier's Secret with tls.crt and tls.key" $v.tls.identities.querier -}}
-{{- if eq $v.tls.identities.ingester $v.tls.identities.querier -}}
-{{- fail "tls.identities: the ingester and the querier need their own identities; the querier's alone may open the hot window" -}}
-{{- end -}}
 {{- end -}}
 {{- if eq $v.auth.mode "jwt" -}}
 {{- if not $v.tls.enabled -}}
@@ -68,7 +72,8 @@ drain_timeout_secs = {{ $v.drainTimeoutSecs }}
 
 [catalog]
 max_connections = {{ $v.catalog.maxConnections }}
-migrate = {{ $v.catalog.migrate }}
+# The migration Job migrates; a role's user has no DDL.
+migrate = false
 
 [bucket]
 kind = "s3"
