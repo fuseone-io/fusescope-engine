@@ -18,8 +18,9 @@ the Prometheus data source.
 
 `fusescope_query_seconds` covers every `DoGet` and `DoAction` of an
 authenticated caller, from the request to the end of its stream, however
-it ends, in buckets from 5 ms to 300 s, past the default 60 s query
-timeout, so a slow quantile is never clipped to a lower bound; requests
+it ends, in buckets from 5 ms to 300 s. `query.timeout_secs` is at most
+300 (60 by default), so every execution ends within a finite bucket and a
+slow quantile is never clipped to a lower bound; requests
 refused for their token or their ticket are left out so they do not pull
 the quantiles down. `fusescope_query_rows_total` counts the rows those
 executions sent.
