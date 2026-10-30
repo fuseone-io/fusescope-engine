@@ -154,7 +154,7 @@ impl Catalog {
     ) -> Result<Vec<FileRecord>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3 and ts_min <= $5 and ts_max >= $4
              order by ts_min, id",
@@ -181,7 +181,7 @@ impl Catalog {
     ) -> Result<Vec<FileRecord>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3
              order by ts_min, id",
@@ -543,12 +543,12 @@ async fn insert_file(
     let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
              (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state, origin,
-              confirmed_at)
+              confirmed_at, content_sha256)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 case when $14 then clock_timestamp() end)
+                 case when $14 then clock_timestamp() end, $15)
          on conflict (id) do nothing
          returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                   services, summary, state, created_at, quarantined_at",
+                   services, summary, content_sha256, state, created_at, quarantined_at",
     )
     .bind(file.id)
     .bind(file.tenant_id)
@@ -564,6 +564,7 @@ async fn insert_file(
     .bind(FileState::Visible.code())
     .bind(file.origin)
     .bind(matches!(confirm, Confirm::OnInsert))
+    .bind(file.content_sha256.map(|digest| digest.to_vec()))
     .fetch_optional(&mut **tx)
     .await?;
     let row = if let Some(row) = inserted {
@@ -571,7 +572,7 @@ async fn insert_file(
     } else {
         let existing = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at
              from engine_file where id = $1",
         )
         .bind(file.id)
@@ -620,6 +621,11 @@ fn verify_same_content(file: &NewFile, existing: &FileRow) -> Result<(), Catalog
     }
     if existing.origin != file.origin {
         return mismatch("origin");
+    }
+    if let (Some(known), Some(ours)) = (&existing.content_sha256, &file.content_sha256) {
+        if known.as_slice() != ours {
+            return mismatch("content_sha256");
+        }
     }
     Ok(())
 }

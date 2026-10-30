@@ -1795,6 +1795,7 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
             },
             services: vec![],
             summary: None,
+            content_sha256: None,
         })
         .await
         .unwrap();
@@ -1914,6 +1915,7 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
                     },
                     services: vec![],
                     summary: None,
+                    content_sha256: None,
                 })
                 .await
                 .unwrap();
@@ -2085,6 +2087,7 @@ async fn derived_contributions_are_pruned_by_time_and_unknown_versions_fail_clos
                 range,
                 services: vec!["api".into()],
                 summary: None,
+                content_sha256: None,
             })
             .await
             .unwrap();

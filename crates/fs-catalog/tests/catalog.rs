@@ -99,7 +99,80 @@ fn file(
         },
         services: services.iter().map(|s| (*s).to_owned()).collect(),
         summary: Some(vec![1, 2, 3]),
+        content_sha256: Some([7; 32]),
     }
+}
+
+/// The digest of the object is kept and compared on a second registration
+/// of the id; a row written before the digest existed reads as `None`.
+#[tokio::test]
+async fn a_registration_keeps_the_content_digest_and_old_rows_have_none() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let new = file(tenant, Signal::Traces, 0, 1, &["api"]);
+    let registered = db.catalog.register_file(&new).await.unwrap();
+    assert_eq!(registered.content_sha256, Some([7; 32]));
+    let again = db.catalog.register_file(&new).await.unwrap();
+    assert_eq!(again, registered, "idempotent on the id");
+    let other = NewFile {
+        content_sha256: Some([8; 32]),
+        ..new.clone()
+    };
+    assert!(matches!(
+        db.catalog.register_file(&other).await.unwrap_err(),
+        CatalogError::FileMismatch {
+            field: "content_sha256",
+            ..
+        }
+    ));
+    let undigested = NewFile {
+        content_sha256: None,
+        ..new.clone()
+    };
+    assert_eq!(
+        db.catalog.register_file(&undigested).await.unwrap(),
+        registered,
+        "a writer without a digest accepts the recorded one"
+    );
+
+    let old = file(tenant, Signal::Traces, 2, 3, &["api"]);
+    db.catalog.register_file(&old).await.unwrap();
+    sqlx::query("update engine_file set content_sha256 = null where id = $1")
+        .bind(old.id)
+        .execute(db.catalog.pool())
+        .await
+        .unwrap();
+    let visible = db
+        .catalog
+        .all_visible_files(tenant, Signal::Traces)
+        .await
+        .unwrap();
+    assert_eq!(
+        visible.iter().map(|f| f.content_sha256).collect::<Vec<_>>(),
+        [Some([7; 32]), None]
+    );
+    let digested_again = db.catalog.register_file(&old).await.unwrap();
+    assert_eq!(
+        digested_again.content_sha256, None,
+        "re-registering an old row leaves it as it is"
+    );
+    assert!(
+        sqlx::query("update engine_file set content_sha256 = $2 where id = $1")
+            .bind(old.id)
+            .bind(vec![1u8; 31])
+            .execute(db.catalog.pool())
+            .await
+            .is_err(),
+        "the column admits only 32 bytes"
+    );
+    db.finish().await;
 }
 
 #[tokio::test]
@@ -1816,6 +1889,7 @@ fn file_spanning(tenant: TenantId, signal: Signal, level: Level, range: TimeRang
         range,
         services: Vec::new(),
         summary: None,
+        content_sha256: None,
     }
 }
 

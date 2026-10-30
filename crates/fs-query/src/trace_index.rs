@@ -481,6 +481,7 @@ mod tests {
             summary: None,
             state: FileState::Visible,
             created_at: now,
+            content_sha256: None,
             quarantined_at: None,
         }
     }

@@ -109,7 +109,7 @@ impl Catalog {
                  limit $6
              )
              returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                       services, summary, state, created_at, quarantined_at",
+                       services, summary, content_sha256, state, created_at, quarantined_at",
         )
         .bind(FileState::Quarantined.code())
         .bind(tenant_id)
@@ -150,7 +150,7 @@ impl Catalog {
         let row: Option<(DateTime<Utc>, FileRow)> = sqlx::query_as::<_, StaleRow>(&format!(
             "select {CUTOFF} as cutoff,
                     f.id, f.origin, f.tenant_id, f.signal, f.level, f.path, f.size_bytes, f.row_count,
-                    f.ts_min, f.ts_max, f.services, f.summary, f.state, f.created_at, f.quarantined_at
+                    f.ts_min, f.ts_max, f.services, f.summary, f.content_sha256, f.state, f.created_at, f.quarantined_at
              from engine_file f join engine_tenant t on t.id = f.tenant_id
              where f.signal = $1 and f.state = $2 and f.ts_min < {CUTOFF}
                and not exists (

@@ -71,7 +71,7 @@ impl Catalog {
         };
         let rows = sqlx::query_as::<_, FileRow>(&format!(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at
              from engine_file
              where tenant_id = $1 and signal = $2 and level = $3 and state = $4
                and {HOUR_BIN} = $5

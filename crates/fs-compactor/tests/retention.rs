@@ -408,6 +408,7 @@ async fn retention_expires_trace_and_per_pass_derived_files_with_the_same_day() 
                 },
                 services: Vec::new(),
                 summary: None,
+                content_sha256: None,
             })
             .await
             .unwrap();

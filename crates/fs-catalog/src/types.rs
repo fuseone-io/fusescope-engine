@@ -361,6 +361,9 @@ pub struct NewFile {
     pub services: Vec<String>,
     /// Opaque binary summary for the querier (small filters, promoted column stats).
     pub summary: Option<Vec<u8>>,
+    /// sha256 of the object as uploaded; `None` only for rows written
+    /// before the digest was recorded.
+    pub content_sha256: Option<[u8; 32]>,
 }
 
 /// A file row.
@@ -388,6 +391,8 @@ pub struct FileRecord {
     pub services: Vec<String>,
     /// Opaque binary summary.
     pub summary: Option<Vec<u8>>,
+    /// sha256 of the object as uploaded, when recorded.
+    pub content_sha256: Option<[u8; 32]>,
     /// Lifecycle state.
     pub state: FileState,
     /// Registration time.
@@ -411,6 +416,7 @@ pub(crate) struct FileRow {
     pub(crate) ts_max: DateTime<Utc>,
     pub(crate) services: Vec<String>,
     pub(crate) summary: Option<Vec<u8>>,
+    pub(crate) content_sha256: Option<Vec<u8>>,
     pub(crate) state: i16,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) quarantined_at: Option<DateTime<Utc>>,
@@ -435,6 +441,16 @@ impl TryFrom<FileRow> for FileRecord {
             },
             services: row.services,
             summary: row.summary,
+            content_sha256: row
+                .content_sha256
+                .map(|digest| {
+                    let len = i64::try_from(digest.len()).unwrap_or(i64::MAX);
+                    <[u8; 32]>::try_from(digest).map_err(|_| CatalogError::InvalidValue {
+                        column: "content_sha256",
+                        value: len,
+                    })
+                })
+                .transpose()?,
             state: FileState::from_code(row.state)?,
             created_at: row.created_at,
             quarantined_at: row.quarantined_at,
