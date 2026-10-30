@@ -139,7 +139,7 @@ tracked here so the order stays visible.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| F1 | Container image with `ca-certificates`, non-root, read-only file system except WAL and spill | deployment | image builds in CI; `--check` passes inside it | S | todo |
+| F1 | Container image with `ca-certificates`, non-root, read-only file system except WAL and spill | deployment | image builds in CI; `--check` passes inside it | S | done: `Dockerfile` (release build on bookworm, runtime `gcr.io/distroless/cc-debian12:nonroot` with the Debian CA bundle, user 65532, volumes `/var/lib/fusescope/{wal,spill}`), `config/container.toml` as its default and validated with `config/image-check.toml` in `the_image_configurations_validate`; the CI `image` job builds it and runs `scripts/image-check.sh` (user, CA bundle, `--check` with a read-only root and only the state paths writable); `make image`, `make image-check`; `docs/ops/image.md`; SBOM at build is still to come |
 | F2 | Helm chart: one `values`, roles as deployments, WAL on a persistent volume, Postgres and bucket secrets from the environment | staging | chart lints; `helm template` in CI | M | todo |
 | F3 | Grafana dashboard from `/metrics`: ingest rate, refusals, flush stages, coalescer, buffers, hot-scan and checkpoint histograms, query latency | the two-week soak needs eyes | dashboard JSON in `docs/ops/` | S | todo |
 | F4 | Runbook: restart, WAL replay, checkpoint, quarantine, orphan collector, token issue, what each refusal means | the people on call during the soak | `docs/ops/runbook.md` | S | todo |
