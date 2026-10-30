@@ -1066,7 +1066,9 @@ surface and is handled as follows:
   once. An ingester caches a live answer for `ingest.token_cache_secs` (60,
   1 to 3600): an answer cached after a rotation never outlives the old
   token's scheduled end, the time left measured on the catalog's clock
-  minus the lookup, but nothing tells an ingester of a change, so an
+  and counted from a monotonic instant taken before the lookup, so no wait
+  before the answer is stored extends it, and an answer whose end came
+  meanwhile is not stored; nothing tells an ingester of a change, so an
   answer cached before a revocation or a rotation lives out its TTL. A
   revocation or rotation therefore reaches every ingester within
   `ingest.token_cache_secs`, and a scheduled end may be passed by up to
