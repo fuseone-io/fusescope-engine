@@ -997,10 +997,12 @@ the same region. Phase 1 uses them to accept or reject the engine.
   only that tenant's tables. There is no "global" table.
 - Under `auth.mode = "jwt"` Flight SQL takes only the backend's tokens and
   refuses the catalog's static ones; `token`, the default, keeps them for
-  development and `admin query`. A token is a compact JWS with `alg`
+  development and `admin query`. `jwt` requires `[tls]` on, refused at
+  start otherwise, since a bearer JWT is reusable by whoever reads it. A token is a compact JWS with `alg`
   `EdDSA` over Ed25519 and nothing else, verified through the crypto
   provider rustls already carries, with the `kid` of a key in the JWK set
-  at `auth.jwt_keys`, an OKP Ed25519 set read again every
+  at `auth.jwt_keys`, an OKP Ed25519 set of public keys only (no `d`; any
+  `use` is `sig`, any `key_ops` only `verify`) read again every
   `auth.jwt_reload_interval_secs` (60) and kept as last loaded when a read
   fails, so keys rotate by overlap. The claims are `iss` as
   `auth.jwt_issuer`, `aud` holding `auth.jwt_audience`
@@ -1125,11 +1127,13 @@ surface and is handled as follows:
 - Every query produces an audit event with tenant, JWT subject, query hash,
   bytes read, duration and outcome, delivered to the backend through the
   hooks `telemetrystore` already has. The engine side logs one event per
-  `DoGet` and `DoAction` under the `fusescope::audit` target: tenant,
-  subject (`token` for a static token), the action type or `statement`,
-  the first 8 bytes of the text's sha256, rows sent, duration and an
-  outcome of `ok`, `failed` or `cancelled`, settled when the stream ends
-  however it ends; the text is never logged.
+  `DoGet` and `DoAction`, refused ones included, under the
+  `fusescope::audit` target: tenant and subject once authenticated (`-`
+  before, `token` for a static token), the action type or `statement`, the
+  first 8 bytes of the text's sha256 once known, rows sent, duration and an
+  outcome of `ok`, `refused` (token or ticket), `failed` or `cancelled`,
+  settled when the request ends however it ends. Strings a client chose are
+  escaped, so an event stays one line; the text is never logged.
 
 ## 11. Rust workspace
 
