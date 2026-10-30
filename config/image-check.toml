@@ -1,9 +1,13 @@
-# What CI and `make image-check` run `--check` with inside the image: the
-# image's paths, a local bucket on a tmpfs the check mounts, the catalog
-# from FS_CATALOG_URL. Tests the image, never deployed.
+# What CI and `make image-check` run inside the image: the image's paths,
+# a local bucket on a tmpfs the check mounts, the catalog from
+# FS_CATALOG_URL, and ports away from the development ones. Tests the
+# image, never deployed.
 
 [server]
 role = "all"
+flight_addr = "127.0.0.1:18815"
+metrics_addr = "127.0.0.1:19464"
+drain_timeout_secs = 10
 
 [bucket]
 kind = "local"
@@ -11,6 +15,11 @@ path = "/var/lib/fusescope/bucket"
 
 [wal]
 dir = "/var/lib/fusescope/wal"
+
+[ingest]
+listen = "127.0.0.1:14317"
+hot_listen = "127.0.0.1:18816"
+hot_advertise = "127.0.0.1:18816"
 
 [query]
 spill_dir = "/var/lib/fusescope/spill"
