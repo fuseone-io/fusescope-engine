@@ -10,6 +10,8 @@
 #                            self-issued, not self-signed
 # server-a, server-a2        identities for localhost, issued by ca-a
 # client-X                   a client identity issued by ca-X
+# jwt-X.key                  an Ed25519 signing key of the backend, kid X
+# jwks-a, jwks-ab, jwks-b    JWK sets of those keys, as the engine reads them
 set -eu
 cd "$(dirname "$0")"
 days=36500
@@ -46,7 +48,7 @@ leaf() {
     issue "$1" "$2" "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=$4\nsubjectAltName=$3\n"
 }
 
-rm -f ./*.pem ./*.key
+rm -f ./*.pem ./*.key ./*.json
 root ca-a
 root ca-a-reissued ca-a ca-a
 root ca-a-renamed ca-a ca-a-renamed
@@ -62,3 +64,16 @@ leaf client-a2 ca-a2 DNS:client.test clientAuth
 leaf client-b ca-b DNS:client.test clientAuth
 leaf client-b2 ca-b2 DNS:client.test clientAuth
 rm -f ca-a.key ca-a2.key ca-b.key ca-b2.key ca-a-intermediate.key
+
+jwk() {
+    x=$(openssl pkey -in "jwt-$1.key" -pubout -outform DER | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')
+    printf '{"kty":"OKP","crv":"Ed25519","kid":"%s","alg":"EdDSA","use":"sig","x":"%s"}' "$1" "$x"
+}
+
+for kid in a b; do
+    openssl genpkey -algorithm ED25519 -out "jwt-$kid.key"
+done
+printf '{"keys":[%s]}\n' "$(jwk a)" > jwks-a.json
+printf '{"keys":[%s,%s]}\n' "$(jwk a)" "$(jwk b)" > jwks-ab.json
+printf '{"keys":[%s]}\n' "$(jwk b)" > jwks-b.json
+

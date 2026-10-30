@@ -11,17 +11,25 @@
 //! interval: a change
 //! that loads is published to new connections while open ones keep the
 //! config they began with, and a change that does not load keeps the last
-//! good config and marks it stale. Tenant JWT validation joins this crate
-//! later (roadmap E2).
+//! good config and marks it stale.
+//!
+//! Tenant JWTs from the backend are verified here too, against a key set
+//! reloaded the same way; see [`JwtVerifier`].
 
 mod anchors;
 mod client;
 mod incoming;
+mod jwks;
+mod jwt;
 mod load;
 mod reload;
 
 pub use client::{ClientTls, endpoint, error_chain};
 pub use incoming::{ServerTls, serve};
+pub use jwks::JwksStats;
+pub use jwt::{
+    Claims, JwtError, JwtRules, JwtVerifier, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES, TENANT_CLAIM,
+};
 pub use load::{TlsError, TlsFiles};
 pub use reload::{MAX_HANDSHAKES, Reload, Tls, TlsLimits, TlsStats};
 
