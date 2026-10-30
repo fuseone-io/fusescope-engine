@@ -37,8 +37,11 @@ Configuration comes from the mounted file and the environment overrides
 `GET /healthz` and readiness `GET /readyz` on the metrics port, since the
 image has no shell for an exec probe.
 
-`make image` builds it as `fusescope-engine:dev`; `make image-check`
-(`scripts/image-check.sh`) asserts the user, the CA bundle and `--check`
-inside the image with a read-only root against the development Postgres,
-as the CI `image` job does on every push. The Rust version of the build
-stage is the `RUST_VERSION` argument, bumped with the toolchain.
+`make image` builds it as `fusescope-engine:dev`. `make image-check`
+(`scripts/image-check.sh`), and the CI `image` job on every push, prove the
+image against a Postgres: it runs as `65532:65532`, its CA bundle holds
+certificates, and with a read-only root, only the WAL, spill and a tmpfs
+bucket writable, `--check` passes and `--role all` starts, reports ready on
+`/readyz` and stops cleanly on SIGTERM. Nothing forces a spill, so that
+path is mounted but not proven written. The Rust version of the build stage
+is the `RUST_VERSION` argument, bumped with the toolchain.

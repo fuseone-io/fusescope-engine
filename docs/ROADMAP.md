@@ -139,15 +139,16 @@ tracked here so the order stays visible.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| F1 | Container image with `ca-certificates`, non-root, read-only file system except WAL and spill | deployment | image builds in CI; `--check` passes inside it | S | done: `Dockerfile` (release build on bookworm, runtime `gcr.io/distroless/cc-debian12:nonroot` with the Debian CA bundle, user 65532, volumes `/var/lib/fusescope/{wal,spill}`), `config/container.toml` as its default and validated with `config/image-check.toml` in `the_image_configurations_validate`; the CI `image` job builds it and runs `scripts/image-check.sh` (user, CA bundle, `--check` with a read-only root and only the state paths writable); `make image`, `make image-check`; `docs/ops/image.md`; SBOM at build is still to come |
+| F1 | Container image with `ca-certificates`, non-root, read-only file system except WAL and spill | deployment | image builds in CI; `--check` passes inside it | S | done: `Dockerfile` (release build on bookworm, runtime `gcr.io/distroless/cc-debian12:nonroot` with the Debian CA bundle, user 65532, volumes `/var/lib/fusescope/{wal,spill}`), `config/container.toml` as its default and validated with `config/image-check.toml` in `the_image_configurations_validate`; the CI `image` job builds it and runs `scripts/image-check.sh`: the user, a CA bundle holding certificates, and with a read-only root and only the state paths writable, `--check` and `--role all` up to readiness and a clean stop on SIGTERM (spill not forced); `make image`, `make image-check`; `docs/ops/image.md` |
 | F2 | Helm chart: one `values`, roles as deployments, WAL on a persistent volume, Postgres and bucket secrets from the environment | staging | chart lints; `helm template` in CI | M | todo |
 | F3 | Grafana dashboard from `/metrics`: ingest rate, refusals, flush stages, coalescer, buffers, hot-scan and checkpoint histograms, query latency | the two-week soak needs eyes | dashboard JSON in `docs/ops/` | S | todo |
 | F4 | Runbook: restart, WAL replay, checkpoint, quarantine, orphan collector, token issue, what each refusal means | the people on call during the soak | `docs/ops/runbook.md` | S | todo |
+| F5 | SBOM generated at image build and published with the image | DESIGN.md section 10.5; supply chain | the CI `image` job produces an SBOM listing the binary's crates | S | todo |
 
 ### M1 order
 
 A1 → B1 → B2 → A2 → A3 → B3 → C1 → C2 → B5 → B4 → B6 → B7 → A4 → A5 →
-A6 → C3 → C4 → C6 → E1 → E2 → E3 → F1 → F2 → F3 → F4, with D1 to D5 in
+A6 → C3 → C4 → C6 → E1 → E2 → E3 → F1 → F2 → F3 → F4 → F5, with D1 to D5 in
 parallel in the other repositories once B4 and B6 define the actions.
 C5 landed after C6.
 
