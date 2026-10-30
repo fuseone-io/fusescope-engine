@@ -4,6 +4,7 @@
 //! ```text
 //! t/{tenant uuid}/traces/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
+//! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/derived/attribute_keys/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
 //!
@@ -51,6 +52,10 @@ impl SpanObject {
                     }
                     (None, true, false)
                 }
+                "derived" => match parts.next()? {
+                    "trace_summary" | "service_graph_1m" => (None, false, true),
+                    _ => return None,
+                },
                 _ => return None,
             },
             "derived" => {
@@ -178,6 +183,15 @@ mod tests {
         assert!(!keys.sidecar);
         assert_eq!(keys.level, None);
         assert_eq!(keys.partition, "dt=2026-10-24/hr=14");
+        for table in ["trace_summary", "service_graph_1m"] {
+            let derived = SpanObject::parse(&format!(
+                "t/{T}/traces/derived/{table}/dt=2026-10-24/hr=14/{F}.parquet"
+            ))
+            .unwrap();
+            assert!(derived.derived);
+            assert!(!derived.sidecar);
+            assert_eq!(derived.level, None);
+        }
     }
 
     #[test]
@@ -199,6 +213,7 @@ mod tests {
             &format!("t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/index/other/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/derived/other/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/derived/other/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/derived/attribute_keys/{F}.parquet"),
             &format!("x/{T}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet"),

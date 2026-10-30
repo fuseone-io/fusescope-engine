@@ -46,6 +46,7 @@ datafusion = { version = "55", default-features = false, features = [
   "recursive_protection",
 ] }
 datafusion-datasource = { version = "55", default-features = false }
+datafusion-functions-aggregate-common = { version = "55", default-features = false }
 async-trait = "0.1"
 arrow-flight = { version = "59", features = ["flight-sql"] }
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }

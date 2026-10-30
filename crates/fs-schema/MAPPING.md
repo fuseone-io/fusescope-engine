@@ -87,6 +87,29 @@ Deferred: `http_url`, `http_host`, `external_http_url`, `external_http_method`
 used by the external-calls views. They are derived from `url.full`,
 `server.address` and span kind and belong to a later schema version.
 
+## Compactor-derived trace data
+
+These rules are evaluated over the spans of one L0-to-L1 compaction pass.
+They derive only from the stored OTLP fields and semantic-convention
+attributes above; they do not derive from an exporter implementation.
+
+| Output | Rule | Source |
+|---|---|---|
+| trace_summary.start | least span `timestamp` for the trace | OTLP span start |
+| trace_summary.end | greatest saturating `timestamp + duration_nano` | OTLP span start and end |
+| trace_summary.num_spans | number of spans for the trace | OTLP trace membership |
+| trace_summary.services | sorted distinct non-empty `service.name` values | semconv resource `service.name` |
+| trace_summary.has_error | true when any span has `STATUS_CODE_ERROR` | OTLP status |
+| direct service edge | a CLIENT parent in `src` with a SERVER child in `dst`, or a PRODUCER parent with a CONSUMER child, joined by `(trace_id, parent_span_id)` | OTLP parent and span identities and `SpanKind`; product service-map contract |
+| inferred destination | for an unmatched CLIENT or PRODUCER, first non-empty value in `db.system`, `messaging.system`, `peer.service`, `server.address`, `net.peer.name` order | semconv database, messaging, peer and server attributes |
+| graph minute | floor of the measured span start to a UTC minute | OTLP span start; engine aggregation window |
+| graph count/error_count | one call, and one error when the measured child or inferred client/producer has error status | OTLP status; product service-map contract |
+| graph digest | latency of that same measured span, in nanoseconds | OTLP span start and end |
+
+A direct edge takes precedence over inference. The parent map is keyed by
+both trace and span id, because span ids are only unique within a trace.
+Pairs split across compaction passes or UTC hours do not form an edge.
+
 ## Events and links
 
 | Field | Rule |

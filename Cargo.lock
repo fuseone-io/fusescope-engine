@@ -1744,6 +1744,7 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "bytes",
+ "datafusion-functions-aggregate-common",
  "opentelemetry-proto",
  "parquet",
  "serde_json",

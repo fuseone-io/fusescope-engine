@@ -10,7 +10,9 @@ pub mod bucket;
 pub mod fingerprint;
 pub mod limits;
 pub mod parquet;
+pub mod service_graph;
 pub mod spans;
+pub mod trace_summary;
 
 use thiserror::Error;
 
