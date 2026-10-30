@@ -53,7 +53,8 @@ written twice. Expect a start to take longer the more the WAL holds.
   flush intent, and replaying without it would write those rows again
   under an id already taken. Keep the volume, do not delete segments, and
   escalate, as above.
-- **Replay stops at a flush intent this version cannot read**, with
+- **Replay stops at a record this version cannot read**, with
+  `ingest: wal record: wal record at … cannot be read by this engine` or
   `ingest: wal record: flush intent at … cannot be read by this engine`:
   a newer engine wrote it. Roll the ingester forward to that version
   rather than back.
@@ -179,7 +180,9 @@ hot window did not answer.
 | `tls: …`, `jwt keys …` | a certificate, key, CA bundle or key set that does not load |
 | `bucket prefix … belongs to catalog …` | another deployment's prefix |
 | `… holds objects but no catalog marker` | see the orphan collector above |
-| `wal: …` | the WAL refuses to open: damage before its last commit marker; see WAL replay and checkpoint |
+| `wal: damage at segment … that recovery must not cut` | damage before the WAL's last commit marker; keep the volume and escalate |
+| `wal: io at …` | the WAL directory cannot be read or written: the volume is missing, read-only or not the pod's to write |
+| `wal: …`, any other | the WAL cannot open; the message names why |
 | `ingest: wal record: wal damage at …` | replay met damage it will not skip; keep the volume and escalate |
-| `ingest: wal record: flush intent at … cannot be read by this engine` | a newer engine wrote the WAL; roll forward |
+| `ingest: wal record: wal record at …` or `… flush intent at … cannot be read by this engine` | a newer engine wrote the WAL; roll forward |
 | `catalog: …`, `bucket: …` | unreachable at start; the pod restarts until they answer |
