@@ -1596,6 +1596,15 @@ dependencies = [
 [[package]]
 name = "fs-auth"
 version = "0.0.1"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "fs-bench"
@@ -1684,6 +1693,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "fs-auth",
  "fs-catalog",
  "fs-index",
  "fs-schema",
@@ -1717,6 +1727,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-datasource",
+ "fs-auth",
  "fs-catalog",
  "fs-index",
  "fs-ingest",
@@ -3355,6 +3366,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -4154,9 +4166,11 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

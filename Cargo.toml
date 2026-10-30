@@ -52,7 +52,9 @@ arrow-flight = { version = "59", features = ["flight-sql"] }
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 # runtime
 tokio = { version = "1", features = ["full"] }
-tonic = { version = "0.14", features = ["server", "channel", "router"] }
+tonic = { version = "0.14", features = ["server", "channel", "router", "tls-ring", "tls-native-roots"] }
+# The listener swaps its rustls config on new connections; same pin and provider as tonic's.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
