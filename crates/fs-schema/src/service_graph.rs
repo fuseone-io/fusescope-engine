@@ -6,7 +6,8 @@
 //! PRODUCER parent inside the same trace and pass. An unmatched CLIENT or
 //! PRODUCER may yield an inferred database, queue, service or external edge.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
@@ -32,10 +33,25 @@ pub const SIGNAL: &str = "service_graph_1m";
 pub const TABLE: &str = "service_graph_1m";
 /// Compression bound used by every latency digest.
 pub const DIGEST_MAX_SIZE: usize = 100;
-/// Conservative inline and tree-node charge for one retained span.
-pub const SPAN_ENTRY_BYTES: usize = 512;
-/// Charge above UTF-8 bytes for one service or destination interned by a pass.
-pub const INTERNED_NAME_BYTES: usize = 96;
+const BTREE_ENTRY_OVERHEAD: usize = 4 * size_of::<usize>();
+const EDGE_NAME_COPIES: usize = 2;
+/// One span's map entry, B-tree slack, finish-time resolution key and latency.
+pub const SPAN_ENTRY_BYTES: usize = size_of::<SpanKey>()
+    + size_of::<SpanMeta>()
+    + BTREE_ENTRY_OVERHEAD
+    + 2 * size_of::<&SpanKey>()
+    + size_of::<f64>();
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(SPAN_ENTRY_BYTES == 168);
+/// One distinct edge through aggregation and the finished digest map.
+pub const EDGE_ENTRY_BYTES: usize = size_of::<EdgeKey>()
+    + size_of::<EdgeValues>()
+    + size_of::<ServiceEdge>()
+    + 2 * BTREE_ENTRY_OVERHEAD
+    + 2 * DIGEST_MAX_SIZE * size_of::<Centroid>()
+    + DIGEST_FIXED;
+/// Hash-table and allocation metadata above one interned name's UTF-8 bytes.
+pub const INTERNED_NAME_BYTES: usize = size_of::<Arc<str>>() + 4 * size_of::<usize>();
 
 const MINUTE_NS: i64 = 60_000_000_000;
 const SPAN_ID_BYTES: usize = 8;
@@ -265,8 +281,8 @@ fn read_f64(bytes: &[u8], at: usize) -> Result<f64, SchemaError> {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EdgeKey {
-    src: String,
-    dst: String,
+    src: Arc<str>,
+    dst: Arc<str>,
     dst_kind: DestinationKind,
     minute: i64,
 }
@@ -288,6 +304,19 @@ pub struct ServiceEdge {
     pub error_count: u64,
     /// Latency distribution in nanoseconds.
     pub digest: LatencyDigest,
+}
+
+/// The configured bound that caused a whole graph contribution to be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitExceeded {
+    /// Configuration field whose bound was crossed.
+    pub limit: &'static str,
+    /// Configured count or byte bound.
+    pub cap: usize,
+    /// Count or bytes that the next retained value would require.
+    pub observed: usize,
+    /// Estimated resident bytes at that point.
+    pub estimated_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -430,15 +459,15 @@ impl ServiceGraph {
                 return Err(SchemaError::Layout("service graph counts"));
             }
             let key = EdgeKey {
-                src: sources.value(row).to_owned(),
-                dst: destinations.value(row).to_owned(),
+                src: Arc::from(sources.value(row)),
+                dst: Arc::from(destinations.value(row)),
                 dst_kind: kind,
                 minute,
             };
             let edge = ServiceEdge {
                 minute,
-                src: key.src.clone(),
-                dst: key.dst.clone(),
+                src: key.src.to_string(),
+                dst: key.dst.to_string(),
                 dst_kind: kind,
                 count,
                 error_count: errors.value(row),
@@ -456,7 +485,7 @@ impl ServiceGraph {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct SpanKey {
     trace: [u8; TRACE_ID_BYTES],
     span: [u8; SPAN_ID_BYTES],
@@ -492,12 +521,25 @@ struct PendingSpan<'a> {
 
 /// Whole-pass span map used to resolve direct edges after every row arrived.
 /// Crossing either the span or byte cap clears the map and permanently skips it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServiceGraphBuilder {
     spans: BTreeMap<SpanKey, SpanMeta>,
     names: HashSet<Arc<str>>,
     estimated_bytes: usize,
-    skipped: bool,
+    max_bytes: usize,
+    exceeded: Option<LimitExceeded>,
+}
+
+impl Default for ServiceGraphBuilder {
+    fn default() -> Self {
+        Self {
+            spans: BTreeMap::new(),
+            names: HashSet::new(),
+            estimated_bytes: 0,
+            max_bytes: usize::MAX,
+            exceeded: None,
+        }
+    }
 }
 
 impl ServiceGraphBuilder {
@@ -511,9 +553,10 @@ impl ServiceGraphBuilder {
         max_spans: usize,
         max_bytes: usize,
     ) -> Result<(), SchemaError> {
-        if self.skipped {
+        if self.exceeded.is_some() {
             return Ok(());
         }
+        self.max_bytes = self.max_bytes.min(max_bytes);
         let schema = batch.schema();
         let traces = batch
             .column(schema.index_of(col::TRACE_ID)?)
@@ -605,12 +648,6 @@ impl ServiceGraphBuilder {
     ) -> bool {
         let new_span = !self.spans.contains_key(&key);
         let mut charge = usize::from(new_span).saturating_mul(SPAN_ENTRY_BYTES);
-        if let Some(name) = span.service {
-            charge = charge.saturating_add(name.len().saturating_mul(6));
-        }
-        if let Some((name, _)) = span.inferred {
-            charge = charge.saturating_add(name.len().saturating_mul(6));
-        }
         if let Some(name) = span.service.filter(|name| !self.names.contains(*name)) {
             charge = charge.saturating_add(name.len().saturating_add(INTERNED_NAME_BYTES));
         }
@@ -621,11 +658,30 @@ impl ServiceGraphBuilder {
             charge = charge.saturating_add(name.len().saturating_add(INTERNED_NAME_BYTES));
         }
         let Some(next_bytes) = self.estimated_bytes.checked_add(charge) else {
-            self.skip();
+            self.skip(LimitExceeded {
+                limit: "service_graph_max_bytes",
+                cap: max_bytes,
+                observed: usize::MAX,
+                estimated_bytes: usize::MAX,
+            });
             return false;
         };
-        if (new_span && self.spans.len() >= max_spans) || next_bytes > max_bytes {
-            self.skip();
+        if new_span && self.spans.len() >= max_spans {
+            self.skip(LimitExceeded {
+                limit: "service_graph_max_spans",
+                cap: max_spans,
+                observed: self.spans.len().saturating_add(1),
+                estimated_bytes: next_bytes,
+            });
+            return false;
+        }
+        if next_bytes > max_bytes {
+            self.skip(LimitExceeded {
+                limit: "service_graph_max_bytes",
+                cap: max_bytes,
+                observed: next_bytes,
+                estimated_bytes: next_bytes,
+            });
             return false;
         }
         self.estimated_bytes = next_bytes;
@@ -651,7 +707,12 @@ impl ServiceGraphBuilder {
 
     /// True when a cap was crossed and no partial graph may be emitted.
     pub fn skipped(&self) -> bool {
-        self.skipped
+        self.exceeded.is_some()
+    }
+
+    /// The first bound crossed by this contribution.
+    pub fn limit_exceeded(&self) -> Option<LimitExceeded> {
+        self.exceeded
     }
 
     /// Conservative bytes charged before every allocation retained by the pass.
@@ -662,16 +723,24 @@ impl ServiceGraphBuilder {
     /// Resolves direct edges first, then inferred edges for unmatched client
     /// and producer spans. `None` means the cap was crossed.
     pub fn finish(self) -> Option<ServiceGraph> {
-        if self.skipped {
-            return None;
+        self.finish_with_limit().0
+    }
+
+    /// Resolves the graph and returns the bound crossed during ingestion or
+    /// finish-time allocation, if any.
+    pub fn finish_with_limit(self) -> (Option<ServiceGraph>, Option<LimitExceeded>) {
+        if self.exceeded.is_some() {
+            return (None, self.exceeded);
         }
-        let mut resolved = BTreeSet::new();
+        let mut resolved: HashSet<&SpanKey> = HashSet::new();
         let mut edges: BTreeMap<EdgeKey, EdgeValues> = BTreeMap::new();
+        let mut estimated_bytes = self.estimated_bytes;
+        let mut exceeded = None;
         for child in self.spans.values() {
             let Some(parent_key) = child.parent else {
                 continue;
             };
-            let Some(parent) = self.spans.get(&parent_key) else {
+            let Some((parent_key, parent)) = self.spans.get_key_value(&parent_key) else {
                 continue;
             };
             let direct = (parent.kind == SpanKind::Client as i32
@@ -688,15 +757,22 @@ impl ServiceGraphBuilder {
             if src == dst {
                 continue;
             }
-            edges
-                .entry(EdgeKey {
-                    src: src.to_string(),
-                    dst: dst.to_string(),
+            if !push_edge(
+                &mut edges,
+                EdgeKey {
+                    src: Arc::clone(src),
+                    dst: Arc::clone(dst),
                     dst_kind: DestinationKind::Service,
                     minute: child.minute,
-                })
-                .or_default()
-                .push(child.duration, child.error);
+                },
+                child.duration,
+                child.error,
+                &mut estimated_bytes,
+                self.max_bytes,
+                &mut exceeded,
+            ) {
+                return (None, exceeded);
+            }
         }
         for (key, span) in &self.spans {
             if !matches!(span.kind, value if value == SpanKind::Client as i32 || value == SpanKind::Producer as i32)
@@ -712,15 +788,22 @@ impl ServiceGraphBuilder {
             {
                 continue;
             }
-            edges
-                .entry(EdgeKey {
-                    src: src.to_string(),
-                    dst: dst.name.to_string(),
+            if !push_edge(
+                &mut edges,
+                EdgeKey {
+                    src: Arc::clone(src),
+                    dst: Arc::clone(&dst.name),
                     dst_kind: dst.kind,
                     minute: span.minute,
-                })
-                .or_default()
-                .push(span.duration, span.error);
+                },
+                span.duration,
+                span.error,
+                &mut estimated_bytes,
+                self.max_bytes,
+                &mut exceeded,
+            ) {
+                return (None, exceeded);
+            }
         }
         let rows = edges
             .into_iter()
@@ -728,8 +811,8 @@ impl ServiceGraphBuilder {
                 let count = values.latencies.len() as u64;
                 let edge = ServiceEdge {
                     minute: key.minute,
-                    src: key.src.clone(),
-                    dst: key.dst.clone(),
+                    src: key.src.to_string(),
+                    dst: key.dst.to_string(),
                     dst_kind: key.dst_kind,
                     count,
                     error_count: values.errors,
@@ -738,7 +821,7 @@ impl ServiceGraphBuilder {
                 (key, edge)
             })
             .collect();
-        Some(ServiceGraph { rows })
+        (Some(ServiceGraph { rows }), None)
     }
 
     fn intern(&mut self, name: &str) -> Arc<str> {
@@ -750,12 +833,52 @@ impl ServiceGraphBuilder {
         name
     }
 
-    fn skip(&mut self) {
+    fn skip(&mut self, exceeded: LimitExceeded) {
         self.spans.clear();
         self.names.clear();
         self.estimated_bytes = 0;
-        self.skipped = true;
+        self.exceeded = Some(exceeded);
     }
+}
+
+fn push_edge(
+    edges: &mut BTreeMap<EdgeKey, EdgeValues>,
+    key: EdgeKey,
+    duration: u64,
+    error: bool,
+    estimated_bytes: &mut usize,
+    max_bytes: usize,
+    exceeded: &mut Option<LimitExceeded>,
+) -> bool {
+    if !edges.contains_key(&key) {
+        let names = key
+            .src
+            .len()
+            .saturating_add(key.dst.len())
+            .saturating_mul(EDGE_NAME_COPIES);
+        let charge = EDGE_ENTRY_BYTES.saturating_add(names);
+        let Some(next_bytes) = estimated_bytes.checked_add(charge) else {
+            *exceeded = Some(LimitExceeded {
+                limit: "service_graph_max_bytes",
+                cap: max_bytes,
+                observed: usize::MAX,
+                estimated_bytes: usize::MAX,
+            });
+            return false;
+        };
+        if next_bytes > max_bytes {
+            *exceeded = Some(LimitExceeded {
+                limit: "service_graph_max_bytes",
+                cap: max_bytes,
+                observed: next_bytes,
+                estimated_bytes: next_bytes,
+            });
+            return false;
+        }
+        *estimated_bytes = next_bytes;
+    }
+    edges.entry(key).or_default().push(duration, error);
+    true
 }
 
 fn string_column(batch: &RecordBatch, name: &str) -> Result<StringArray, SchemaError> {
@@ -1079,6 +1202,101 @@ mod tests {
             .unwrap();
         assert!(builder.skipped());
         assert_eq!(builder.estimated_bytes(), 0);
+        assert_eq!(
+            builder.limit_exceeded(),
+            Some(LimitExceeded {
+                limit: "service_graph_max_bytes",
+                cap: SPAN_ENTRY_BYTES - 1,
+                observed: SPAN_ENTRY_BYTES + INTERNED_NAME_BYTES + "api".len(),
+                estimated_bytes: SPAN_ENTRY_BYTES + INTERNED_NAME_BYTES + "api".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn estimated_bytes_follow_the_retained_layout() {
+        let mut builder = ServiceGraphBuilder::default();
+        builder.absorb(&batch(), usize::MAX, usize::MAX).unwrap();
+        assert_eq!(
+            SPAN_ENTRY_BYTES,
+            size_of::<SpanKey>()
+                + size_of::<SpanMeta>()
+                + BTREE_ENTRY_OVERHEAD
+                + 2 * size_of::<&SpanKey>()
+                + size_of::<f64>()
+        );
+        let names = builder
+            .names
+            .iter()
+            .map(|name| INTERNED_NAME_BYTES + name.len())
+            .sum::<usize>();
+        assert_eq!(
+            builder.estimated_bytes(),
+            builder.spans.len() * SPAN_ENTRY_BYTES + names
+        );
+    }
+
+    #[test]
+    fn finish_charges_each_distinct_edge_once() {
+        let mut edges = BTreeMap::new();
+        let mut estimated = 0;
+        let mut exceeded = None;
+        let key = EdgeKey {
+            src: Arc::from("api"),
+            dst: Arc::from("worker"),
+            dst_kind: DestinationKind::Service,
+            minute: MINUTE_NS,
+        };
+        assert!(push_edge(
+            &mut edges,
+            key.clone(),
+            10,
+            false,
+            &mut estimated,
+            usize::MAX,
+            &mut exceeded,
+        ));
+        let once = EDGE_ENTRY_BYTES + EDGE_NAME_COPIES * ("api".len() + "worker".len());
+        assert_eq!(estimated, once);
+        assert!(push_edge(
+            &mut edges,
+            key,
+            20,
+            true,
+            &mut estimated,
+            usize::MAX,
+            &mut exceeded,
+        ));
+        assert_eq!(estimated, once);
+        assert_eq!(edges.values().next().unwrap().latencies.len(), 2);
+
+        let mut limited = BTreeMap::new();
+        let mut limited_bytes = 0;
+        let mut limited_by = None;
+        assert!(!push_edge(
+            &mut limited,
+            EdgeKey {
+                src: Arc::from("api"),
+                dst: Arc::from("worker"),
+                dst_kind: DestinationKind::Service,
+                minute: MINUTE_NS,
+            },
+            10,
+            false,
+            &mut limited_bytes,
+            once - 1,
+            &mut limited_by,
+        ));
+        assert_eq!(
+            limited_by,
+            Some(LimitExceeded {
+                limit: "service_graph_max_bytes",
+                cap: once - 1,
+                observed: once,
+                estimated_bytes: once,
+            })
+        );
+        assert_eq!(limited.len(), 0);
     }
 
     #[test]

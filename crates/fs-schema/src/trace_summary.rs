@@ -5,6 +5,7 @@
 //! contributions: queries combine every visible file for the hour.
 
 use std::collections::{BTreeMap, HashSet};
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
@@ -27,12 +28,18 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const SIGNAL: &str = "trace_summary";
 /// Name in a query session.
 pub const TABLE: &str = "trace_summary";
-/// Conservative inline and tree-node charge for one trace before services.
-pub const TRACE_ENTRY_BYTES: usize = 512;
-/// Fixed charge for one service reference retained and encoded by one trace.
-pub const TRACE_SERVICE_BYTES: usize = 64;
-/// Charge above UTF-8 bytes for one service interned by a pass.
-pub const INTERNED_SERVICE_BYTES: usize = 96;
+const BTREE_ENTRY_OVERHEAD: usize = 4 * size_of::<usize>();
+const TRACE_OUTPUT_FIXED_BYTES: usize = TRACE_ID_BYTES + 8 + 8 + 8 + 1 + 4;
+
+/// One trace's map entry, B-tree node slack and fixed Arrow output storage.
+pub const TRACE_ENTRY_BYTES: usize = size_of::<[u8; TRACE_ID_BYTES]>()
+    + size_of::<TraceSummary>()
+    + BTREE_ENTRY_OVERHEAD
+    + TRACE_OUTPUT_FIXED_BYTES;
+/// One service link's vector slack, list offset and Arrow UTF-8 offset.
+pub const TRACE_SERVICE_BYTES: usize = 2 * size_of::<Arc<str>>() + 2 * size_of::<i32>();
+/// Hash-table and allocation metadata above one interned service's UTF-8 bytes.
+pub const INTERNED_SERVICE_BYTES: usize = size_of::<Arc<str>>() + 4 * size_of::<usize>();
 
 /// Column names.
 pub mod columns {
@@ -65,6 +72,19 @@ pub struct TraceSummary {
     pub has_error: bool,
 }
 
+/// The configured bound that caused a whole contribution to be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitExceeded {
+    /// Configuration field whose bound was crossed.
+    pub limit: &'static str,
+    /// Configured count or byte bound.
+    pub cap: usize,
+    /// Count or bytes that the next retained row would require.
+    pub observed: usize,
+    /// Estimated resident bytes at that point.
+    pub estimated_bytes: usize,
+}
+
 impl TraceSummary {
     fn merge(&mut self, other: Self) {
         self.start = self.start.min(other.start);
@@ -89,7 +109,7 @@ pub struct TraceSummaries {
     rows: BTreeMap<[u8; TRACE_ID_BYTES], TraceSummary>,
     services: HashSet<Arc<str>>,
     estimated_bytes: usize,
-    skipped: bool,
+    exceeded: Option<LimitExceeded>,
 }
 
 impl TraceSummaries {
@@ -104,7 +124,7 @@ impl TraceSummaries {
         max_traces: usize,
         max_bytes: usize,
     ) -> Result<(), SchemaError> {
-        if self.skipped {
+        if self.exceeded.is_some() {
             return Ok(());
         }
         let schema = batch.schema();
@@ -149,26 +169,16 @@ impl TraceSummaries {
                 })
             });
             let new_service = service.is_some_and(|service| !self.services.contains(service));
-            let charge =
-                usize::from(new_trace)
-                    .saturating_mul(TRACE_ENTRY_BYTES)
-                    .saturating_add(usize::from(new_link).saturating_mul(
-                        TRACE_SERVICE_BYTES.saturating_add(
-                            service.map_or(0, |value| value.len().saturating_mul(2)),
-                        ),
-                    ))
-                    .saturating_add(service.filter(|_| new_service).map_or(0, |value| {
-                        value.len().saturating_add(INTERNED_SERVICE_BYTES)
-                    }));
-            let Some(next_bytes) = self.estimated_bytes.checked_add(charge) else {
-                self.skip();
-                return Ok(());
-            };
-            if (new_trace && self.rows.len() >= max_traces) || next_bytes > max_bytes {
-                self.skip();
+            if !self.reserve(
+                new_trace,
+                new_link,
+                service,
+                new_service,
+                max_traces,
+                max_bytes,
+            ) {
                 return Ok(());
             }
-            self.estimated_bytes = next_bytes;
             let service = if new_link {
                 service.map(|value| {
                     if let Some(known) = self.services.get(value) {
@@ -205,9 +215,63 @@ impl TraceSummaries {
         Ok(())
     }
 
+    fn reserve(
+        &mut self,
+        new_trace: bool,
+        new_link: bool,
+        service: Option<&str>,
+        new_service: bool,
+        max_traces: usize,
+        max_bytes: usize,
+    ) -> bool {
+        let charge =
+            usize::from(new_trace)
+                .saturating_mul(TRACE_ENTRY_BYTES)
+                .saturating_add(usize::from(new_link).saturating_mul(
+                    TRACE_SERVICE_BYTES.saturating_add(service.map_or(0, str::len)),
+                ))
+                .saturating_add(service.filter(|_| new_service).map_or(0, |value| {
+                    value.len().saturating_add(INTERNED_SERVICE_BYTES)
+                }));
+        let Some(next_bytes) = self.estimated_bytes.checked_add(charge) else {
+            self.skip(LimitExceeded {
+                limit: "trace_summary_max_bytes",
+                cap: max_bytes,
+                observed: usize::MAX,
+                estimated_bytes: usize::MAX,
+            });
+            return false;
+        };
+        if new_trace && self.rows.len() >= max_traces {
+            self.skip(LimitExceeded {
+                limit: "trace_summary_max_traces",
+                cap: max_traces,
+                observed: self.rows.len().saturating_add(1),
+                estimated_bytes: next_bytes,
+            });
+            return false;
+        }
+        if next_bytes > max_bytes {
+            self.skip(LimitExceeded {
+                limit: "trace_summary_max_bytes",
+                cap: max_bytes,
+                observed: next_bytes,
+                estimated_bytes: next_bytes,
+            });
+            return false;
+        }
+        self.estimated_bytes = next_bytes;
+        true
+    }
+
     /// True when a cap was crossed and no partial file may be emitted.
     pub fn skipped(&self) -> bool {
-        self.skipped
+        self.exceeded.is_some()
+    }
+
+    /// The first bound crossed by this contribution.
+    pub fn limit_exceeded(&self) -> Option<LimitExceeded> {
+        self.exceeded
     }
 
     /// Number of trace rows.
@@ -245,8 +309,8 @@ impl TraceSummaries {
     /// Merges another partial contribution, used when a file has several
     /// row groups.
     pub fn merge(&mut self, other: Self) {
-        if self.skipped || other.skipped {
-            self.skip();
+        if let Some(exceeded) = self.exceeded.or(other.exceeded) {
+            self.skip(exceeded);
             return;
         }
         for (id, summary) in other.rows {
@@ -258,11 +322,11 @@ impl TraceSummaries {
         self.recount();
     }
 
-    fn skip(&mut self) {
+    fn skip(&mut self, exceeded: LimitExceeded) {
         self.rows.clear();
         self.services.clear();
         self.estimated_bytes = 0;
-        self.skipped = true;
+        self.exceeded = Some(exceeded);
     }
 
     fn recount(&mut self) {
@@ -279,9 +343,7 @@ impl TraceSummaries {
             self.estimated_bytes = self
                 .estimated_bytes
                 .saturating_add(row.services.iter().fold(0usize, |bytes, service| {
-                    bytes.saturating_add(
-                        TRACE_SERVICE_BYTES.saturating_add(service.len().saturating_mul(2)),
-                    )
+                    bytes.saturating_add(TRACE_SERVICE_BYTES.saturating_add(service.len()))
                 }));
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(
@@ -587,6 +649,54 @@ mod tests {
             .unwrap();
         assert!(rows.skipped());
         assert_eq!(rows.estimated_bytes(), 0);
+        assert_eq!(
+            rows.limit_exceeded(),
+            Some(LimitExceeded {
+                limit: "trace_summary_max_bytes",
+                cap: TRACE_ENTRY_BYTES - 1,
+                observed: TRACE_ENTRY_BYTES
+                    + TRACE_SERVICE_BYTES
+                    + "api".len()
+                    + INTERNED_SERVICE_BYTES
+                    + "api".len(),
+                estimated_bytes: TRACE_ENTRY_BYTES
+                    + TRACE_SERVICE_BYTES
+                    + "api".len()
+                    + INTERNED_SERVICE_BYTES
+                    + "api".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn estimated_bytes_follow_the_retained_layout() {
+        let mut rows = TraceSummaries::default();
+        rows.absorb(&batch(), usize::MAX, usize::MAX).unwrap();
+        assert_eq!(
+            TRACE_ENTRY_BYTES,
+            size_of::<[u8; TRACE_ID_BYTES]>()
+                + size_of::<TraceSummary>()
+                + BTREE_ENTRY_OVERHEAD
+                + TRACE_OUTPUT_FIXED_BYTES
+        );
+        let links = rows
+            .rows
+            .values()
+            .map(|row| {
+                row.services.iter().fold(0usize, |bytes, service| {
+                    bytes + TRACE_SERVICE_BYTES + service.len()
+                })
+            })
+            .sum::<usize>();
+        let names = rows
+            .services
+            .iter()
+            .map(|service| INTERNED_SERVICE_BYTES + service.len())
+            .sum::<usize>();
+        assert_eq!(
+            rows.estimated_bytes(),
+            rows.len() * TRACE_ENTRY_BYTES + links + names
+        );
     }
 
     #[test]
