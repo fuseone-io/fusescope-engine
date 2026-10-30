@@ -584,7 +584,9 @@ object to the orphan collector. If an hour needs several passes, it has
 several partial files and the query combines them: trace summaries use
 `min(start)`, `max(end)`, `sum(num_spans)`, unioned services and
 `bool_or(has_error)`; graph rows use `sum(count)`, `sum(error_count)` and
-`quantile_tdigest(digest, q)`.
+`quantile_tdigest(digest, q)`. The quantile is normally a `Float64` in
+`[0, 1]`; an integer literal is accepted only for the exact endpoints `0`
+and `1`, so percentiles such as p99 are written as `0.99`, not `99`.
 
 The summary file's catalog range is the minimum and maximum **span start**
 in the pass, which is already confined to one hour. `end` stays in the rows
@@ -612,15 +614,28 @@ map crosses `compactor.trace_summary_max_traces` or
 `compactor.trace_summary_max_bytes`, or whose span map crosses
 `compactor.service_graph_max_spans` or `compactor.service_graph_max_bytes`,
 skips that whole contribution and increments the corresponding
-`_skipped_total`; it never publishes a partial derived file. Service and
-destination names are interned once per builder. The charged footprint is
-conservative and is reserved before retaining a row: 512 bytes per trace,
-64 bytes plus two copies of its UTF-8 length per trace/service link, 512 bytes
-plus six copies of its service/destination lengths per span, and 96 bytes plus
-UTF-8 length per interned name. These charges include finalization and writer
-scratch, not only the maps. The two byte caps together may not exceed 1 GiB;
-their defaults are 256 MiB each. Graph resolution and all derived Parquet
-encoding run on the blocking pool, not on an async executor thread.
+`_skipped_total`; it never publishes a partial derived file. The first skip
+for a tenant, hour and derived signal is also warned with the limit, cap,
+observed value and estimated bytes. Service and destination names are interned
+once per builder.
+
+The charged footprint is derived from the retained Rust layouts instead of a
+fixed per-row guess. A trace pays its key, `TraceSummary`, four machine words
+of B-tree slack and the fixed Arrow output columns; each trace/service link
+pays vector slack, offsets and one output copy of the UTF-8 bytes, while an
+interned name is charged once. A graph span pays `SpanKey`, `SpanMeta`, four
+machine words of B-tree slack, its finish-time resolution reference and one
+`f64` latency. On a 64-bit build that is 168 bytes per span, so the default
+256 MiB covers about 1.5 million spans before the comparatively small shared
+name and distinct-edge charges. Names pay hash-table/allocation slack plus
+their UTF-8 bytes only when first interned. Each distinct edge, rather than
+each span observation, additionally reserves both aggregation maps, a maximum
+size digest and its encoded copy, and the two output copies of its names;
+every latency observation was already reserved by its span. All charges are
+taken before the allocation they protect, including finalization. The two
+byte caps together may not exceed 1 GiB; their defaults are 256 MiB each.
+Graph resolution and all derived Parquet encoding run on the blocking pool,
+not on an async executor thread.
 
 The format fixtures under `crates/fs-schema/tests/fixtures` are bytes emitted
 by the first v1 writer and are decoded by every current test run. They pin
