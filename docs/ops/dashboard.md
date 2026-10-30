@@ -29,3 +29,5 @@ executions sent.
 component registered and fails if the dashboard queries a metric the
 engine does not render, so a renamed metric breaks the build, not the
 dashboard.
+
+What to do about what a panel shows is in `docs/ops/runbook.md`.
