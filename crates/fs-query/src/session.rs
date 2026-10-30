@@ -17,6 +17,7 @@ use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use fs_catalog::{Signal, TenantId};
 use fs_schema::attribute_keys;
+use fs_schema::{service_graph, trace_summary};
 
 use crate::QueryError;
 use crate::derived_table::{DerivedTable, VerifiedPaths};
@@ -78,17 +79,51 @@ pub fn tenant_session(
         attribute_keys::TABLE.into(),
         Arc::new(DerivedTable::new(
             tenant,
-            cache,
+            Arc::clone(&cache),
             store_url.clone(),
             Signal::AttributeKeys,
             attribute_keys::table_schema(),
             |schema| attribute_keys::check_schema(schema).map(|_| ()),
-            verified,
+            Arc::clone(&verified),
         )),
+    )?;
+    schema.register_table(
+        trace_summary::TABLE.into(),
+        Arc::new(
+            DerivedTable::new(
+                tenant,
+                Arc::clone(&cache),
+                store_url.clone(),
+                Signal::TraceSummary,
+                trace_summary::schema(),
+                trace_summary::check_schema,
+                Arc::clone(&verified),
+            )
+            // The catalog range is deliberately based on span starts. A bad
+            // end timestamp must not keep this hourly contribution forever,
+            // so only start predicates can prune whole files here.
+            .with_time_columns(&[trace_summary::columns::START]),
+        ),
+    )?;
+    schema.register_table(
+        service_graph::TABLE.into(),
+        Arc::new(
+            DerivedTable::new(
+                tenant,
+                cache,
+                store_url.clone(),
+                Signal::ServiceGraph1m,
+                service_graph::schema(),
+                service_graph::check_schema,
+                verified,
+            )
+            .with_time_columns(&[service_graph::columns::MINUTE]),
+        ),
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());
     catalog.register_schema(SCHEMA, schema)?;
     ctx.register_catalog(CATALOG, catalog);
+    ctx.register_udaf(crate::tdigest::quantile_tdigest());
     Ok(ctx)
 }
 

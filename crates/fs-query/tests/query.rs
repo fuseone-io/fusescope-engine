@@ -786,7 +786,7 @@ mod sandbox {
         f.db.finish().await;
     }
 
-    /// A session sees its tenant's two tables and nothing else: no other
+    /// A session sees its tenant's four tables and nothing else: no other
     /// catalog, no other schema, and `information_schema` lists only them.
     #[tokio::test]
     async fn only_the_tenants_tables_exist() {
@@ -812,9 +812,17 @@ mod sandbox {
             .unwrap();
         assert_eq!(
             strings(&tables, "table_catalog"),
-            ["fusescope", "fusescope"]
+            ["fusescope", "fusescope", "fusescope", "fusescope"]
         );
-        assert_eq!(strings(&tables, "table_name"), ["attribute_keys", "spans"]);
+        assert_eq!(
+            strings(&tables, "table_name"),
+            [
+                "attribute_keys",
+                "service_graph_1m",
+                "spans",
+                "trace_summary"
+            ]
+        );
         f.db.finish().await;
     }
 }
@@ -2010,6 +2018,112 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
     );
 
     stop(shutdown, server).await;
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn derived_contributions_are_pruned_by_time_and_unknown_versions_fail_closed() {
+    let Some(f) = fixture().await else { return };
+    let mut builder = SpanBatchBuilder::new(Limits::default());
+    builder.append_request(&request("api", 1, T0, 2)).unwrap();
+    let mut summaries = fs_schema::trace_summary::TraceSummaries::default();
+    summaries
+        .absorb(&builder.finish().unwrap(), usize::MAX, usize::MAX)
+        .unwrap();
+    let valid = fs_schema::trace_summary::encode(&summaries).unwrap();
+    let batch = summaries.to_batch().unwrap();
+    let mut metadata = batch.schema().metadata().clone();
+    metadata.insert("fusescope.schema_version".into(), "2".into());
+    let future_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        batch.schema().fields().clone(),
+        metadata,
+    ));
+    let future_batch =
+        RecordBatch::try_new(future_schema.clone(), batch.columns().to_vec()).unwrap();
+    let mut writer =
+        datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), future_schema, None).unwrap();
+    writer.write(&future_batch).unwrap();
+    let future = writer.into_inner().unwrap();
+    let store = LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap();
+    for (bytes, hour, range) in [
+        (
+            valid,
+            "14",
+            TimeRange {
+                start: chrono::Utc.timestamp_nanos(i64::try_from(T0).unwrap()),
+                end: chrono::Utc.timestamp_nanos(i64::try_from(T0 + 2_000_000).unwrap()),
+            },
+        ),
+        (
+            future,
+            "16",
+            TimeRange {
+                start: chrono::Utc.timestamp_nanos(i64::try_from(T0 + 2 * HOUR).unwrap()),
+                end: chrono::Utc.timestamp_nanos(i64::try_from(T0 + 2 * HOUR + 1).unwrap()),
+            },
+        ),
+    ] {
+        let id = FileId::new();
+        let path = format!(
+            "t/{}/traces/derived/trace_summary/dt=2026-10-22/hr={hour}/{}.parquet",
+            f.tenant.0, id.0
+        );
+        store
+            .put(&Path::from(path.as_str()), bytes.clone().into())
+            .await
+            .unwrap();
+        f.db.catalog
+            .register_file(&NewFile {
+                id,
+                origin: id,
+                tenant_id: f.tenant,
+                signal: Signal::TraceSummary,
+                level: Level::L1,
+                path,
+                size_bytes: i64::try_from(bytes.len()).unwrap(),
+                row_count: 1,
+                range,
+                services: vec!["api".into()],
+                summary: None,
+            })
+            .await
+            .unwrap();
+    }
+    let rows = f
+        .querier
+        .collect(
+            f.tenant,
+            "select count(*) from trace_summary where start < timestamp '2026-10-22T15:00:00Z'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts(&rows, "count(*)"), [1]);
+    assert_eq!(
+        f.querier.verified_derived_files(),
+        1,
+        "the pruned future file's footer was not fetched"
+    );
+    let err = f
+        .querier
+        .collect(
+            f.tenant,
+            "select count(*) from trace_summary where \"end\" < timestamp '2026-10-22T15:00:00Z'",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not readable by this version"),
+        "an end predicate cannot prune by the start-only catalog range: {err}"
+    );
+    let err = f
+        .querier
+        .collect(f.tenant, "select count(*) from trace_summary")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not readable by this version"),
+        "{err}"
+    );
     f.db.finish().await;
 }
 

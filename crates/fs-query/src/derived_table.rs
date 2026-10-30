@@ -1,11 +1,11 @@
 //! A derived table as a DataFusion table: the tenant's visible files of
-//! one derived signal, read whole. No pruning, no hot window and no budget
-//! apply: a derived table is one small file per tenant, rebuilt by the
-//! compactor, and only the tenant's own files are ever listed. Every
-//! file's schema metadata is checked before the scan, from its footer
-//! alone and once per path, since objects are created once and never
-//! rewritten, so a file of another version or signal fails the query
-//! instead of being misread.
+//! one derived signal, with conservative catalog pruning on its time
+//! columns. There is no hot-window contribution here: compaction publishes
+//! immutable partial files, and queries aggregate the files that overlap
+//! their range. Every file's schema metadata is checked before the scan,
+//! from its footer alone and once per path, since objects are created once
+//! and never rewritten, so a file of another version or signal fails the
+//! query instead of being misread.
 
 use std::sync::Arc;
 
@@ -34,6 +34,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::QueryError;
 use crate::files::FileCache;
+use crate::prune::Pruning;
 
 /// Refuses a file schema the table's reader does not know.
 pub type SchemaCheck = fn(&arrow::datatypes::Schema) -> Result<(), SchemaError>;
@@ -58,6 +59,7 @@ pub struct DerivedTable {
     schema: SchemaRef,
     check: SchemaCheck,
     verified: VerifiedPaths,
+    time_columns: &'static [&'static str],
 }
 
 impl DerivedTable {
@@ -81,7 +83,16 @@ impl DerivedTable {
             schema,
             check,
             verified,
+            time_columns: &[],
         }
+    }
+
+    /// Enables conservative file pruning from predicates on these time
+    /// columns, against the catalog range of each contribution.
+    #[must_use]
+    pub fn with_time_columns(mut self, columns: &'static [&'static str]) -> Self {
+        self.time_columns = columns;
+        self
     }
 
     /// Refuses `file` unless its footer, fetched by ranges and only the
@@ -186,6 +197,8 @@ impl TableProvider for DerivedTable {
             .files(self.tenant, self.signal)
             .await
             .map_err(external)?;
+        let pruning = Pruning::from_filters_on(filters, self.time_columns);
+        let files: Vec<&FileRecord> = files.iter().filter(|file| pruning.keeps(file)).collect();
         let projected_schema = match projection {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => Arc::clone(&self.schema),
@@ -194,11 +207,11 @@ impl TableProvider for DerivedTable {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
         let store = state.runtime_env().object_store(&self.store_url)?;
-        for file in files.iter() {
+        for file in &files {
             self.check_file(&store, file).await.map_err(external)?;
         }
         let group: Vec<PartitionedFile> = files
-            .iter()
+            .into_iter()
             .map(|f| PartitionedFile::new(f.path.clone(), u64::try_from(f.size_bytes).unwrap_or(0)))
             .collect();
         let mut source = ParquetSource::new(TableSchema::from(Arc::clone(&self.schema)))

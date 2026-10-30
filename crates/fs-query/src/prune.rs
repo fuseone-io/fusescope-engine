@@ -32,29 +32,35 @@ const BUCKET_SECONDS_I64: i64 = fs_schema::bucket::BUCKET_SECONDS as i64;
 impl Pruning {
     /// Derives bounds from `filters` (implicitly ANDed).
     pub fn from_filters(filters: &[Expr]) -> Self {
+        Self::from_filters_on(filters, &[col::TIMESTAMP])
+    }
+
+    /// Derives time bounds from any column in `time_columns`; the other
+    /// span-specific predicates remain recognised as usual.
+    pub fn from_filters_on(filters: &[Expr], time_columns: &[&str]) -> Self {
         let mut out = Self::default();
         for filter in filters {
-            out.absorb(filter);
+            out.absorb(filter, time_columns);
         }
         out
     }
 
-    fn absorb(&mut self, expr: &Expr) {
+    fn absorb(&mut self, expr: &Expr, time_columns: &[&str]) {
         match expr {
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Operator::And,
                 right,
             }) => {
-                self.absorb(left);
-                self.absorb(right);
+                self.absorb(left, time_columns);
+                self.absorb(right, time_columns);
             }
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 if let (Some(column), Some(literal)) = (column_name(left), literal(right)) {
-                    self.compare(column, *op, literal);
+                    self.compare(column, *op, literal, time_columns);
                 } else if let (Some(literal), Some(column)) = (literal(left), column_name(right)) {
                     if let Some(flipped) = op.swap() {
-                        self.compare(column, flipped, literal);
+                        self.compare(column, flipped, literal, time_columns);
                     }
                 }
             }
@@ -87,9 +93,15 @@ impl Pruning {
         }
     }
 
-    fn compare(&mut self, column: &str, op: Operator, literal: &ScalarValue) {
+    fn compare(
+        &mut self,
+        column: &str,
+        op: Operator,
+        literal: &ScalarValue,
+        time_columns: &[&str],
+    ) {
         match column {
-            col::TIMESTAMP => {
+            name if time_columns.contains(&name) => {
                 if let Some(ns) = timestamp_nanos(literal) {
                     self.bound(op, ns);
                 }
@@ -390,5 +402,13 @@ mod tests {
         let pruning = Pruning::from_filters(&filters);
         assert_eq!(pruning.ts_min, Some(1_800_000_000_000));
         assert_eq!(pruning.ts_max, Some(5_400_000_000_000));
+    }
+
+    #[test]
+    fn a_derived_time_column_prunes_by_the_catalog_range() {
+        let pruning = Pruning::from_filters_on(&[dfcol("minute").gt_eq(ts(500))], &["minute"]);
+        assert_eq!(pruning.ts_min, Some(500));
+        assert!(!pruning.keeps(&file(0, 499, &[])));
+        assert!(pruning.keeps(&file(500, 900, &[])));
     }
 }
