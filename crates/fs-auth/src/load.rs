@@ -97,8 +97,9 @@ pub(crate) struct Loaded {
 }
 
 /// Builds every side from `pems`, refusing a certificate or CA that does
-/// not parse, a key that does not match the certificate, an empty file, or
-/// two client CA bundles that share a CA.
+/// not parse, a key that does not match the certificate, an empty file, a
+/// client CA that is not a self-signed root, or two client CA bundles that
+/// share a CA key.
 pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let chain = certificates(&pems.cert, &files.cert)?;
@@ -106,11 +107,15 @@ pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
         .map_err(|e| invalid(&files.key, format!("no private key: {e}")))?;
     let public_cas = certificates(&pems.public_client_ca, &files.public_client_ca)?;
     let hot_cas = certificates(&pems.hot_client_ca, &files.hot_client_ca)?;
-    if public_cas.iter().any(|ca| hot_cas.contains(ca)) {
+    let public_keys = crate::anchors::root_keys(&public_cas, &provider)
+        .map_err(|reason| invalid(&files.public_client_ca, reason))?;
+    let hot_keys = crate::anchors::root_keys(&hot_cas, &provider)
+        .map_err(|reason| invalid(&files.hot_client_ca, reason))?;
+    if public_keys.iter().any(|key| hot_keys.contains(key)) {
         return Err(invalid(
             &files.hot_client_ca,
             format!(
-                "shares a CA with {}: a backend certificate would open the hot window",
+                "shares a CA key with {}: a backend certificate would open the hot window",
                 files.public_client_ca.display()
             ),
         ));
