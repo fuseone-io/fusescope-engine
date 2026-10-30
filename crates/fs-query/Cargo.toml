@@ -32,6 +32,7 @@ fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
 fs-ingest = { path = "../fs-ingest" }
 fs-index = { path = "../fs-index" }
+fs-auth = { path = "../fs-auth" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -169,6 +169,17 @@ pub struct Querier {
 }
 
 impl Querier {
+    /// Asks the ingesters for the hot window over mTLS with `tls`.
+    #[must_use]
+    pub fn with_hot_tls(mut self, tls: fs_auth::ClientTls) -> Self {
+        self.hot = Arc::new(
+            crate::hot::HotWindow::new(self.catalog.clone(), self.limits.hot_window)
+                .with_stats(Arc::clone(&self.stats))
+                .with_tls(tls),
+        );
+        self
+    }
+
     /// Builds the engine over `store`, with a memory-limited runtime that
     /// spills to `spill_dir`.
     ///

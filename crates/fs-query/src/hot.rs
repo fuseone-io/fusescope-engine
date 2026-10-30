@@ -8,7 +8,7 @@ use std::time::Duration;
 use arrow::record_batch::RecordBatch;
 use chrono::{Duration as ChronoDuration, Utc};
 use fs_catalog::{Catalog, FileId, TenantId};
-use fs_ingest::hot::{HotScanRequest, scan};
+use fs_ingest::hot::{HotScanRequest, scan_with};
 use tracing::{debug, warn};
 
 use crate::prune::Pruning;
@@ -72,6 +72,7 @@ pub struct HotWindow {
     catalog: Catalog,
     config: HotWindowConfig,
     stats: Option<Arc<crate::querier::QueryStats>>,
+    tls: Option<fs_auth::ClientTls>,
 }
 
 impl HotWindow {
@@ -81,7 +82,15 @@ impl HotWindow {
             catalog,
             config,
             stats: None,
+            tls: None,
         }
+    }
+
+    /// Asks the ingesters over mTLS with `tls` instead of plain text.
+    #[must_use]
+    pub fn with_tls(mut self, tls: fs_auth::ClientTls) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     /// Counts fan-outs and unavailable ingesters in `stats`.
@@ -130,10 +139,11 @@ impl HotWindow {
         let calls = ingesters.iter().map(|ingester| {
             let request = request.clone();
             let timeout = self.config.timeout;
+            let tls = self.tls.as_ref();
             async move {
                 (
                     ingester.id.clone(),
-                    scan(&ingester.address, &request, timeout).await,
+                    scan_with(&ingester.address, &request, timeout, tls).await,
                 )
             }
         });

@@ -45,12 +45,26 @@ pub const PARTIAL_HEADER: &str = "x-fusescope-partial";
 pub struct FlightSql {
     querier: Querier,
     catalog: Catalog,
+    tls: Option<fs_auth::ServerTls>,
 }
 
 impl FlightSql {
     /// Service over `querier`, authenticating against `catalog`.
     pub fn new(querier: Querier, catalog: Catalog) -> Self {
-        Self { querier, catalog }
+        Self {
+            querier,
+            catalog,
+            tls: None,
+        }
+    }
+
+    /// Serves over mTLS with `tls` instead of plain text: a client must
+    /// present a certificate from the client CA before its bearer token is
+    /// read.
+    #[must_use]
+    pub fn with_tls(mut self, tls: fs_auth::ServerTls) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     /// Serves until `shutdown` flips. Sends the bound address on `bound`.
@@ -73,19 +87,17 @@ impl FlightSql {
             addr: "local_addr".into(),
             source,
         })?;
-        info!(%addr, "flight sql listening");
+        info!(%addr, tls = self.tls.is_some(), "flight sql listening");
         if let Some(tx) = bound {
             let _ = tx.send(addr);
         }
-        tonic::transport::Server::builder()
-            .add_service(FlightServiceServer::new(self))
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async move {
-                    let _ = shutdown.changed().await;
-                },
-            )
-            .await?;
+        let tls = self.tls.clone();
+        let router =
+            tonic::transport::Server::builder().add_service(FlightServiceServer::new(self));
+        fs_auth::serve(router, listener, tls.as_ref(), async move {
+            let _ = shutdown.changed().await;
+        })
+        .await?;
         info!("flight sql stopped");
         Ok(())
     }
