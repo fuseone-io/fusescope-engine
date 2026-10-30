@@ -1047,6 +1047,28 @@ surface and is handled as follows:
   (log body, tenant-listed attributes), with a key per tenant. parquet-rs
   supports it.
 - Catalog Postgres with TLS and one user per role, minimal `GRANT`s.
+- mTLS on the Flight SQL listener and the internal hot-window Flight, under
+  `[tls]`. A process has one identity, `tls.cert` and `tls.key`, that it
+  serves with and presents as a client, and one bundle of client CAs,
+  `tls.client_ca`; a listener refuses a client without a certificate that
+  chains to it before any request is read, the bearer token or tenant JWT
+  coming after. Clients verify the server against the operating system's
+  trust store only, so a private CA is installed in the image's store, and
+  against the host they dial, so an ingester advertises the name its
+  certificate carries. The three files are read again every
+  `tls.reload_interval_secs` (60): contents that load go to new
+  connections while open ones keep the config they began with, on the same
+  listener; contents that do not load keep the last good config, count
+  `fusescope_tls_reload_failures_total`, set `fusescope_tls_stale` and show
+  `tls=stale` on `/readyz` without failing it, since every replica would
+  read the same broken secret and the old config still serves. Files that
+  do not load at start stop the start. Handshakes run off the accept loop,
+  each within `tls.handshake_timeout_secs` (10) and at most
+  `tls.max_handshakes` (1024) at a time per listener. `[tls]` is off by
+  default for development, where the start warns, and half a section, on
+  without its files or off with files named, is refused; staging and
+  production turn it on. The OTLP listener of section 10.3 is not covered
+  yet.
 
 ### 10.5 Supply chain and code
 
