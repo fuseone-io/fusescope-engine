@@ -23,9 +23,13 @@ pub struct TlsSection {
     /// PEM private key of the leaf.
     #[serde(default)]
     pub key: String,
-    /// PEM bundle of the CAs a connecting client must chain to.
+    /// PEM bundle of the CAs a Flight SQL client, the backend, must chain to.
     #[serde(default)]
-    pub client_ca: String,
+    pub public_client_ca: String,
+    /// PEM bundle of the CAs a hot-window client, a querier, must chain to.
+    /// Shares no CA with `public_client_ca`.
+    #[serde(default)]
+    pub hot_client_ca: String,
     /// How often the three files are read again.
     #[serde(default = "default_reload_interval")]
     pub reload_interval_secs: u64,
@@ -43,7 +47,8 @@ impl Default for TlsSection {
             enabled: false,
             cert: String::new(),
             key: String::new(),
-            client_ca: String::new(),
+            public_client_ca: String::new(),
+            hot_client_ca: String::new(),
             reload_interval_secs: default_reload_interval(),
             handshake_timeout_secs: default_handshake_timeout(),
             max_handshakes: default_max_handshakes(),
@@ -69,7 +74,8 @@ impl TlsSection {
         self.enabled.then(|| fs_auth::TlsFiles {
             cert: PathBuf::from(&self.cert),
             key: PathBuf::from(&self.key),
-            client_ca: PathBuf::from(&self.client_ca),
+            public_client_ca: PathBuf::from(&self.public_client_ca),
+            hot_client_ca: PathBuf::from(&self.hot_client_ca),
         })
     }
 
@@ -82,29 +88,40 @@ impl TlsSection {
         }
     }
 
-    /// Refuses a half-configured section: on without its three files, or
+    /// Refuses a half-configured section: on without its four files, or
     /// off with files named, which would look protected and is not.
     ///
     /// # Errors
     /// The section is incomplete, contradictory or out of bounds.
     pub fn validate(&self) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
-        let named = [&self.cert, &self.key, &self.client_ca].map(|p| !p.is_empty());
+        let named = [
+            &self.cert,
+            &self.key,
+            &self.public_client_ca,
+            &self.hot_client_ca,
+        ]
+        .map(|p| !p.is_empty());
         if self.enabled && named.contains(&false) {
-            return invalid("tls.enabled requires tls.cert, tls.key and tls.client_ca");
+            return invalid(
+                "tls.enabled requires tls.cert, tls.key, tls.public_client_ca and tls.hot_client_ca",
+            );
         }
         if !self.enabled && named.contains(&true) {
             return invalid(
-                "tls.cert, tls.key or tls.client_ca is set but tls.enabled is false; enable it or remove them",
+                "tls.cert, tls.key, tls.public_client_ca or tls.hot_client_ca is set but tls.enabled is false; enable it or remove them",
             );
+        }
+        if self.enabled && self.public_client_ca == self.hot_client_ca {
+            return invalid("tls.public_client_ca and tls.hot_client_ca must be different bundles");
         }
         let day = 86_400;
         if !(1..=day).contains(&self.reload_interval_secs)
             || !(1..=day).contains(&self.handshake_timeout_secs)
-            || self.max_handshakes == 0
+            || !(1..=fs_auth::MAX_HANDSHAKES).contains(&self.max_handshakes)
         {
             return invalid(
-                "tls.reload_interval_secs and tls.handshake_timeout_secs must be between 1 and 86400 and tls.max_handshakes positive",
+                "tls.reload_interval_secs and tls.handshake_timeout_secs must be between 1 and 86400 and tls.max_handshakes between 1 and 65536",
             );
         }
         Ok(())
@@ -160,10 +177,20 @@ mod tests {
         off.validate().unwrap();
         assert!(off.files().is_none());
         let on = section(
-            "enabled = true\ncert = \"/tls/tls.crt\"\nkey = \"/tls/tls.key\"\nclient_ca = \"/tls/ca.crt\"\n",
+            "enabled = true\ncert = \"/tls/tls.crt\"\nkey = \"/tls/tls.key\"\npublic_client_ca = \"/tls/backend-ca.crt\"\nhot_client_ca = \"/tls/querier-ca.crt\"\n",
         );
         on.validate().unwrap();
-        assert_eq!(on.files().unwrap().client_ca, PathBuf::from("/tls/ca.crt"));
+        assert_eq!(
+            on.files().unwrap().hot_client_ca,
+            PathBuf::from("/tls/querier-ca.crt")
+        );
+        let at = |n: usize| TlsSection {
+            max_handshakes: n,
+            ..on.clone()
+        };
+        at(fs_auth::MAX_HANDSHAKES).validate().unwrap();
+        assert!(at(fs_auth::MAX_HANDSHAKES + 1).validate().is_err());
+        assert!(at(usize::MAX).validate().is_err());
         assert_eq!(on.limits().reload_interval, Duration::from_secs(60));
         assert_eq!(on.limits().max_handshakes, 1024);
         for (bad, why) in [
@@ -174,12 +201,16 @@ mod tests {
             ("enabled = true\n", "tls.enabled requires"),
             ("cert = \"a\"\n", "tls.enabled is false"),
             (
-                "enabled = true\ncert = \"a\"\nkey = \"b\"\nclient_ca = \"c\"\nreload_interval_secs = 0\n",
+                "enabled = true\ncert = \"a\"\nkey = \"b\"\npublic_client_ca = \"c\"\nhot_client_ca = \"d\"\nreload_interval_secs = 0\n",
                 "between 1 and 86400",
             ),
             (
-                "enabled = true\ncert = \"a\"\nkey = \"b\"\nclient_ca = \"c\"\nmax_handshakes = 0\n",
-                "max_handshakes positive",
+                "enabled = true\ncert = \"a\"\nkey = \"b\"\npublic_client_ca = \"c\"\nhot_client_ca = \"d\"\nmax_handshakes = 0\n",
+                "max_handshakes between 1 and 65536",
+            ),
+            (
+                "enabled = true\ncert = \"a\"\nkey = \"b\"\npublic_client_ca = \"c\"\nhot_client_ca = \"c\"\n",
+                "different bundles",
             ),
         ] {
             let err = section(bad).validate().unwrap_err().to_string();

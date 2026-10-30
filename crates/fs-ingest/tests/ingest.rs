@@ -4404,16 +4404,25 @@ fn tls_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// A process TLS from the fixtures, copied under `dir` so it can rotate.
-fn tls_in(dir: &std::path::Path, cert: &str, key: &str, client_ca: &str) -> Arc<fs_auth::Tls> {
+/// A process TLS from the fixtures, copied under `dir` so it can rotate:
+/// the backend's clients from `public_ca`, the queriers' from `hot_ca`.
+fn tls_in(
+    dir: &std::path::Path,
+    cert: &str,
+    key: &str,
+    public_ca: &str,
+    hot_ca: &str,
+) -> Arc<fs_auth::Tls> {
     let files = fs_auth::TlsFiles {
         cert: dir.join("tls.crt"),
         key: dir.join("tls.key"),
-        client_ca: dir.join("ca.crt"),
+        public_client_ca: dir.join("public-ca.crt"),
+        hot_client_ca: dir.join("hot-ca.crt"),
     };
     std::fs::copy(tls_fixture(cert), &files.cert).unwrap();
     std::fs::copy(tls_fixture(key), &files.key).unwrap();
-    std::fs::copy(tls_fixture(client_ca), &files.client_ca).unwrap();
+    std::fs::copy(tls_fixture(public_ca), &files.public_client_ca).unwrap();
+    std::fs::copy(tls_fixture(hot_ca), &files.hot_client_ca).unwrap();
     fs_auth::Tls::load(
         files,
         fs_auth::TlsLimits {
@@ -4451,6 +4460,7 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         server_dir.path(),
         "server-a.pem",
         "server-a.key",
+        "ca-b.pem",
         "ca-a.pem",
     );
     std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
@@ -4462,7 +4472,7 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         test_config(),
         wal_config,
         store,
-        Some(server.server()),
+        Some(server.hot_server()),
     )
     .await;
     let mut client = h.client().await;
@@ -4486,14 +4496,21 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         querier_dir.path(),
         "client-a.pem",
         "client-a.key",
+        "ca-b.pem",
         "ca-a.pem",
     )
     .client()
     .trusting_only(&ca_a);
     let other_dir = tempfile::tempdir().unwrap();
-    let other = tls_in(other_dir.path(), "client-b.pem", "client-b.key", "ca-b.pem")
-        .client()
-        .trusting_only(&ca_a);
+    let other = tls_in(
+        other_dir.path(),
+        "client-b.pem",
+        "client-b.key",
+        "ca-a.pem",
+        "ca-b.pem",
+    )
+    .client()
+    .trusting_only(&ca_a);
     let named = format!("localhost:{}", h.hot_addr.port());
     let timeout = Duration::from_secs(5);
     let rows = |response: fs_ingest::hot::HotScanResponse| {
@@ -4528,7 +4545,16 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         "the address is not the name in the certificate: {err}"
     );
 
-    std::fs::copy(tls_fixture("ca-b.pem"), server_dir.path().join("ca.crt")).unwrap();
+    std::fs::copy(
+        tls_fixture("ca-a.pem"),
+        server_dir.path().join("public-ca.crt"),
+    )
+    .unwrap();
+    std::fs::copy(
+        tls_fixture("ca-b.pem"),
+        server_dir.path().join("hot-ca.crt"),
+    )
+    .unwrap();
     assert_eq!(server.reload().unwrap(), fs_auth::Reload::Reloaded);
     assert!(
         fs_ingest::hot::scan_with(&named, &request, timeout, Some(&querier))

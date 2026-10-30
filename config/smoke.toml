@@ -56,7 +56,8 @@ retention_interval_secs = 15
 enabled = false
 # cert = "/etc/fusescope/tls/tls.crt"
 # key = "/etc/fusescope/tls/tls.key"
-# client_ca = "/etc/fusescope/tls/ca.crt"
+# public_client_ca = "/etc/fusescope/tls/backend-ca.crt"
+# hot_client_ca = "/etc/fusescope/tls/querier-ca.crt"
 # reload_interval_secs = 60
 
 [log]

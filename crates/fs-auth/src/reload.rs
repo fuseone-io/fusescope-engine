@@ -13,6 +13,10 @@ use crate::client::ClientTls;
 use crate::incoming::ServerTls;
 use crate::load::{Pems, TlsError, TlsFiles, load};
 
+/// Most handshakes a listener runs at a time; `max_handshakes` above it
+/// is clamped to it.
+pub const MAX_HANDSHAKES: usize = 65_536;
+
 /// Bounds of the TLS listeners and the reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsLimits {
@@ -20,8 +24,8 @@ pub struct TlsLimits {
     pub reload_interval: Duration,
     /// Longest a handshake may take before the connection is dropped.
     pub handshake_timeout: Duration,
-    /// Handshakes in progress per listener; connections beyond it are
-    /// closed at once.
+    /// Handshakes in progress per listener, 1 to [`MAX_HANDSHAKES`];
+    /// connections beyond it are closed at once.
     pub max_handshakes: usize,
 }
 
@@ -56,7 +60,8 @@ pub enum Reload {
 pub struct Tls {
     files: TlsFiles,
     limits: TlsLimits,
-    server: watch::Sender<Arc<ServerConfig>>,
+    public: watch::Sender<Arc<ServerConfig>>,
+    hot: watch::Sender<Arc<ServerConfig>>,
     identity: watch::Sender<Identity>,
     seen: Mutex<Pems>,
     stats: Arc<TlsStats>,
@@ -72,31 +77,47 @@ impl std::fmt::Debug for Tls {
 }
 
 impl Tls {
-    /// Reads and validates the files.
+    /// Reads and validates the files. `max_handshakes` is clamped to
+    /// 1..=[`MAX_HANDSHAKES`].
     ///
     /// # Errors
     /// A file is unreadable or empty, a certificate or CA does not parse,
-    /// or the key does not match the certificate.
-    pub fn load(files: TlsFiles, limits: TlsLimits) -> Result<Arc<Self>, TlsError> {
+    /// the key does not match the certificate, or the two client CA
+    /// bundles share a CA.
+    pub fn load(files: TlsFiles, mut limits: TlsLimits) -> Result<Arc<Self>, TlsError> {
+        limits.max_handshakes = limits.max_handshakes.clamp(1, MAX_HANDSHAKES);
         let pems = Pems::read(&files)?;
         let loaded = load(&pems, &files)?;
         Ok(Arc::new(Self {
             files,
             limits,
-            server: watch::Sender::new(loaded.server),
+            public: watch::Sender::new(loaded.public),
+            hot: watch::Sender::new(loaded.hot),
             identity: watch::Sender::new(loaded.identity),
             seen: Mutex::new(pems),
             stats: Arc::new(TlsStats::default()),
         }))
     }
 
-    /// What a listener needs: the current config, followed.
-    pub fn server(&self) -> ServerTls {
+    /// The public Flight SQL listener's side: clients from
+    /// `public_client_ca` only, followed across reloads.
+    pub fn public_server(&self) -> ServerTls {
         ServerTls::new(
-            self.server.subscribe(),
+            self.public.subscribe(),
             Arc::clone(&self.stats),
             self.limits,
         )
+    }
+
+    /// The internal hot-window listener's side: clients from
+    /// `hot_client_ca` only, followed across reloads.
+    pub fn hot_server(&self) -> ServerTls {
+        ServerTls::new(self.hot.subscribe(), Arc::clone(&self.stats), self.limits)
+    }
+
+    /// The limits in force, after clamping.
+    pub fn limits(&self) -> TlsLimits {
+        self.limits
     }
 
     /// What a client needs: the current identity, followed.
@@ -143,7 +164,8 @@ impl Tls {
         *seen = pems;
         drop(seen);
         let loaded = loaded?;
-        self.server.send_replace(loaded.server);
+        self.public.send_replace(loaded.public);
+        self.hot.send_replace(loaded.hot);
         self.identity.send_replace(loaded.identity);
         Ok(Reload::Reloaded)
     }

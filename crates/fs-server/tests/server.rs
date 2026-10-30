@@ -740,17 +740,35 @@ fn tls_on(cfg: &mut Config, cert: &str, key: &str) {
         enabled: true,
         cert: tls_fixture(cert).display().to_string(),
         key: tls_fixture(key).display().to_string(),
-        client_ca: tls_fixture("ca-a.pem").display().to_string(),
+        public_client_ca: tls_fixture("ca-b.pem").display().to_string(),
+        hot_client_ca: tls_fixture("ca-a.pem").display().to_string(),
         ..fs_server::tls::TlsSection::default()
     };
 }
 
-/// With `[tls]` on, the server refuses to start on files that do not load;
-/// on good files its Flight SQL listener answers a certified client at the
-/// name in its certificate and refuses plain text, and readiness and the
-/// metrics report the TLS.
+/// A client of the fixtures' `cert`, trusting the CA of the servers.
+fn certified(cert: &str, key: &str) -> fs_auth::ClientTls {
+    let identity = fs_auth::Tls::load(
+        fs_auth::TlsFiles {
+            cert: tls_fixture(cert),
+            key: tls_fixture(key),
+            public_client_ca: tls_fixture("ca-b.pem"),
+            hot_client_ca: tls_fixture("ca-a.pem"),
+        },
+        fs_server::tls::TlsSection::default().limits(),
+    )
+    .unwrap();
+    let ca = std::fs::read(tls_fixture("ca-a.pem")).unwrap();
+    identity.client().trusting_only(&ca)
+}
+
+/// With `[tls]` on, the server refuses to start on files that do not load.
+/// On good files, in one process running every role, a backend
+/// certificate opens Flight SQL and not the hot window, a querier
+/// certificate the reverse, plain text opens neither, and readiness and
+/// the metrics report the TLS.
 #[tokio::test]
-async fn with_tls_on_the_querier_requires_a_client_certificate() {
+async fn with_tls_on_each_flight_admits_only_its_own_clients() {
     use fs_server::client;
     let Some(db) = TestDb::new().await else {
         return;
@@ -768,10 +786,13 @@ async fn with_tls_on_the_querier_requires_a_client_certificate() {
     assert!(err.to_string().contains("server-a.pem"), "{err}");
 
     let port = free_port();
+    let hot_port = free_port();
     let metrics_port = free_port();
     let mut cfg = config(dir.path());
     cfg.server.flight_addr = format!("127.0.0.1:{port}");
     cfg.server.metrics_addr = format!("127.0.0.1:{metrics_port}");
+    cfg.ingest.hot_listen = format!("127.0.0.1:{hot_port}");
+    cfg.ingest.hot_advertise = format!("localhost:{hot_port}");
     tls_on(&mut cfg, "server-a.pem", "server-a.key");
     let (tx, rx) = watch::channel(false);
     let server = tokio::spawn(server::run(cfg, secrets, Role::All, "test-node".into(), rx));
@@ -792,38 +813,56 @@ async fn with_tls_on_the_querier_requires_a_client_certificate() {
         .create_token(tenant, "operator", fs_catalog::TokenScope::Query)
         .await
         .unwrap();
-    let identity = fs_auth::Tls::load(
-        fs_auth::TlsFiles {
-            cert: tls_fixture("client-a.pem"),
-            key: tls_fixture("client-a.key"),
-            client_ca: tls_fixture("ca-a.pem"),
-        },
-        fs_server::tls::TlsSection::default().limits(),
-    )
-    .unwrap();
-    let ca = std::fs::read(tls_fixture("ca-a.pem")).unwrap();
-    let certified = identity.client().trusting_only(&ca);
-    let named = format!("localhost:{port}");
+    let backend = certified("client-b.pem", "client-b.key");
+    let querier = certified("client-a.pem", "client-a.key");
+    let flight = format!("localhost:{port}");
+    let hot = format!("localhost:{hot_port}");
+    let scan = fs_ingest::hot::HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: None,
+        span_ids: None,
+        distinct: None,
+    };
+    let timeout = Duration::from_secs(5);
+
     let counted = client::query(
-        &named,
+        &flight,
         &token,
         "select count(*) as n from spans",
-        Some(&certified),
+        Some(&backend),
     )
     .await
     .unwrap();
     assert!(client::render(&counted).unwrap().ends_with("1 rows"));
-    let err = client::query(&named, &token, "select 1", None)
-        .await
-        .unwrap_err();
     assert!(
-        err.to_string().contains("connect") || err.to_string().contains("transport"),
-        "{err}"
+        fs_ingest::hot::scan_with(&hot, &scan, timeout, Some(&backend))
+            .await
+            .is_err(),
+        "a backend certificate on the hot window"
     );
+    fs_ingest::hot::scan_with(&hot, &scan, timeout, Some(&querier))
+        .await
+        .unwrap();
+    assert!(
+        client::query(&flight, &token, "select 1", Some(&querier))
+            .await
+            .is_err(),
+        "a querier certificate on Flight SQL"
+    );
+    assert!(
+        client::query(&flight, &token, "select 1", None)
+            .await
+            .is_err()
+    );
+    assert!(fs_ingest::hot::scan(&hot, &scan, timeout).await.is_err());
     let (_, body) = http_get(&metrics_addr, "/metrics").await;
     assert!(
         !body.contains("fusescope_tls_handshake_failures_total 0\n"),
-        "the plain-text attempt failed its handshake: {body}"
+        "the refused attempts failed their handshakes: {body}"
     );
 
     tx.send(true).unwrap();

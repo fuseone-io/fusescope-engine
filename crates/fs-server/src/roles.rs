@@ -80,7 +80,7 @@ pub async fn ingester(
         wal,
     )?;
     if let Some(tls) = &ctx.tls {
-        ingester = ingester.with_hot_tls(tls.server());
+        ingester = ingester.with_hot_tls(tls.hot_server());
     }
     let ingester = Arc::new(ingester);
     let wal_probe = Arc::clone(&ingester);
@@ -164,7 +164,10 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     let cache = querier.cache();
     let follower = cache.follow(shutdown.clone());
     let (querier, tls) = match &ctx.tls {
-        Some(tls) => (querier.with_hot_tls(tls.client()), Some(tls.server())),
+        Some(tls) => (
+            querier.with_hot_tls(tls.client()),
+            Some(tls.public_server()),
+        ),
         None => (querier, None),
     };
     let mut service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());

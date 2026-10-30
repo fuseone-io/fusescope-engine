@@ -42,7 +42,7 @@ pub async fn bootstrap(
     config.validate(secrets)?;
     let tls = if let Some(files) = config.tls.files() {
         let tls = fs_auth::Tls::load(files, config.tls.limits())?;
-        info!(cert = %config.tls.cert, client_ca = %config.tls.client_ca, "tls loaded; the flight listeners require client certificates");
+        info!(cert = %config.tls.cert, public_client_ca = %config.tls.public_client_ca, hot_client_ca = %config.tls.hot_client_ca, "tls loaded; the flight listeners require client certificates");
         Some(tls)
     } else {
         warn!(
