@@ -1,0 +1,78 @@
+# One release runs the three roles: ingesters as a StatefulSet, each with
+# its write-ahead log on a persistent volume, queriers and the compactor as
+# Deployments. Secure by default: mTLS on both Flights and the backend's
+# tenant JWTs on Flight SQL; development overrides it (ci/dev-values.yaml).
+
+image:
+  repository: ghcr.io/fuseone-io/fusescope-engine
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Secret, created outside the chart, whose keys are the environment the
+# engine reads its secrets from: FS_CATALOG_URL, FS_BUCKET_ACCESS_KEY and
+# FS_BUCKET_SECRET_KEY. Required.
+secretName: ""
+
+catalog:
+  maxConnections: 16
+  # Every pod migrates on start; migrations serialise on a Postgres lock.
+  migrate: true
+
+bucket:
+  name: ""
+  prefix: ""
+  # Empty for AWS S3; the endpoint of any other S3-compatible store.
+  endpoint: ""
+  region: ""
+  allowHttp: false
+
+tls:
+  enabled: true
+  # Secret with tls.crt and tls.key (the identity, with serverAuth and
+  # clientAuth; ingesters' must name *.<release>-ingester-hot.<namespace>.svc
+  # and the querier's <release>-flight), public-ca.crt (the backend's client
+  # CAs) and hot-ca.crt (the queriers'), two disjoint sets of roots.
+  secretName: ""
+  reloadIntervalSecs: 60
+
+auth:
+  # "jwt" (the backend's tenant JWTs, requires tls) or "token".
+  mode: jwt
+  # ConfigMap with jwks.json, the backend's Ed25519 public keys.
+  jwksConfigMap: ""
+  issuer: ""
+
+log:
+  level: info
+  format: json
+
+# A stop drains in flight work for this long; the pod gets more.
+drainTimeoutSecs: 30
+
+ingester:
+  replicas: 2
+  wal:
+    size: 20Gi
+    storageClassName: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+querier:
+  replicas: 2
+  spillSizeLimit: 10Gi
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+compactor:
+  # One holds the lease at a time; a second stands by.
+  replicas: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

@@ -1,0 +1,22 @@
+{{- $ctx := dict "Values" .Values "Release" .Release "Chart" .Chart "role" "compactor" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fse.name" . }}-compactor
+  labels:
+    {{- include "fse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: compactor
+spec:
+  replicas: {{ .Values.compactor.replicas }}
+  selector:
+    matchLabels:
+      {{- include "fse.selector" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fse.labels" . | nindent 8 }}
+        app.kubernetes.io/component: compactor
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- include "fse.pod" $ctx | nindent 6 }}

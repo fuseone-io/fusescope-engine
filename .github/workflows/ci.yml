@@ -46,6 +46,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: scripts/image-check.sh fusescope-engine:ci
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - name: install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM}/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+        env:
+          KUBECONFORM: v0.7.0
+      - run: scripts/chart-check.sh --image fusescope-engine:ci
   deny:
     runs-on: ubuntu-latest
     steps:

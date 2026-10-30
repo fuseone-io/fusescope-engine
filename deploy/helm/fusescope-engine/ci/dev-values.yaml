@@ -1,0 +1,15 @@
+# A development release: plain text and static query tokens, against an
+# S3-compatible store over http.
+secretName: fusescope-engine-secrets
+bucket:
+  name: fusescope
+  endpoint: http://minio:9000
+  allowHttp: true
+tls:
+  enabled: false
+auth:
+  mode: token
+ingester:
+  replicas: 1
+querier:
+  replicas: 1

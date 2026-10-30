@@ -11,7 +11,7 @@ JOBS         ?= 8
 TEST_THREADS ?= 4
 THROTTLE     ?= nice -n 10
 
-.PHONY: dev-up dev-down check test test-full lint deny ci run check-env tenant token image image-check bench-stages bench-load bench-query
+.PHONY: dev-up dev-down check test test-full lint deny ci run check-env tenant token image image-check chart-check bench-stages bench-load bench-query
 
 dev-up:        ## start Postgres and an S3-compatible store, create the dev bucket
 	docker compose up -d --wait postgres s3
@@ -61,6 +61,10 @@ image:         ## build the container image (a release build of the whole worksp
 
 image-check:   ## non-root, CA bundle, --check and --role all inside the image with a read-only root, against a throwaway Postgres
 	scripts/image-check.sh $(IMAGE)
+
+chart-check:   ## lint and render the Helm chart, validate what it renders with the engine, check what it refuses
+	cargo build -q -p fs-server
+	scripts/chart-check.sh --binary target/debug/fusescope-engine
 
 bench-stages:  ## ingest decomposed by stage, in process, WAL on the project disk
 	cargo run --release -q -p fs-bench -- stages --requests $(or $(REQUESTS),5000) $(BENCH_ARGS)

@@ -1,0 +1,36 @@
+{{- $ctx := dict "Values" .Values "Release" .Release "Chart" .Chart "role" "querier" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fse.name" . }}-flight
+  labels:
+    {{- include "fse.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "fse.selector" $ctx | nindent 4 }}
+  ports:
+    - name: flight
+      port: 8815
+      targetPort: flight
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fse.name" . }}-querier
+  labels:
+    {{- include "fse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: querier
+spec:
+  replicas: {{ .Values.querier.replicas }}
+  selector:
+    matchLabels:
+      {{- include "fse.selector" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fse.labels" . | nindent 8 }}
+        app.kubernetes.io/component: querier
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- include "fse.pod" $ctx | nindent 6 }}

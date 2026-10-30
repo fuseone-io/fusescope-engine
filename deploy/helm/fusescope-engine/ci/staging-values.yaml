@@ -1,0 +1,11 @@
+# What a staging release sets: mTLS and the backend's JWTs on, as the
+# defaults have them, with the cluster's names.
+secretName: fusescope-engine-secrets
+bucket:
+  name: fusescope-staging
+  region: us-east-1
+tls:
+  secretName: fusescope-engine-tls
+auth:
+  jwksConfigMap: fusescope-backend-jwks
+  issuer: fusescope-backend
