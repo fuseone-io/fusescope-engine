@@ -1053,10 +1053,15 @@ surface and is handled as follows:
   `serverAuth` and the `clientAuth` extended key usages. Each listener has
   its own bundle of client CAs: Flight SQL admits clients of
   `tls.public_client_ca`, the backend's, and the hot window clients of
-  `tls.hot_client_ca`, the queriers'. The two bundles share no CA, refused
-  at start and at reload, because the hot window trusts the tenant in its
-  ticket: a backend certificate that opened it would read any tenant
-  without a bearer token or a JWT. A listener refuses a client without a
+  `tls.hot_client_ca`, the queriers'. The two are separate trust domains,
+  because the hot window trusts the tenant in its ticket: a backend
+  certificate that opened it would read any tenant without a bearer token
+  or a JWT. A certificate verifies under whatever CA holds the key that
+  signed it, whatever that CA's serial, validity or name, so every client
+  CA must be a self-signed root, never an intermediate or a
+  cross-certificate that could descend from a root of the other bundle,
+  and no public key may appear in both bundles; both are refused at start
+  and at reload. A listener refuses a client without a
   certificate from its bundle before any request is read. Clients verify
   the server against the operating system's trust store only, so a private
   CA is installed in the image's store, and against the host they dial, so
