@@ -1131,7 +1131,7 @@ surface and is handled as follows:
   `fusescope::audit` target: tenant and subject once authenticated (`-`
   before, `token` for a static token), the action type or `statement`, the
   first 8 bytes of the text's sha256 once known, rows sent, duration and an
-  outcome of `ok`, `refused` (token or ticket), `failed` or `cancelled`,
+  outcome of `ok`, `refused` (the token or ticket turned away), `failed` (anything else, an unreachable catalog or a deadline included) or `cancelled`,
   settled when the request ends however it ends. Strings a client chose are
   escaped, so an event stays one line; the text is never logged.
 

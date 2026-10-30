@@ -74,9 +74,15 @@ impl Audit {
         );
     }
 
-    /// The token or the ticket was refused.
-    pub(crate) fn refused(&mut self) {
-        self.outcome = Outcome::Refused;
+    /// Settles the record on the status that ended the request before
+    /// streaming: `refused` when the caller or its ticket was turned away
+    /// (`UNAUTHENTICATED`, `PERMISSION_DENIED`), `failed` for anything else,
+    /// an unreachable catalog or a deadline included.
+    pub(crate) fn ended_with(&mut self, status: &tonic::Status) {
+        self.outcome = match status.code() {
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => Outcome::Refused,
+            _ => Outcome::Failed,
+        };
     }
 
     /// Follows `batches` to their end, counting rows; the record is
@@ -188,8 +194,21 @@ mod tests {
         assert_eq!(audit().outcome, Outcome::Failed, "failed before streaming");
         assert_eq!(audit().hash.as_deref().map(str::len), Some(16));
         let mut refused = Audit::begin("metadata.services\nforged=line");
-        refused.refused();
+        refused.ended_with(&tonic::Status::unauthenticated("bad signature"));
         assert_eq!((refused.outcome, refused.tenant), (Outcome::Refused, None));
+        for (status, outcome) in [
+            (tonic::Status::permission_denied("ticket"), Outcome::Refused),
+            (tonic::Status::unavailable("catalog"), Outcome::Failed),
+            (tonic::Status::deadline_exceeded("timeout"), Outcome::Failed),
+            (
+                tonic::Status::invalid_argument("bad ticket"),
+                Outcome::Failed,
+            ),
+        ] {
+            let mut audit = Audit::begin("statement");
+            audit.ended_with(&status);
+            assert_eq!(audit.outcome, outcome, "{status:?}");
+        }
         assert_eq!(
             refused.kind.escape_debug().to_string(),
             "metadata.services\\nforged=line",

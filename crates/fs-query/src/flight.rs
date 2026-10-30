@@ -344,10 +344,10 @@ impl FlightSqlService for FlightSql {
         let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await
-            .inspect_err(|_| audit.refused())?;
+            .inspect_err(|status| audit.ended_with(status))?;
         audit.caller(&caller);
         let sql = redeem_ticket(&ticket.statement_handle, &caller).inspect_err(|e| {
-            audit.refused();
+            audit.ended_with(e);
             warn!(tenant = %caller.tenant.0, reason = e.message(), "ticket refused");
         })?;
         audit.text(sql.as_bytes());
@@ -394,7 +394,7 @@ impl FlightSqlService for FlightSql {
         let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await
-            .inspect_err(|_| audit.refused())?;
+            .inspect_err(|status| audit.ended_with(status))?;
         audit.caller(&caller);
         let (stream, warnings) = self
             .run_action(caller.tenant, action, deadline, limits)
