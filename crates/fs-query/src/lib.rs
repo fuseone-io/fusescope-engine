@@ -8,6 +8,8 @@
 //! refuses scans that would read too much.
 
 pub mod actions;
+mod audit;
+pub mod auth;
 pub mod derived_table;
 pub mod files;
 pub mod flight;

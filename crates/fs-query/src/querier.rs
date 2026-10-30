@@ -83,6 +83,8 @@ pub struct QueryStats {
     pub hot_fanouts: std::sync::atomic::AtomicU64,
     /// Ingesters that did not answer a fan-out.
     pub hot_unavailable: std::sync::atomic::AtomicU64,
+    /// Flight requests refused for a missing, unknown or invalid token.
+    pub auth_refused: std::sync::atomic::AtomicU64,
     /// `trace_id` sidecars fetched from the bucket.
     pub trace_index_fetches: std::sync::atomic::AtomicU64,
     /// Sidecars missing, unreadable or unreachable; their files were scanned.

@@ -1,12 +1,12 @@
 //! Arrow Flight SQL front end.
 //!
-//! Clients authenticate with `authorization: Bearer <query token>`. A
+//! Clients authenticate with `authorization: Bearer <token>`, a static
+//! query token or the backend's tenant JWT ([`crate::auth`]). A
 //! statement is planned on `GetFlightInfo` (so schema and errors surface
 //! early), kept by the querier, and executed on `DoGet` from that plan.
-//! The ticket is the tenant id followed by the SQL, unchanged since before
-//! plans were kept, so a ticket issued by either version executes on the
-//! other: `DoGet` re-authenticates, refuses a ticket from another tenant,
-//! and plans the SQL again only when no kept plan matches it. The typed
+//! `DoGet` re-authenticates, executes only a ticket issued to the same
+//! caller, and plans the SQL again only when no kept plan matches it.
+//! Every execution is audited ([`crate::audit`]). The typed
 //! actions of [`crate::actions`] arrive through `DoAction` and answer in
 //! Arrow IPC.
 
@@ -22,7 +22,7 @@ use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, SqlInfo, TicketStatementQuery};
 use arrow_flight::{Action, ActionType, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use datafusion::execution::SendableRecordBatchStream;
-use fs_catalog::{Catalog, TenantId, TokenScope};
+use fs_catalog::{Catalog, TenantId};
 use futures_util::{Future, Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use tokio::sync::watch;
@@ -35,6 +35,8 @@ use crate::actions::{
     KeysLookup, METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, OperationsLookup,
     ServicesLookup, TRACE_LOOKUP, TraceLookup,
 };
+use crate::audit::Audit;
+use crate::auth::{Authenticator, Caller, QueryAuth, encode_ticket, redeem_ticket};
 use crate::querier::{Querier, QueryLimits, QueryWarnings};
 
 /// Response header set when the result may be incomplete, with the reasons.
@@ -44,16 +46,22 @@ pub const PARTIAL_HEADER: &str = "x-fusescope-partial";
 #[derive(Clone)]
 pub struct FlightSql {
     querier: Querier,
-    catalog: Catalog,
+    auth: Arc<Authenticator>,
     tls: Option<fs_auth::ServerTls>,
 }
 
 impl FlightSql {
     /// Service over `querier`, authenticating against `catalog`.
     pub fn new(querier: Querier, catalog: Catalog) -> Self {
+        Self::with_auth(querier, catalog, QueryAuth::Token)
+    }
+
+    /// Service over `querier` authenticating its clients by `auth`.
+    pub fn with_auth(querier: Querier, catalog: Catalog, auth: QueryAuth) -> Self {
+        let auth = Arc::new(Authenticator::new(catalog, auth, querier.stats()));
         Self {
             querier,
-            catalog,
+            auth,
             tls: None,
         }
     }
@@ -151,49 +159,18 @@ impl FlightSql {
         }
     }
 
-    /// Resolves the bearer token under the request's `deadline`, so a
-    /// catalog that does not answer ends the request like any other step.
+    /// Resolves the caller under the request's `deadline`, so a catalog
+    /// that does not answer ends the request like any other step.
     async fn authenticate_by(
         &self,
         metadata: &MetadataMap,
         deadline: tokio::time::Instant,
         limits: QueryLimits,
-    ) -> Result<TenantId, Status> {
-        tokio::time::timeout_at(deadline, self.authenticate(metadata))
+    ) -> Result<Caller, Status> {
+        tokio::time::timeout_at(deadline, self.auth.caller(metadata))
             .await
             .unwrap_or_else(|_| Err(status_of(&QueryError::Timeout(limits.timeout))))
     }
-
-    async fn authenticate(&self, metadata: &MetadataMap) -> Result<TenantId, Status> {
-        let token = metadata
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-            .map(|(_, t)| t.trim())
-            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
-        self.catalog
-            .resolve_token(token, TokenScope::Query)
-            .await
-            .map_err(|e| Status::unavailable(format!("token lookup failed: {e}")))?
-            .ok_or_else(|| Status::unauthenticated("unknown or revoked token"))
-    }
-}
-
-/// Ticket payload: tenant id then SQL text.
-fn encode_ticket(tenant: TenantId, sql: &str) -> bytes::Bytes {
-    let mut out = Vec::with_capacity(16 + sql.len());
-    out.extend_from_slice(tenant.0.as_bytes());
-    out.extend_from_slice(sql.as_bytes());
-    bytes::Bytes::from(out)
-}
-
-fn decode_ticket(handle: &[u8]) -> Result<(TenantId, String), Status> {
-    let bad = || Status::invalid_argument("bad ticket");
-    let (id, sql) = handle.split_at_checked(16).ok_or_else(bad)?;
-    let tenant = uuid::Uuid::from_slice(id).map_err(|_| bad())?;
-    let sql = std::str::from_utf8(sql).map_err(|_| bad())?;
-    Ok((TenantId(tenant), sql.to_owned()))
 }
 
 /// Stands in for a deadline the clock cannot represent, as tokio does for
@@ -330,13 +307,17 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<FlightInfo>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let tenant = self
+        let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await?;
-        let schema: SchemaRef =
-            within(deadline, limits, self.querier.prepare(tenant, &query.query)).await?;
+        let schema: SchemaRef = within(
+            deadline,
+            limits,
+            self.querier.prepare(caller.tenant, &query.query),
+        )
+        .await?;
         let ticket = TicketStatementQuery {
-            statement_handle: encode_ticket(tenant, &query.query),
+            statement_handle: encode_ticket(&caller, &query.query),
         };
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -359,16 +340,14 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let tenant = self
+        let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await?;
-        let (ticket_tenant, sql) = decode_ticket(&ticket.statement_handle)?;
-        if ticket_tenant != tenant {
-            warn!(tenant = %tenant.0, "ticket from another tenant refused");
-            return Err(Status::permission_denied(
-                "ticket does not belong to this tenant",
-            ));
-        }
+        let sql = redeem_ticket(&ticket.statement_handle, &caller).inspect_err(|e| {
+            warn!(tenant = %caller.tenant.0, reason = e.message(), "ticket refused");
+        })?;
+        let audit = Audit::start(&caller, "statement", sql.as_bytes());
+        let tenant = caller.tenant;
         let kept = within(
             deadline,
             limits,
@@ -380,7 +359,8 @@ impl FlightSqlService for FlightSql {
             None => within(deadline, limits, self.querier.execute(tenant, &sql)).await?,
         };
         let schema = stream.schema();
-        let limited = bound_rows(stream, limits, deadline)
+        let limited = audit
+            .follow(bound_rows(stream, limits, deadline))
             .map_err(|e| FlightError::ExternalError(Box::new(e)));
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -404,14 +384,16 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
-        let tenant = self
+        let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
             .await?;
+        let action = request.get_ref();
+        let audit = Audit::start(&caller, &action.r#type, &action.body);
         let (stream, warnings) = self
-            .run_action(tenant, request.get_ref(), deadline, limits)
+            .run_action(caller.tenant, action, deadline, limits)
             .await?;
         let schema = stream.schema();
-        let results = ipc_results(&schema, bound_rows(stream, limits, deadline))?;
+        let results = ipc_results(&schema, audit.follow(bound_rows(stream, limits, deadline)))?;
         let mut response = Response::new(Box::pin(results)
             as Pin<
                 Box<
@@ -459,22 +441,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-
-    #[test]
-    fn ticket_round_trip_and_rejects_garbage() {
-        let tenant = TenantId::new();
-        let ticket = encode_ticket(tenant, "select 1");
-        assert_eq!(
-            decode_ticket(&ticket).unwrap(),
-            (tenant, "select 1".to_owned())
-        );
-        assert_eq!(
-            ticket.len(),
-            16 + "select 1".len(),
-            "nothing but tenant and SQL"
-        );
-        assert!(decode_ticket(b"short").is_err());
-    }
 
     fn batch_stream(
         batches: Vec<RecordBatch>,

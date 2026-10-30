@@ -2416,3 +2416,181 @@ async fn hot_window_merges_unflushed_rows_without_duplicates() {
 
     db.finish().await;
 }
+
+mod jwt {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use fs_query::auth::QueryAuth;
+    use tokio_rustls::rustls::SignatureScheme;
+    use tokio_rustls::rustls::crypto::ring::default_provider;
+    use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+
+    use super::*;
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fs-auth/tests/fixtures")
+            .join(name)
+    }
+
+    /// A backend token for `tenant` and `subject`, signed with key `a`,
+    /// issued now and expiring `ttl` seconds later, which may be negative.
+    fn token(tenant: TenantId, subject: &str, ttl: i64) -> String {
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let segment = |value: serde_json::Value| URL_SAFE_NO_PAD.encode(value.to_string());
+        let signed = format!(
+            "{}.{}",
+            segment(serde_json::json!({"alg": "EdDSA", "kid": "a"})),
+            segment(serde_json::json!({
+                "iss": "fusescope-backend",
+                "aud": "fusescope-engine",
+                "sub": subject,
+                "fusescope_tenant": tenant.0.to_string(),
+                "iat": now - 120,
+                "exp": now + ttl,
+            }))
+        );
+        let key = default_provider()
+            .key_provider
+            .load_private_key(PrivateKeyDer::from_pem_file(fixture_path("jwt-a.key")).unwrap())
+            .unwrap();
+        let signature = key
+            .choose_scheme(&[SignatureScheme::ED25519])
+            .unwrap()
+            .sign(signed.as_bytes())
+            .unwrap();
+        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    fn code(err: &arrow_flight::error::FlightError) -> Code {
+        match err {
+            arrow_flight::error::FlightError::Tonic(status) => status.code(),
+            other => panic!("not a status: {other}"),
+        }
+    }
+
+    /// In `jwt` mode the tenant and the subject come from the backend's
+    /// token; a ticket executes only for the same tenant and subject; a
+    /// static token, an expired or tampered JWT and a deleted tenant are
+    /// refused.
+    #[tokio::test]
+    async fn tenant_jwts_bind_the_ticket_to_tenant_and_subject() {
+        let Some(f) = fixture().await else { return };
+        let verifier = fs_auth::JwtVerifier::load(
+            fixture_path("jwks-a.json"),
+            fs_auth::JwtRules {
+                issuer: "fusescope-backend".into(),
+                audience: "fusescope-engine".into(),
+                max_ttl: Duration::from_secs(300),
+                leeway: Duration::from_secs(30),
+            },
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let service = FlightSql::with_auth(
+            f.querier.clone(),
+            f.db.catalog.clone(),
+            QueryAuth::Jwt {
+                verifier,
+                tenant_ttl: Duration::ZERO,
+            },
+        );
+        let (shutdown, rx) = tokio::sync::watch::channel(false);
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let server =
+            tokio::spawn(service.serve("127.0.0.1:0".parse().unwrap(), rx, Some(bound_tx)));
+        let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = |token: String| {
+            let mut client = FlightSqlServiceClient::new(channel.clone());
+            client.set_token(token);
+            client
+        };
+
+        let mut alice = client(token(f.tenant, "user:alice", 120));
+        let info = alice.execute("select 1 as n".into(), None).await.unwrap();
+        let ticket = info.endpoint[0].ticket.clone().unwrap();
+        let rows: Vec<RecordBatch> = alice
+            .do_get(ticket.clone())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        for (who, mut other) in [
+            (
+                "another tenant",
+                client(token(f.other_tenant, "user:alice", 120)),
+            ),
+            ("another subject", client(token(f.tenant, "user:bob", 120))),
+        ] {
+            let err = match other.do_get(ticket.clone()).await {
+                Ok(stream) => stream.try_collect::<Vec<_>>().await.unwrap_err(),
+                Err(e) => e,
+            };
+            assert_eq!(code(&err), Code::PermissionDenied, "{who}: {err}");
+        }
+
+        let (static_token, _) =
+            f.db.catalog
+                .create_token(f.tenant, "backend", TokenScope::Query)
+                .await
+                .unwrap();
+        let mut tampered = token(f.tenant, "user:alice", 120);
+        let at = tampered.rfind('.').unwrap() - 4;
+        tampered.replace_range(at..=at, if &tampered[at..=at] == "A" { "B" } else { "A" });
+        for (why, token) in [
+            ("a static token", static_token),
+            ("an expired token", token(f.tenant, "user:alice", -60)),
+            ("a tampered token", tampered),
+        ] {
+            let err = client(token)
+                .execute("select 1".into(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(code(&err), Code::Unauthenticated, "{why}: {err}");
+        }
+
+        sqlx::query("update engine_tenant set deleted_at = now() where id = $1")
+            .bind(f.other_tenant.0)
+            .execute(f.db.catalog.pool())
+            .await
+            .unwrap();
+        let err = client(token(f.other_tenant, "user:alice", 120))
+            .execute("select 1".into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Code::Unauthenticated, "a deleted tenant: {err}");
+        assert!(
+            f.querier
+                .stats()
+                .auth_refused
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 4
+        );
+
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        f.db.finish().await;
+    }
+}
