@@ -90,6 +90,13 @@ enabled = false
 # hot_client_ca = "/etc/fusescope/tls/querier-ca.crt"
 # reload_interval_secs = 60
 
+# How Flight SQL clients authenticate: "token" (catalog query tokens) for
+# development, "jwt" (the backend's tenant JWTs only) for staging.
+[auth]
+mode = "token"
+# jwt_keys = "/etc/fusescope/jwt/jwks.json"
+# jwt_issuer = "fusescope-backend"
+
 [log]
 level = "info"
 format = "text"

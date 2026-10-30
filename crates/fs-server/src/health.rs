@@ -20,6 +20,7 @@ pub struct Health {
     wal_open: AtomicBool,
     has_ingester: AtomicBool,
     tls: std::sync::OnceLock<std::sync::Arc<fs_auth::TlsStats>>,
+    jwks: std::sync::OnceLock<std::sync::Arc<fs_auth::JwksStats>>,
 }
 
 /// What the last probe of a dependency found.
@@ -65,25 +66,26 @@ impl WalState {
     }
 }
 
-/// The process's TLS, as far as readiness reports it.
+/// Reloaded files, the TLS ones or the JWT key set, as far as readiness
+/// reports them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsState {
-    /// Off: plain text.
+pub enum FilesState {
+    /// Not in use.
     Off,
-    /// On, serving what the files hold.
+    /// In use, as the files hold them.
     Current,
-    /// On, but the last reload failed: new connections get the last good
-    /// config. Reported, not counted against readiness, since the process
-    /// still serves and every replica would read the same broken files.
+    /// In use, but the last reload failed: the last good contents serve.
+    /// Reported, not counted against readiness, since the process still
+    /// serves and every replica would read the same broken files.
     Stale,
 }
 
-impl TlsState {
+impl FilesState {
     fn name(self) -> &'static str {
         match self {
-            TlsState::Off => "off",
-            TlsState::Current => "current",
-            TlsState::Stale => "stale",
+            FilesState::Off => "off",
+            FilesState::Current => "current",
+            FilesState::Stale => "stale",
         }
     }
 }
@@ -104,14 +106,16 @@ pub struct Readiness {
     /// A stop was asked for and the roles are finishing.
     pub draining: bool,
     /// The process's TLS.
-    pub tls: TlsState,
+    pub tls: FilesState,
+    /// The JWT key set.
+    pub jwt_keys: FilesState,
 }
 
 impl Readiness {
     /// One line per fact, the verdict first.
     pub fn render(&self) -> String {
         format!(
-            "{}\nroles={}/{}\ncatalog={}\nbucket={}\nwal={}\ndraining={}\ntls={}\n",
+            "{}\nroles={}/{}\ncatalog={}\nbucket={}\nwal={}\ndraining={}\ntls={}\njwt_keys={}\n",
             if self.ready { "ready" } else { "not ready" },
             self.roles.0,
             self.roles.1,
@@ -119,7 +123,8 @@ impl Readiness {
             self.bucket.name(),
             self.wal.name(),
             self.draining,
-            self.tls.name()
+            self.tls.name(),
+            self.jwt_keys.name()
         )
     }
 }
@@ -135,6 +140,11 @@ impl Health {
     /// Reports the state of the process's TLS from `stats`.
     pub fn follow_tls(&self, stats: std::sync::Arc<fs_auth::TlsStats>) {
         let _ = self.tls.set(stats);
+    }
+
+    /// Reports the state of the JWT key set from `stats`.
+    pub fn follow_jwks(&self, stats: std::sync::Arc<fs_auth::JwksStats>) {
+        let _ = self.jwks.set(stats);
     }
 
     /// One role is serving.
@@ -205,9 +215,14 @@ impl Health {
             wal,
             draining,
             tls: match self.tls.get() {
-                None => TlsState::Off,
-                Some(stats) if stats.stale.load(Ordering::Relaxed) => TlsState::Stale,
-                Some(_) => TlsState::Current,
+                None => FilesState::Off,
+                Some(stats) if stats.stale.load(Ordering::Relaxed) => FilesState::Stale,
+                Some(_) => FilesState::Current,
+            },
+            jwt_keys: match self.jwks.get() {
+                None => FilesState::Off,
+                Some(stats) if stats.stale.load(Ordering::Relaxed) => FilesState::Stale,
+                Some(_) => FilesState::Current,
             },
         }
     }
@@ -231,16 +246,22 @@ mod tests {
         assert!(health.readiness().ready);
         assert_eq!(
             health.readiness().render(),
-            "ready\nroles=2/2\ncatalog=ok\nbucket=ok\nwal=open\ndraining=false\ntls=off\n"
+            "ready\nroles=2/2\ncatalog=ok\nbucket=ok\nwal=open\ndraining=false\ntls=off\njwt_keys=off\n"
         );
         let tls = std::sync::Arc::new(fs_auth::TlsStats::default());
         health.follow_tls(std::sync::Arc::clone(&tls));
-        assert_eq!(health.readiness().tls, TlsState::Current);
+        assert_eq!(health.readiness().tls, FilesState::Current);
         tls.stale.store(true, Ordering::Relaxed);
         let stale = health.readiness();
-        assert_eq!(stale.tls, TlsState::Stale);
+        assert_eq!(stale.tls, FilesState::Stale);
         assert!(stale.ready, "a stale config still serves");
-        assert!(stale.render().ends_with("tls=stale\n"));
+        assert!(stale.render().contains("tls=stale\n"));
+        let keys = std::sync::Arc::new(fs_auth::JwksStats::default());
+        health.follow_jwks(std::sync::Arc::clone(&keys));
+        assert_eq!(health.readiness().jwt_keys, FilesState::Current);
+        keys.stale.store(true, Ordering::Relaxed);
+        assert!(health.readiness().ready);
+        assert!(health.readiness().render().ends_with("jwt_keys=stale\n"));
         health.bucket(false);
         assert!(!health.readiness().ready);
         health.bucket(true);

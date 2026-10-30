@@ -42,6 +42,9 @@ pub struct Config {
     /// mTLS of the Flight listeners and their clients.
     #[serde(default)]
     pub tls: crate::tls::TlsSection,
+    /// How Flight SQL clients authenticate.
+    #[serde(default)]
+    pub auth: crate::auth::AuthSection,
 }
 
 /// Process identity and role.
@@ -1133,6 +1136,11 @@ impl Config {
     }
 
     /// The ingest bounds the runtime or the cut enforces as hard ceilings.
+    fn validate_access(&self) -> Result<(), ServerError> {
+        self.tls.validate()?;
+        self.auth.validate()
+    }
+
     fn validate_server(&self) -> Result<(), ServerError> {
         let day = 86_400;
         let within = |secs: u64| (1..=day).contains(&secs);
@@ -1257,7 +1265,7 @@ impl Config {
         }
         self.validate_ingest_bounds()?;
         self.validate_server()?;
-        self.tls.validate()?;
+        self.validate_access()?;
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
             || self.query.memory_bytes < 64 * 1024 * 1024

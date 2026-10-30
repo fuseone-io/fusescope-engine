@@ -24,6 +24,7 @@ pub struct Metrics {
     query: OnceLock<Arc<fs_query::QueryStats>>,
     compactor: OnceLock<Arc<fs_compactor::Stats>>,
     tls: OnceLock<Arc<fs_auth::TlsStats>>,
+    jwks: OnceLock<Arc<fs_auth::JwksStats>>,
 }
 
 impl Default for Metrics {
@@ -36,6 +37,7 @@ impl Default for Metrics {
             wal_bytes: OnceLock::new(),
             query: OnceLock::new(),
             tls: OnceLock::new(),
+            jwks: OnceLock::new(),
             compactor: OnceLock::new(),
         }
     }
@@ -78,6 +80,11 @@ impl Metrics {
         let _ = self.tls.set(stats);
     }
 
+    /// Registers the JWT key set's counters.
+    pub fn register_jwks(&self, stats: Arc<fs_auth::JwksStats>) {
+        let _ = self.jwks.set(stats);
+    }
+
     /// Registers the compactor's counters.
     pub fn register_compactor(&self, stats: Arc<fs_compactor::Stats>) {
         let _ = self.compactor.set(stats);
@@ -92,6 +99,9 @@ impl Metrics {
         self.render_compactor(&mut out);
         if let Some(stats) = self.tls.get() {
             crate::tls::render(&mut out, stats);
+        }
+        if let Some(stats) = self.jwks.get() {
+            crate::auth::render(&mut out, stats);
         }
         if let Some(f) = self.wal_bytes.get() {
             gauge(
@@ -420,6 +430,12 @@ impl Metrics {
                 "fusescope_query_hot_fanouts_total",
                 "Hot-window fan-outs",
                 q.hot_fanouts.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_auth_refused_total",
+                "Flight requests refused for a missing, unknown or invalid token",
+                q.auth_refused.load(Ordering::Relaxed),
             );
             counter(
                 out,

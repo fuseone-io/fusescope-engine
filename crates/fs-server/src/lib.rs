@@ -3,6 +3,7 @@
 //! The binary in `main.rs` is a thin wrapper over [`server::run`] and
 //! [`server::check`] so integration tests can drive the same code in-process.
 
+pub mod auth;
 pub mod bucket;
 pub mod client;
 pub mod config;
@@ -59,6 +60,9 @@ pub enum ServerError {
     /// TLS files that do not load.
     #[error("{0}")]
     Tls(#[from] fs_auth::TlsError),
+    /// A JWT key set that does not load.
+    #[error("{0}")]
+    Jwt(#[from] fs_auth::JwtError),
     /// The bucket prefix is marked for another catalog.
     #[error("bucket prefix {prefix:?} belongs to catalog {owner}; this is not it")]
     PrefixOwnedByAnother {

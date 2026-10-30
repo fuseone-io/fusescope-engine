@@ -874,3 +874,124 @@ async fn with_tls_on_each_flight_admits_only_its_own_clients() {
     catalog.pool().close().await;
     db.finish().await;
 }
+
+/// A backend token for `tenant`, signed with the fixtures' key `a`.
+fn backend_jwt(tenant: fs_catalog::TenantId) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let segment = |value: serde_json::Value| URL_SAFE_NO_PAD.encode(value.to_string());
+    let signed = format!(
+        "{}.{}",
+        segment(serde_json::json!({"alg": "EdDSA", "kid": "a"})),
+        segment(serde_json::json!({
+            "iss": "fusescope-backend",
+            "aud": "fusescope-engine",
+            "sub": "user:operator",
+            "fusescope_tenant": tenant.0.to_string(),
+            "iat": now,
+            "exp": now + 120,
+        }))
+    );
+    let key = tokio_rustls::rustls::crypto::ring::default_provider()
+        .key_provider
+        .load_private_key(
+            tokio_rustls::rustls::pki_types::PrivateKeyDer::from_pem_file(tls_fixture("jwt-a.key"))
+                .unwrap(),
+        )
+        .unwrap();
+    let signature = key
+        .choose_scheme(&[tokio_rustls::rustls::SignatureScheme::ED25519])
+        .unwrap()
+        .sign(signed.as_bytes())
+        .unwrap();
+    format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+/// With `auth.mode = "jwt"` the server refuses to start on a key set that
+/// does not load; running, Flight SQL answers the backend's JWT, refuses
+/// the catalog's static token, and readiness and the metrics report the
+/// key set.
+#[tokio::test]
+async fn in_jwt_mode_the_querier_takes_only_backend_tokens() {
+    use fs_server::client;
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let jwt_on = |cfg: &mut Config, keys: &str| {
+        cfg.auth = fs_server::auth::AuthSection {
+            mode: fs_server::auth::AuthMode::Jwt,
+            jwt_keys: tls_fixture(keys).display().to_string(),
+            jwt_issuer: "fusescope-backend".into(),
+            ..fs_server::auth::AuthSection::default()
+        };
+    };
+    let mut broken = config(dir.path());
+    jwt_on(&mut broken, "server-a.pem");
+    let err = server::check(broken, secrets.clone(), "checker".into())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("server-a.pem"), "{err}");
+
+    let port = free_port();
+    let metrics_port = free_port();
+    let mut cfg = config(dir.path());
+    cfg.server.flight_addr = format!("127.0.0.1:{port}");
+    cfg.server.metrics_addr = format!("127.0.0.1:{metrics_port}");
+    jwt_on(&mut cfg, "jwks-a.json");
+    let (tx, rx) = watch::channel(false);
+    let server = tokio::spawn(server::run(cfg, secrets, Role::All, "test-node".into(), rx));
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
+    wait_for_ready(&metrics_addr).await;
+    let (_, body) = http_get(&metrics_addr, "/readyz").await;
+    assert!(body.contains("jwt_keys=current\n"), "{body}");
+
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    let tenant = catalog
+        .create_tenant(&fs_catalog::NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (static_token, _) = catalog
+        .create_token(tenant, "operator", fs_catalog::TokenScope::Query)
+        .await
+        .unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let counted = client::query(
+        &addr,
+        &backend_jwt(tenant),
+        "select count(*) as n from spans",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(client::render(&counted).unwrap().ends_with("1 rows"));
+    let err = client::query(&addr, &static_token, "select 1", None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Unauthenticated"), "{err}");
+    let (_, body) = http_get(&metrics_addr, "/metrics").await;
+    assert!(
+        body.contains("fusescope_query_auth_refused_total 1\n"),
+        "{body}"
+    );
+    assert!(body.contains("fusescope_jwt_keys_stale 0\n"), "{body}");
+
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("shutdown in time")
+        .unwrap()
+        .unwrap();
+    catalog.pool().close().await;
+    db.finish().await;
+}

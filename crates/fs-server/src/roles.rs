@@ -39,6 +39,8 @@ pub struct Context {
     pub ingest_override: Option<fs_ingest::IngestConfig>,
     /// mTLS of the Flight listeners and their clients, when on.
     pub tls: Option<Arc<fs_auth::Tls>>,
+    /// The backend's JWT verifier, in `auth.mode = "jwt"`.
+    pub jwt: Option<Arc<fs_auth::JwtVerifier>>,
 }
 
 /// Heartbeat period of the ingester. The querier treats 10 s of silence as down.
@@ -170,7 +172,14 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
         ),
         None => (querier, None),
     };
-    let mut service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
+    let auth = match &ctx.jwt {
+        Some(verifier) => fs_query::auth::QueryAuth::Jwt {
+            verifier: Arc::clone(verifier),
+            tenant_ttl: ctx.config.auth.tenant_cache(),
+        },
+        None => fs_query::auth::QueryAuth::Token,
+    };
+    let mut service = fs_query::flight::FlightSql::with_auth(querier, ctx.catalog.clone(), auth);
     if let Some(tls) = tls {
         service = service.with_tls(tls);
     }

@@ -50,6 +50,14 @@ pub async fn bootstrap(
         );
         None
     };
+    let jwt = match config.auth.jwt() {
+        Some((keys, rules, reload)) => {
+            let verifier = fs_auth::JwtVerifier::load(keys, rules, reload)?;
+            info!(keys = %config.auth.jwt_keys, issuer = %config.auth.jwt_issuer, "flight sql takes tenant jwts only");
+            Some(verifier)
+        }
+        None => None,
+    };
     let url = config
         .catalog_url(secrets)
         .ok_or_else(|| ServerError::InvalidConfig("catalog url missing".into()))?;
@@ -89,6 +97,10 @@ pub async fn bootstrap(
         metrics.register_tls(tls.stats());
         health.follow_tls(tls.stats());
     }
+    if let Some(jwt) = &jwt {
+        metrics.register_jwks(jwt.stats());
+        health.follow_jwks(jwt.stats());
+    }
     Ok(Context {
         config: Arc::new(config),
         catalog,
@@ -100,6 +112,7 @@ pub async fn bootstrap(
         health,
         ingest_override: None,
         tls,
+        jwt,
     })
 }
 
@@ -249,6 +262,13 @@ pub async fn run_with(
         tasks.spawn(async move {
             tls.run(rx).await;
             ("tls", Ok(()))
+        });
+    }
+    if let Some(jwt) = ctx.jwt.clone() {
+        let rx = stop_rx.clone();
+        tasks.spawn(async move {
+            jwt.run(rx).await;
+            ("jwt keys", Ok(()))
         });
     }
     for r in role.expand() {
