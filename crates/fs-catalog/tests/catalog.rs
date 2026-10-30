@@ -1795,13 +1795,26 @@ async fn tokens_are_revoked_and_rotated_by_their_id() {
             "both work during the overlap"
         );
     }
-    let (_, until) = db
+    let (_, left) = db
         .catalog
         .resolve_token_until(&secret, TokenScope::Ingest)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(until, Some(due), "a cache learns when the old token stops");
+    let left = left.expect("a cache learns how long the old token has left");
+    assert!(
+        left > StdDuration::from_secs(3590) && left <= StdDuration::from_secs(3600),
+        "{left:?}, on the catalog's clock"
+    );
+    assert_eq!(
+        db.catalog
+            .resolve_token_until(&successor, TokenScope::Ingest)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        None
+    );
 
     let again = db
         .catalog
@@ -1875,6 +1888,53 @@ async fn tokens_are_revoked_and_rotated_by_their_id() {
             .await
             .unwrap(),
         None
+    );
+    db.finish().await;
+}
+
+/// Two live tokens whose hashes share their first 8 bytes share an id:
+/// revoke and rotate refuse it and change nothing.
+#[tokio::test]
+async fn an_ambiguous_token_id_changes_nothing() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let prefix = [0xab_u8; 8];
+    for tail in [1_u8, 2] {
+        let mut hash = prefix.to_vec();
+        hash.extend([tail; 24]);
+        sqlx::query(
+            "insert into engine_tenant_token (token_hash, tenant_id, name, scope) values ($1, $2, 'twin', 'ingest')",
+        )
+        .bind(hash)
+        .bind(t)
+        .execute(db.catalog.pool())
+        .await
+        .unwrap();
+    }
+    let id = hex(&prefix);
+    assert!(matches!(
+        db.catalog.revoke_token_by_id(&id).await,
+        Err(fs_catalog::CatalogError::AmbiguousToken { id: ref named }) if *named == id
+    ));
+    assert!(matches!(
+        db.catalog
+            .rotate_token(&id, StdDuration::from_secs(60))
+            .await,
+        Err(fs_catalog::CatalogError::AmbiguousToken { .. })
+    ));
+    let listed = db.catalog.tokens(t).await.unwrap();
+    assert_eq!(listed.len(), 2, "no successor was issued");
+    assert!(
+        listed
+            .iter()
+            .all(|token| token.revoked_at.is_none() && token.id == id)
     );
     db.finish().await;
 }
