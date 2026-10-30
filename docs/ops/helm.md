@@ -23,8 +23,10 @@ No role migrates the catalog: every role's configuration says
 `migrate = false`, so a role's Postgres user needs no DDL. With
 `migration.enabled` (the default) a pre-install and pre-upgrade hook Job
 runs `fusescope-engine admin migrate` as `secrets.migrator`, the one user
-allowed DDL, before the workloads roll; it touches only the catalog, never
-the bucket. Disabled, the operator runs that command before upgrading.
+allowed DDL, before the workloads roll, retrying `migration.backoffLimit`
+times (0 to 10); it touches only the catalog, never the bucket. Disabled,
+no Job renders, `secrets.migrator` is not needed, and the operator runs
+that command before upgrading.
 
 The roles are kept apart, since the hot window trusts the tenant in its
 ticket and each role needs different rights:
