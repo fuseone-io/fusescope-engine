@@ -18,7 +18,7 @@ use fs_server::{ServerError, client, server};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]
+const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check | --validate] [--version]
        fusescope-engine --config <file> admin tenant create <name>
        fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
        fusescope-engine --config <file> admin token list <tenant-id>
@@ -33,6 +33,7 @@ struct Args {
     config: Option<PathBuf>,
     role: Option<Role>,
     check: bool,
+    validate: bool,
     admin: Option<Admin>,
 }
 
@@ -63,6 +64,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Result<Args, Early>,
         config: None,
         role: None,
         check: false,
+        validate: false,
         admin: None,
     };
     let mut args = args.peekable();
@@ -75,6 +77,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Result<Args, Early>,
             "--version" => return Ok(Err(Early::Version)),
             "-h" | "--help" => return Ok(Err(Early::Help)),
             "--check" => out.check = true,
+            "--validate" => out.validate = true,
             "--config" => {
                 let value = args
                     .next()
@@ -263,6 +266,13 @@ async fn real_main(args: Args) -> Result<(), ServerError> {
         }
         return Ok(());
     }
+    if args.validate {
+        // The configuration alone, as the environment completes it: no
+        // connection, no file it names is read.
+        config.validate(&secrets)?;
+        println!("ok: configuration valid for role {role}");
+        return Ok(());
+    }
     if args.check {
         let report = server::check(config, secrets, node_id).await?;
         println!(
@@ -331,6 +341,12 @@ mod tests {
         assert_eq!(parsed.config, Some(PathBuf::from("x.toml")));
         assert_eq!(parsed.role, Some(Role::Querier));
         assert!(parsed.check);
+        assert!(!parsed.validate);
+        let validate = parse_args(args(&["--config", "x.toml", "--validate"]))
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(validate.validate && !validate.check);
     }
 
     #[test]
