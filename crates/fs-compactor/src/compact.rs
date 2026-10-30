@@ -118,8 +118,38 @@ impl CountsOrphans for CompactorStats {
 /// Partial derived data accumulated while the pass streamed its inputs.
 struct DerivedContributions {
     keys: KeyStats,
-    summaries: Option<TraceSummaries>,
-    service_graph: Option<ServiceGraphBuilder>,
+    summaries: TraceSummaries,
+    service_graph: ServiceGraphBuilder,
+}
+
+#[derive(Clone, Copy)]
+struct DerivedLimit {
+    limit: &'static str,
+    cap: usize,
+    observed: usize,
+    estimated_bytes: usize,
+}
+
+impl From<fs_schema::trace_summary::LimitExceeded> for DerivedLimit {
+    fn from(value: fs_schema::trace_summary::LimitExceeded) -> Self {
+        Self {
+            limit: value.limit,
+            cap: value.cap,
+            observed: value.observed,
+            estimated_bytes: value.estimated_bytes,
+        }
+    }
+}
+
+impl From<fs_schema::service_graph::LimitExceeded> for DerivedLimit {
+    fn from(value: fs_schema::service_graph::LimitExceeded) -> Self {
+        Self {
+            limit: value.limit,
+            cap: value.cap,
+            observed: value.observed,
+            estimated_bytes: value.estimated_bytes,
+        }
+    }
 }
 
 /// Catalog rows for the derived objects uploaded by a pass.
@@ -127,8 +157,8 @@ struct PublishedDerived {
     keys: Option<NewFile>,
     summaries: Option<NewFile>,
     service_graph: Option<NewFile>,
-    summary_skipped: bool,
-    service_graph_skipped: bool,
+    summary_skipped: Option<DerivedLimit>,
+    service_graph_skipped: Option<DerivedLimit>,
 }
 
 /// The compaction side of the compactor.
@@ -142,6 +172,14 @@ pub struct Compactor {
     /// Hours already reported as exceeding the input cap.
     reported: std::sync::Mutex<
         std::collections::HashSet<(fs_catalog::TenantId, chrono::DateTime<chrono::Utc>)>,
+    >,
+    /// Derived contributions already reported as crossing a cap.
+    derived_reported: std::sync::Mutex<
+        std::collections::HashSet<(
+            fs_catalog::TenantId,
+            chrono::DateTime<chrono::Utc>,
+            &'static str,
+        )>,
     >,
 }
 
@@ -170,6 +208,7 @@ impl Compactor {
             stats,
             inject_swap_failures: AtomicU32::new(inject),
             reported: std::sync::Mutex::new(std::collections::HashSet::new()),
+            derived_reported: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -341,7 +380,7 @@ impl Compactor {
             .await?;
         guard.armed = false;
         self.count(&owned, &outputs);
-        self.count_derived(&derived);
+        self.count_derived(tenant, hour, &derived);
         info!(
             role = "compactor",
             tenant = %tenant.0,
@@ -432,33 +471,28 @@ impl Compactor {
             tokio::task::spawn_blocking(move || table_file(&root, tenant, hour, &keys)).await??;
         let keys = self.publish_prepared(keys, guard, puts).await?;
 
-        let summary_skipped = summaries.is_none();
-        let summaries = match summaries {
-            Some(rows) => {
-                let root = self.root.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::derived::trace_summary_file(&root, tenant, hour, &rows)
-                })
-                .await??
-            }
-            None => None,
+        let summary_skipped = summaries.limit_exceeded().map(Into::into);
+        let summaries = if summary_skipped.is_none() {
+            let root = self.root.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::derived::trace_summary_file(&root, tenant, hour, &summaries)
+            })
+            .await??
+        } else {
+            None
         };
         let summaries = self.publish_prepared(summaries, guard, puts).await?;
 
-        let service_graph_skipped = service_graph
-            .as_ref()
-            .is_some_and(ServiceGraphBuilder::skipped);
-        let service_graph = match service_graph {
-            Some(builder) => {
-                let root = self.root.clone();
-                tokio::task::spawn_blocking(move || match builder.finish() {
-                    Some(rows) => crate::derived::service_graph_file(&root, tenant, hour, &rows),
-                    None => Ok(None),
-                })
-                .await??
-            }
-            None => None,
-        };
+        let root = self.root.clone();
+        let (service_graph, service_graph_skipped) = tokio::task::spawn_blocking(move || {
+            let (rows, exceeded) = service_graph.finish_with_limit();
+            let prepared = match rows {
+                Some(rows) => crate::derived::service_graph_file(&root, tenant, hour, &rows)?,
+                None => None,
+            };
+            Ok::<_, CompactError>((prepared, exceeded.map(Into::into)))
+        })
+        .await??;
         let service_graph = self.publish_prepared(service_graph, guard, puts).await?;
         Ok(PublishedDerived {
             keys,
@@ -469,23 +503,57 @@ impl Compactor {
         })
     }
 
-    fn count_derived(&self, published: &PublishedDerived) {
+    fn count_derived(
+        &self,
+        tenant: fs_catalog::TenantId,
+        hour: chrono::DateTime<chrono::Utc>,
+        published: &PublishedDerived,
+    ) {
         if published.keys.is_some() {
             self.stats.derived.fetch_add(1, Ordering::Relaxed);
         }
         if published.summaries.is_some() {
             self.stats.trace_summary.fetch_add(1, Ordering::Relaxed);
-        } else if published.summary_skipped {
+        } else if let Some(limit) = published.summary_skipped {
             self.stats
                 .trace_summary_skipped
                 .fetch_add(1, Ordering::Relaxed);
+            self.report_derived_over_cap(tenant, hour, "trace_summary", limit);
         }
         if published.service_graph.is_some() {
             self.stats.service_graph.fetch_add(1, Ordering::Relaxed);
-        } else if published.service_graph_skipped {
+        } else if let Some(limit) = published.service_graph_skipped {
             self.stats
                 .service_graph_skipped
                 .fetch_add(1, Ordering::Relaxed);
+            self.report_derived_over_cap(tenant, hour, "service_graph_1m", limit);
+        }
+    }
+
+    fn report_derived_over_cap(
+        &self,
+        tenant: fs_catalog::TenantId,
+        hour: chrono::DateTime<chrono::Utc>,
+        signal: &'static str,
+        limit: DerivedLimit,
+    ) {
+        let first_time = self
+            .derived_reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((tenant, hour, signal));
+        if first_time {
+            warn!(
+                role = "compactor",
+                tenant = %tenant.0,
+                hour = %hour,
+                signal,
+                limit = limit.limit,
+                cap = limit.cap,
+                observed = limit.observed,
+                estimated_bytes = limit.estimated_bytes,
+                "derived contribution crossed its cap and was skipped"
+            );
         }
     }
 

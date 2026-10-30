@@ -1751,9 +1751,9 @@ mod tests {
         for bad in [
             "trace_summary_max_traces = 0",
             "service_graph_max_spans = 0",
-            "trace_summary_max_bytes = 511",
-            "service_graph_max_bytes = 511",
-            "trace_summary_max_bytes = 1073741824\nservice_graph_max_bytes = 512",
+            "trace_summary_max_bytes = 1",
+            "service_graph_max_bytes = 1",
+            "trace_summary_max_bytes = 1073741824",
         ] {
             let err = Config::parse(&format!(
                 "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"

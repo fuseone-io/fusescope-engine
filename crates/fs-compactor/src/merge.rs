@@ -86,7 +86,7 @@ pub struct L1Merger {
     /// `hour` in nanoseconds, the budget the merge admits keys on.
     hour_ns: i64,
     summaries: TraceSummaries,
-    graph: Option<ServiceGraphBuilder>,
+    graph: ServiceGraphBuilder,
 }
 
 impl L1Merger {
@@ -121,7 +121,7 @@ impl L1Merger {
             keys,
             hour_ns,
             summaries: TraceSummaries::default(),
-            graph: Some(ServiceGraphBuilder::default()),
+            graph: ServiceGraphBuilder::default(),
         })
     }
 
@@ -131,15 +131,14 @@ impl L1Merger {
         std::mem::take(&mut self.keys)
     }
 
-    /// The pass's trace summaries, or `None` when its trace cap was crossed.
-    pub fn take_trace_summaries(&mut self) -> Option<TraceSummaries> {
-        let summaries = std::mem::take(&mut self.summaries);
-        (!summaries.skipped()).then_some(summaries)
+    /// The pass's trace summaries, including which cap skipped them.
+    pub fn take_trace_summaries(&mut self) -> TraceSummaries {
+        std::mem::take(&mut self.summaries)
     }
 
-    /// The pass's service graph, or `None` when its span cap was crossed.
-    pub fn take_service_graph(&mut self) -> Option<ServiceGraphBuilder> {
-        self.graph.take()
+    /// The pass's service graph builder, including which cap skipped it.
+    pub fn take_service_graph(&mut self) -> ServiceGraphBuilder {
+        std::mem::take(&mut self.graph)
     }
 
     /// The next output, closed at the target size or at the end of the
@@ -166,13 +165,11 @@ impl L1Merger {
                 self.config.trace_summary_max_traces,
                 self.config.trace_summary_max_bytes,
             )?;
-            if let Some(graph) = &mut self.graph {
-                graph.absorb(
-                    &group,
-                    self.config.service_graph_max_spans,
-                    self.config.service_graph_max_bytes,
-                )?;
-            }
+            self.graph.absorb(
+                &group,
+                self.config.service_graph_max_spans,
+                self.config.service_graph_max_bytes,
+            )?;
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
                 return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
