@@ -54,9 +54,11 @@ impl QueryWarnings {
 }
 
 /// Upper bounds of the query latency buckets, in seconds: a statement
-/// runs from milliseconds up to the query timeout.
-pub const LATENCY_BOUNDS: [f64; 12] = [
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+/// runs from milliseconds up to the query timeout, 60 s by default, so the
+/// last bounds sit past it and a slow quantile is never clipped to a bound
+/// below the time it took.
+pub const LATENCY_BOUNDS: [f64; 15] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
 
 /// Latency of executions, from the request to the end of its stream.

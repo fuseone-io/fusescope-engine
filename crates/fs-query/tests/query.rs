@@ -938,6 +938,13 @@ async fn flight_sql_round_trip_with_query_token() {
         .unwrap();
     assert_eq!(info.endpoint.len(), 1);
     let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let returned = || {
+        f.querier
+            .stats()
+            .rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = returned();
     let batches: Vec<RecordBatch> = client
         .do_get(ticket)
         .await
@@ -947,6 +954,11 @@ async fn flight_sql_round_trip_with_query_token() {
         .unwrap();
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(rows, 2);
+    assert_eq!(
+        returned() - before,
+        2,
+        "the rows a Flight client received count in fusescope_query_rows_total"
+    );
     let first_n = batches[0].column(1).as_primitive::<Int64Type>().value(0);
     assert_eq!(first_n, 17, "api first");
 

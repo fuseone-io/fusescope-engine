@@ -215,11 +215,11 @@ impl Metrics {
                 "Appends refused because the writer queue was full",
                 w.backpressure.load(Ordering::Relaxed),
             );
-            counter(
+            seconds_counter(
                 out,
                 "fusescope_wal_sync_seconds_total",
                 "Seconds spent in fsync",
-                w.sync_nanos.load(Ordering::Relaxed) / 1_000_000_000,
+                w.sync_nanos.load(Ordering::Relaxed),
             );
         }
     }
@@ -711,6 +711,16 @@ fn render_retention(out: &mut String, r: &fs_compactor::RetentionStats) {
     ] {
         counter(out, name, help, value);
     }
+}
+
+/// A counter of seconds kept as nanoseconds, rendered with its fraction so
+/// a rate over a short window is not lost to truncation.
+fn seconds_counter(out: &mut String, name: &str, help: &str, nanos: u64) {
+    let _ = writeln!(
+        out,
+        "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}",
+        std::time::Duration::from_nanos(nanos).as_secs_f64()
+    );
 }
 
 pub(crate) fn counter(out: &mut String, name: &str, help: &str, value: u64) {

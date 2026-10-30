@@ -110,7 +110,7 @@ impl Drop for Audit {
             Outcome::Cancelled => "cancelled",
             Outcome::Ok => "ok",
         };
-        if self.tenant.is_some() {
+        if self.tenant.is_some() && self.outcome != Outcome::Refused {
             self.stats.latency.0.observe(self.started.elapsed());
         }
         let tenant = self
@@ -152,7 +152,12 @@ where
         let next = this.inner.as_mut().poll_next(cx);
         match &next {
             Poll::Ready(Some(Ok(batch))) => {
-                this.audit.rows += u64::try_from(batch.num_rows()).unwrap_or(0);
+                let rows = u64::try_from(batch.num_rows()).unwrap_or(0);
+                this.audit.rows += rows;
+                this.audit
+                    .stats
+                    .rows
+                    .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
             }
             Poll::Ready(Some(Err(_))) => this.audit.outcome = Outcome::Failed,
             Poll::Ready(None) if this.audit.outcome == Outcome::Cancelled => {
@@ -258,6 +263,27 @@ mod tests {
         });
         drop(ran);
         assert_eq!(stats.latency.0.count(), 1);
-        assert_eq!(stats.latency.0.bounds().last(), Some(&30.0));
+        let mut denied = Audit::begin("statement", std::sync::Arc::clone(&stats));
+        denied.caller(&Caller {
+            tenant: fs_catalog::TenantId(uuid::Uuid::from_u128(1)),
+            subject: Some("user:alice".into()),
+        });
+        denied.ended_with(&tonic::Status::permission_denied("another tenant's ticket"));
+        drop(denied);
+        assert_eq!(
+            stats.latency.0.count(),
+            1,
+            "an authenticated caller refused its ticket is not an execution"
+        );
+
+        let slow = crate::querier::QueryLatency::default();
+        slow.0.observe(std::time::Duration::from_secs(45));
+        let at = slow.0.bounds().iter().position(|b| *b >= 45.0).unwrap();
+        assert_eq!(slow.0.bounds().get(at), Some(&60.0));
+        assert_eq!(
+            slow.0.cumulative().get(at),
+            Some(&1),
+            "45 s lands in a finite bucket, so its quantile is not clipped to 30 s"
+        );
     }
 }
