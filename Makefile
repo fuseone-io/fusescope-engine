@@ -11,7 +11,7 @@ JOBS         ?= 8
 TEST_THREADS ?= 4
 THROTTLE     ?= nice -n 10
 
-.PHONY: dev-up dev-down check test test-full lint deny ci run check-env tenant token bench-stages bench-load bench-query
+.PHONY: dev-up dev-down check test test-full lint deny ci run check-env tenant token image image-check bench-stages bench-load bench-query
 
 dev-up:        ## start Postgres and an S3-compatible store, create the dev bucket
 	docker compose up -d --wait postgres s3
@@ -53,6 +53,14 @@ tenant:        ## create a tenant: make tenant NAME=acme
 token:         ## issue a token: make token TENANT=<uuid> NAME=collector [SCOPE=ingest|query]
 	FS_CATALOG_URL=$(FS_TEST_DATABASE_URL) FS_BUCKET_ACCESS_KEY=fusescope FS_BUCKET_SECRET_KEY=fusescope-dev \
 	cargo run -q -p fs-server -- --config config/dev.toml admin token create $(TENANT) $(NAME) $(or $(SCOPE),ingest)
+
+IMAGE ?= fusescope-engine:dev
+
+image:         ## build the container image (a release build of the whole workspace)
+	docker build -t $(IMAGE) .
+
+image-check:   ## non-root, CA bundle and --check inside the image with a read-only root, against the dev Postgres
+	scripts/image-check.sh $(IMAGE) $(FS_TEST_DATABASE_URL)
 
 bench-stages:  ## ingest decomposed by stage, in process, WAL on the project disk
 	cargo run --release -q -p fs-bench -- stages --requests $(or $(REQUESTS),5000) $(BENCH_ARGS)

@@ -1,0 +1,16 @@
+# What CI and `make image-check` run `--check` with inside the image: the
+# image's paths, a local bucket on a tmpfs the check mounts, the catalog
+# from FS_CATALOG_URL. Tests the image, never deployed.
+
+[server]
+role = "all"
+
+[bucket]
+kind = "local"
+path = "/var/lib/fusescope/bucket"
+
+[wal]
+dir = "/var/lib/fusescope/wal"
+
+[query]
+spill_dir = "/var/lib/fusescope/spill"

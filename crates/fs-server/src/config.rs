@@ -1687,6 +1687,28 @@ mod tests {
     }
 
     #[test]
+    fn the_image_configurations_validate() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let mut container = Config::parse(include_str!("../../../config/container.toml")).unwrap();
+        container
+            .apply_env(&env(&[("FS_BUCKET_NAME", "fusescope")]))
+            .unwrap();
+        container.validate(&secrets).unwrap();
+        assert_eq!(container.wal.dir, PathBuf::from("/var/lib/fusescope/wal"));
+        assert_eq!(
+            container.query.spill_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/fusescope/spill"))
+        );
+        Config::parse(include_str!("../../../config/image-check.toml"))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap();
+    }
+
+    #[test]
     fn the_token_cache_ttl_is_configured_and_bounded() {
         let secrets = Secrets {
             catalog_url: Some("postgres://x".into()),

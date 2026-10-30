@@ -1,0 +1,29 @@
+# The image's default configuration: every role, listening on all
+# interfaces, state under /var/lib/fusescope. A deployment mounts its own
+# file over /etc/fusescope/config.toml or sets the environment: FS_ROLE,
+# FS_NODE_ID (else the hostname), FS_BUCKET_NAME, FS_BUCKET_ENDPOINT,
+# FS_INGEST_HOT_ADVERTISE, and the secrets FS_CATALOG_URL,
+# FS_BUCKET_ACCESS_KEY and FS_BUCKET_SECRET_KEY. [tls] and [auth] are off
+# here; staging turns both on in its own file.
+
+[server]
+role = "all"
+flight_addr = "0.0.0.0:8815"
+metrics_addr = "0.0.0.0:9464"
+
+[bucket]
+kind = "s3"
+
+[wal]
+dir = "/var/lib/fusescope/wal"
+
+[ingest]
+listen = "0.0.0.0:4317"
+hot_listen = "0.0.0.0:8816"
+
+[query]
+spill_dir = "/var/lib/fusescope/spill"
+
+[log]
+level = "info"
+format = "json"
