@@ -851,9 +851,16 @@ Arrow Flight over gRPC with mTLS between backend and queriers. Two kinds of
 operation:
 
 **Flight SQL** for everything that is generated SQL in the `statementbuilder`
-packages today. The ticket is the tenant id followed by the SQL, and has
-been since the first version, so a ticket issued by any engine version
-executes on any other. A statement is planned once: `GetFlightInfo` plans
+packages today. Under `auth.mode = "token"` the ticket is the tenant id
+followed by the SQL, as it has been since the first version, so a ticket
+issued by any engine version executes on any other in that mode. Under
+`auth.mode = "jwt"` it is `FST2`, the tenant id, the JWT subject's length
+in two big-endian bytes, the subject and the SQL, and `DoGet` executes it
+only for a token of the same tenant and subject; it needs no MAC, since a
+caller writing its own ticket can only name itself. A `jwt` querier
+refuses the old ticket, so queriers turn `jwt` on before the backend sends
+JWTs, and every querier behind one endpoint is in the same mode. A
+statement is planned once: `GetFlightInfo` plans
 it, returns its schema and keeps the plan, keyed by tenant and SQL, oldest
 first; `DoGet` re-authenticates, refuses a ticket of another tenant,
 executes the oldest kept plan for its tenant and SQL and drops it, and only
@@ -988,6 +995,24 @@ the same region. Phase 1 uses them to accept or reject the engine.
 - `tenant_id` comes from the JWT signed by the Go backend, never from the SQL
   text. The engine builds one DataFusion logical catalog per session holding
   only that tenant's tables. There is no "global" table.
+- Under `auth.mode = "jwt"` Flight SQL takes only the backend's tokens and
+  refuses the catalog's static ones; `token`, the default, keeps them for
+  development and `admin query`. A token is a compact JWS with `alg`
+  `EdDSA` over Ed25519 and nothing else, verified through the crypto
+  provider rustls already carries, with the `kid` of a key in the JWK set
+  at `auth.jwt_keys`, an OKP Ed25519 set read again every
+  `auth.jwt_reload_interval_secs` (60) and kept as last loaded when a read
+  fails, so keys rotate by overlap. The claims are `iss` as
+  `auth.jwt_issuer`, `aud` holding `auth.jwt_audience`
+  (`fusescope-engine`), `sub`, the backend user or service acting, at most
+  256 bytes, `fusescope_tenant`, the tenant's UUID, and integer `iat` and
+  `exp` at most `auth.jwt_max_ttl_secs` (300) apart, with
+  `auth.jwt_leeway_secs` (30) of clock tolerance and `nbf` honoured when
+  present. The signature is checked before any claim is read, a token over
+  8 KiB is not read at all, and the tenant must exist undeleted in the
+  catalog, a live answer trusted for `auth.tenant_cache_secs` (10).
+  Refusals count `fusescope_query_auth_refused_total`; the key set shows as
+  `jwt_keys=` on `/readyz` and in `fusescope_jwt_*`.
 - Per-prefix IAM policies on `t/{tenant_id}/` when a large customer gets its
   own bucket. For multi-tenant in one bucket, isolation is the engine's job,
   and the backend is the only network client of the engine.
@@ -1099,7 +1124,12 @@ surface and is handled as follows:
   ids and sizes, not bodies.
 - Every query produces an audit event with tenant, JWT subject, query hash,
   bytes read, duration and outcome, delivered to the backend through the
-  hooks `telemetrystore` already has.
+  hooks `telemetrystore` already has. The engine side logs one event per
+  `DoGet` and `DoAction` under the `fusescope::audit` target: tenant,
+  subject (`token` for a static token), the action type or `statement`,
+  the first 8 bytes of the text's sha256, rows sent, duration and an
+  outcome of `ok`, `failed` or `cancelled`, settled when the stream ends
+  however it ends; the text is never logged.
 
 ## 11. Rust workspace
 

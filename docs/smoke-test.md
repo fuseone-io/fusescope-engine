@@ -95,8 +95,9 @@ Then read back, in this order, and compare with what was exported:
    `InvalidArgument`.
 
 `curl 127.0.0.1:9464/readyz` answers `ready` once every role is up, and
-`not ready` with `draining=true` from the moment of the `SIGTERM`; `tls=off`,
-since the smoke configuration keeps `[tls]` off.
+`not ready` with `draining=true` from the moment of the `SIGTERM`; `tls=off`
+and `jwt_keys=off`, since the smoke configuration keeps `[tls]` off and
+`[auth]` in `token` mode.
 `curl 127.0.0.1:9464/metrics` shows each step: `fusescope_ingest_requests_total`,
 `fusescope_flush_total`, `fusescope_compaction_passes_total`,
 `fusescope_compaction_derived_total`,
