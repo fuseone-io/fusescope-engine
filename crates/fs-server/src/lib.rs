@@ -13,6 +13,7 @@ pub mod role;
 pub mod roles;
 pub mod server;
 pub mod tls;
+pub mod tokens;
 
 use std::path::PathBuf;
 

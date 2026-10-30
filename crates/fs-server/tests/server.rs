@@ -6,6 +6,7 @@
     clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::indexing_slicing,
     clippy::panic
 )]
 
@@ -1001,6 +1002,97 @@ async fn in_jwt_mode_the_querier_takes_only_backend_tokens() {
         .expect("shutdown in time")
         .unwrap()
         .unwrap();
+    catalog.pool().close().await;
+    db.finish().await;
+}
+
+/// `admin token` issues, lists, rotates and revokes by id: the rotated
+/// token keeps working through its overlap, the revoked one stops at once,
+/// and no secret is ever listed.
+#[tokio::test]
+async fn admin_rotates_and_revokes_tokens_by_id() {
+    use fs_server::server::AdminAction;
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let admin = |action| server::admin(config(dir.path()), secrets.clone(), action);
+    let tenant: uuid::Uuid = admin(AdminAction::CreateTenant {
+        name: "acme".into(),
+    })
+    .await
+    .unwrap()[0]
+        .strip_prefix("tenant_id=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let field = |line: &str, key: &str| {
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .map(str::to_owned)
+    };
+    let issued = admin(AdminAction::CreateToken {
+        tenant,
+        name: "collector".into(),
+        scope: fs_catalog::TokenScope::Ingest,
+    })
+    .await
+    .unwrap();
+    let id = field(&issued[0], "id").unwrap();
+    let secret = issued[1].strip_prefix("token=").unwrap().to_owned();
+
+    let rotated = admin(AdminAction::RotateToken {
+        id: id.clone(),
+        overlap_secs: 600,
+    })
+    .await
+    .unwrap();
+    assert!(field(&rotated[0], "stops_at").is_some(), "{rotated:?}");
+    let new_id = field(&rotated[1], "id").unwrap();
+    let successor = rotated[2].strip_prefix("token=").unwrap().to_owned();
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    for live in [&secret, &successor] {
+        assert!(
+            catalog
+                .resolve_token(live, fs_catalog::TokenScope::Ingest)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    let listed = admin(AdminAction::ListTokens { tenant }).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed.iter().all(|line| !line.contains("fst_")),
+        "{listed:?}"
+    );
+
+    let revoked = admin(AdminAction::RevokeToken { id: id.clone() })
+        .await
+        .unwrap();
+    assert!(field(&revoked[0], "revoked_at").is_some(), "{revoked:?}");
+    assert!(
+        catalog
+            .resolve_token(&secret, fs_catalog::TokenScope::Ingest)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let err = admin(AdminAction::RevokeToken { id }).await.unwrap_err();
+    assert!(err.to_string().contains("no live token"), "{err}");
+    assert!(
+        catalog
+            .resolve_token(&successor, fs_catalog::TokenScope::Ingest)
+            .await
+            .unwrap()
+            .is_some(),
+        "the successor {new_id} lives on"
+    );
     catalog.pool().close().await;
     db.finish().await;
 }

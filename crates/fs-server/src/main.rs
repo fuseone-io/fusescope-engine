@@ -21,6 +21,9 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]
        fusescope-engine --config <file> admin tenant create <name>
        fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
+       fusescope-engine --config <file> admin token list <tenant-id>
+       fusescope-engine --config <file> admin token revoke <token-id>
+       fusescope-engine --config <file> admin token rotate <token-id> [overlap-secs, default 3600, at most 604800]
        FS_QUERY_TOKEN=<token> fusescope-engine [--config <file>] admin query <addr> <sql>
        FS_QUERY_TOKEN=<token> fusescope-engine [--config <file>] admin action <addr> <type> [json]
        (admin query and action go over mTLS when the configuration turns [tls] on)";
@@ -118,6 +121,31 @@ fn parse_admin(rest: &[String]) -> Result<Admin, String> {
                 tenant,
                 name: (*name).to_owned(),
                 scope,
+            }))
+        }
+        ["token", "list", tenant] => Ok(Admin::Catalog(AdminAction::ListTokens {
+            tenant: tenant
+                .parse()
+                .map_err(|e| format!("tenant id {tenant:?}: {e}\n{USAGE}"))?,
+        })),
+        ["token", "revoke", id] => Ok(Admin::Catalog(AdminAction::RevokeToken {
+            id: (*id).to_owned(),
+        })),
+        ["token", "rotate", id] | ["token", "rotate", id, _] => {
+            let overlap_secs =
+                words
+                    .get(3)
+                    .map_or(Ok(fs_server::tokens::DEFAULT_ROTATION_OVERLAP_SECS), |s| {
+                        s.parse::<u64>()
+                            .ok()
+                            .filter(|secs| *secs <= fs_catalog::MAX_ROTATION_OVERLAP.as_secs())
+                            .ok_or_else(|| {
+                                format!("overlap {s:?} is not 0 to 604800 seconds\n{USAGE}")
+                            })
+                    })?;
+            Ok(Admin::Catalog(AdminAction::RotateToken {
+                id: (*id).to_owned(),
+                overlap_secs,
             }))
         }
         _ => Err(format!("unknown admin command\n{USAGE}")),
@@ -354,6 +382,28 @@ mod tests {
         assert!(
             matches!(parsed.admin, Some(Admin::Catalog(AdminAction::CreateToken { name, .. })) if name == "collector")
         );
+        let rotate = |extra: &[&str]| {
+            let mut words = vec![
+                "--config",
+                "x.toml",
+                "admin",
+                "token",
+                "rotate",
+                "00ff10a0b0c0d0e0",
+            ];
+            words.extend_from_slice(extra);
+            parse_args(args(&words))
+        };
+        assert_eq!(
+            rotate(&[]).unwrap().ok().unwrap().admin,
+            Some(Admin::Catalog(AdminAction::RotateToken {
+                id: "00ff10a0b0c0d0e0".into(),
+                overlap_secs: 3600,
+            }))
+        );
+        assert!(rotate(&["604800"]).is_ok());
+        assert!(rotate(&["604801"]).is_err());
+        assert!(rotate(&["soon"]).is_err());
         let parsed = parse_args(args(&["admin", "query", "127.0.0.1:8815", "select 1"]))
             .unwrap()
             .ok()

@@ -321,6 +321,11 @@ pub struct IngestSection {
     /// registered. Must exceed the querier's file cache TTL.
     #[serde(default = "default_persisted_retain")]
     pub persisted_retain_secs: u64,
+    /// Seconds an ingester trusts a token the catalog found live: how long
+    /// a revocation may take to reach it. A rotation's scheduled end is
+    /// never outlived.
+    #[serde(default = "default_token_cache")]
+    pub token_cache_secs: u64,
     /// Most records in one WAL group-commit batch.
     #[serde(default = "default_wal_batch_records")]
     pub wal_batch_records: usize,
@@ -372,6 +377,7 @@ impl Default for IngestSection {
             hot_listen: default_hot_listen(),
             hot_advertise: default_hot_advertise(),
             persisted_retain_secs: default_persisted_retain(),
+            token_cache_secs: default_token_cache(),
             wal_batch_records: default_wal_batch_records(),
             wal_batch_bytes: default_wal_batch_bytes(),
             wal_linger_ms: 0,
@@ -408,6 +414,10 @@ fn default_hot_listen() -> String {
 
 fn default_hot_advertise() -> String {
     "127.0.0.1:8816".to_owned()
+}
+
+fn default_token_cache() -> u64 {
+    60
 }
 
 fn default_persisted_retain() -> u64 {
@@ -450,6 +460,7 @@ impl IngestSection {
                 ServerError::InvalidConfig(format!("ingest.hot_listen {:?}: {e}", self.hot_listen))
             })?),
             persisted_retain: std::time::Duration::from_secs(self.persisted_retain_secs),
+            token_cache_ttl: std::time::Duration::from_secs(self.token_cache_secs),
             group_commit: fs_ingest::walwriter::GroupCommitConfig {
                 max_records: self.wal_batch_records,
                 max_bytes: self.wal_batch_bytes,
@@ -1168,6 +1179,9 @@ impl Config {
         {
             return invalid("ingest.wal_batch_* and ingest.wal_queue_* must be positive");
         }
+        if !(1..=3600).contains(&self.ingest.token_cache_secs) {
+            return invalid("ingest.token_cache_secs must be between 1 and 3600");
+        }
         if self.ingest.wal_queue_records > tokio::sync::Semaphore::MAX_PERMITS {
             return invalid("ingest.wal_queue_records is larger than the runtime can track");
         }
@@ -1670,6 +1684,29 @@ mod tests {
         )
         .unwrap();
         assert!(edge.validate(&secrets).is_ok());
+    }
+
+    #[test]
+    fn the_token_cache_ttl_is_configured_and_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let config = Config::parse(MINIMAL).unwrap();
+        assert_eq!(
+            config
+                .ingest
+                .to_ingest_config()
+                .unwrap()
+                .token_cache_ttl
+                .as_secs(),
+            60
+        );
+        for (secs, ok) in [(1, true), (3600, true), (0, false), (3601, false)] {
+            let config =
+                Config::parse(&format!("{MINIMAL}[ingest]\ntoken_cache_secs = {secs}\n")).unwrap();
+            assert_eq!(config.validate(&secrets).is_ok(), ok, "{secs}");
+        }
     }
 
     #[test]

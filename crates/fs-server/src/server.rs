@@ -156,6 +156,23 @@ pub enum AdminAction {
         /// What the token may do.
         scope: fs_catalog::TokenScope,
     },
+    /// List a tenant's tokens by id, without secrets.
+    ListTokens {
+        /// Tenant id.
+        tenant: uuid::Uuid,
+    },
+    /// Revoke a token now.
+    RevokeToken {
+        /// Its id, as listed.
+        id: String,
+    },
+    /// Issue a successor of a token, the old one working `overlap_secs` more.
+    RotateToken {
+        /// Its id, as listed.
+        id: String,
+        /// Seconds both work, at most seven days.
+        overlap_secs: u64,
+    },
 }
 
 /// Runs an administrative action and returns the lines to print.
@@ -193,10 +210,37 @@ pub async fn admin(
             let (secret, token) = catalog
                 .create_token(fs_catalog::TenantId(tenant), &name, scope)
                 .await?;
+            crate::tokens::audit("token.create", &token);
             Ok(vec![
-                format!("tenant_id={}", token.tenant_id.0),
-                format!("name={}", token.name),
-                format!("scope={}", token.scope.name()),
+                crate::tokens::describe(&token),
+                format!("token={secret}"),
+                "store the token now; it is not kept in plaintext".to_owned(),
+            ])
+        }
+        AdminAction::ListTokens { tenant } => Ok(catalog
+            .tokens(fs_catalog::TenantId(tenant))
+            .await?
+            .iter()
+            .map(crate::tokens::describe)
+            .collect()),
+        AdminAction::RevokeToken { id } => {
+            let token = catalog
+                .revoke_token_by_id(&id)
+                .await?
+                .ok_or_else(|| ServerError::InvalidConfig(format!("no live token with id {id}")))?;
+            crate::tokens::audit("token.revoke", &token);
+            Ok(vec![crate::tokens::describe(&token)])
+        }
+        AdminAction::RotateToken { id, overlap_secs } => {
+            let (secret, new, old) = catalog
+                .rotate_token(&id, Duration::from_secs(overlap_secs))
+                .await?
+                .ok_or_else(|| ServerError::InvalidConfig(format!("no live token with id {id}")))?;
+            crate::tokens::audit("token.rotate.old", &old);
+            crate::tokens::audit("token.rotate.new", &new);
+            Ok(vec![
+                crate::tokens::describe(&old),
+                crate::tokens::describe(&new),
                 format!("token={secret}"),
                 "store the token now; it is not kept in plaintext".to_owned(),
             ])
