@@ -1146,8 +1146,9 @@ surface and is handled as follows:
   comment.
 - Distroless image (`gcr.io/distroless/cc-debian12:nonroot`, uid 65532),
   non-root process, read-only filesystem except the WAL and spill volumes,
-  the Debian CA bundle as the only trust store (`docs/ops/image.md`). SBOM
-  generated at build: roadmap F5.
+  the Debian CA bundle as the only trust store (`docs/ops/image.md`). The
+  binary's crates as a CycloneDX 1.5 SBOM, generated at build by
+  `cargo-cyclonedx` and shipped in the image and as a CI artifact.
 - Engine logs never contain telemetry payloads, tokens or keys. `debug` logs
   ids and sizes, not bodies.
 - Every query produces an audit event with tenant, JWT subject, query hash,

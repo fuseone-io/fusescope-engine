@@ -16,6 +16,7 @@ to that bundle in a derived image, not configured in the engine.
 | Default configuration | `config/container.toml`: every role, all interfaces, `[tls]` and `[auth]` off |
 | Writable paths | `/var/lib/fusescope/wal`, `/var/lib/fusescope/spill`, both declared volumes |
 | Ports | 4317 OTLP gRPC, 8815 Flight SQL, 8816 hot-window Flight, 9464 metrics and probes |
+| SBOM | `/usr/share/doc/fusescope-engine/sbom.cdx.json`, CycloneDX 1.5 JSON of the binary's crates |
 
 Run it with a read-only root and the two state paths mounted; nothing else
 is written. The WAL holds rows not yet flushed and must survive a restart,
@@ -47,3 +48,13 @@ bucket writable, `--check` passes and `--role all` starts, reports ready on
 `/readyz` and stops cleanly on SIGTERM. Nothing forces a spill, so that
 path is mounted but not proven written. The Rust version of the build stage
 is the `RUST_VERSION` argument, bumped with the toolchain.
+
+The SBOM is generated in the build stage by `cargo-cyclonedx` 0.5.9,
+installed with `--locked` and left in that stage, describing the
+`fusescope-engine` binary for the build's target with its full dependency
+graph and no development dependencies (`--describe binaries --all`). It is
+copied into the image readable by every user and published by the CI
+`image` job as the `fusescope-engine-sbom` artifact; `scripts/sbom-check.py`
+checks it is CycloneDX 1.5 JSON whose root is the binary, with a non-empty
+graph naming the engine's runtime crates. It lists crates only: the
+distroless base's Debian packages are recorded by the base image itself.
