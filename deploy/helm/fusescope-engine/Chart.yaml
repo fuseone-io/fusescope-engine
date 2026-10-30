@@ -1,6 +1,0 @@
-apiVersion: v2
-name: fusescope-engine
-description: FuseScope's storage and query engine for OpenTelemetry traces, one chart for its three roles.
-type: application
-version: 0.1.0
-appVersion: "0.0.1"

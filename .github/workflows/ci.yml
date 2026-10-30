@@ -62,7 +62,14 @@ jobs:
             | tar -xz -C /usr/local/bin kubeconform
         env:
           KUBECONFORM: v0.7.0
-      - run: scripts/chart-check.sh --image fusescope-engine:ci
+      # The engine's chart lives in fusescope-charts; checking it here against
+      # the image just built catches a configuration change that breaks it.
+      - uses: actions/checkout@v4
+        with:
+          repository: fuseone-io/fusescope-charts
+          path: fusescope-charts
+      - run: scripts/fusescope-engine-chart-check.sh --image fusescope-engine:ci
+        working-directory: fusescope-charts
   deny:
     runs-on: ubuntu-latest
     steps:
