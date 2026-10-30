@@ -1049,26 +1049,36 @@ surface and is handled as follows:
 - Catalog Postgres with TLS and one user per role, minimal `GRANT`s.
 - mTLS on the Flight SQL listener and the internal hot-window Flight, under
   `[tls]`. A process has one identity, `tls.cert` and `tls.key`, that it
-  serves with and presents as a client, and one bundle of client CAs,
-  `tls.client_ca`; a listener refuses a client without a certificate that
-  chains to it before any request is read, the bearer token or tenant JWT
-  coming after. Clients verify the server against the operating system's
-  trust store only, so a private CA is installed in the image's store, and
-  against the host they dial, so an ingester advertises the name its
-  certificate carries. The three files are read again every
-  `tls.reload_interval_secs` (60): contents that load go to new
-  connections while open ones keep the config they began with, on the same
-  listener; contents that do not load keep the last good config, count
-  `fusescope_tls_reload_failures_total`, set `fusescope_tls_stale` and show
-  `tls=stale` on `/readyz` without failing it, since every replica would
-  read the same broken secret and the old config still serves. Files that
-  do not load at start stop the start. Handshakes run off the accept loop,
-  each within `tls.handshake_timeout_secs` (10) and at most
-  `tls.max_handshakes` (1024) at a time per listener. `[tls]` is off by
-  default for development, where the start warns, and half a section, on
-  without its files or off with files named, is refused; staging and
-  production turn it on. The OTLP listener of section 10.3 is not covered
-  yet.
+  serves with and presents as a client, so its certificate carries both the
+  `serverAuth` and the `clientAuth` extended key usages. Each listener has
+  its own bundle of client CAs: Flight SQL admits clients of
+  `tls.public_client_ca`, the backend's, and the hot window clients of
+  `tls.hot_client_ca`, the queriers'. The two bundles share no CA, refused
+  at start and at reload, because the hot window trusts the tenant in its
+  ticket: a backend certificate that opened it would read any tenant
+  without a bearer token or a JWT. A listener refuses a client without a
+  certificate from its bundle before any request is read. Clients verify
+  the server against the operating system's trust store only, so a private
+  CA is installed in the image's store, and against the host they dial, so
+  an ingester advertises the name its certificate carries. The files are
+  read again every `tls.reload_interval_secs` (60): contents that load go
+  to new connections while open ones keep the config they began with, on
+  the same listener; contents that do not load keep the last good config,
+  count `fusescope_tls_reload_failures_total`, set `fusescope_tls_stale`
+  and show `tls=stale` on `/readyz` without failing it, since every
+  replica would read the same broken secret and the old config still
+  serves. Replicas reload at different moments, so a CA rotation goes
+  through a bundle holding both the old and the new CA until every client
+  certificate is reissued, never a direct switch. Files that do not load at
+  start stop the start. Handshakes run off the accept loop, each within
+  `tls.handshake_timeout_secs` (10) and at most `tls.max_handshakes` (1024,
+  never above 65536, clamped inside `fs-auth` as well) at a time per
+  listener. `[tls]` is off by default for development, where the start
+  warns, and half a section, on without its four files or off with files
+  named, is refused; staging and production turn it on. Required before
+  staging: refusing at start, and reporting, a certificate already expired
+  or not yet valid, which today loads and fails every handshake. The OTLP
+  listener of section 10.3 is not covered yet.
 
 ### 10.5 Supply chain and code
 
