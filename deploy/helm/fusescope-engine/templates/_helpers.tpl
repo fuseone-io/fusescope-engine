@@ -19,15 +19,22 @@ app.kubernetes.io/component: {{ .role }}
 {{/* Refuses a release that would run half-configured or insecurely. */}}
 {{- define "fse.validate" -}}
 {{- $v := .Values -}}
-{{- range $role := list "ingester" "querier" "compactor" "migrator" -}}
-{{- $_ := required (printf "secrets.%s: the Secret with FS_CATALOG_URL and, for the roles, the bucket credentials" $role) (index $v.secrets $role) -}}
+{{- $needed := list "ingester" "querier" "compactor" -}}
+{{- if $v.migration.enabled -}}
+{{- $needed = append $needed "migrator" -}}
 {{- end -}}
-{{- $names := list $v.secrets.ingester $v.secrets.querier $v.secrets.compactor $v.secrets.migrator -}}
+{{- $names := list -}}
+{{- range $role := $needed -}}
+{{- $names = append $names (required (printf "secrets.%s: the Secret with FS_CATALOG_URL and, for the roles, the bucket credentials" $role) (index $v.secrets $role)) -}}
+{{- end -}}
 {{- if $v.tls.enabled -}}
 {{- $names = concat $names (list $v.tls.clientCASecret $v.tls.identities.ingester $v.tls.identities.querier) -}}
 {{- end -}}
 {{- if ne (len $names) (len (uniq $names)) -}}
 {{- fail (printf "every Secret must differ: each role's environment, the migrator's, the client CAs and each identity, since a shared one hands a role another's credentials or key: %v" $names) -}}
+{{- end -}}
+{{- if and $v.migration.enabled (or (lt (int64 $v.migration.backoffLimit) 0) (gt (int64 $v.migration.backoffLimit) 10)) -}}
+{{- fail (printf "migration.backoffLimit must be between 0 and 10, not %v" $v.migration.backoffLimit) -}}
 {{- end -}}
 {{- if or (lt (int $v.startupTimeoutSecs) 1) (gt (int $v.startupTimeoutSecs) 86400) -}}
 {{- fail (printf "startupTimeoutSecs must be between 1 and 86400, not %v" $v.startupTimeoutSecs) -}}

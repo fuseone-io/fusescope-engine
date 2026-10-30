@@ -118,7 +118,24 @@ refuse -f "$chart/ci/staging-values.yaml" --set secrets.migrator=fusescope-engin
 refuse -f "$chart/ci/staging-values.yaml" --set secrets.migrator=
 refuse -f "$chart/ci/staging-values.yaml" --set startupTimeoutSecs=0
 refuse -f "$chart/ci/staging-values.yaml" --set startupTimeoutSecs=86401
+refuse -f "$chart/ci/staging-values.yaml" --set migration.backoffLimit=-1
+refuse -f "$chart/ci/staging-values.yaml" --set migration.backoffLimit=11
+refuse -f "$chart/ci/staging-values.yaml" --set migration.backoffLimit=2147483648
+for limit in 0 10; do
+    helm template check "$chart" -f "$chart/ci/staging-values.yaml" --set migration.backoffLimit=$limit >/dev/null
+done
+helm template check "$chart" -f "$chart/ci/staging-values.yaml" \
+    --set migration.enabled=false --set secrets.migrator= > "$work/unmigrated.yaml"
+python3 - "$work/unmigrated.yaml" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+if any(d["kind"] == "Job" or d["metadata"]["name"].endswith("-migrate-config") for d in docs):
+    sys.exit("migration disabled, yet a migration Job or its ConfigMap renders")
+config = next(d for d in docs if d["metadata"]["name"].endswith("-config"))["data"]
+if any("migrate = false" not in config[f"{role}.toml"] for role in ("ingester", "querier", "compactor")):
+    sys.exit("migration disabled, yet a role migrates on start")
+PY
 for bound in 1 86400; do
     helm template check "$chart" -f "$chart/ci/staging-values.yaml" --set startupTimeoutSecs=$bound >/dev/null
 done
-echo "chart refuses a release without its secrets, any two Secrets alike (roles, migrator, client CAs, identities), a startup budget outside 1..86400, jwt without tls, or an unknown auth mode"
+echo "chart refuses a release without its secrets, any two Secrets alike (roles, migrator, client CAs, identities), a startup budget outside 1..86400, a migration backoff outside 0..10, jwt without tls, or an unknown auth mode; without the migration Job it needs no migrator and no role migrates"
