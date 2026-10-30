@@ -158,6 +158,16 @@ arriving meanwhile:
 - Uploads never overwrite (conditional create), and registering an existing
   id verifies the immutable fields; a mismatch is an error, never a silent
   accept.
+- Every writer records the sha256 of the object on its catalog row
+  (`content_sha256`), the flush and the compactor alike, computed where the
+  bytes are encoded. A retried flush that meets its object already in the
+  bucket streams it back and compares the digest, not only the size: other
+  bytes under a recorded layout mean a corrupt object or a broken encoder,
+  so the rows take a fresh id as they do for a doomed path, the object is
+  left to the orphan sweep and `fusescope_flush_replay_mismatch_total`
+  counts it; an intent logged before layouts were recorded registers the
+  object it finds, with its digest. Rows from before the column existed
+  carry no digest and are accepted as they are.
 
 The checkpoint is a durable marker next to the segments: replay after a
 restart starts there, which is what prevents rows already in the bucket from
@@ -294,6 +304,7 @@ create table engine_file (
   ts_max         timestamptz not null,
   services       text[] not null default '{}', -- coarse pruning summary
   summary        bytea,                        -- binary summary: small filters, min/max of promoted columns
+  content_sha256 bytea,                        -- sha256 of the object as uploaded; null on rows from before it was recorded
   state          smallint not null,           -- 0 writing, 1 visible, 2 quarantined
   created_at     timestamptz not null default clock_timestamp(),
   confirmed_at   timestamptz,                 -- set by the writer once it retains the rows; null keeps the file out of compaction

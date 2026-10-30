@@ -103,8 +103,9 @@ Then read back, in this order, and compare with what was exported:
 `fusescope_compaction_trace_summary_skipped_total`,
 `fusescope_compaction_service_graph_total`,
 `fusescope_compaction_service_graph_skipped_total`, `fusescope_query_*`; the
-`fusescope_retention_*` counters stay at zero, since nothing the run
-ingests is a day old.
+`fusescope_retention_*` counters and `fusescope_flush_replay_mismatch_total`
+stay at zero, since nothing the run ingests is a day old and no object is
+touched behind the engine.
 
 Last run: 2026-10-29, every step as described, no warning or error in the
 log across both runs.
