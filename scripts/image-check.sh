@@ -1,6 +1,7 @@
 #!/bin/sh
-# Checks a built image: it runs as the non-root user and carries a
-# non-empty system CA bundle; with a read-only root, writing only to its
+# Checks a built image: it runs as the non-root user, carries a non-empty
+# system CA bundle and a readable CycloneDX SBOM of its binary that
+# scripts/sbom-check.py accepts (copied to $SBOM_OUT when set); with a read-only root, writing only to its
 # WAL and spill paths and to a tmpfs bucket, `--check` passes, and
 # `--role all` starts, reports ready, and stops cleanly on SIGTERM. Spill
 # is not forced, so its path is mounted but not proven written.
@@ -37,6 +38,16 @@ created=$(docker create "$image")
 certificates=$(docker cp -L "$created:/etc/ssl/certs/ca-certificates.crt" - | tar -xOf - | grep -c 'BEGIN CERTIFICATE' || true)
 [ "$certificates" -gt 0 ] || { echo "image has no certificate in its CA bundle" >&2; exit 1; }
 
+sbom_path=/usr/share/doc/fusescope-engine/sbom.cdx.json
+mode=$(docker cp "$created:$sbom_path" - | tar -tvf - | cut -c1-10)
+case "$mode" in
+    -r??r??r??) ;;
+    *) echo "image SBOM is not readable by every user: '$mode'" >&2; exit 1 ;;
+esac
+sbom=${SBOM_OUT:-$(mktemp)}
+docker cp "$created:$sbom_path" - | tar -xOf - > "$sbom"
+python3 "$(dirname "$0")/sbom-check.py" "$sbom"
+
 tmpfs="uid=65532,gid=65532,mode=0700"
 run() {
     docker run --read-only --network host \
@@ -71,4 +82,4 @@ if [ "$status" != "0" ]; then
     echo "the engine exited $status on SIGTERM" >&2
     exit 1
 fi
-echo "image $image: non-root, $certificates CA certificates, --check and --role all ready and stopped cleanly with a read-only root"
+echo "image $image: non-root, $certificates CA certificates, a valid SBOM, --check and --role all ready and stopped cleanly with a read-only root"

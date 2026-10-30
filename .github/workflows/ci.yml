@@ -46,6 +46,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: scripts/image-check.sh fusescope-engine:ci
+        env:
+          SBOM_OUT: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusescope-engine-sbom
+          path: sbom.cdx.json
+          if-no-files-found: error
       - uses: azure/setup-helm@v4
         with:
           version: v4.3.0

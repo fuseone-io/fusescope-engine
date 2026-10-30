@@ -3,3 +3,4 @@
 *.pdb
 .env
 /data
+*.cdx.json
