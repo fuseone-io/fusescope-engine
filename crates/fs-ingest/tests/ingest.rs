@@ -154,9 +154,23 @@ async fn start_with_store(
     wal_config: WalConfig,
     store: Arc<dyn ObjectStore>,
 ) -> Harness {
+    start_with_hot_tls(catalog, dir, config, wal_config, store, None).await
+}
+
+async fn start_with_hot_tls(
+    catalog: &Catalog,
+    dir: tempfile::TempDir,
+    config: IngestConfig,
+    wal_config: WalConfig,
+    store: Arc<dyn ObjectStore>,
+    hot_tls: Option<fs_auth::ServerTls>,
+) -> Harness {
     let wal = Wal::open(wal_config).unwrap();
-    let ingester =
-        Arc::new(Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap());
+    let mut ingester = Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap();
+    if let Some(tls) = hot_tls {
+        ingester = ingester.with_hot_tls(tls);
+    }
+    let ingester = Arc::new(ingester);
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     let (hot_tx, hot_rx) = tokio::sync::oneshot::channel();
@@ -4381,5 +4395,155 @@ async fn corruption_in_the_active_segment_refuses_to_open() {
         panic!("the log must not open over corrupted, acknowledged records")
     };
     assert!(matches!(err, fs_wal::WalError::Corrupt { .. }), "{err}");
+    db.finish().await;
+}
+
+fn tls_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../fs-auth/tests/fixtures")
+        .join(name)
+}
+
+/// A process TLS from the fixtures, copied under `dir` so it can rotate.
+fn tls_in(dir: &std::path::Path, cert: &str, key: &str, client_ca: &str) -> Arc<fs_auth::Tls> {
+    let files = fs_auth::TlsFiles {
+        cert: dir.join("tls.crt"),
+        key: dir.join("tls.key"),
+        client_ca: dir.join("ca.crt"),
+    };
+    std::fs::copy(tls_fixture(cert), &files.cert).unwrap();
+    std::fs::copy(tls_fixture(key), &files.key).unwrap();
+    std::fs::copy(tls_fixture(client_ca), &files.client_ca).unwrap();
+    fs_auth::Tls::load(
+        files,
+        fs_auth::TlsLimits {
+            reload_interval: Duration::from_secs(3600),
+            handshake_timeout: Duration::from_secs(5),
+            max_handshakes: 16,
+        },
+    )
+    .unwrap()
+}
+
+/// With mTLS on, the hot window answers a querier presenting a certificate
+/// from the client CA at the name its certificate carries, and refuses
+/// plain text, another CA's client and another name; a reload of the
+/// client CA applies to the next scan on the same listener.
+#[tokio::test]
+async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = tls_in(
+        server_dir.path(),
+        "server-a.pem",
+        "server-a.key",
+        "ca-a.pem",
+    );
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let wal_config = WalConfig::new(dir.path().join("wal"));
+    let h = start_with_hot_tls(
+        &db.catalog,
+        dir,
+        test_config(),
+        wal_config,
+        store,
+        Some(server.server()),
+    )
+    .await;
+    let mut client = h.client().await;
+    client
+        .export(authed(request("api", 1, 3), &token))
+        .await
+        .unwrap();
+    let request = fs_ingest::hot::HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: None,
+        span_ids: None,
+        distinct: None,
+    };
+    let ca_a = std::fs::read(tls_fixture("ca-a.pem")).unwrap();
+    let querier_dir = tempfile::tempdir().unwrap();
+    let querier = tls_in(
+        querier_dir.path(),
+        "client-a.pem",
+        "client-a.key",
+        "ca-a.pem",
+    )
+    .client()
+    .trusting_only(&ca_a);
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = tls_in(other_dir.path(), "client-b.pem", "client-b.key", "ca-b.pem")
+        .client()
+        .trusting_only(&ca_a);
+    let named = format!("localhost:{}", h.hot_addr.port());
+    let timeout = Duration::from_secs(5);
+    let rows = |response: fs_ingest::hot::HotScanResponse| {
+        response
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+    };
+
+    let scanned = fs_ingest::hot::scan_with(&named, &request, timeout, Some(&querier))
+        .await
+        .unwrap();
+    assert_eq!(rows(scanned), 3);
+    assert!(
+        fs_ingest::hot::scan(&named, &request, timeout)
+            .await
+            .is_err(),
+        "plain text"
+    );
+    assert!(
+        fs_ingest::hot::scan_with(&named, &request, timeout, Some(&other))
+            .await
+            .is_err(),
+        "a client certificate from another CA"
+    );
+    let err = fs_ingest::hot::scan_with(&h.hot_addr.to_string(), &request, timeout, Some(&querier))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("certificate"),
+        "the address is not the name in the certificate: {err}"
+    );
+
+    std::fs::copy(tls_fixture("ca-b.pem"), server_dir.path().join("ca.crt")).unwrap();
+    assert_eq!(server.reload().unwrap(), fs_auth::Reload::Reloaded);
+    assert!(
+        fs_ingest::hot::scan_with(&named, &request, timeout, Some(&querier))
+            .await
+            .is_err(),
+        "the old client CA no longer admits the querier"
+    );
+    let scanned = fs_ingest::hot::scan_with(&named, &request, timeout, Some(&other))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(scanned),
+        3,
+        "the same listener admits the new CA's client"
+    );
+    h.stop().await;
     db.finish().await;
 }

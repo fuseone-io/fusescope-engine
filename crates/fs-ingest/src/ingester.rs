@@ -1339,9 +1339,17 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
 /// The ingester role.
 pub struct Ingester {
     shared: Arc<Shared>,
+    hot_tls: Option<fs_auth::ServerTls>,
 }
 
 impl Ingester {
+    /// Serves the hot window over mTLS with `tls` instead of plain text.
+    #[must_use]
+    pub fn with_hot_tls(mut self, tls: fs_auth::ServerTls) -> Self {
+        self.hot_tls = Some(tls);
+        self
+    }
+
     /// Wires the pieces together and replays the WAL into memory.
     ///
     /// # Errors
@@ -1427,6 +1435,7 @@ impl Ingester {
         };
         Ok(Self {
             shared: Arc::new(shared),
+            hot_tls: None,
         })
     }
 
@@ -1524,6 +1533,7 @@ impl Ingester {
         let hot = crate::hot::serve(
             self.shared.clone(),
             self.shared.config.hot_listen,
+            self.hot_tls.as_ref(),
             shutdown.clone(),
             hot_bound,
         );

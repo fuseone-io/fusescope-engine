@@ -169,6 +169,7 @@ pub fn apply(
 pub(crate) async fn serve(
     shared: Arc<Shared>,
     listen: Option<std::net::SocketAddr>,
+    tls: Option<&fs_auth::ServerTls>,
     mut shutdown: watch::Receiver<bool>,
     bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 ) -> Result<(), IngestError> {
@@ -186,24 +187,21 @@ pub(crate) async fn serve(
         addr: "local_addr".into(),
         source,
     })?;
-    info!(%addr, "hot window flight listening");
+    info!(%addr, tls = tls.is_some(), "hot window flight listening");
     if let Some(tx) = bound {
         let _ = tx.send(addr);
     }
-    tonic::transport::Server::builder()
-        .add_service(FlightServiceServer::new(HotService { shared }))
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            async move {
-                let _ = shutdown.changed().await;
-            },
-        )
-        .await?;
+    let router = tonic::transport::Server::builder()
+        .add_service(FlightServiceServer::new(HotService { shared }));
+    fs_auth::serve(router, listener, tls, async move {
+        let _ = shutdown.changed().await;
+    })
+    .await?;
     info!("hot window flight stopped");
     Ok(())
 }
 
-/// Scans one ingester. Used by the querier.
+/// Scans one ingester in plain text, as [`scan_with`] without TLS.
 ///
 /// # Errors
 /// Connection, timeout or decoding failures, wrapped as [`IngestError::HotScan`].
@@ -212,18 +210,31 @@ pub async fn scan(
     request: &HotScanRequest,
     timeout: Duration,
 ) -> Result<HotScanResponse, IngestError> {
+    scan_with(address, request, timeout, None).await
+}
+
+/// Scans one ingester, over mTLS with `tls`. Used by the querier.
+///
+/// # Errors
+/// Connection, handshake, timeout or decoding failures, wrapped as
+/// [`IngestError::HotScan`].
+pub async fn scan_with(
+    address: &str,
+    request: &HotScanRequest,
+    timeout: Duration,
+    tls: Option<&fs_auth::ClientTls>,
+) -> Result<HotScanResponse, IngestError> {
     let fail = |reason: String| IngestError::HotScan {
         ingester: address.to_owned(),
         reason,
     };
     let run = async {
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
-            .map_err(|e| fail(e.to_string()))?;
+        let endpoint = fs_auth::endpoint(address, tls).map_err(|e| fail(e.to_string()))?;
         let channel = endpoint
             .connect_timeout(timeout)
             .connect()
             .await
-            .map_err(|e| fail(e.to_string()))?;
+            .map_err(|e| fail(fs_auth::error_chain(&e)))?;
         let mut client = FlightServiceClient::new(channel);
         let response = client
             .do_get(request.to_ticket())

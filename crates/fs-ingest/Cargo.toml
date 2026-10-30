@@ -31,6 +31,7 @@ fs-schema = { path = "../fs-schema" }
 fs-wal = { path = "../fs-wal" }
 fs-catalog = { path = "../fs-catalog" }
 fs-index = { path = "../fs-index" }
+fs-auth = { path = "../fs-auth" }
 sha2 = { workspace = true }
 
 [dev-dependencies]
