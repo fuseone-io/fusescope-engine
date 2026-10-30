@@ -6,7 +6,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::CatalogError;
-use crate::token::{TenantToken, TokenScope, generate_token, hash_token, looks_like_token};
+use crate::token::{TenantToken, TokenScope, generate_token, hash_token};
 use crate::types::{
     Compaction, FileId, FileRecord, FileRow, FileState, Ingester, NewFile, NewTenant, PurgedFile,
     Signal, Tenant, TenantId, TimeRange,
@@ -426,10 +426,11 @@ impl Catalog {
     ) -> Result<(String, TenantToken), CatalogError> {
         let token = generate_token()?;
         let hash = hash_token(&token);
-        let row = sqlx::query_as::<_, TenantToken>(
-            "insert into engine_tenant_token (token_hash, tenant_id, name, scope) values ($1, $2, $3, $4)
-             returning tenant_id, name, scope, created_at, revoked_at",
-        )
+        let row = sqlx::query_as::<_, TenantToken>(&format!(
+            "insert into engine_tenant_token as t (token_hash, tenant_id, name, scope) values ($1, $2, $3, $4)
+             returning {}",
+            crate::token::TOKEN_COLUMNS
+        ))
         .bind(hash.as_slice())
         .bind(tenant)
         .bind(name)
@@ -449,20 +450,10 @@ impl Catalog {
         token: &str,
         scope: TokenScope,
     ) -> Result<Option<TenantId>, CatalogError> {
-        if !looks_like_token(token) {
-            return Ok(None);
-        }
-        let hash = hash_token(token);
-        let row: Option<(TenantId,)> = sqlx::query_as(
-            "select t.tenant_id from engine_tenant_token t
-             join engine_tenant n on n.id = t.tenant_id
-             where t.token_hash = $1 and t.scope = $2 and t.revoked_at is null and n.deleted_at is null",
-        )
-        .bind(hash.as_slice())
-        .bind(scope)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| r.0))
+        Ok(self
+            .resolve_token_until(token, scope)
+            .await?
+            .map(|(tenant, _)| tenant))
     }
 
     /// Revokes a token by its hash. Returns whether a live token was revoked.
@@ -471,7 +462,8 @@ impl Catalog {
     /// Database failure.
     pub async fn revoke_token(&self, hash: &[u8; 32]) -> Result<bool, CatalogError> {
         let result = sqlx::query(
-            "update engine_tenant_token set revoked_at = now() where token_hash = $1 and revoked_at is null",
+            "update engine_tenant_token set revoked_at = now()
+             where token_hash = $1 and (revoked_at is null or revoked_at > now())",
         )
         .bind(hash.as_slice())
         .execute(&self.pool)
@@ -484,10 +476,11 @@ impl Catalog {
     /// # Errors
     /// Database failure.
     pub async fn tokens(&self, tenant: TenantId) -> Result<Vec<TenantToken>, CatalogError> {
-        let rows = sqlx::query_as::<_, TenantToken>(
-            "select tenant_id, name, scope, created_at, revoked_at from engine_tenant_token
-             where tenant_id = $1 order by created_at desc",
-        )
+        let rows = sqlx::query_as::<_, TenantToken>(&format!(
+            "select {} from engine_tenant_token t
+             where t.tenant_id = $1 order by t.created_at desc",
+            crate::token::TOKEN_COLUMNS
+        ))
         .bind(tenant)
         .fetch_all(&self.pool)
         .await?;

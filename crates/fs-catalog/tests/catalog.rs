@@ -1750,6 +1750,143 @@ async fn watcher_sees_file_changes() {
     db.finish().await;
 }
 
+/// An operator names a token by the id the listing shows; revoking it
+/// takes effect at once, and rotating it issues a successor while the old
+/// token keeps working until its overlap ends.
+#[tokio::test]
+async fn tokens_are_revoked_and_rotated_by_their_id() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let (secret, token) = db
+        .catalog
+        .create_token(t, "collector-a", TokenScope::Ingest)
+        .await
+        .unwrap();
+    assert_eq!(token.id, hex(&hash_token(&secret)[..8]));
+    assert_eq!(db.catalog.tokens(t).await.unwrap()[0].id, token.id);
+
+    let (successor, new, old) = db
+        .catalog
+        .rotate_token(&token.id, StdDuration::from_secs(3600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (new.name.as_str(), new.scope, new.tenant_id),
+        ("collector-a", TokenScope::Ingest, t)
+    );
+    assert_ne!(new.id, old.id);
+    let due = old.revoked_at.expect("the old token is scheduled to stop");
+    assert!(due > Utc::now() + Duration::minutes(59) && due < Utc::now() + Duration::minutes(61));
+    for live in [&secret, &successor] {
+        assert_eq!(
+            db.catalog
+                .resolve_token(live, TokenScope::Ingest)
+                .await
+                .unwrap(),
+            Some(t),
+            "both work during the overlap"
+        );
+    }
+    let (_, until) = db
+        .catalog
+        .resolve_token_until(&secret, TokenScope::Ingest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(until, Some(due), "a cache learns when the old token stops");
+
+    let again = db
+        .catalog
+        .rotate_token(&token.id, StdDuration::from_secs(86_400))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        again.2.revoked_at,
+        Some(due),
+        "a second rotation never pushes the end later"
+    );
+
+    let revoked = db
+        .catalog
+        .revoke_token_by_id(&token.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(revoked.revoked_at.unwrap() <= Utc::now());
+    assert_eq!(
+        db.catalog
+            .resolve_token(&secret, TokenScope::Ingest)
+            .await
+            .unwrap(),
+        None,
+        "a revocation brings the scheduled end forward"
+    );
+    assert_eq!(
+        db.catalog
+            .resolve_token(&successor, TokenScope::Ingest)
+            .await
+            .unwrap(),
+        Some(t)
+    );
+    assert!(
+        db.catalog
+            .revoke_token_by_id(&token.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.catalog
+            .rotate_token(&token.id, StdDuration::ZERO)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.catalog
+            .revoke_token_by_id("not-an-id")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (_, _, ended) = db
+        .catalog
+        .rotate_token(&new.id, StdDuration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        ended.revoked_at.unwrap() <= Utc::now(),
+        "no overlap: the old token stops now"
+    );
+    assert_eq!(
+        db.catalog
+            .resolve_token(&successor, TokenScope::Ingest)
+            .await
+            .unwrap(),
+        None
+    );
+    db.finish().await;
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
 #[tokio::test]
 async fn tokens_resolve_until_revoked() {
     let Some(db) = TestDb::new().await else {

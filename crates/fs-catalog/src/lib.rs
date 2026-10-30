@@ -23,7 +23,8 @@ pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
 pub use orphans::{Doom, OrphanClaim};
 pub use retention::{ExpiredFiles, RebuildInput, StaleKey, StaleTable};
 pub use token::{
-    TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token, looks_like_token,
+    MAX_ROTATION_OVERLAP, TOKEN_PREFIX, TenantToken, TokenScope, generate_token, hash_token,
+    looks_like_token,
 };
 pub use types::{
     Compaction, FileId, FileRecord, FileState, Ingester, Level, NewFile, NewTenant, PurgedFile,
@@ -86,6 +87,13 @@ pub enum CatalogError {
     /// The operating system could not provide randomness for a token.
     #[error("randomness unavailable: {0}")]
     Randomness(#[from] getrandom::Error),
+    /// A token id names more than one live token; give the full listing's
+    /// id of the one meant.
+    #[error("token id {id} names more than one live token")]
+    AmbiguousToken {
+        /// The id given.
+        id: String,
+    },
     /// A value read from the database is outside the domain, for example an
     /// unknown signal code.
     #[error("invalid value in column {column}: {value}")]
