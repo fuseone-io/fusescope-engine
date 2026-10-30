@@ -47,11 +47,19 @@ written twice. Expect a start to take longer the more the WAL holds.
   acknowledged records are corrupt and the engine will not cut them. Keep
   the volume, do not delete segments, and escalate: the records are the
   only copy of rows the clients were told were stored.
-- **Damage in an earlier segment** is reported in the log during replay
-  and the scan goes on; the records in the damaged part are lost.
+- **Replay stops at damage anywhere else**, in an earlier segment or in a
+  record, and the ingester refuses to start with
+  `ingest: wal record: wal damage at …`: the records past it may hold a
+  flush intent, and replaying without it would write those rows again
+  under an id already taken. Keep the volume, do not delete segments, and
+  escalate, as above.
+- **Replay stops at a flush intent this version cannot read**, with
+  `ingest: wal record: flush intent at … cannot be read by this engine`:
+  a newer engine wrote it. Roll the ingester forward to that version
+  rather than back.
 - **A torn tail** after the last commit marker belongs to a batch whose
-  sync never finished and whose clients were never acknowledged; it is cut
-  silently and appends continue.
+  sync never finished and whose clients were never acknowledged; it is the
+  only damage cut, silently, and appends continue.
 - **The WAL volume is lost** (a deleted claim): rows the ingester
   acknowledged and had not flushed are gone. The ingester starts with a new
   WAL instance and new file ids.
@@ -91,8 +99,12 @@ sweep marks it the first time it sees it and deletes it once it has stayed
 unregistered for `compactor.orphan_ttl_secs`, leaving a tombstone that keeps
 the path from being written again. `fusescope_orphan_delete_failures_total`
 rising means deletes are failing (bucket permissions, throttling); they are
-retried with backoff. `fusescope_orphan_forgotten_total` counts paths that
-turned out to belong to a catalog row and were left alone.
+retried with backoff. `fusescope_orphan_forgotten_total` counts remembered
+paths the sweep dropped and left in the bucket, for one of two reasons: a
+catalog row owns them after all, the benign case of a registration that
+landed late, or they are not in the engine's layout at all. The second
+means something else writes into the engine's prefix; find out what, since
+the sweep never deletes what it does not recognise.
 
 The bucket prefix belongs to one catalog. A start refused with
 `bucket prefix … belongs to catalog …; this is not it` means the pod points
@@ -152,6 +164,7 @@ trace or span ids were dropped and the rest stored.
 | `RESOURCE_EXHAUSTED` | `query would scan N bytes, over the budget of M`, `result exceeded N rows` | the scan budget or the row cap | narrow the query |
 | `DEADLINE_EXCEEDED` | `query exceeded …` | `query.timeout_secs` | narrow the query |
 | `INVALID_ARGUMENT` | `bad ticket`, `invalid action: …`, a planning error | malformed input | the caller |
+| `UNIMPLEMENTED` | `unknown action "…"` | a `DoAction` type this engine does not serve | the backend calls an action of a newer engine, or a typo |
 | `UNAVAILABLE` | `token lookup failed: …`, `tenant lookup failed: …` | the catalog did not answer | catalog health |
 
 A result carrying the `x-fusescope-partial` header is complete for what it
@@ -166,5 +179,7 @@ hot window did not answer.
 | `tls: …`, `jwt keys …` | a certificate, key, CA bundle or key set that does not load |
 | `bucket prefix … belongs to catalog …` | another deployment's prefix |
 | `… holds objects but no catalog marker` | see the orphan collector above |
-| `wal: …` | the WAL refuses to open; see WAL replay and checkpoint |
+| `wal: …` | the WAL refuses to open: damage before its last commit marker; see WAL replay and checkpoint |
+| `ingest: wal record: wal damage at …` | replay met damage it will not skip; keep the volume and escalate |
+| `ingest: wal record: flush intent at … cannot be read by this engine` | a newer engine wrote the WAL; roll forward |
 | `catalog: …`, `bucket: …` | unreachable at start; the pod restarts until they answer |
