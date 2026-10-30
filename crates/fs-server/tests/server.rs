@@ -206,7 +206,7 @@ async fn the_operator_client_queries_a_running_server() {
         .await
         .unwrap();
     let counted = loop {
-        match client::query(&addr, &token, "select count(*) as n from spans").await {
+        match client::query(&addr, &token, "select count(*) as n from spans", None).await {
             Ok(batches) => break batches,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -218,14 +218,14 @@ async fn the_operator_client_queries_a_running_server() {
     assert!(rendered.contains("| 0 |"), "{rendered}");
     assert!(rendered.ends_with("1 rows"), "{rendered}");
 
-    let services = client::action(&addr, &token, "metadata.services", "{}")
+    let services = client::action(&addr, &token, "metadata.services", "{}", None)
         .await
         .unwrap();
     assert_eq!(
         client::render(&services).unwrap().lines().last(),
         Some("0 rows")
     );
-    let err = client::query(&addr, "fst_nope", "select 1")
+    let err = client::query(&addr, "fst_nope", "select 1", None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Unauthenticated"), "{err}");
@@ -727,4 +727,111 @@ async fn bootstrap_fails_fast_on_bad_catalog() {
         .await
         .unwrap_err();
     assert!(matches!(err, fs_server::ServerError::Catalog(_)), "{err}");
+}
+
+fn tls_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../fs-auth/tests/fixtures")
+        .join(name)
+}
+
+fn tls_on(cfg: &mut Config, cert: &str, key: &str) {
+    cfg.tls = fs_server::tls::TlsSection {
+        enabled: true,
+        cert: tls_fixture(cert).display().to_string(),
+        key: tls_fixture(key).display().to_string(),
+        client_ca: tls_fixture("ca-a.pem").display().to_string(),
+        ..fs_server::tls::TlsSection::default()
+    };
+}
+
+/// With `[tls]` on, the server refuses to start on files that do not load;
+/// on good files its Flight SQL listener answers a certified client at the
+/// name in its certificate and refuses plain text, and readiness and the
+/// metrics report the TLS.
+#[tokio::test]
+async fn with_tls_on_the_querier_requires_a_client_certificate() {
+    use fs_server::client;
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets {
+        catalog_url: Some(db.url.clone()),
+        ..Secrets::default()
+    };
+    let mut broken = config(dir.path());
+    tls_on(&mut broken, "server-a.pem", "client-a.key");
+    let err = server::check(broken, secrets.clone(), "checker".into())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("server-a.pem"), "{err}");
+
+    let port = free_port();
+    let metrics_port = free_port();
+    let mut cfg = config(dir.path());
+    cfg.server.flight_addr = format!("127.0.0.1:{port}");
+    cfg.server.metrics_addr = format!("127.0.0.1:{metrics_port}");
+    tls_on(&mut cfg, "server-a.pem", "server-a.key");
+    let (tx, rx) = watch::channel(false);
+    let server = tokio::spawn(server::run(cfg, secrets, Role::All, "test-node".into(), rx));
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
+    wait_for_ready(&metrics_addr).await;
+    let (_, body) = http_get(&metrics_addr, "/readyz").await;
+    assert!(body.contains("tls=current\n"), "{body}");
+    let (_, body) = http_get(&metrics_addr, "/metrics").await;
+    assert!(body.contains("fusescope_tls_stale 0\n"), "{body}");
+
+    let catalog = Catalog::connect(&db.url, 2).await.unwrap();
+    let tenant = catalog
+        .create_tenant(&fs_catalog::NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (token, _) = catalog
+        .create_token(tenant, "operator", fs_catalog::TokenScope::Query)
+        .await
+        .unwrap();
+    let identity = fs_auth::Tls::load(
+        fs_auth::TlsFiles {
+            cert: tls_fixture("client-a.pem"),
+            key: tls_fixture("client-a.key"),
+            client_ca: tls_fixture("ca-a.pem"),
+        },
+        fs_server::tls::TlsSection::default().limits(),
+    )
+    .unwrap();
+    let ca = std::fs::read(tls_fixture("ca-a.pem")).unwrap();
+    let certified = identity.client().trusting_only(&ca);
+    let named = format!("localhost:{port}");
+    let counted = client::query(
+        &named,
+        &token,
+        "select count(*) as n from spans",
+        Some(&certified),
+    )
+    .await
+    .unwrap();
+    assert!(client::render(&counted).unwrap().ends_with("1 rows"));
+    let err = client::query(&named, &token, "select 1", None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("connect") || err.to_string().contains("transport"),
+        "{err}"
+    );
+    let (_, body) = http_get(&metrics_addr, "/metrics").await;
+    assert!(
+        !body.contains("fusescope_tls_handshake_failures_total 0\n"),
+        "the plain-text attempt failed its handshake: {body}"
+    );
+
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("shutdown in time")
+        .unwrap()
+        .unwrap();
+    catalog.pool().close().await;
+    db.finish().await;
 }

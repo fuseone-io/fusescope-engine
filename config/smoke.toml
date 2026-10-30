@@ -51,6 +51,14 @@ orphan_interval_secs = 3600
 orphan_ttl_secs = 3600
 retention_interval_secs = 15
 
+# mTLS of the Flight listeners and their clients; off for development only.
+[tls]
+enabled = false
+# cert = "/etc/fusescope/tls/tls.crt"
+# key = "/etc/fusescope/tls/tls.key"
+# client_ca = "/etc/fusescope/tls/ca.crt"
+# reload_interval_secs = 60
+
 [log]
 level = "info"
 format = "text"

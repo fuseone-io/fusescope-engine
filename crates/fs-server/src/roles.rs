@@ -37,6 +37,8 @@ pub struct Context {
     /// An ingester configuration in place of the file's, for tests that
     /// need the ingester's own knobs.
     pub ingest_override: Option<fs_ingest::IngestConfig>,
+    /// mTLS of the Flight listeners and their clients, when on.
+    pub tls: Option<Arc<fs_auth::Tls>>,
 }
 
 /// Heartbeat period of the ingester. The querier treats 10 s of silence as down.
@@ -70,13 +72,17 @@ pub async fn ingester(
         Some(config) => config,
         None => ctx.config.ingest.to_ingest_config()?,
     };
-    let ingester = Arc::new(fs_ingest::Ingester::new(
+    let mut ingester = fs_ingest::Ingester::new(
         ingest_config,
         ctx.catalog.clone(),
         ctx.store.clone(),
         ctx.root.clone(),
         wal,
-    )?);
+    )?;
+    if let Some(tls) = &ctx.tls {
+        ingester = ingester.with_hot_tls(tls.server());
+    }
+    let ingester = Arc::new(ingester);
     let wal_probe = Arc::clone(&ingester);
     ctx.metrics.register_ingest(
         ingester.shared_stats(),
@@ -157,7 +163,14 @@ pub async fn querier(ctx: Context, shutdown: watch::Receiver<bool>) -> Result<()
     ctx.metrics.register_query(querier.stats());
     let cache = querier.cache();
     let follower = cache.follow(shutdown.clone());
-    let service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
+    let (querier, tls) = match &ctx.tls {
+        Some(tls) => (querier.with_hot_tls(tls.client()), Some(tls.server())),
+        None => (querier, None),
+    };
+    let mut service = fs_query::flight::FlightSql::new(querier, ctx.catalog.clone());
+    if let Some(tls) = tls {
+        service = service.with_tls(tls);
+    }
     info!(role = "querier", %listen, "ready");
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     let up = tokio::spawn({

@@ -19,8 +19,13 @@ use crate::ServerError;
 /// # Errors
 /// Connection, authentication, planning or execution failure, with the
 /// status the querier answered.
-pub async fn query(addr: &str, token: &str, sql: &str) -> Result<Vec<RecordBatch>, ServerError> {
-    let mut client = connect(addr, token).await?;
+pub async fn query(
+    addr: &str,
+    token: &str,
+    sql: &str,
+    tls: Option<&fs_auth::ClientTls>,
+) -> Result<Vec<RecordBatch>, ServerError> {
+    let mut client = connect(addr, token, tls).await?;
     let info = client.execute(sql.to_owned(), None).await.map_err(flight)?;
     let mut batches = Vec::new();
     for endpoint in info.endpoint {
@@ -44,8 +49,9 @@ pub async fn action(
     token: &str,
     kind: &str,
     body: &str,
+    tls: Option<&fs_auth::ClientTls>,
 ) -> Result<Vec<RecordBatch>, ServerError> {
-    let mut client = connect(addr, token).await?;
+    let mut client = connect(addr, token, tls).await?;
     let results: Vec<arrow_flight::Result> = client
         .do_action(Action {
             r#type: kind.to_owned(),
@@ -81,12 +87,14 @@ pub fn render(batches: &[RecordBatch]) -> Result<String, ServerError> {
     Ok(format!("{table}\n{rows} rows"))
 }
 
-async fn connect(addr: &str, token: &str) -> Result<FlightSqlServiceClient<Channel>, ServerError> {
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .map_err(|e| ServerError::Flight(format!("address {addr:?}: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| ServerError::Flight(format!("connect to {addr}: {e}")))?;
+async fn connect(
+    addr: &str,
+    token: &str,
+    tls: Option<&fs_auth::ClientTls>,
+) -> Result<FlightSqlServiceClient<Channel>, ServerError> {
+    let channel = fs_auth::endpoint(addr, tls)?.connect().await.map_err(|e| {
+        ServerError::Flight(format!("connect to {addr}: {}", fs_auth::error_chain(&e)))
+    })?;
     let mut client = FlightSqlServiceClient::new(channel);
     client.set_token(token.to_owned());
     Ok(client)

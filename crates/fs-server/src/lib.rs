@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod role;
 pub mod roles;
 pub mod server;
+pub mod tls;
 
 use std::path::PathBuf;
 
@@ -55,6 +56,9 @@ pub enum ServerError {
     /// The operator client could not reach the querier or was refused.
     #[error("flight: {0}")]
     Flight(String),
+    /// TLS files that do not load.
+    #[error("{0}")]
+    Tls(#[from] fs_auth::TlsError),
     /// The bucket prefix is marked for another catalog.
     #[error("bucket prefix {prefix:?} belongs to catalog {owner}; this is not it")]
     PrefixOwnedByAnother {

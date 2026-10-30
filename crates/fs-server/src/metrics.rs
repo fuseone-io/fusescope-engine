@@ -23,6 +23,7 @@ pub struct Metrics {
     wal_bytes: OnceLock<Arc<dyn Fn() -> u64 + Send + Sync>>,
     query: OnceLock<Arc<fs_query::QueryStats>>,
     compactor: OnceLock<Arc<fs_compactor::Stats>>,
+    tls: OnceLock<Arc<fs_auth::TlsStats>>,
 }
 
 impl Default for Metrics {
@@ -34,6 +35,7 @@ impl Default for Metrics {
             flush: OnceLock::new(),
             wal_bytes: OnceLock::new(),
             query: OnceLock::new(),
+            tls: OnceLock::new(),
             compactor: OnceLock::new(),
         }
     }
@@ -71,6 +73,11 @@ impl Metrics {
         let _ = self.query.set(stats);
     }
 
+    /// Registers the TLS counters.
+    pub fn register_tls(&self, stats: Arc<fs_auth::TlsStats>) {
+        let _ = self.tls.set(stats);
+    }
+
     /// Registers the compactor's counters.
     pub fn register_compactor(&self, stats: Arc<fs_compactor::Stats>) {
         let _ = self.compactor.set(stats);
@@ -83,6 +90,9 @@ impl Metrics {
         self.render_flush(&mut out);
         self.render_query(&mut out);
         self.render_compactor(&mut out);
+        if let Some(stats) = self.tls.get() {
+            crate::tls::render(&mut out, stats);
+        }
         if let Some(f) = self.wal_bytes.get() {
             gauge(
                 &mut out,
@@ -675,7 +685,7 @@ fn render_retention(out: &mut String, r: &fs_compactor::RetentionStats) {
     }
 }
 
-fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+pub(crate) fn counter(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(
         out,
         "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
@@ -697,7 +707,7 @@ fn histogram(out: &mut String, name: &str, help: &str, h: &fs_ingest::histogram:
     );
 }
 
-fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+pub(crate) fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
     let _ = writeln!(
         out,
         "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"

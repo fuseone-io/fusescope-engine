@@ -39,6 +39,9 @@ pub struct Config {
     /// Logging.
     #[serde(default)]
     pub log: LogConfig,
+    /// mTLS of the Flight listeners and their clients.
+    #[serde(default)]
+    pub tls: crate::tls::TlsSection,
 }
 
 /// Process identity and role.
@@ -1254,6 +1257,7 @@ impl Config {
         }
         self.validate_ingest_bounds()?;
         self.validate_server()?;
+        self.tls.validate()?;
         if self.query.max_rows == 0
             || self.query.timeout_secs == 0
             || self.query.memory_bytes < 64 * 1024 * 1024

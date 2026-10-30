@@ -81,6 +81,14 @@ rebuild_max_bytes = 2147483648
 rebuilds_per_tick = 64
 rebuild_backoff_secs = 3600
 
+# mTLS of the Flight listeners and their clients; off for development only.
+[tls]
+enabled = false
+# cert = "/etc/fusescope/tls/tls.crt"
+# key = "/etc/fusescope/tls/tls.key"
+# client_ca = "/etc/fusescope/tls/ca.crt"
+# reload_interval_secs = 60
+
 [log]
 level = "info"
 format = "text"

@@ -6,7 +6,7 @@ use std::time::Duration;
 use fs_catalog::Catalog;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ServerError;
 use crate::bucket;
@@ -40,6 +40,16 @@ pub async fn bootstrap(
     write_probe: bool,
 ) -> Result<Context, ServerError> {
     config.validate(secrets)?;
+    let tls = if let Some(files) = config.tls.files() {
+        let tls = fs_auth::Tls::load(files, config.tls.limits())?;
+        info!(cert = %config.tls.cert, client_ca = %config.tls.client_ca, "tls loaded; the flight listeners require client certificates");
+        Some(tls)
+    } else {
+        warn!(
+            "tls is off: the flight listeners accept plain text; turn [tls] on outside development"
+        );
+        None
+    };
     let url = config
         .catalog_url(secrets)
         .ok_or_else(|| ServerError::InvalidConfig("catalog url missing".into()))?;
@@ -73,16 +83,23 @@ pub async fn bootstrap(
         bucket::probe_write(store.as_ref(), &root).await?;
     }
 
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let health = Arc::new(crate::health::Health::default());
+    if let Some(tls) = &tls {
+        metrics.register_tls(tls.stats());
+        health.follow_tls(tls.stats());
+    }
     Ok(Context {
         config: Arc::new(config),
         catalog,
         store,
         root,
         node_id,
-        metrics: Arc::new(crate::metrics::Metrics::default()),
+        metrics,
         ownership,
-        health: Arc::new(crate::health::Health::default()),
+        health,
         ingest_override: None,
+        tls,
     })
 }
 
@@ -227,6 +244,13 @@ pub async fn run_with(
     let mut http = start_health(&ctx, http_stop_rx, &forwarder).await?;
 
     let mut tasks: JoinSet<(&'static str, Result<(), ServerError>)> = JoinSet::new();
+    if let Some(tls) = ctx.tls.clone() {
+        let rx = stop_rx.clone();
+        tasks.spawn(async move {
+            tls.run(rx).await;
+            ("tls", Ok(()))
+        });
+    }
     for r in role.expand() {
         let ctx = ctx.clone();
         let rx = stop_rx.clone();

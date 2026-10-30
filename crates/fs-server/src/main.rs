@@ -21,8 +21,9 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check] [--version]
        fusescope-engine --config <file> admin tenant create <name>
        fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
-       FS_QUERY_TOKEN=<token> fusescope-engine admin query <addr> <sql>
-       FS_QUERY_TOKEN=<token> fusescope-engine admin action <addr> <type> [json]";
+       FS_QUERY_TOKEN=<token> fusescope-engine [--config <file>] admin query <addr> <sql>
+       FS_QUERY_TOKEN=<token> fusescope-engine [--config <file>] admin action <addr> <type> [json]
+       (admin query and action go over mTLS when the configuration turns [tls] on)";
 
 #[derive(Debug)]
 struct Args {
@@ -164,6 +165,23 @@ async fn shutdown_signal(tx: watch::Sender<bool>) {
     let _ = tx.send(true);
 }
 
+/// The TLS of the configuration at `path`, when one is given and turns it on.
+fn client_tls(
+    path: Option<&std::path::Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<std::sync::Arc<fs_auth::Tls>>, ServerError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let mut config = Config::load(path)?;
+    config.apply_env(env)?;
+    config.tls.validate()?;
+    match config.tls.files() {
+        Some(files) => Ok(Some(fs_auth::Tls::load(files, config.tls.limits())?)),
+        None => Ok(None),
+    }
+}
+
 async fn real_main(args: Args) -> Result<(), ServerError> {
     let query_token = || {
         Secrets::from_env(&env).query_token.ok_or_else(|| {
@@ -174,12 +192,27 @@ async fn real_main(args: Args) -> Result<(), ServerError> {
     };
     let admin = match args.admin {
         Some(Admin::Query { addr, sql }) => {
-            let batches = client::query(&addr, &query_token()?, &sql).await?;
+            let tls = client_tls(args.config.as_deref(), &env)?;
+            let batches = client::query(
+                &addr,
+                &query_token()?,
+                &sql,
+                tls.as_ref().map(|t| t.client()).as_ref(),
+            )
+            .await?;
             println!("{}", client::render(&batches)?);
             return Ok(());
         }
         Some(Admin::Action { addr, kind, body }) => {
-            let batches = client::action(&addr, &query_token()?, &kind, &body).await?;
+            let tls = client_tls(args.config.as_deref(), &env)?;
+            let batches = client::action(
+                &addr,
+                &query_token()?,
+                &kind,
+                &body,
+                tls.as_ref().map(|t| t.client()).as_ref(),
+            )
+            .await?;
             println!("{}", client::render(&batches)?);
             return Ok(());
         }

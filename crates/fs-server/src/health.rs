@@ -19,6 +19,7 @@ pub struct Health {
     bucket_ok: AtomicBool,
     wal_open: AtomicBool,
     has_ingester: AtomicBool,
+    tls: std::sync::OnceLock<std::sync::Arc<fs_auth::TlsStats>>,
 }
 
 /// What the last probe of a dependency found.
@@ -64,6 +65,29 @@ impl WalState {
     }
 }
 
+/// The process's TLS, as far as readiness reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsState {
+    /// Off: plain text.
+    Off,
+    /// On, serving what the files hold.
+    Current,
+    /// On, but the last reload failed: new connections get the last good
+    /// config. Reported, not counted against readiness, since the process
+    /// still serves and every replica would read the same broken files.
+    Stale,
+}
+
+impl TlsState {
+    fn name(self) -> &'static str {
+        match self {
+            TlsState::Off => "off",
+            TlsState::Current => "current",
+            TlsState::Stale => "stale",
+        }
+    }
+}
+
 /// One readiness verdict with what it was made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Readiness {
@@ -79,20 +103,23 @@ pub struct Readiness {
     pub wal: WalState,
     /// A stop was asked for and the roles are finishing.
     pub draining: bool,
+    /// The process's TLS.
+    pub tls: TlsState,
 }
 
 impl Readiness {
     /// One line per fact, the verdict first.
     pub fn render(&self) -> String {
         format!(
-            "{}\nroles={}/{}\ncatalog={}\nbucket={}\nwal={}\ndraining={}\n",
+            "{}\nroles={}/{}\ncatalog={}\nbucket={}\nwal={}\ndraining={}\ntls={}\n",
             if self.ready { "ready" } else { "not ready" },
             self.roles.0,
             self.roles.1,
             self.catalog.name(),
             self.bucket.name(),
             self.wal.name(),
-            self.draining
+            self.draining,
+            self.tls.name()
         )
     }
 }
@@ -103,6 +130,11 @@ impl Health {
     pub fn expect(&self, roles: usize, ingester: bool) {
         self.expected.store(roles, Ordering::SeqCst);
         self.has_ingester.store(ingester, Ordering::SeqCst);
+    }
+
+    /// Reports the state of the process's TLS from `stats`.
+    pub fn follow_tls(&self, stats: std::sync::Arc<fs_auth::TlsStats>) {
+        let _ = self.tls.set(stats);
     }
 
     /// One role is serving.
@@ -172,6 +204,11 @@ impl Health {
             bucket: Probe::of(bucket_ok),
             wal,
             draining,
+            tls: match self.tls.get() {
+                None => TlsState::Off,
+                Some(stats) if stats.stale.load(Ordering::Relaxed) => TlsState::Stale,
+                Some(_) => TlsState::Current,
+            },
         }
     }
 }
@@ -194,8 +231,16 @@ mod tests {
         assert!(health.readiness().ready);
         assert_eq!(
             health.readiness().render(),
-            "ready\nroles=2/2\ncatalog=ok\nbucket=ok\nwal=open\ndraining=false\n"
+            "ready\nroles=2/2\ncatalog=ok\nbucket=ok\nwal=open\ndraining=false\ntls=off\n"
         );
+        let tls = std::sync::Arc::new(fs_auth::TlsStats::default());
+        health.follow_tls(std::sync::Arc::clone(&tls));
+        assert_eq!(health.readiness().tls, TlsState::Current);
+        tls.stale.store(true, Ordering::Relaxed);
+        let stale = health.readiness();
+        assert_eq!(stale.tls, TlsState::Stale);
+        assert!(stale.ready, "a stale config still serves");
+        assert!(stale.render().ends_with("tls=stale\n"));
         health.bucket(false);
         assert!(!health.readiness().ready);
         health.bucket(true);
