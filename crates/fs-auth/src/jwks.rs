@@ -47,6 +47,8 @@ impl KeySet {
             alg: Option<String>,
             #[serde(rename = "use")]
             usage: Option<String>,
+            key_ops: Option<Vec<String>>,
+            d: Option<serde_json::Value>,
         }
         let set: Set = serde_json::from_slice(bytes).map_err(|e| format!("not a JWK set: {e}"))?;
         if set.keys.is_empty() {
@@ -58,10 +60,19 @@ impl KeySet {
             if jwk.kty != "OKP" || jwk.crv.as_deref() != Some("Ed25519") {
                 return Err(at("is not an Ed25519 key (kty OKP, crv Ed25519)"));
             }
+            if jwk.d.is_some() {
+                return Err(at(
+                    "holds private key material (d); publish only the public key",
+                ));
+            }
             if jwk.alg.as_deref().is_some_and(|alg| alg != "EdDSA")
                 || jwk.usage.as_deref().is_some_and(|usage| usage != "sig")
+                || jwk
+                    .key_ops
+                    .as_ref()
+                    .is_some_and(|ops| ops.is_empty() || ops.iter().any(|op| op != "verify"))
             {
-                return Err(at("is not for EdDSA signatures"));
+                return Err(at("is not for verifying EdDSA signatures"));
             }
             let kid = jwk
                 .kid
@@ -222,6 +233,18 @@ mod tests {
                 r#""kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}","use":"enc""#
             )),
             key(r#""kty":"OKP","crv":"Ed25519","kid":"k1","x":"AAAA""#),
+            key(&format!(
+                r#""kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}","key_ops":["encrypt"]"#
+            )),
+            key(&format!(
+                r#""kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}","key_ops":["verify","sign"]"#
+            )),
+            key(&format!(
+                r#""kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}","key_ops":[]"#
+            )),
+            key(&format!(
+                r#""kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}","d":"{X}""#
+            )),
             format!(
                 r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}"}},{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{X}"}}]}}"#
             ),
