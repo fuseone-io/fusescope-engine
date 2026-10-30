@@ -19,7 +19,7 @@ to that bundle in a derived image, not configured in the engine.
 
 Run it with a read-only root and the two state paths mounted; nothing else
 is written. The WAL holds rows not yet flushed and must survive a restart,
-so in Kubernetes it is a persistent volume per ingester; the spill path is
+so in Kubernetes it is a persistent volume per ingester (`docs/ops/helm.md`); the spill path is
 scratch for large sorts and joins and may be an `emptyDir`.
 
 ```sh
