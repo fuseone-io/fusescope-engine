@@ -17,8 +17,8 @@ use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use fs_catalog::Compaction;
 use fs_catalog::{
-    COMPACTOR_LEASE, Catalog, CatalogError, FileRecord, LeaseFence, Level, NewTenant, Signal,
-    TenantId,
+    COMPACTOR_LEASE, Catalog, CatalogError, FileId, FileRecord, LeaseFence, Level, NewFile,
+    NewTenant, Signal, TenantId, TimeRange,
 };
 use fs_compactor::{
     CompactError, CompactionConfig, Compactor, CompactorStats, Rebuild, Retention, RetentionConfig,
@@ -206,10 +206,16 @@ async fn write_l0_for(
     spans: u8,
     attribute: (&str, &str),
 ) -> FileRecord {
+    write_request_l0(f, tenant, request(service, trace, start, spans, attribute)).await
+}
+
+async fn write_request_l0(
+    f: &Fixture,
+    tenant: TenantId,
+    request: ExportTraceServiceRequest,
+) -> FileRecord {
     let mut builder = SpanBatchBuilder::new(Limits::default());
-    builder
-        .append_request(&request(service, trace, start, spans, attribute))
-        .unwrap();
+    builder.append_request(&request).unwrap();
     let batch = builder.finish().unwrap();
     let prepared = flush::prepare(
         tenant,
@@ -292,6 +298,10 @@ fn compactor(f: &Fixture) -> Compactor {
             l1_target_bytes: 512 * 1024 * 1024,
             max_inputs_per_pass: 16,
             max_input_bytes: 2 << 30,
+            trace_summary_max_traces: 4_000_000,
+            trace_summary_max_bytes: 256 << 20,
+            service_graph_max_spans: 4_000_000,
+            service_graph_max_bytes: 256 << 20,
             row_group_rows: 4,
             inject_swap_failures: 0,
             inject_put_failure_at: None,
@@ -366,6 +376,116 @@ async fn objects_under(f: &Fixture, part: &str) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+#[tokio::test]
+async fn retention_expires_trace_and_per_pass_derived_files_with_the_same_day() {
+    let Some(f) = fixture().await else { return };
+    let before = f.cut - chrono::Duration::hours(2);
+    for signal in [Signal::Traces, Signal::TraceSummary, Signal::ServiceGraph1m] {
+        let id = FileId::new();
+        let path = format!(
+            "t/{}/{}/dt={}/hr={:02}/{}.parquet",
+            f.tenant.0,
+            signal.path_name(),
+            before.format("%Y-%m-%d"),
+            before.format("%H"),
+            id.0
+        );
+        f.db.catalog
+            .register_file(&NewFile {
+                id,
+                origin: id,
+                tenant_id: f.tenant,
+                signal,
+                level: Level::L1,
+                path,
+                size_bytes: 1,
+                row_count: 1,
+                range: TimeRange {
+                    start: before,
+                    end: before + chrono::Duration::minutes(1),
+                },
+                services: Vec::new(),
+                summary: None,
+            })
+            .await
+            .unwrap();
+    }
+    let retention = retention(&f, retention_config());
+    let fence = fence(&f).await;
+    let mut expired = Vec::new();
+    for _ in 0..3 {
+        let pass = retention.expire_once(&fence).await.unwrap().unwrap();
+        expired.push(pass.files[0].signal);
+    }
+    assert_eq!(
+        expired,
+        [Signal::Traces, Signal::TraceSummary, Signal::ServiceGraph1m]
+    );
+    for signal in expired {
+        assert_eq!(
+            f.db.catalog
+                .all_visible_files(f.tenant, signal)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+    assert!(retention.expire_once(&fence).await.unwrap().is_none());
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn a_distant_span_end_does_not_keep_its_hourly_summary_past_retention() {
+    let Some(f) = fixture().await else { return };
+    let start = f.at(-2);
+    let mut distant = request("api", 1, start, 1, ("k", "v"));
+    distant.resource_spans[0].scope_spans[0].spans[0].end_time_unix_nano = u64::MAX;
+    let first = write_request_l0(&f, f.tenant, distant).await;
+    let second = write_l0(&f, "api", 2, start + 1_000_000, 1, ("k", "v")).await;
+    let c = compactor(&f);
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+
+    let traces =
+        f.db.catalog
+            .all_visible_files(f.tenant, Signal::Traces)
+            .await
+            .unwrap();
+    let summaries =
+        f.db.catalog
+            .all_visible_files(f.tenant, Signal::TraceSummary)
+            .await
+            .unwrap();
+    assert_eq!(traces.len(), 1, "the two inputs became one L1");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].range, traces[0].range, "both use span starts");
+    assert!(summaries[0].range.end < f.cut);
+
+    let r = retention(
+        &f,
+        RetentionConfig {
+            files_per_pass: 10,
+            ..retention_config()
+        },
+    );
+    let fence = fence(&f).await;
+    let mut expired = Vec::new();
+    for _ in 0..3 {
+        let Some(pass) = r.expire_once(&fence).await.unwrap() else {
+            break;
+        };
+        expired.extend(pass.files);
+    }
+    assert!(expired.iter().any(|file| file.id == traces[0].id));
+    assert!(expired.iter().any(|file| file.id == summaries[0].id));
+    assert!(
+        expired
+            .iter()
+            .all(|file| file.id != first.id && file.id != second.id)
+    );
+    f.db.finish().await;
 }
 
 /// Files whose rows all ended before the tenant's cut, a UTC day boundary
@@ -507,6 +627,9 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         1,
         "the L1 of the hour beyond retention"
     );
+    let summary = r.expire_once(&fence).await.unwrap().unwrap();
+    assert_eq!(summary.files.len(), 1);
+    assert_eq!(summary.files[0].signal, Signal::TraceSummary);
     assert!(r.expire_once(&fence).await.unwrap().is_none());
     assert_eq!(
         tables(&f).await[0].id,
@@ -618,6 +741,11 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
     assert_eq!(
         r.expire_once(&fence).await.unwrap().unwrap().tenant_id,
         other
+    );
+    assert_eq!(
+        r.expire_once(&fence).await.unwrap().unwrap().tenant_id,
+        other,
+        "the per-pass trace summary expires with the same day"
     );
     assert!(r.expire_once(&fence).await.unwrap().is_none());
     std::fs::write(f.dir.path().join(&others_table[0].path), b"not parquet").unwrap();
@@ -932,6 +1060,10 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
                 l1_target_bytes: 512 * 1024 * 1024,
                 max_inputs_per_pass: 16,
                 max_input_bytes: 2 << 30,
+                trace_summary_max_traces: 4_000_000,
+                trace_summary_max_bytes: 256 << 20,
+                service_graph_max_spans: 4_000_000,
+                service_graph_max_bytes: 256 << 20,
                 row_group_rows: 4,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
@@ -983,7 +1115,11 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
         stats.retention.rebuild_failures.load(Ordering::Relaxed) >= 1,
         "the broken tenant failed, the walk went on"
     );
-    assert_eq!(stats.retention.expired.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        stats.retention.expired.load(Ordering::Relaxed),
+        4,
+        "two expired L1 files and their trace summaries"
+    );
     assert_eq!(visible(&f).await.len(), 1, "the L1 of the hour kept");
     std::fs::write(f.dir.path().join(&kept.path), good).unwrap();
     f.db.finish().await;

@@ -374,84 +374,8 @@ impl Metrics {
         let Some(stats) = self.compactor.get() else {
             return;
         };
-        let c = &stats.compaction;
-        let o = &stats.orphans;
-        let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
-        for (name, help, value) in [
-            (
-                "fusescope_compaction_passes_total",
-                "Compaction passes that swapped outputs in",
-                load(&c.passes),
-            ),
-            (
-                "fusescope_compaction_inputs_total",
-                "L0 files merged by completed passes",
-                load(&c.inputs),
-            ),
-            (
-                "fusescope_compaction_outputs_total",
-                "L1 files published by completed passes",
-                load(&c.outputs),
-            ),
-            (
-                "fusescope_compaction_rows_total",
-                "Rows written by completed passes",
-                load(&c.rows),
-            ),
-            (
-                "fusescope_compaction_input_bytes_total",
-                "Bytes of inputs merged by completed passes",
-                load(&c.input_bytes),
-            ),
-            (
-                "fusescope_compaction_output_bytes_total",
-                "Bytes of outputs published by completed passes",
-                load(&c.output_bytes),
-            ),
-            (
-                "fusescope_compaction_conflicts_total",
-                "Swaps refused because an input was no longer visible",
-                load(&c.conflicts),
-            ),
-            (
-                "fusescope_compaction_lease_lost_total",
-                "Swaps refused because the lease had changed hands",
-                load(&c.lease_lost),
-            ),
-            (
-                "fusescope_compaction_failures_total",
-                "Passes that failed for any other reason",
-                load(&c.failures),
-            ),
-            (
-                "fusescope_compaction_orphaned_total",
-                "Outputs uploaded by passes that did not publish them",
-                load(&c.orphaned),
-            ),
-            (
-                "fusescope_compaction_skipped_total",
-                "Hours skipped because their two oldest files exceed the input cap",
-                load(&c.skipped),
-            ),
-            (
-                "fusescope_compaction_derived_total",
-                "attribute_keys tables rebuilt by completed passes",
-                load(&c.derived),
-            ),
-            (
-                "fusescope_compaction_derived_unreadable_total",
-                "Passes aborted because the attribute_keys table before could not be read",
-                load(&c.derived_unreadable),
-            ),
-            (
-                "fusescope_compaction_derived_keys_dropped_total",
-                "Entries of attribute keys beyond the tenant's max_keys_hour not counted",
-                load(&c.derived_keys_dropped),
-            ),
-        ] {
-            counter(out, name, help, value);
-        }
-        render_orphans(out, o);
+        render_compaction(out, &stats.compaction);
+        render_orphans(out, &stats.orphans);
         render_retention(out, &stats.retention);
     }
 
@@ -548,6 +472,104 @@ impl Metrics {
                 q.prepared_bytes.load(Ordering::Relaxed),
             );
         }
+    }
+}
+
+fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    for (name, help, value) in [
+        (
+            "fusescope_compaction_passes_total",
+            "Compaction passes that swapped outputs in",
+            load(&c.passes),
+        ),
+        (
+            "fusescope_compaction_inputs_total",
+            "L0 files merged by completed passes",
+            load(&c.inputs),
+        ),
+        (
+            "fusescope_compaction_outputs_total",
+            "L1 files published by completed passes",
+            load(&c.outputs),
+        ),
+        (
+            "fusescope_compaction_rows_total",
+            "Rows written by completed passes",
+            load(&c.rows),
+        ),
+        (
+            "fusescope_compaction_input_bytes_total",
+            "Bytes of inputs merged by completed passes",
+            load(&c.input_bytes),
+        ),
+        (
+            "fusescope_compaction_output_bytes_total",
+            "Bytes of outputs published by completed passes",
+            load(&c.output_bytes),
+        ),
+        (
+            "fusescope_compaction_conflicts_total",
+            "Swaps refused because an input was no longer visible",
+            load(&c.conflicts),
+        ),
+        (
+            "fusescope_compaction_lease_lost_total",
+            "Swaps refused because the lease had changed hands",
+            load(&c.lease_lost),
+        ),
+        (
+            "fusescope_compaction_failures_total",
+            "Passes that failed for any other reason",
+            load(&c.failures),
+        ),
+        (
+            "fusescope_compaction_orphaned_total",
+            "Outputs uploaded by passes that did not publish them",
+            load(&c.orphaned),
+        ),
+        (
+            "fusescope_compaction_skipped_total",
+            "Hours skipped because their two oldest files exceed the input cap",
+            load(&c.skipped),
+        ),
+        (
+            "fusescope_compaction_derived_total",
+            "attribute_keys tables rebuilt by completed passes",
+            load(&c.derived),
+        ),
+        (
+            "fusescope_compaction_derived_unreadable_total",
+            "Passes aborted because the attribute_keys table before could not be read",
+            load(&c.derived_unreadable),
+        ),
+        (
+            "fusescope_compaction_derived_keys_dropped_total",
+            "Entries of attribute keys beyond the tenant's max_keys_hour not counted",
+            load(&c.derived_keys_dropped),
+        ),
+        (
+            "fusescope_compaction_trace_summary_total",
+            "trace_summary contribution files published",
+            load(&c.trace_summary),
+        ),
+        (
+            "fusescope_compaction_trace_summary_skipped_total",
+            "Completed passes whose trace count crossed the summary cap",
+            load(&c.trace_summary_skipped),
+        ),
+        (
+            "fusescope_compaction_service_graph_total",
+            "service_graph_1m contribution files published",
+            load(&c.service_graph),
+        ),
+        (
+            "fusescope_compaction_service_graph_skipped_total",
+            "Completed passes whose span count crossed the graph cap",
+            load(&c.service_graph_skipped),
+        ),
+    ] {
+        counter(out, name, help, value);
     }
 }
 
@@ -807,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_compactor_and_query_counters_in_exposition_format() {
+    fn renders_compactor_counters_in_exposition_format() {
         let metrics = Metrics::default();
         let compactor = Arc::new(fs_compactor::Stats::default());
         compactor.compaction.passes.fetch_add(4, Ordering::Relaxed);
@@ -824,6 +846,14 @@ mod tests {
             .compaction
             .derived_keys_dropped
             .fetch_add(7, Ordering::Relaxed);
+        compactor
+            .compaction
+            .trace_summary
+            .fetch_add(8, Ordering::Relaxed);
+        compactor
+            .compaction
+            .service_graph_skipped
+            .fetch_add(9, Ordering::Relaxed);
         compactor.orphans.deleted.fetch_add(6, Ordering::Relaxed);
         compactor.retention.expired.fetch_add(5, Ordering::Relaxed);
         compactor
@@ -857,6 +887,14 @@ mod tests {
             "{page}"
         );
         assert!(
+            page.contains("fusescope_compaction_trace_summary_total 8\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_compaction_service_graph_skipped_total 9\n"),
+            "{page}"
+        );
+        assert!(
             page.contains("fusescope_retention_expired_total 5\n"),
             "{page}"
         );
@@ -868,6 +906,16 @@ mod tests {
             page.contains("fusescope_retention_rebuilds_total 0\n"),
             "{page}"
         );
+        assert!(page.lines().all(|l| {
+            l.starts_with('#')
+                || l.split_once(' ')
+                    .is_some_and(|(_, v)| v.parse::<u64>().is_ok())
+        }));
+    }
+
+    #[test]
+    fn renders_query_counters_in_exposition_format() {
+        let metrics = Metrics::default();
         let query = Arc::new(fs_query::QueryStats::default());
         query.plannings.fetch_add(2, Ordering::Relaxed);
         query.trace_lookups.fetch_add(3, Ordering::Relaxed);
@@ -900,10 +948,5 @@ mod tests {
             ),
             "{page}"
         );
-        assert!(page.lines().all(|l| {
-            l.starts_with('#')
-                || l.split_once(' ')
-                    .is_some_and(|(_, v)| v.parse::<u64>().is_ok())
-        }));
     }
 }

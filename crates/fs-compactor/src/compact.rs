@@ -17,6 +17,8 @@ use fs_catalog::{
     Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, NewFile, Signal,
 };
 use fs_schema::attribute_keys::KeyStats;
+use fs_schema::service_graph::ServiceGraphBuilder;
+use fs_schema::trace_summary::TraceSummaries;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tracing::{info, warn};
@@ -25,6 +27,9 @@ use crate::CompactError;
 use crate::derived::{read_table, table_file};
 use crate::merge::{L1Merger, MergeConfig};
 use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
+
+/// Hard ceiling for the two C6 builders retained by one pass together.
+pub const MAX_DERIVED_BUILDER_BYTES: usize = 1024 * 1024 * 1024;
 
 /// What one pass is allowed to take on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +44,14 @@ pub struct CompactionConfig {
     /// Most input bytes one pass merges, a ceiling: an hour whose two
     /// oldest files do not fit is skipped and reported.
     pub max_input_bytes: u64,
+    /// Most distinct traces retained to build one pass's summary.
+    pub trace_summary_max_traces: usize,
+    /// Conservative bytes retained to build one pass's summary.
+    pub trace_summary_max_bytes: usize,
+    /// Most spans retained to build one pass's service graph.
+    pub service_graph_max_spans: usize,
+    /// Conservative bytes retained to build one pass's service graph.
+    pub service_graph_max_bytes: usize,
     /// Rows per output row group.
     pub row_group_rows: usize,
     /// Make this many swaps fail artificially after the outputs are
@@ -86,12 +99,36 @@ pub struct CompactorStats {
     /// Entries of keys beyond the tenant's `max_keys_hour` a pass did not
     /// count.
     pub derived_keys_dropped: AtomicU64,
+    /// `trace_summary` contribution files published.
+    pub trace_summary: AtomicU64,
+    /// Completed passes whose trace count crossed the summary cap.
+    pub trace_summary_skipped: AtomicU64,
+    /// `service_graph_1m` contribution files published.
+    pub service_graph: AtomicU64,
+    /// Completed passes whose span count crossed the graph cap.
+    pub service_graph_skipped: AtomicU64,
 }
 
 impl CountsOrphans for CompactorStats {
     fn count_orphans(&self, created: u64) {
         self.orphaned.fetch_add(created, Ordering::Relaxed);
     }
+}
+
+/// Partial derived data accumulated while the pass streamed its inputs.
+struct DerivedContributions {
+    keys: KeyStats,
+    summaries: Option<TraceSummaries>,
+    service_graph: Option<ServiceGraphBuilder>,
+}
+
+/// Catalog rows for the derived objects uploaded by a pass.
+struct PublishedDerived {
+    keys: Option<NewFile>,
+    summaries: Option<NewFile>,
+    service_graph: Option<NewFile>,
+    summary_skipped: bool,
+    service_graph_skipped: bool,
 }
 
 /// The compaction side of the compactor.
@@ -114,9 +151,16 @@ impl Compactor {
         catalog: Catalog,
         store: Arc<dyn ObjectStore>,
         root: Path,
-        config: CompactionConfig,
+        mut config: CompactionConfig,
         stats: Arc<CompactorStats>,
     ) -> Self {
+        (
+            config.trace_summary_max_bytes,
+            config.service_graph_max_bytes,
+        ) = bounded_derived_bytes(
+            config.trace_summary_max_bytes,
+            config.service_graph_max_bytes,
+        );
         let inject = config.inject_swap_failures;
         Self {
             catalog,
@@ -250,6 +294,10 @@ impl Compactor {
                 row_group_rows: self.config.row_group_rows,
                 target_bytes: self.config.l1_target_bytes,
                 max_new_keys,
+                trace_summary_max_traces: self.config.trace_summary_max_traces,
+                trace_summary_max_bytes: self.config.trace_summary_max_bytes,
+                service_graph_max_spans: self.config.service_graph_max_spans,
+                service_graph_max_bytes: self.config.service_graph_max_bytes,
             },
             table_before,
         )
@@ -278,39 +326,31 @@ impl Compactor {
                 file: output.file,
             });
         }
-        let keys = merger.take_keys();
+        let contributions = DerivedContributions {
+            keys: merger.take_keys(),
+            summaries: merger.take_trace_summaries(),
+            service_graph: merger.take_service_graph(),
+        };
         drop(merger);
-        if keys.dropped() > 0 {
-            self.stats
-                .derived_keys_dropped
-                .fetch_add(keys.dropped(), Ordering::Relaxed);
-            warn!(
-                role = "compactor",
-                tenant = %tenant.0,
-                hour = %hour,
-                admitted = keys.new_keys(),
-                dropped = keys.dropped(),
-                "attribute keys beyond max_keys_hour were not counted"
-            );
-        }
+        self.report_dropped_keys(tenant, hour, &contributions.keys);
         let derived = self
-            .publish_attribute_keys(tenant, hour, &keys, &mut guard, &mut puts)
+            .publish_derived(tenant, hour, contributions, &mut guard, &mut puts)
             .await?;
         let compaction = self
-            .swap(tenant, &owned, &replaced, &outputs, derived.as_ref(), fence)
+            .swap(tenant, &owned, &replaced, &outputs, &derived, fence)
             .await?;
         guard.armed = false;
         self.count(&owned, &outputs);
-        if derived.is_some() {
-            self.stats.derived.fetch_add(1, Ordering::Relaxed);
-        }
+        self.count_derived(&derived);
         info!(
             role = "compactor",
             tenant = %tenant.0,
             hour = %hour,
             inputs = owned.len(),
             outputs = outputs.len(),
-            derived = derived.is_some(),
+            derived = derived.keys.is_some(),
+            trace_summary = derived.summaries.is_some(),
+            service_graph = derived.service_graph.is_some(),
             "compacted"
         );
         Ok(compaction)
@@ -352,17 +392,112 @@ impl Compactor {
         Ok((keys.settled(), replaced))
     }
 
-    /// Uploads `keys` as the tenant's `attribute_keys` table of this pass:
-    /// the file for the swap, or `None` when there is nothing to list.
-    async fn publish_attribute_keys(
+    fn report_dropped_keys(
         &self,
         tenant: fs_catalog::TenantId,
         hour: chrono::DateTime<chrono::Utc>,
         keys: &KeyStats,
+    ) {
+        if keys.dropped() == 0 {
+            return;
+        }
+        self.stats
+            .derived_keys_dropped
+            .fetch_add(keys.dropped(), Ordering::Relaxed);
+        warn!(
+            role = "compactor",
+            tenant = %tenant.0,
+            hour = %hour,
+            admitted = keys.new_keys(),
+            dropped = keys.dropped(),
+            "attribute keys beyond max_keys_hour were not counted"
+        );
+    }
+
+    async fn publish_derived(
+        &self,
+        tenant: fs_catalog::TenantId,
+        hour: chrono::DateTime<chrono::Utc>,
+        contributions: DerivedContributions,
+        guard: &mut OrphanGuard<CompactorStats>,
+        puts: &mut usize,
+    ) -> Result<PublishedDerived, CompactError> {
+        let DerivedContributions {
+            keys,
+            summaries,
+            service_graph,
+        } = contributions;
+        let root = self.root.clone();
+        let keys =
+            tokio::task::spawn_blocking(move || table_file(&root, tenant, hour, &keys)).await??;
+        let keys = self.publish_prepared(keys, guard, puts).await?;
+
+        let summary_skipped = summaries.is_none();
+        let summaries = match summaries {
+            Some(rows) => {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::derived::trace_summary_file(&root, tenant, hour, &rows)
+                })
+                .await??
+            }
+            None => None,
+        };
+        let summaries = self.publish_prepared(summaries, guard, puts).await?;
+
+        let service_graph_skipped = service_graph
+            .as_ref()
+            .is_some_and(ServiceGraphBuilder::skipped);
+        let service_graph = match service_graph {
+            Some(builder) => {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || match builder.finish() {
+                    Some(rows) => crate::derived::service_graph_file(&root, tenant, hour, &rows),
+                    None => Ok(None),
+                })
+                .await??
+            }
+            None => None,
+        };
+        let service_graph = self.publish_prepared(service_graph, guard, puts).await?;
+        Ok(PublishedDerived {
+            keys,
+            summaries,
+            service_graph,
+            summary_skipped,
+            service_graph_skipped,
+        })
+    }
+
+    fn count_derived(&self, published: &PublishedDerived) {
+        if published.keys.is_some() {
+            self.stats.derived.fetch_add(1, Ordering::Relaxed);
+        }
+        if published.summaries.is_some() {
+            self.stats.trace_summary.fetch_add(1, Ordering::Relaxed);
+        } else if published.summary_skipped {
+            self.stats
+                .trace_summary_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if published.service_graph.is_some() {
+            self.stats.service_graph.fetch_add(1, Ordering::Relaxed);
+        } else if published.service_graph_skipped {
+            self.stats
+                .service_graph_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Uploads `keys` as the tenant's `attribute_keys` table of this pass:
+    /// the file for the swap, or `None` when there is nothing to list.
+    async fn publish_prepared(
+        &self,
+        prepared: Option<(NewFile, Bytes)>,
         guard: &mut OrphanGuard<CompactorStats>,
         puts: &mut usize,
     ) -> Result<Option<NewFile>, CompactError> {
-        let Some((file, bytes)) = table_file(&self.root, tenant, hour, keys)? else {
+        let Some((file, bytes)) = prepared else {
             return Ok(None);
         };
         self.put_once(&file.path, bytes, puts).await?;
@@ -376,7 +511,7 @@ impl Compactor {
         inputs: &[FileRecord],
         replaced: &[(Signal, FileId)],
         outputs: &[Published],
-        derived: Option<&NewFile>,
+        derived: &PublishedDerived,
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         if take_injected(&self.inject_swap_failures) {
@@ -386,7 +521,9 @@ impl Compactor {
         let files: Vec<NewFile> = outputs
             .iter()
             .map(|o| o.file.clone())
-            .chain(derived.cloned())
+            .chain(derived.keys.clone())
+            .chain(derived.summaries.clone())
+            .chain(derived.service_graph.clone())
             .collect();
         Ok(self
             .catalog
@@ -437,8 +574,41 @@ impl Compactor {
     }
 }
 
+fn bounded_derived_bytes(summary: usize, graph: usize) -> (usize, usize) {
+    let summary = summary.clamp(
+        fs_schema::trace_summary::TRACE_ENTRY_BYTES,
+        MAX_DERIVED_BUILDER_BYTES - fs_schema::service_graph::SPAN_ENTRY_BYTES,
+    );
+    let graph = graph.clamp(
+        fs_schema::service_graph::SPAN_ENTRY_BYTES,
+        MAX_DERIVED_BUILDER_BYTES - summary,
+    );
+    (summary, graph)
+}
+
 /// An output already in the bucket, waiting for the swap.
 struct Published {
     file: NewFile,
     bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derived_byte_limits_are_bounded_inside_the_compactor() {
+        let (summary, graph) = bounded_derived_bytes(usize::MAX, usize::MAX);
+        assert_eq!(summary + graph, MAX_DERIVED_BUILDER_BYTES);
+        assert!(summary >= fs_schema::trace_summary::TRACE_ENTRY_BYTES);
+        assert!(graph >= fs_schema::service_graph::SPAN_ENTRY_BYTES);
+
+        assert_eq!(
+            bounded_derived_bytes(0, 0),
+            (
+                fs_schema::trace_summary::TRACE_ENTRY_BYTES,
+                fs_schema::service_graph::SPAN_ENTRY_BYTES,
+            )
+        );
+    }
 }

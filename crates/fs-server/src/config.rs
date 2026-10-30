@@ -653,6 +653,18 @@ pub struct CompactorConfig {
     /// Most input bytes one compaction pass merges.
     #[serde(default = "default_max_input_bytes")]
     pub max_input_bytes: u64,
+    /// Most distinct traces retained for one pass's `trace_summary`.
+    #[serde(default = "default_trace_summary_max_traces")]
+    pub trace_summary_max_traces: usize,
+    /// Conservative bytes retained for one pass's `trace_summary` builder.
+    #[serde(default = "default_trace_summary_max_bytes")]
+    pub trace_summary_max_bytes: usize,
+    /// Most spans retained to resolve one pass's `service_graph_1m`.
+    #[serde(default = "default_service_graph_max_spans")]
+    pub service_graph_max_spans: usize,
+    /// Conservative bytes retained for one pass's `service_graph_1m` builder.
+    #[serde(default = "default_service_graph_max_bytes")]
+    pub service_graph_max_bytes: usize,
     /// How often the bucket is swept for objects without a catalog row.
     #[serde(default = "default_orphan_interval")]
     pub orphan_interval_secs: u64,
@@ -712,6 +724,10 @@ impl Default for CompactorConfig {
             l1_target_bytes: default_l1_target_bytes(),
             max_inputs_per_pass: default_max_inputs_per_pass(),
             max_input_bytes: default_max_input_bytes(),
+            trace_summary_max_traces: default_trace_summary_max_traces(),
+            trace_summary_max_bytes: default_trace_summary_max_bytes(),
+            service_graph_max_spans: default_service_graph_max_spans(),
+            service_graph_max_bytes: default_service_graph_max_bytes(),
             orphan_interval_secs: default_orphan_interval(),
             orphan_ttl_secs: default_orphan_ttl(),
             sweep_objects_per_pass: default_sweep_objects(),
@@ -742,6 +758,10 @@ impl CompactorConfig {
                 l1_target_bytes: self.l1_target_bytes,
                 max_inputs_per_pass: self.max_inputs_per_pass,
                 max_input_bytes: self.max_input_bytes,
+                trace_summary_max_traces: self.trace_summary_max_traces,
+                trace_summary_max_bytes: self.trace_summary_max_bytes,
+                service_graph_max_spans: self.service_graph_max_spans,
+                service_graph_max_bytes: self.service_graph_max_bytes,
                 row_group_rows,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
@@ -837,6 +857,22 @@ fn default_max_inputs_per_pass() -> usize {
 
 fn default_max_input_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
+}
+
+fn default_trace_summary_max_traces() -> usize {
+    4_000_000
+}
+
+fn default_trace_summary_max_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
+fn default_service_graph_max_spans() -> usize {
+    4_000_000
+}
+
+fn default_service_graph_max_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 fn default_purge_interval() -> u64 {
@@ -994,6 +1030,10 @@ impl Config {
 
     fn validate_compactor(&self) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
+        let derived_bytes = self
+            .compactor
+            .trace_summary_max_bytes
+            .checked_add(self.compactor.service_graph_max_bytes);
         if self.compactor.purge_batch <= 0 {
             return invalid("compactor.purge_batch must be positive");
         }
@@ -1005,9 +1045,15 @@ impl Config {
         if self.compactor.max_inputs_per_pass < 2
             || self.compactor.l1_target_bytes < 1024 * 1024
             || self.compactor.max_input_bytes < self.compactor.l1_target_bytes as u64
+            || self.compactor.trace_summary_max_traces == 0
+            || self.compactor.service_graph_max_spans == 0
+            || self.compactor.trace_summary_max_bytes < fs_schema::trace_summary::TRACE_ENTRY_BYTES
+            || self.compactor.service_graph_max_bytes < fs_schema::service_graph::SPAN_ENTRY_BYTES
+            || derived_bytes
+                .is_none_or(|bytes| bytes > fs_compactor::compact::MAX_DERIVED_BUILDER_BYTES)
         {
             return invalid(
-                "compactor.max_inputs_per_pass must be at least 2, l1_target_bytes at least 1 MiB and max_input_bytes at least l1_target_bytes",
+                "compactor input limits are invalid or derived-table count and byte caps exceed their bounds",
             );
         }
         if self.compactor.orphan_ttl_secs < 60
@@ -1688,6 +1734,39 @@ mod tests {
                 .to_string()
                 .contains("compactor.rebuilds_per_tick must be at most 256")
         );
+    }
+
+    #[test]
+    fn derived_builder_caps_convert_and_validate() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let config = Config::parse(MINIMAL).unwrap();
+        let compactor = config.compactor.to_compactor(config.ingest.row_group_rows);
+        assert_eq!(compactor.compaction.trace_summary_max_traces, 4_000_000);
+        assert_eq!(compactor.compaction.trace_summary_max_bytes, 256 << 20);
+        assert_eq!(compactor.compaction.service_graph_max_spans, 4_000_000);
+        assert_eq!(compactor.compaction.service_graph_max_bytes, 256 << 20);
+        for bad in [
+            "trace_summary_max_traces = 0",
+            "service_graph_max_spans = 0",
+            "trace_summary_max_bytes = 511",
+            "service_graph_max_bytes = 511",
+            "trace_summary_max_bytes = 1073741824\nservice_graph_max_bytes = 512",
+        ] {
+            let err = Config::parse(&format!(
+                "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\n{bad}\n"
+            ))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("derived-table count and byte caps"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

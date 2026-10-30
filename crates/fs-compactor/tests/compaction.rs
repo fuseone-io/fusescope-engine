@@ -31,7 +31,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
 
@@ -189,6 +189,10 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         l1_target_bytes: 512 * 1024 * 1024,
         max_inputs_per_pass: 16,
         max_input_bytes: 2 << 30,
+        trace_summary_max_traces: 4_000_000,
+        trace_summary_max_bytes: 256 << 20,
+        service_graph_max_spans: 4_000_000,
+        service_graph_max_bytes: 256 << 20,
         row_group_rows,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
@@ -339,8 +343,8 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     assert_eq!(done.inputs.len(), 3);
     assert_eq!(
         done.outputs.len(),
-        2,
-        "the L1 file and the attribute_keys table"
+        3,
+        "the L1, attribute_keys and trace_summary files"
     );
 
     let now = visible(&f).await;
@@ -401,6 +405,8 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     assert_eq!(stats.inputs.load(Ordering::Relaxed), 3);
     assert_eq!(stats.outputs.load(Ordering::Relaxed), 1);
     assert_eq!(stats.rows.load(Ordering::Relaxed), 18);
+    assert_eq!(stats.trace_summary.load(Ordering::Relaxed), 1);
+    assert_eq!(trace_summary_files(&f).await.len(), 1);
     assert!(
         c.compact_once(&fence(&f).await).await.unwrap().is_none(),
         "nothing left to compact"
@@ -428,8 +434,8 @@ async fn outputs_close_at_the_target_size() {
     let now = visible(&f).await;
     assert_eq!(
         now.len(),
-        done.outputs.len() - 1,
-        "every L1 output; the other output is the attribute_keys table"
+        done.outputs.len() - 2,
+        "every L1 output; the others are attribute_keys and trace_summary"
     );
     assert_eq!(now.iter().map(|x| x.row_count).sum::<i64>(), 18);
     let mut all_rows = Vec::new();
@@ -448,6 +454,260 @@ async fn outputs_close_at_the_target_size() {
         all_rows.windows(2).all(|w| w[0] <= w[1]),
         "outputs follow each other in order"
     );
+    f.db.finish().await;
+}
+
+fn graph_request(trace: u8, start: u64, error: bool) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "web")],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![trace; 16],
+                        span_id: vec![1; 8],
+                        name: "call".into(),
+                        kind: 3,
+                        start_time_unix_nano: start,
+                        end_time_unix_nano: start + 50_000_000,
+                        ..Span::default()
+                    }],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            },
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "api")],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![trace; 16],
+                        span_id: vec![2; 8],
+                        parent_span_id: vec![1; 8],
+                        name: "serve".into(),
+                        kind: 2,
+                        start_time_unix_nano: start + 1_000,
+                        end_time_unix_nano: start + 10_001_000,
+                        status: error.then_some(Status {
+                            code: 2,
+                            ..Status::default()
+                        }),
+                        ..Span::default()
+                    }],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            },
+        ],
+    }
+}
+
+/// Three L0 files whose spans produce a non-empty service graph.
+async fn three_closed_graph_l0(f: &Fixture, row_group_rows: usize) -> Vec<FileRecord> {
+    let start = nanos(closed_hour()) + 60_000_000_000;
+    let mut files = Vec::new();
+    for trace in 1..=3 {
+        files.push(
+            write_l0(
+                &f.db.catalog,
+                &f.store,
+                f.tenant,
+                &[graph_request(trace, start + u64::from(trace), trace == 1)],
+                row_group_rows,
+            )
+            .await,
+        );
+    }
+    registered_an_hour_ago(f, &files).await;
+    files
+}
+
+#[tokio::test]
+async fn a_pass_publishes_trace_and_service_graph_contributions_with_the_l1() {
+    let Some(f) = fixture().await else { return };
+    let start = nanos(closed_hour()) + 60_000_000_000;
+    let inputs = vec![
+        write_l0(
+            &f.db.catalog,
+            &f.store,
+            f.tenant,
+            &[graph_request(1, start, true)],
+            4,
+        )
+        .await,
+        write_l0(
+            &f.db.catalog,
+            &f.store,
+            f.tenant,
+            &[graph_request(2, start + 2_000_000, false)],
+            4,
+        )
+        .await,
+    ];
+    registered_an_hour_ago(&f, &inputs).await;
+    let c = compactor(&f, config(4));
+    let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    assert_eq!(done.outputs.len(), 4, "L1 and all three derived files");
+
+    let summaries = trace_summary_files(&f).await;
+    assert_eq!(summaries.len(), 1);
+    let summary = fs_schema::trace_summary::decode(
+        std::fs::read(f.dir.path().join(&summaries[0].path))
+            .unwrap()
+            .into(),
+    )
+    .unwrap();
+    assert_eq!(summary.len(), 2);
+    assert_eq!(summary.iter().map(|(_, row)| row.num_spans).sum::<u64>(), 4);
+
+    let graphs = service_graph_files(&f).await;
+    assert_eq!(graphs.len(), 1);
+    let graph = fs_schema::service_graph::decode(
+        std::fs::read(f.dir.path().join(&graphs[0].path))
+            .unwrap()
+            .into(),
+    )
+    .unwrap();
+    let edge = graph.iter().next().unwrap();
+    assert_eq!((edge.src.as_str(), edge.dst.as_str()), ("web", "api"));
+    assert_eq!((edge.count, edge.error_count), (2, 1));
+    assert!((edge.digest.quantile(0.99) - 10_000_000.0).abs() < 1.0);
+
+    let q = querier(&f);
+    let total = q
+        .collect(f.tenant, "select sum(num_spans) from trace_summary")
+        .await
+        .unwrap();
+    assert_eq!(
+        total[0]
+            .column(0)
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0),
+        4
+    );
+    let graph_rows = q
+        .collect(
+            f.tenant,
+            "select src, dst, sum(count), quantile_tdigest(digest, 0.99) \
+             from service_graph_1m group by src, dst",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        graph_rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1
+    );
+    let quantile = graph_rows[0]
+        .column(3)
+        .as_primitive::<arrow::datatypes::Float64Type>()
+        .value(0);
+    assert!((quantile - 10_000_000.0).abs() < 1.0);
+    let maximum = q
+        .collect(
+            f.tenant,
+            "select quantile_tdigest(digest, 1) from service_graph_1m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        maximum[0]
+            .column(0)
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0),
+        10_000_000.0
+    );
+    assert_eq!(c.stats().trace_summary.load(Ordering::Relaxed), 1);
+    assert_eq!(c.stats().service_graph.load(Ordering::Relaxed), 1);
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn two_passes_leave_partial_derived_files_that_queries_aggregate() {
+    let Some(f) = fixture().await else { return };
+    let start = nanos(closed_hour()) + 60_000_000_000;
+    let mut inputs = Vec::new();
+    for trace in 1..=4 {
+        inputs.push(
+            write_l0(
+                &f.db.catalog,
+                &f.store,
+                f.tenant,
+                &[graph_request(trace, start + u64::from(trace), trace == 1)],
+                4,
+            )
+            .await,
+        );
+    }
+    registered_an_hour_ago(&f, &inputs).await;
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            max_inputs_per_pass: 2,
+            ..config(4)
+        },
+    );
+    assert!(c.compact_once(&fence(&f).await).await.unwrap().is_some());
+    assert!(c.compact_once(&fence(&f).await).await.unwrap().is_some());
+    assert_eq!(trace_summary_files(&f).await.len(), 2);
+    assert_eq!(service_graph_files(&f).await.len(), 2);
+    let q = querier(&f);
+    let rows = q
+        .collect(f.tenant, "select sum(num_spans) from trace_summary")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0),
+        8
+    );
+    let graph = q
+        .collect(
+            f.tenant,
+            "select sum(count), sum(error_count) from service_graph_1m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        graph[0]
+            .column(0)
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0),
+        4
+    );
+    assert_eq!(
+        graph[0]
+            .column(1)
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0),
+        1
+    );
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn derived_caps_skip_whole_contributions_and_count_them() {
+    let Some(f) = fixture().await else { return };
+    three_closed_l0(&f, 4).await;
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            trace_summary_max_traces: 1,
+            service_graph_max_spans: 1,
+            ..config(4)
+        },
+    );
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    assert_eq!(trace_summary_files(&f).await.len(), 0);
+    assert_eq!(service_graph_files(&f).await.len(), 0);
+    assert_eq!(c.stats().trace_summary_skipped.load(Ordering::Relaxed), 1);
+    assert_eq!(c.stats().service_graph_skipped.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }
 
@@ -482,7 +742,7 @@ async fn a_pass_takes_the_oldest_inputs_up_to_its_limit() {
 #[tokio::test]
 async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     let Some(f) = fixture().await else { return };
-    let inputs = three_closed_l0(&f, 4).await;
+    let inputs = three_closed_graph_l0(&f, 4).await;
     let c = compactor(
         &f,
         CompactionConfig {
@@ -515,9 +775,25 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     );
     assert_eq!(attribute_keys_files(&f).await.len(), 0, "and has no row");
     assert_eq!(
+        objects_under(&f, "/traces/derived/trace_summary/")
+            .await
+            .len(),
+        1,
+        "the trace summary went up before the swap"
+    );
+    assert_eq!(trace_summary_files(&f).await.len(), 0, "and has no row");
+    assert_eq!(
+        objects_under(&f, "/traces/derived/service_graph_1m/")
+            .await
+            .len(),
+        1,
+        "the service graph went up before the swap"
+    );
+    assert_eq!(service_graph_files(&f).await.len(), 0, "and has no row");
+    assert_eq!(
         c.stats().orphaned.load(Ordering::Relaxed),
-        2,
-        "the L1 object and the attribute_keys table"
+        4,
+        "the L1 object and the three derived tables"
     );
     assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
 
@@ -527,6 +803,8 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     assert_eq!(now.len(), 1);
     assert!(orphans.iter().all(|o| o != &now[0].path), "fresh ids");
     assert_eq!(attribute_keys_files(&f).await.len(), 1);
+    assert_eq!(trace_summary_files(&f).await.len(), 1);
+    assert_eq!(service_graph_files(&f).await.len(), 1);
     f.db.finish().await;
 }
 
@@ -534,7 +812,7 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
 #[tokio::test]
 async fn a_stale_fence_publishes_nothing() {
     let Some(f) = fixture().await else { return };
-    let inputs = three_closed_l0(&f, 4).await;
+    let inputs = three_closed_graph_l0(&f, 4).await;
     let generation =
         f.db.catalog
             .acquire_lease(COMPACTOR_LEASE, "other", Duration::from_secs(60))
@@ -558,8 +836,8 @@ async fn a_stale_fence_publishes_nothing() {
     assert_eq!(c.stats().lease_lost.load(Ordering::Relaxed), 1);
     assert_eq!(
         c.stats().orphaned.load(Ordering::Relaxed),
-        2,
-        "the L1 object and the attribute_keys table"
+        4,
+        "the L1 object and the three derived tables"
     );
 
     // The real holder's fence works.
@@ -906,7 +1184,7 @@ async fn present(f: &Fixture, path: &str) -> bool {
 #[tokio::test]
 async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let Some(f) = fixture().await else { return };
-    let registered = three_closed_l0(&f, 4).await;
+    let registered = three_closed_graph_l0(&f, 4).await;
     // A compaction that uploads and does not publish: an L1 and its sidecar.
     let c = compactor(
         &f,
@@ -953,18 +1231,24 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let stats = sweeper.stats();
 
     let orphan_keys = derived_objects(&f).await.remove(0);
+    let orphan_summary = objects_under(&f, "/traces/derived/trace_summary/")
+        .await
+        .remove(0);
+    let orphan_graph = objects_under(&f, "/traces/derived/service_graph_1m/")
+        .await
+        .remove(0);
     let first = sweeper.sweep_once().await.unwrap();
     assert_eq!(
-        first.prefixes, 4,
-        "the tenant's l0, l1, sidecar and attribute_keys days"
+        first.prefixes, 6,
+        "the tenant's l0, l1, sidecar and three derived days"
     );
     assert_eq!(
-        first.listed, 10,
+        first.listed, 12,
         "the objects of those partitions, foreign levels and signals not walked"
     );
     assert_eq!(
-        first.seen, 4,
-        "the L1, its sidecar, the attribute_keys table and the stray; nothing foreign"
+        first.seen, 6,
+        "the L1, sidecar, three derived files and the stray; nothing foreign"
     );
     assert_eq!(first.deleted, 0, "first sight: nothing deleted");
     assert!(first.wrapped);
@@ -974,7 +1258,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let again = sweeper.sweep_once().await.unwrap();
     assert_eq!(
         (again.seen, again.deleted),
-        (4, 0),
+        (6, 0),
         "seen twice within the TTL: still nothing"
     );
 
@@ -996,14 +1280,16 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;
     let second = sweeper.sweep_once().await.unwrap();
-    assert_eq!(second.seen, 3, "the stray has a row now");
+    assert_eq!(second.seen, 5, "the stray has a row now");
     assert_eq!(
-        second.deleted, 3,
-        "the L1, its sidecar and the attribute_keys table"
+        second.deleted, 5,
+        "the L1, its sidecar and the three derived files"
     );
     assert_eq!(second.forgotten, 1, "the stray");
     assert!(!present(&f, &orphan_l1).await);
     assert!(!present(&f, &orphan_keys).await);
+    assert!(!present(&f, &orphan_summary).await);
+    assert!(!present(&f, &orphan_graph).await);
     assert!(!present(&f, &fs_index::sidecar_path(&orphan_l1).unwrap()).await);
     assert!(present(&f, &stray).await);
     for path in &foreign {
@@ -1019,7 +1305,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         Vec::<String>::new()
     );
     assert_eq!(stats.sweeps.load(Ordering::Relaxed), 3);
-    assert_eq!(stats.deleted.load(Ordering::Relaxed), 3);
+    assert_eq!(stats.deleted.load(Ordering::Relaxed), 5);
     assert_eq!(stats.forgotten.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }
@@ -1333,6 +1619,20 @@ async fn objects_under(f: &Fixture, part: &str) -> Vec<String> {
 async fn attribute_keys_files(f: &Fixture) -> Vec<FileRecord> {
     f.db.catalog
         .all_visible_files(f.tenant, Signal::AttributeKeys)
+        .await
+        .unwrap()
+}
+
+async fn trace_summary_files(f: &Fixture) -> Vec<FileRecord> {
+    f.db.catalog
+        .all_visible_files(f.tenant, Signal::TraceSummary)
+        .await
+        .unwrap()
+}
+
+async fn service_graph_files(f: &Fixture) -> Vec<FileRecord> {
+    f.db.catalog
+        .all_visible_files(f.tenant, Signal::ServiceGraph1m)
         .await
         .unwrap()
 }

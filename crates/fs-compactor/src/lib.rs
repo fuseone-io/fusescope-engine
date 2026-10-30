@@ -52,6 +52,9 @@ pub enum CompactError {
     /// The span schema refused a batch or a writer setting.
     #[error("schema: {0}")]
     Schema(#[from] fs_schema::SchemaError),
+    /// A blocking CPU task failed or was cancelled.
+    #[error("blocking task: {0}")]
+    Join(#[from] tokio::task::JoinError),
     /// The sidecar could not be built.
     #[error("trace index: {0}")]
     Index(#[from] fs_index::IndexError),

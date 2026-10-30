@@ -25,7 +25,9 @@ use fs_catalog::{FileId, FileRecord, Level, NewFile, Signal, TenantId, TimeRange
 use fs_index::TraceIndex;
 use fs_schema::attribute_keys::KeyStats;
 use fs_schema::parquet::{gather, writer_properties};
+use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::spans::{TRACE_ID_BYTES, col, span_schema_v1, trace_ids};
+use fs_schema::trace_summary::TraceSummaries;
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
@@ -60,6 +62,14 @@ pub struct MergeConfig {
     /// Most keys new to the `attribute_keys` table this merge admits: what
     /// is left of the tenant's `max_keys_hour` for the hour being merged.
     pub max_new_keys: usize,
+    /// Most distinct traces retained for the pass's summary contribution.
+    pub trace_summary_max_traces: usize,
+    /// Conservative byte budget for the summary builder.
+    pub trace_summary_max_bytes: usize,
+    /// Most spans retained to resolve the pass's service graph.
+    pub service_graph_max_spans: usize,
+    /// Conservative byte budget for the service-graph builder.
+    pub service_graph_max_bytes: usize,
 }
 
 /// Merges L0 files of one tenant and hour into L1 outputs, one at a time.
@@ -75,6 +85,8 @@ pub struct L1Merger {
     keys: KeyStats,
     /// `hour` in nanoseconds, the budget the merge admits keys on.
     hour_ns: i64,
+    summaries: TraceSummaries,
+    graph: Option<ServiceGraphBuilder>,
 }
 
 impl L1Merger {
@@ -108,6 +120,8 @@ impl L1Merger {
             done: false,
             keys,
             hour_ns,
+            summaries: TraceSummaries::default(),
+            graph: Some(ServiceGraphBuilder::default()),
         })
     }
 
@@ -115,6 +129,17 @@ impl L1Merger {
     /// in; taken once the inputs are spent.
     pub fn take_keys(&mut self) -> KeyStats {
         std::mem::take(&mut self.keys)
+    }
+
+    /// The pass's trace summaries, or `None` when its trace cap was crossed.
+    pub fn take_trace_summaries(&mut self) -> Option<TraceSummaries> {
+        let summaries = std::mem::take(&mut self.summaries);
+        (!summaries.skipped()).then_some(summaries)
+    }
+
+    /// The pass's service graph, or `None` when its span cap was crossed.
+    pub fn take_service_graph(&mut self) -> Option<ServiceGraphBuilder> {
+        self.graph.take()
     }
 
     /// The next output, closed at the target size or at the end of the
@@ -136,6 +161,18 @@ impl L1Merger {
         {
             self.keys
                 .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
+            self.summaries.absorb(
+                &group,
+                self.config.trace_summary_max_traces,
+                self.config.trace_summary_max_bytes,
+            )?;
+            if let Some(graph) = &mut self.graph {
+                graph.absorb(
+                    &group,
+                    self.config.service_graph_max_spans,
+                    self.config.service_graph_max_bytes,
+                )?;
+            }
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
                 return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
@@ -158,6 +195,16 @@ pub fn l1_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -
 /// partitioned by the hour of the pass that rebuilt the table.
 pub fn attribute_keys_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
     partitioned_path(root, tenant, "derived/attribute_keys", hour, id)
+}
+
+/// Path of a per-pass trace summary contribution.
+pub fn trace_summary_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
+    partitioned_path(root, tenant, Signal::TraceSummary.path_name(), hour, id)
+}
+
+/// Path of a per-pass service graph contribution.
+pub fn service_graph_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
+    partitioned_path(root, tenant, Signal::ServiceGraph1m.path_name(), hour, id)
 }
 
 fn partitioned_path(

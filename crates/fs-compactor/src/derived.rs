@@ -4,11 +4,13 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_schema::attribute_keys::KeyStats;
+use fs_schema::service_graph::ServiceGraph;
+use fs_schema::trace_summary::TraceSummaries;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::CompactError;
-use crate::merge::attribute_keys_path;
+use crate::merge::{attribute_keys_path, service_graph_path, trace_summary_path};
 
 /// The table at `path`, decoded.
 ///
@@ -56,4 +58,96 @@ pub(crate) fn table_file(
         summary: None,
     };
     Ok(Some((file, bytes)))
+}
+
+/// One pass's trace summaries with their catalog row.
+///
+/// # Errors
+/// Encoding failure.
+pub(crate) fn trace_summary_file(
+    root: &Path,
+    tenant: TenantId,
+    hour: DateTime<Utc>,
+    rows: &TraceSummaries,
+) -> Result<Option<(NewFile, Bytes)>, CompactError> {
+    let Some((first, last)) = rows.range() else {
+        return Ok(None);
+    };
+    let bytes = Bytes::from(fs_schema::trace_summary::encode(rows)?);
+    let id = FileId::new();
+    let path = trace_summary_path(root, tenant, hour, id);
+    let services = rows
+        .iter()
+        .flat_map(|(_, row)| row.services.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|service| service.to_string())
+        .collect();
+    Ok(Some((
+        NewFile {
+            id,
+            origin: id,
+            tenant_id: tenant,
+            signal: Signal::TraceSummary,
+            level: Level::L1,
+            path: path.to_string(),
+            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            row_count: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+            range: TimeRange {
+                start: Utc.timestamp_nanos(first),
+                end: Utc.timestamp_nanos(last),
+            },
+            services,
+            summary: None,
+        },
+        bytes,
+    )))
+}
+
+/// One pass's service graph with its catalog row.
+///
+/// # Errors
+/// Encoding failure.
+pub(crate) fn service_graph_file(
+    root: &Path,
+    tenant: TenantId,
+    hour: DateTime<Utc>,
+    graph: &ServiceGraph,
+) -> Result<Option<(NewFile, Bytes)>, CompactError> {
+    let Some((first, last)) = graph.range() else {
+        return Ok(None);
+    };
+    let bytes = Bytes::from(fs_schema::service_graph::encode(graph)?);
+    let id = FileId::new();
+    let path = service_graph_path(root, tenant, hour, id);
+    let services = graph
+        .iter()
+        .flat_map(|edge| {
+            std::iter::once(edge.src.clone()).chain(
+                (edge.dst_kind == fs_schema::service_graph::DestinationKind::Service)
+                    .then(|| edge.dst.clone()),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some((
+        NewFile {
+            id,
+            origin: id,
+            tenant_id: tenant,
+            signal: Signal::ServiceGraph1m,
+            level: Level::L1,
+            path: path.to_string(),
+            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            row_count: i64::try_from(graph.len()).unwrap_or(i64::MAX),
+            range: TimeRange {
+                start: Utc.timestamp_nanos(first),
+                end: Utc.timestamp_nanos(last),
+            },
+            services,
+            summary: None,
+        },
+        bytes,
+    )))
 }

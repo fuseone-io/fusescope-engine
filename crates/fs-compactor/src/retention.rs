@@ -331,10 +331,16 @@ impl Retention {
         &self,
         fence: &LeaseFence,
     ) -> Result<Option<ExpiredFiles>, CompactError> {
-        let result = self
-            .catalog
-            .expire_files_fenced(Signal::Traces, self.config.files_per_pass, fence)
-            .await;
+        let mut result = Ok(None);
+        for signal in [Signal::Traces, Signal::TraceSummary, Signal::ServiceGraph1m] {
+            result = self
+                .catalog
+                .expire_files_fenced(signal, self.config.files_per_pass, fence)
+                .await;
+            if !matches!(result, Ok(None)) {
+                break;
+            }
+        }
         match &result {
             Ok(Some(expired)) => {
                 self.stats.passes.fetch_add(1, Ordering::Relaxed);
