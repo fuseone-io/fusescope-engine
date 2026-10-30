@@ -59,8 +59,8 @@ IMAGE ?= fusescope-engine:dev
 image:         ## build the container image (a release build of the whole workspace)
 	docker build -t $(IMAGE) .
 
-image-check:   ## non-root, CA bundle and --check inside the image with a read-only root, against the dev Postgres
-	scripts/image-check.sh $(IMAGE) $(FS_TEST_DATABASE_URL)
+image-check:   ## non-root, CA bundle, --check and --role all inside the image with a read-only root, against a throwaway Postgres
+	scripts/image-check.sh $(IMAGE)
 
 bench-stages:  ## ingest decomposed by stage, in process, WAL on the project disk
 	cargo run --release -q -p fs-bench -- stages --requests $(or $(REQUESTS),5000) $(BENCH_ARGS)

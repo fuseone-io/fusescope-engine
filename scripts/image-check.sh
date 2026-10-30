@@ -5,17 +5,35 @@
 # `--role all` starts, reports ready, and stops cleanly on SIGTERM. Spill
 # is not forced, so its path is mounted but not proven written.
 #
-# usage: scripts/image-check.sh <image> <catalog-url>
+# The catalog is a Postgres of its own, started here on an ephemeral
+# loopback port and removed on exit: `--role all` runs a compactor, which
+# would expire, purge and compact a real catalog's rows against the empty
+# test bucket, so no catalog URL is ever taken from outside.
+#
+# usage: scripts/image-check.sh <image>
 set -eu
 image=$1
-catalog=$2
 name="fusescope-image-check-$$"
+postgres="fusescope-image-check-pg-$$"
+created=""
+trap 'docker rm -fv "$created" "$name" "$postgres" >/dev/null 2>&1 || true' EXIT
+
+docker run -d --name "$postgres" \
+    -e POSTGRES_USER=fusescope -e POSTGRES_PASSWORD=fusescope -e POSTGRES_DB=fusescope \
+    -p 127.0.0.1::5432 postgres:17-alpine >/dev/null
+for _ in $(seq 1 60); do
+    docker exec "$postgres" pg_isready -U fusescope -d fusescope >/dev/null 2>&1 && break
+    sleep 1
+done
+docker exec "$postgres" pg_isready -U fusescope -d fusescope >/dev/null \
+    || { echo "the throwaway Postgres never became ready" >&2; exit 1; }
+port=$(docker port "$postgres" 5432/tcp | head -n 1 | sed 's/.*://')
+catalog="postgres://fusescope:fusescope@127.0.0.1:$port/fusescope"
 
 user=$(docker image inspect "$image" --format '{{.Config.User}}')
 [ "$user" = "65532:65532" ] || { echo "image runs as '$user', not 65532:65532" >&2; exit 1; }
 
 created=$(docker create "$image")
-trap 'docker rm -fv "$created" "$name" >/dev/null 2>&1 || true' EXIT
 certificates=$(docker cp -L "$created:/etc/ssl/certs/ca-certificates.crt" - | tar -xOf - | grep -c 'BEGIN CERTIFICATE' || true)
 [ "$certificates" -gt 0 ] || { echo "image has no certificate in its CA bundle" >&2; exit 1; }
 

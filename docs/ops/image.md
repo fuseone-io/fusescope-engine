@@ -39,7 +39,9 @@ image has no shell for an exec probe.
 
 `make image` builds it as `fusescope-engine:dev`. `make image-check`
 (`scripts/image-check.sh`), and the CI `image` job on every push, prove the
-image against a Postgres: it runs as `65532:65532`, its CA bundle holds
+image against a throwaway Postgres the script starts on an ephemeral
+loopback port and removes, never a catalog given from outside, since
+`--role all` runs a compactor: it runs as `65532:65532`, its CA bundle holds
 certificates, and with a read-only root, only the WAL, spill and a tmpfs
 bucket writable, `--check` passes and `--role all` starts, reports ready on
 `/readyz` and stops cleanly on SIGTERM. Nothing forces a spill, so that
