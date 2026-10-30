@@ -4603,9 +4603,10 @@ fn bearer(token: &str) -> tonic::metadata::MetadataMap {
     metadata
 }
 
-/// A revoked token is refused once its cached answer expires, without a
-/// restart; a token a rotation scheduled to stop is refused from that
-/// moment whatever the cache's TTL.
+/// A revocation or a rotation reaches an ingester within its cache TTL,
+/// however the token was cached: an answer cached before the change lives
+/// out its TTL and is refused after it. An answer cached after a rotation
+/// never outlives the old token's scheduled end, whatever the TTL.
 #[tokio::test]
 async fn revoked_and_rotated_tokens_stop_within_the_cache_ttl() {
     let Some(db) = TestDb::new().await else {
@@ -4617,33 +4618,43 @@ async fn revoked_and_rotated_tokens_stop_within_the_cache_ttl() {
         .await
         .unwrap()
         .id;
-    let (revoked, row) = db
-        .catalog
-        .create_token(tenant, "collector", TokenScope::Ingest)
-        .await
-        .unwrap();
-    let ttl = Duration::from_millis(500);
+    let ttl = Duration::from_millis(800);
     let auth = fs_ingest::auth::Authenticator::new(db.catalog.clone(), ttl, None);
-    assert_eq!(auth.authenticate(&bearer(&revoked)).await.unwrap(), tenant);
-    db.catalog
-        .revoke_token_by_id(&row.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        auth.authenticate(&bearer(&revoked)).await.unwrap(),
-        tenant,
-        "the cached answer holds until its TTL"
-    );
-    tokio::time::sleep(ttl + Duration::from_millis(100)).await;
-    assert_eq!(
-        auth.authenticate(&bearer(&revoked))
+    let refused = |result: Result<fs_catalog::TenantId, tonic::Status>| {
+        result.unwrap_err().code() == tonic::Code::Unauthenticated
+    };
+
+    for change in ["revoke", "rotate"] {
+        let (token, row) = db
+            .catalog
+            .create_token(tenant, change, TokenScope::Ingest)
             .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unauthenticated,
-        "refused once the TTL passed"
-    );
+            .unwrap();
+        assert_eq!(auth.authenticate(&bearer(&token)).await.unwrap(), tenant);
+        if change == "revoke" {
+            db.catalog
+                .revoke_token_by_id(&row.id)
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            db.catalog
+                .rotate_token(&row.id, Duration::ZERO)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            auth.authenticate(&bearer(&token)).await.unwrap(),
+            tenant,
+            "{change}: cached before the change, the answer lives out its TTL"
+        );
+        tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+        assert!(
+            refused(auth.authenticate(&bearer(&token)).await),
+            "{change}: refused once the TTL passed"
+        );
+    }
 
     let (rotated, row) = db
         .catalog
@@ -4664,13 +4675,9 @@ async fn revoked_and_rotated_tokens_stop_within_the_cache_ttl() {
         tenant
     );
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(
-        long.authenticate(&bearer(&rotated))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unauthenticated,
-        "the cache never outlives the scheduled end"
+    assert!(
+        refused(long.authenticate(&bearer(&rotated)).await),
+        "cached after the rotation, never past its scheduled end"
     );
     assert_eq!(
         long.authenticate(&bearer(&successor)).await.unwrap(),

@@ -1,7 +1,8 @@
 //! Bearer token authentication with a short positive and negative cache.
-//! A revoked token is refused within the positive TTL; one a rotation
-//! scheduled to stop is refused from that moment, the cache never holding
-//! it longer.
+//! A revocation or a rotation reaches the ingester within the positive TTL:
+//! an answer cached before it lives out its TTL, since nothing tells the
+//! cache of the change. An answer cached after a rotation never outlives
+//! the old token's scheduled end, measured on the catalog's clock.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -72,16 +73,20 @@ impl Authenticator {
                 .tenant()
                 .ok_or_else(|| Status::unauthenticated("unknown or revoked token"));
         }
+        let asked = Instant::now();
         let found = self
             .catalog
             .resolve_token_until(token, TokenScope::Ingest)
             .await
             .map_err(|e| Status::unavailable(format!("token lookup failed: {e}")))?;
-        let (resolved, ends) = match found {
-            Some((tenant, ends)) => (Lookup::Tenant(tenant), ends),
+        let (resolved, left) = match found {
+            Some((tenant, left)) => (
+                Lookup::Tenant(tenant),
+                left.map(|left| left.saturating_sub(asked.elapsed())),
+            ),
             None => (Lookup::Unknown, None),
         };
-        self.remember(hash, resolved, ends);
+        self.remember(hash, resolved, left);
         resolved
             .tenant()
             .ok_or_else(|| Status::unauthenticated("unknown or revoked token"))
@@ -100,16 +105,15 @@ impl Authenticator {
         (Instant::now() < *expires).then_some(*value)
     }
 
-    /// Caches `value` for the TTL, a positive answer never past `ends`,
-    /// when a rotation scheduled the token to stop.
-    fn remember(&self, hash: [u8; 32], value: Lookup, ends: Option<chrono::DateTime<chrono::Utc>>) {
+    /// Caches `value` for the TTL, a positive answer for no longer than
+    /// `left`, the time a rotation left the token.
+    fn remember(&self, hash: [u8; 32], value: Lookup, left: Option<Duration>) {
         let mut ttl = if matches!(value, Lookup::Tenant(_)) {
             self.ttl
         } else {
             NEGATIVE_TTL
         };
-        if let Some(ends) = ends {
-            let left = (ends - chrono::Utc::now()).to_std().unwrap_or_default();
+        if let Some(left) = left {
             ttl = ttl.min(left);
         }
         if let Ok(mut cache) = self.cache.lock() {

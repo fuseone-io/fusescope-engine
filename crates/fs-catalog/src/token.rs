@@ -139,9 +139,10 @@ fn id_bytes(id: &str) -> Option<[u8; 8]> {
 }
 
 impl Catalog {
-    /// The tenant of a live token with `scope` and when it stops being
-    /// accepted, if a rotation scheduled that; `None` when the token is
-    /// unknown, revoked, of another scope, or its tenant deleted.
+    /// The tenant of a live token with `scope` and, when a rotation
+    /// scheduled it to stop, how long it has left, measured on the
+    /// catalog's clock at the lookup; `None` when the token is unknown,
+    /// revoked, of another scope, or its tenant deleted.
     ///
     /// # Errors
     /// Database failure.
@@ -149,13 +150,14 @@ impl Catalog {
         &self,
         token: &str,
         scope: TokenScope,
-    ) -> Result<Option<(TenantId, Option<DateTime<Utc>>)>, CatalogError> {
+    ) -> Result<Option<(TenantId, Option<std::time::Duration>)>, CatalogError> {
         if !looks_like_token(token) {
             return Ok(None);
         }
         let hash = hash_token(token);
-        Ok(sqlx::query_as(
-            "select t.tenant_id, t.revoked_at from engine_tenant_token t
+        let row: Option<(TenantId, Option<f64>)> = sqlx::query_as(
+            "select t.tenant_id, extract(epoch from t.revoked_at - now())::float8
+             from engine_tenant_token t
              join engine_tenant n on n.id = t.tenant_id
              where t.token_hash = $1 and t.scope = $2
                and (t.revoked_at is null or t.revoked_at > now()) and n.deleted_at is null",
@@ -163,7 +165,12 @@ impl Catalog {
         .bind(hash.as_slice())
         .bind(scope)
         .fetch_optional(self.pool())
-        .await?)
+        .await?;
+        Ok(row.map(|(tenant, left)| {
+            let left =
+                left.map(|secs| std::time::Duration::try_from_secs_f64(secs).unwrap_or_default());
+            (tenant, left)
+        }))
     }
 
     /// Revokes the token named `id` now, a scheduled revocation brought
