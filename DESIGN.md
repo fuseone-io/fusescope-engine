@@ -1062,9 +1062,17 @@ surface and is handled as follows:
   (3600 s by default, at most seven days, never later than it was already
   due). `revoked_at` in the future is that scheduled end; an engine older
   than this reads it as revoked already, failing closed. A querier in
-  `token` mode looks a token up on every request; an ingester caches a live
-  answer for `ingest.token_cache_secs` (60, 1 to 3600), never past a scheduled end, so a
-  revocation takes effect within that TTL without a restart. Every issue,
+  `token` mode looks a token up on every request, so a change reaches it at
+  once. An ingester caches a live answer for `ingest.token_cache_secs` (60,
+  1 to 3600): an answer cached after a rotation never outlives the old
+  token's scheduled end, the time left measured on the catalog's clock
+  minus the lookup, but nothing tells an ingester of a change, so an
+  answer cached before a revocation or a rotation lives out its TTL. A
+  revocation or rotation therefore reaches every ingester within
+  `ingest.token_cache_secs`, and a scheduled end may be passed by up to
+  that TTL; an operator who needs faster lowers it. Invalidating the
+  caches on the change would need the catalog to notify token changes, a
+  migration left for later. Every issue,
   rotation and revocation logs a `fusescope::audit` event with the
   tenant, the token's id, name and scope.
 - Limits: gRPC message size (default 16 MB), attributes per record, key and
