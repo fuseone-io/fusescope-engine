@@ -1,6 +1,7 @@
 //! The `[auth]` section: how Flight SQL clients authenticate. `token`, the
 //! default, takes the catalog's static query tokens; `jwt` takes only the
-//! backend's tenant JWTs, verified against the key set in `jwt_keys`.
+//! backend's tenant JWTs, verified against the key set in `jwt_keys`, and
+//! requires `[tls]` on, since a bearer JWT is reusable by whoever reads it.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

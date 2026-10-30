@@ -1138,7 +1138,13 @@ impl Config {
     /// The ingest bounds the runtime or the cut enforces as hard ceilings.
     fn validate_access(&self) -> Result<(), ServerError> {
         self.tls.validate()?;
-        self.auth.validate()
+        self.auth.validate()?;
+        if self.auth.mode == crate::auth::AuthMode::Jwt && !self.tls.enabled {
+            return Err(ServerError::InvalidConfig(
+                "auth.mode = \"jwt\" requires tls.enabled: a bearer JWT never crosses the network in plain text".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_server(&self) -> Result<(), ServerError> {
@@ -1664,6 +1670,25 @@ mod tests {
         )
         .unwrap();
         assert!(edge.validate(&secrets).is_ok());
+    }
+
+    #[test]
+    fn jwt_mode_requires_tls() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let auth =
+            "[auth]\nmode = \"jwt\"\njwt_keys = \"/k/jwks.json\"\njwt_issuer = \"backend\"\n";
+        let tls = "[tls]\nenabled = true\ncert = \"c\"\nkey = \"k\"\npublic_client_ca = \"p\"\nhot_client_ca = \"h\"\n";
+        let plain = Config::parse(&format!("{MINIMAL}{auth}")).unwrap();
+        let err = plain.validate(&secrets).unwrap_err().to_string();
+        assert!(err.contains("requires tls.enabled"), "{err}");
+        Config::parse(&format!("{MINIMAL}{auth}{tls}"))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap();
+        Config::parse(MINIMAL).unwrap().validate(&secrets).unwrap();
     }
 
     #[test]

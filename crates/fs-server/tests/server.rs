@@ -912,10 +912,10 @@ fn backend_jwt(tenant: fs_catalog::TenantId) -> String {
     format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 
-/// With `auth.mode = "jwt"` the server refuses to start on a key set that
-/// does not load; running, Flight SQL answers the backend's JWT, refuses
-/// the catalog's static token, and readiness and the metrics report the
-/// key set.
+/// With `auth.mode = "jwt"` the server refuses to start without TLS or on
+/// a key set that does not load; running over mTLS, Flight SQL answers the
+/// backend's JWT, refuses the catalog's static token, and readiness and
+/// the metrics report the key set.
 #[tokio::test]
 async fn in_jwt_mode_the_querier_takes_only_backend_tokens() {
     use fs_server::client;
@@ -935,7 +935,14 @@ async fn in_jwt_mode_the_querier_takes_only_backend_tokens() {
             ..fs_server::auth::AuthSection::default()
         };
     };
+    let mut plain = config(dir.path());
+    jwt_on(&mut plain, "jwks-a.json");
+    let err = server::check(plain, secrets.clone(), "checker".into())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("requires tls.enabled"), "{err}");
     let mut broken = config(dir.path());
+    tls_on(&mut broken, "server-a.pem", "server-a.key");
     jwt_on(&mut broken, "server-a.pem");
     let err = server::check(broken, secrets.clone(), "checker".into())
         .await
@@ -947,6 +954,7 @@ async fn in_jwt_mode_the_querier_takes_only_backend_tokens() {
     let mut cfg = config(dir.path());
     cfg.server.flight_addr = format!("127.0.0.1:{port}");
     cfg.server.metrics_addr = format!("127.0.0.1:{metrics_port}");
+    tls_on(&mut cfg, "server-a.pem", "server-a.key");
     jwt_on(&mut cfg, "jwks-a.json");
     let (tx, rx) = watch::channel(false);
     let server = tokio::spawn(server::run(cfg, secrets, Role::All, "test-node".into(), rx));
@@ -965,17 +973,18 @@ async fn in_jwt_mode_the_querier_takes_only_backend_tokens() {
         .create_token(tenant, "operator", fs_catalog::TokenScope::Query)
         .await
         .unwrap();
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("localhost:{port}");
+    let backend = certified("client-b.pem", "client-b.key");
     let counted = client::query(
         &addr,
         &backend_jwt(tenant),
         "select count(*) as n from spans",
-        None,
+        Some(&backend),
     )
     .await
     .unwrap();
     assert!(client::render(&counted).unwrap().ends_with("1 rows"));
-    let err = client::query(&addr, &static_token, "select 1", None)
+    let err = client::query(&addr, &static_token, "select 1", Some(&backend))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Unauthenticated"), "{err}");
