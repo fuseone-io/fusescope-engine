@@ -340,13 +340,17 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
+        let mut audit = Audit::begin("statement");
         let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
-            .await?;
+            .await
+            .inspect_err(|_| audit.refused())?;
+        audit.caller(&caller);
         let sql = redeem_ticket(&ticket.statement_handle, &caller).inspect_err(|e| {
+            audit.refused();
             warn!(tenant = %caller.tenant.0, reason = e.message(), "ticket refused");
         })?;
-        let audit = Audit::start(&caller, "statement", sql.as_bytes());
+        audit.text(sql.as_bytes());
         let tenant = caller.tenant;
         let kept = within(
             deadline,
@@ -384,11 +388,14 @@ impl FlightSqlService for FlightSql {
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
         let limits = self.querier.limits();
         let deadline = deadline_of(limits);
+        let action = request.get_ref();
+        let mut audit = Audit::begin(&action.r#type);
+        audit.text(&action.body);
         let caller = self
             .authenticate_by(request.metadata(), deadline, limits)
-            .await?;
-        let action = request.get_ref();
-        let audit = Audit::start(&caller, &action.r#type, &action.body);
+            .await
+            .inspect_err(|_| audit.refused())?;
+        audit.caller(&caller);
         let (stream, warnings) = self
             .run_action(caller.tenant, action, deadline, limits)
             .await?;

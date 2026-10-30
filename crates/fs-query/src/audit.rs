@@ -1,7 +1,9 @@
-//! One audit event per execution: tenant, subject, what ran (the action
-//! type or `statement`), a hash of its text, rows sent, duration and
+//! One audit event per `DoGet` and `DoAction`, refused ones included:
+//! tenant and subject once known, what ran (the action type or
+//! `statement`), a hash of its text once known, rows sent, duration and
 //! outcome, logged at `info` under the `fusescope::audit` target once the
-//! execution ends, however it ends. The text itself is never logged.
+//! request ends, however it ends. Strings a client chose are escaped, so
+//! one event stays one line; the text itself is never logged.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -13,10 +15,12 @@ use tracing::info;
 
 use crate::auth::Caller;
 
-/// How an execution ended.
+/// How a request ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// Refused or failed before or while streaming.
+    /// Its token or its ticket was refused.
+    Refused,
+    /// Failed before or while streaming.
     Failed,
     /// The client went away mid-stream.
     Cancelled,
@@ -24,35 +28,55 @@ enum Outcome {
     Ok,
 }
 
-/// The audit record of one execution, logged when dropped.
+/// The audit record of one request, logged when dropped.
 pub(crate) struct Audit {
-    caller: Caller,
+    tenant: Option<fs_catalog::TenantId>,
+    subject: Option<String>,
     kind: String,
-    hash: String,
+    hash: Option<String>,
     started: Instant,
     rows: u64,
     outcome: Outcome,
 }
 
 impl Audit {
-    pub(crate) fn start(caller: &Caller, kind: &str, text: &[u8]) -> Self {
-        let digest = Sha256::digest(text);
-        let hash = digest
-            .iter()
-            .take(8)
-            .fold(String::with_capacity(16), |mut out, b| {
-                use std::fmt::Write;
-                let _ = write!(out, "{b:02x}");
-                out
-            });
+    /// A record for a request of `kind`, before anything about it is known.
+    pub(crate) fn begin(kind: &str) -> Self {
         Self {
-            caller: caller.clone(),
+            tenant: None,
+            subject: None,
             kind: kind.to_owned(),
-            hash,
+            hash: None,
             started: Instant::now(),
             rows: 0,
             outcome: Outcome::Failed,
         }
+    }
+
+    /// The caller, once authenticated.
+    pub(crate) fn caller(&mut self, caller: &Caller) {
+        self.tenant = Some(caller.tenant);
+        self.subject.clone_from(&caller.subject);
+    }
+
+    /// The text that runs, once known; only its hash is kept.
+    pub(crate) fn text(&mut self, text: &[u8]) {
+        let digest = Sha256::digest(text);
+        self.hash = Some(
+            digest
+                .iter()
+                .take(8)
+                .fold(String::with_capacity(16), |mut out, b| {
+                    use std::fmt::Write;
+                    let _ = write!(out, "{b:02x}");
+                    out
+                }),
+        );
+    }
+
+    /// The token or the ticket was refused.
+    pub(crate) fn refused(&mut self) {
+        self.outcome = Outcome::Refused;
     }
 
     /// Follows `batches` to their end, counting rows; the record is
@@ -72,16 +96,25 @@ impl Audit {
 impl Drop for Audit {
     fn drop(&mut self) {
         let outcome = match self.outcome {
+            Outcome::Refused => "refused",
             Outcome::Failed => "failed",
             Outcome::Cancelled => "cancelled",
             Outcome::Ok => "ok",
         };
+        let tenant = self
+            .tenant
+            .map_or_else(|| "-".to_owned(), |t| t.0.to_string());
+        let subject = match (&self.tenant, &self.subject) {
+            (None, _) => "-",
+            (Some(_), None) => "token",
+            (Some(_), Some(subject)) => subject,
+        };
         info!(
             target: "fusescope::audit",
-            tenant = %self.caller.tenant.0,
-            subject = self.caller.subject.as_deref().unwrap_or("token"),
-            kind = %self.kind,
-            query_hash = %self.hash,
+            tenant = %tenant,
+            subject = %subject.escape_debug(),
+            kind = %self.kind.escape_debug(),
+            query_hash = self.hash.as_deref().unwrap_or("-"),
             rows = self.rows,
             duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             outcome,
@@ -144,13 +177,24 @@ mod tests {
             tenant: fs_catalog::TenantId(uuid::Uuid::from_u128(1)),
             subject: Some("user:alice".into()),
         };
-        Audit::start(&caller, "statement", b"select 1")
+        let mut audit = Audit::begin("statement");
+        audit.caller(&caller);
+        audit.text(b"select 1");
+        audit
     }
 
     #[tokio::test]
     async fn the_outcome_follows_how_the_stream_ends() {
-        assert_eq!(audit().outcome, Outcome::Failed, "refused before streaming");
-        assert_eq!(audit().hash.len(), 16);
+        assert_eq!(audit().outcome, Outcome::Failed, "failed before streaming");
+        assert_eq!(audit().hash.as_deref().map(str::len), Some(16));
+        let mut refused = Audit::begin("metadata.services\nforged=line");
+        refused.refused();
+        assert_eq!((refused.outcome, refused.tenant), (Outcome::Refused, None));
+        assert_eq!(
+            refused.kind.escape_debug().to_string(),
+            "metadata.services\\nforged=line",
+            "a client's string stays on one line"
+        );
 
         let mut done = audit().follow(futures_util::stream::iter([
             Ok::<_, String>(batch(2)),
