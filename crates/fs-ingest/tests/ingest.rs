@@ -4596,3 +4596,85 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
     h.stop().await;
     db.finish().await;
 }
+
+fn bearer(token: &str) -> tonic::metadata::MetadataMap {
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    metadata
+}
+
+/// A revoked token is refused once its cached answer expires, without a
+/// restart; a token a rotation scheduled to stop is refused from that
+/// moment whatever the cache's TTL.
+#[tokio::test]
+async fn revoked_and_rotated_tokens_stop_within_the_cache_ttl() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let (revoked, row) = db
+        .catalog
+        .create_token(tenant, "collector", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let ttl = Duration::from_millis(500);
+    let auth = fs_ingest::auth::Authenticator::new(db.catalog.clone(), ttl, None);
+    assert_eq!(auth.authenticate(&bearer(&revoked)).await.unwrap(), tenant);
+    db.catalog
+        .revoke_token_by_id(&row.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        auth.authenticate(&bearer(&revoked)).await.unwrap(),
+        tenant,
+        "the cached answer holds until its TTL"
+    );
+    tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+    assert_eq!(
+        auth.authenticate(&bearer(&revoked))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated,
+        "refused once the TTL passed"
+    );
+
+    let (rotated, row) = db
+        .catalog
+        .create_token(tenant, "collector-b", TokenScope::Ingest)
+        .await
+        .unwrap();
+    let (successor, _, _) = db
+        .catalog
+        .rotate_token(&row.id, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let long =
+        fs_ingest::auth::Authenticator::new(db.catalog.clone(), Duration::from_secs(3600), None);
+    assert_eq!(long.authenticate(&bearer(&rotated)).await.unwrap(), tenant);
+    assert_eq!(
+        long.authenticate(&bearer(&successor)).await.unwrap(),
+        tenant
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        long.authenticate(&bearer(&rotated))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated,
+        "the cache never outlives the scheduled end"
+    );
+    assert_eq!(
+        long.authenticate(&bearer(&successor)).await.unwrap(),
+        tenant
+    );
+    db.finish().await;
+}
