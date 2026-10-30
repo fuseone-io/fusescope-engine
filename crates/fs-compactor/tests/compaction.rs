@@ -361,6 +361,19 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     );
     assert_eq!(l1.row_count, 18);
     assert_eq!(l1.services, ["api", "web"]);
+    assert_eq!(l1.content_sha256, Some(sha256_of(&f, &l1.path)));
+    for derived in [
+        attribute_keys_files(&f).await,
+        trace_summary_files(&f).await,
+    ] {
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            derived[0].content_sha256,
+            Some(sha256_of(&f, &derived[0].path)),
+            "{}",
+            derived[0].path
+        );
+    }
     assert_eq!(
         l1.range.start,
         inputs.iter().map(|i| i.range.start).min().unwrap()
@@ -1276,6 +1289,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         range: registered[0].range,
         services: vec![],
         summary: None,
+        content_sha256: None,
     };
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;
@@ -1621,6 +1635,11 @@ async fn attribute_keys_files(f: &Fixture) -> Vec<FileRecord> {
         .all_visible_files(f.tenant, Signal::AttributeKeys)
         .await
         .unwrap()
+}
+
+fn sha256_of(f: &Fixture, path: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(std::fs::read(f.dir.path().join(path)).unwrap()).into()
 }
 
 async fn trace_summary_files(f: &Fixture) -> Vec<FileRecord> {

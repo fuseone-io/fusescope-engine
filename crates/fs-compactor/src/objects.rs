@@ -8,6 +8,7 @@ use bytes::Bytes;
 use fs_catalog::TenantId;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::CompactError;
@@ -85,4 +86,9 @@ pub(crate) fn take_injected(counter: &AtomicU32) -> bool {
             Err(actual) => remaining = actual,
         }
     }
+}
+
+/// sha256 of an object's bytes, recorded on its catalog row.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }

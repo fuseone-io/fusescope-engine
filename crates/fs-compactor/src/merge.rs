@@ -579,6 +579,7 @@ impl OutputBuilder {
             },
             services: self.services.into_iter().collect(),
             summary: None,
+            content_sha256: Some(crate::objects::sha256(&bytes)),
         };
         Ok(Output {
             file,
