@@ -79,14 +79,14 @@ impl Authenticator {
             .resolve_token_until(token, TokenScope::Ingest)
             .await
             .map_err(|e| Status::unavailable(format!("token lookup failed: {e}")))?;
-        let (resolved, left) = match found {
+        let (resolved, not_after) = match found {
             Some((tenant, left)) => (
                 Lookup::Tenant(tenant),
-                left.map(|left| left.saturating_sub(asked.elapsed())),
+                left.map(|left| asked.checked_add(left).unwrap_or(asked)),
             ),
             None => (Lookup::Unknown, None),
         };
-        self.remember(hash, resolved, left);
+        self.remember(hash, resolved, not_after);
         resolved
             .tenant()
             .ok_or_else(|| Status::unauthenticated("unknown or revoked token"))
@@ -105,23 +105,37 @@ impl Authenticator {
         (Instant::now() < *expires).then_some(*value)
     }
 
-    /// Caches `value` for the TTL, a positive answer for no longer than
-    /// `left`, the time a rotation left the token.
-    fn remember(&self, hash: [u8; 32], value: Lookup, left: Option<Duration>) {
-        let mut ttl = if matches!(value, Lookup::Tenant(_)) {
+    /// Caches `value` for the TTL, a positive answer never past
+    /// `not_after`, the instant a rotation stops the token, counted from
+    /// before the lookup so no wait since then extends it.
+    fn remember(&self, hash: [u8; 32], value: Lookup, not_after: Option<Instant>) {
+        let ttl = if matches!(value, Lookup::Tenant(_)) {
             self.ttl
         } else {
             NEGATIVE_TTL
         };
-        if let Some(left) = left {
-            ttl = ttl.min(left);
-        }
         if let Ok(mut cache) = self.cache.lock() {
+            let now = Instant::now();
+            let Some(expires) = expiry(now, ttl, not_after) else {
+                return;
+            };
             if cache.len() > 10_000 {
-                cache.retain(|_, (_, expires)| Instant::now() < *expires);
+                cache.retain(|_, (_, expires)| now < *expires);
             }
-            cache.insert(hash, (value, Instant::now() + ttl));
+            cache.insert(hash, (value, expires));
         }
+    }
+}
+
+/// When an answer stored at `now` expires: after `ttl`, never past
+/// `not_after`; `None` when `not_after` has already come and the answer
+/// must not be stored at all.
+fn expiry(now: Instant, ttl: Duration, not_after: Option<Instant>) -> Option<Instant> {
+    let expires = now.checked_add(ttl).unwrap_or(now);
+    match not_after {
+        Some(deadline) if deadline <= now => None,
+        Some(deadline) => Some(expires.min(deadline)),
+        None => Some(expires),
     }
 }
 
@@ -139,6 +153,29 @@ fn bearer(metadata: &MetadataMap) -> Option<&str> {
 mod tests {
     use super::*;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn an_answer_never_outlives_the_scheduled_end() {
+        let asked = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let end = asked + Duration::from_secs(10);
+        assert_eq!(expiry(asked, ttl, None), Some(asked + ttl));
+        assert_eq!(expiry(asked, ttl, Some(end)), Some(end));
+        let after_a_wait = asked + Duration::from_secs(9);
+        assert_eq!(
+            expiry(after_a_wait, ttl, Some(end)),
+            Some(end),
+            "a wait before storing does not move the end"
+        );
+        assert_eq!(
+            expiry(end, ttl, Some(end)),
+            None,
+            "stored at the end: not at all"
+        );
+        assert_eq!(expiry(end + Duration::from_secs(1), ttl, Some(end)), None);
+        let short = Duration::from_secs(5);
+        assert_eq!(expiry(asked, short, Some(end)), Some(asked + short));
+    }
 
     #[test]
     fn extracts_bearer_tokens() {
