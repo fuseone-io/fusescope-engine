@@ -5,6 +5,7 @@
 //! t/{tenant uuid}/traces/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/logs/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
+//! t/{tenant uuid}/logs/index/ngram/dt=YYYY-MM-DD/hr=HH/{file uuid}.ngb
 //! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/derived/{attribute_keys|log_attribute_keys}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
@@ -23,7 +24,7 @@ pub struct EngineObject {
     pub partition: String,
     /// File id, as written in the path.
     pub id: String,
-    /// True for a `trace_id` sidecar.
+    /// True for a `trace_id` or text sidecar.
     pub sidecar: bool,
     /// True for a derived table file.
     pub derived: bool,
@@ -63,6 +64,12 @@ impl EngineObject {
                 "l0" => (Some(0), false, false),
                 "l1" => (Some(1), false, false),
                 "l2" => (Some(2), false, false),
+                "index" => {
+                    if parts.next()? != "ngram" {
+                        return None;
+                    }
+                    (None, true, false)
+                }
                 _ => return None,
             },
             "derived" => match parts.next()? {
@@ -81,7 +88,11 @@ impl EngineObject {
             return None;
         }
         let (id, ext) = file.rsplit_once('.')?;
-        let expected = if sidecar { "tix" } else { "parquet" };
+        let expected = match (sidecar, path.split('/').nth(2) == Some("logs")) {
+            (false, _) => "parquet",
+            (true, false) => "tix",
+            (true, true) => "ngb",
+        };
         if ext != expected || !is_uuid(id) {
             return None;
         }
@@ -180,6 +191,13 @@ mod tests {
         assert_eq!(tix.level, None);
         assert_eq!(tix.tenant, T);
         assert!(!tix.derived);
+        let ngb = EngineObject::parse(&format!(
+            "t/{T}/logs/index/ngram/dt=2026-10-24/hr=14/{F}.ngb"
+        ))
+        .unwrap();
+        assert!(ngb.sidecar && !ngb.derived);
+        assert_eq!(ngb.level, None);
+        assert_eq!(ngb.partition, "dt=2026-10-24/hr=14");
         for table in ["attribute_keys", "log_attribute_keys"] {
             let keys = EngineObject::parse(&format!(
                 "t/{T}/derived/{table}/dt=2026-10-24/hr=14/{F}.parquet"
@@ -217,6 +235,12 @@ mod tests {
             &format!("t/{T}/logs/l3/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/logs/index/trace_id/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/logs/l0/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/logs/l0/dt=2026-10-24/hr=14/{F}.ngb"),
+            &format!("t/{T}/logs/index/ngram/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/logs/index/ngram/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/logs/index/other/dt=2026-10-24/hr=14/{F}.ngb"),
+            &format!("t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/{F}.ngb"),
+            &format!("t/{T}/traces/index/ngram/dt=2026-10-24/hr=14/{F}.ngb"),
             &format!("t/{T}/metrics/l0/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l3/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=24/{F}.parquet"),

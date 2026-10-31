@@ -21,13 +21,13 @@
 use std::ops::Range;
 
 use crate::IndexError;
+use crate::frame::{self, Cursor, HEADER_LEN};
 
 /// Bytes of a trace id.
 pub const TRACE_ID_BYTES: usize = 16;
 
-const MAGIC: &[u8; 6] = b"FSTIX\0";
+const MAGIC: [u8; 6] = *b"FSTIX\0";
 const VERSION: u8 = 1;
-const HEADER_LEN: usize = 6 + 1 + 1 + 4 + 8;
 const ENTRY_LEN: usize = TRACE_ID_BYTES + 4;
 
 /// One trace in one file.
@@ -106,8 +106,8 @@ impl TraceIndex {
     /// # Errors
     /// Any header or framing check that fails.
     pub fn decode_cost(bytes: &[u8]) -> Result<DecodeCost, IndexError> {
-        let body = frame(bytes)?;
-        let mut cursor = Cursor { bytes: body, at: 0 };
+        let body = frame::body(bytes, MAGIC, VERSION)?;
+        let mut cursor = Cursor::new(body);
         let file_count = cursor.u32()? as usize;
         let mut paths = 0usize;
         for _ in 0..file_count {
@@ -121,7 +121,7 @@ impl TraceIndex {
                 .checked_mul(ENTRY_LEN)
                 .ok_or(IndexError::BadBody("count past the end"))?,
         )?;
-        if cursor.at != body.len() {
+        if cursor.remaining() != 0 {
             return Err(IndexError::BadBody("trailing bytes"));
         }
         Ok(DecodeCost {
@@ -203,11 +203,7 @@ impl TraceIndex {
             body.extend_from_slice(&e.file.to_le_bytes());
         }
         let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-        out.extend_from_slice(MAGIC);
-        out.push(VERSION);
-        out.push(0);
-        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
-        out.extend_from_slice(&checksum(&body).to_le_bytes());
+        out.extend_from_slice(&frame::header(MAGIC, VERSION, &body));
         out.extend_from_slice(&body);
         out
     }
@@ -217,8 +213,8 @@ impl TraceIndex {
     /// # Errors
     /// Any header or body check that fails; see [`IndexError`].
     pub fn decode(bytes: &[u8]) -> Result<Self, IndexError> {
-        let body = frame(bytes)?;
-        let mut cursor = Cursor { bytes: body, at: 0 };
+        let body = frame::body(bytes, MAGIC, VERSION)?;
+        let mut cursor = Cursor::new(body);
         let file_count = cursor.u32()? as usize;
         // Every count is checked against the bytes present before its
         // vector is allocated, exactly, so a damaged count allocates
@@ -256,7 +252,7 @@ impl TraceIndex {
             last = Some(entry);
             entries.push(entry);
         }
-        if cursor.at != body.len() {
+        if cursor.remaining() != 0 {
             return Err(IndexError::BadBody("trailing bytes"));
         }
         Ok(Self { files, entries })
@@ -274,30 +270,6 @@ pub fn sidecar_path(parquet: &str) -> Option<String> {
         return None;
     }
     Some(format!("{prefix}/traces/index/trace_id/{partition}.tix"))
-}
-
-/// The body of a framed sidecar, after every header check.
-fn frame(bytes: &[u8]) -> Result<&[u8], IndexError> {
-    let (header, body) = bytes
-        .split_at_checked(HEADER_LEN)
-        .ok_or(IndexError::BadMagic)?;
-    if header.get(..6) != Some(MAGIC.as_slice()) {
-        return Err(IndexError::BadMagic);
-    }
-    let version = *header.get(6).ok_or(IndexError::BadMagic)?;
-    if version != VERSION {
-        return Err(IndexError::UnknownVersion(version));
-    }
-    let declared = u64::from(read_u32(header, 8).ok_or(IndexError::BadMagic)?);
-    let present = body.len() as u64;
-    if declared != present {
-        return Err(IndexError::BadLength { declared, present });
-    }
-    let expected = read_u64(header, 12).ok_or(IndexError::BadMagic)?;
-    if checksum(body) != expected {
-        return Err(IndexError::ChecksumMismatch);
-    }
-    Ok(body)
 }
 
 /// Bytes of one `String` beyond its characters.
@@ -353,65 +325,10 @@ pub fn owners_of_sidecar(tix: &str) -> Vec<String> {
         .collect()
 }
 
-fn checksum(body: &[u8]) -> u64 {
-    twox_hash::XxHash3_64::oneshot(body)
-}
-
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    bytes
-        .get(at..at + 4)
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-}
-
-fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
-    bytes
-        .get(at..at + 8)
-        .and_then(|b| b.try_into().ok())
-        .map(u64::from_le_bytes)
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.at)
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], IndexError> {
-        let end = self
-            .at
-            .checked_add(len)
-            .ok_or(IndexError::BadBody("count past the end"))?;
-        let out = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(IndexError::BadBody("count past the end"))?;
-        self.at = end;
-        Ok(out)
-    }
-
-    fn u16(&mut self) -> Result<u16, IndexError> {
-        let raw = self.take(2)?;
-        raw.try_into()
-            .map(u16::from_le_bytes)
-            .map_err(|_| IndexError::BadBody("u16"))
-    }
-
-    fn u32(&mut self) -> Result<u32, IndexError> {
-        let raw = self.take(4)?;
-        raw.try_into()
-            .map(u32::from_le_bytes)
-            .map_err(|_| IndexError::BadBody("u32"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::checksum;
 
     fn trace(n: u8) -> [u8; TRACE_ID_BYTES] {
         [n; TRACE_ID_BYTES]
@@ -483,7 +400,7 @@ mod tests {
         body.extend_from_slice(&trace(1));
         body.extend_from_slice(&1u32.to_le_bytes());
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
         bytes.push(0);
         bytes.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());

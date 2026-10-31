@@ -6,10 +6,13 @@
 //! loudly and one that meets damage reports it so the caller degrades to a
 //! scan.
 
+mod frame;
 pub mod layout;
+pub mod text_index;
 pub mod trace_index;
 
 pub use layout::EngineObject;
+pub use text_index::{TextIndex, TextIndexBuilder, TextIndexLimits};
 pub use trace_index::{TraceIndex, owners_of_sidecar, sidecar_path};
 
 /// Crate version, exposed for diagnostics and the `--version` flag.
