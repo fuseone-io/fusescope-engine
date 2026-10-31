@@ -356,6 +356,12 @@ impl Metrics {
         );
         counter(
             out,
+            "fusescope_flush_text_index_bytes_total",
+            "Bytes of text sidecars of log files created",
+            ns(&f.text_index_bytes),
+        );
+        counter(
+            out,
             "fusescope_flush_superseded_total",
             "Flushes given a fresh id because the orphan sweep marked their path or the object at it held other bytes",
             ns(&f.superseded),

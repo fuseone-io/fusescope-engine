@@ -16,6 +16,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use fs_catalog::{Catalog, FileRecord, NewTenant, Signal, TenantId, TokenScope};
+use fs_index::TextIndex;
+use fs_index::text_index::Probe;
 use fs_ingest::{IngestConfig, Ingester};
 use fs_wal::{Wal, WalConfig};
 use object_store::local::LocalFileSystem;
@@ -645,6 +647,230 @@ async fn the_hot_window_serves_log_rows_by_their_schema() {
     assert!(
         scan(&addr, &span_column, wait).await.is_err(),
         "logs have no name"
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
+fn relative(bucket: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(bucket)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The text sidecar of the log file at `parquet`, decoded.
+fn text_index_of(bucket: &std::path::Path, parquet: &std::path::Path) -> TextIndex {
+    let sidecar = fs_index::text_index::sidecar_path(&relative(bucket, parquet)).unwrap();
+    TextIndex::decode(std::fs::read(bucket.join(sidecar)).unwrap()).unwrap()
+}
+
+fn row_group_rows(path: &std::path::Path) -> Vec<u64> {
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
+    reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|g| u64::try_from(g.num_rows()).unwrap())
+        .collect()
+}
+
+fn small_groups() -> IngestConfig {
+    IngestConfig {
+        row_group_rows: 4,
+        ..test_config()
+    }
+}
+
+/// A log file gets a text sidecar bound to its path, its bytes and its row
+/// groups, whose blooms find a body's token in its row group only.
+#[tokio::test]
+async fn a_log_file_gets_a_text_sidecar_bound_to_its_bytes() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), small_groups()).await;
+    h.export_logs(logs("api", 10, 0, 0), &token).await;
+    h.ingester.flush_all().await;
+
+    let bucket = h.bucket();
+    let log_files = files_under(&bucket, "/logs/l0/", "parquet");
+    assert_eq!(log_files.len(), 1);
+    let sidecars = files_under(&bucket, "/logs/index/ngram/", "ngb");
+    assert_eq!(sidecars.len(), 1);
+    let index = text_index_of(&bucket, &log_files[0]);
+    assert_eq!(index.path(), relative(&bucket, &log_files[0]));
+    let registered = db.files(tenant, Signal::Logs).await;
+    assert_eq!(Some(*index.content_sha256()), registered[0].content_sha256);
+    assert_eq!(
+        index.rows().collect::<Vec<_>>(),
+        row_group_rows(&log_files[0])
+    );
+    assert_eq!(index.rows().collect::<Vec<_>>(), [4, 4, 2]);
+    // Rows are sorted by time: "api line 6" is the third of row group 1.
+    assert_eq!(index.select(&Probe::token(b"6", false)), [1]);
+    assert_eq!(index.select(&Probe::fragment(b"API LINE", true)), [0, 1, 2]);
+    assert_eq!(files_under(&bucket, "", "tix").len(), 0, "no trace sidecar");
+    let flush = h.ingester.flush_stats();
+    assert_eq!(
+        flush.text_index_bytes.load(Ordering::Relaxed),
+        std::fs::metadata(&sidecars[0]).unwrap().len()
+    );
+    assert_eq!(flush.trace_index_bytes.load(Ordering::Relaxed), 0);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The sidecar upload fails after the Parquet object, then the process
+/// crashes: the replay finds the object, writes the sidecar and registers
+/// the file once.
+#[tokio::test]
+async fn a_crash_before_the_text_sidecar_writes_it_on_replay() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let fails = IngestConfig {
+        inject_index_failures: 1,
+        ..small_groups()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), fails).await;
+    h.export_logs(logs("api", 6, 0, 0), &token).await;
+    h.ingester.flush_all().await;
+    let bucket = h.bucket();
+    assert_eq!(files_under(&bucket, "/logs/l0/", "parquet").len(), 1);
+    assert_eq!(files_under(&bucket, "", "ngb").len(), 0);
+    assert_eq!(db.files(tenant, Signal::Logs).await.len(), 0);
+    let dir = h.crash().await;
+
+    let h = start(&db.catalog, dir, small_groups()).await;
+    h.ingester.flush_all().await;
+    let log_files = files_under(&h.bucket(), "/logs/l0/", "parquet");
+    assert_eq!(log_files.len(), 1);
+    let registered = db.files(tenant, Signal::Logs).await;
+    assert_eq!(registered.len(), 1);
+    let index = text_index_of(&h.bucket(), &log_files[0]);
+    assert_eq!(Some(*index.content_sha256()), registered[0].content_sha256);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Both objects are written and the registration fails, then the process
+/// crashes: the replay writes the same sidecar bytes, finds them in place
+/// and registers the file under its id.
+#[tokio::test]
+async fn a_crash_between_the_text_sidecar_and_the_registration_reproduces_it() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let fails = IngestConfig {
+        inject_register_failures: 1,
+        ..small_groups()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), fails).await;
+    h.export_logs(logs("api", 6, 0, 0), &token).await;
+    h.ingester.flush_all().await;
+    let sidecars = files_under(&h.bucket(), "", "ngb");
+    assert_eq!(sidecars.len(), 1);
+    let before = std::fs::read(&sidecars[0]).unwrap();
+    let dir = h.crash().await;
+
+    let h = start(&db.catalog, dir, small_groups()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(files_under(&h.bucket(), "", "ngb"), sidecars);
+    assert_eq!(
+        std::fs::read(&sidecars[0]).unwrap(),
+        before,
+        "the same bytes"
+    );
+    let flush = h.ingester.flush_stats();
+    assert_eq!(flush.replay_mismatch.load(Ordering::Relaxed), 0);
+    assert_eq!(flush.superseded.load(Ordering::Relaxed), 0);
+    assert_eq!(db.files(tenant, Signal::Logs).await.len(), 1);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// Registered, never confirmed, then a crash: the replay meets both
+/// objects with the bytes it produces and confirms the file, with no
+/// second sidecar.
+#[tokio::test]
+async fn a_crash_after_the_registration_keeps_the_text_sidecar() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let never_confirms = IngestConfig {
+        inject_confirm_failures: u32::MAX,
+        ..small_groups()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), never_confirms).await;
+    h.export_logs(logs("api", 6, 0, 0), &token).await;
+    h.ingester.flush_all().await;
+    assert_eq!(db.files(tenant, Signal::Logs).await.len(), 1);
+    let sidecars = files_under(&h.bucket(), "", "ngb");
+    let before = std::fs::read(&sidecars[0]).unwrap();
+    let dir = h.crash().await;
+
+    let h = start(&db.catalog, dir, small_groups()).await;
+    h.ingester.flush_all().await;
+    assert_eq!(files_under(&h.bucket(), "", "ngb"), sidecars);
+    assert_eq!(std::fs::read(&sidecars[0]).unwrap(), before);
+    assert_eq!(
+        h.ingester.flush_stats().superseded.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(db.files(tenant, Signal::Logs).await.len(), 1);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A retried flush meets a sidecar with other bytes at its path: the rows
+/// take a fresh id and are published under it with a sidecar of their own,
+/// instead of retrying forever against the one in place.
+#[tokio::test]
+async fn a_text_sidecar_with_other_bytes_gives_the_rows_a_fresh_id() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let fails = IngestConfig {
+        inject_register_failures: 1,
+        checkpoint_after_flush: false,
+        ..small_groups()
+    };
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), fails).await;
+    h.export_logs(logs("api", 6, 0, 0), &token).await;
+    h.ingester.flush_all().await;
+    let bucket = h.bucket();
+    let old = files_under(&bucket, "/logs/l0/", "parquet");
+    let sidecars = files_under(&bucket, "", "ngb");
+    assert_eq!((old.len(), sidecars.len()), (1, 1));
+    std::fs::write(&sidecars[0], b"other bytes").unwrap();
+
+    h.ingester.flush_all().await;
+    let flush = h.ingester.flush_stats();
+    assert_eq!(flush.replay_mismatch.load(Ordering::Relaxed), 1);
+    assert_eq!(flush.superseded.load(Ordering::Relaxed), 1);
+    h.ingester.flush_all().await;
+
+    let registered = db.files(tenant, Signal::Logs).await;
+    assert_eq!(registered.len(), 1);
+    let old_id = fs_catalog::FileId(
+        uuid::Uuid::parse_str(old[0].file_stem().unwrap().to_str().unwrap()).unwrap(),
+    );
+    assert_ne!(registered[0].id, old_id);
+    assert_eq!(registered[0].origin, old_id);
+    let new = bucket.join(&registered[0].path);
+    let index = text_index_of(&bucket, &new);
+    assert_eq!(Some(*index.content_sha256()), registered[0].content_sha256);
+    assert_eq!(
+        files_under(&bucket, "", "ngb").len(),
+        2,
+        "the damaged one is left to the sweep"
     );
     h.stop().await;
     db.finish().await;

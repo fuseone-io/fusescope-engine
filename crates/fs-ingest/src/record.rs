@@ -130,6 +130,26 @@ pub struct FileLayout {
     pub version: u32,
     /// Rows per Parquet row group.
     pub row_group_rows: usize,
+    /// Sizing of the text sidecar of a log file; `None` writes none, as
+    /// for spans and for log intents logged before text sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_index: Option<TextIndexLayout>,
+}
+
+/// The text sidecar's format and budgets, which decide its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TextIndexLayout {
+    /// Sidecar format version.
+    pub version: u8,
+    /// [`fs_index::TextIndexLimits::max_bytes_per_row_group`].
+    pub max_bytes_per_row_group: usize,
+    /// [`fs_index::TextIndexLimits::max_bytes_per_file`].
+    pub max_bytes_per_file: usize,
+}
+
+impl TextIndexLayout {
+    /// The sidecar format this engine writes.
+    pub const CURRENT_VERSION: u8 = 1;
 }
 
 impl FileLayout {
@@ -151,12 +171,52 @@ impl FileLayout {
         }
     }
 
-    /// The current encoder with `row_group_rows` rows per row group.
+    /// The current encoder with `row_group_rows` rows per row group and
+    /// no text sidecar.
     pub fn current(row_group_rows: usize) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             row_group_rows,
+            text_index: None,
         }
+    }
+
+    /// The current encoder for rows of `signal`: log files get a text
+    /// sidecar within `text`.
+    pub fn for_signal(
+        signal: RowSignal,
+        row_group_rows: usize,
+        text: fs_index::TextIndexLimits,
+    ) -> Self {
+        let text_index = (signal == RowSignal::Logs).then_some(TextIndexLayout {
+            version: TextIndexLayout::CURRENT_VERSION,
+            max_bytes_per_row_group: text.max_bytes_per_row_group,
+            max_bytes_per_file: text.max_bytes_per_file,
+        });
+        Self {
+            text_index,
+            ..Self::current(row_group_rows)
+        }
+    }
+
+    /// The budgets of the text sidecar, `None` when the layout writes none.
+    ///
+    /// # Errors
+    /// A sidecar version this engine does not write, or budgets outside
+    /// their ceilings.
+    pub fn text_limits(&self) -> Result<Option<fs_index::TextIndexLimits>, IngestError> {
+        let Some(text) = self.text_index else {
+            return Ok(None);
+        };
+        if text.version != TextIndexLayout::CURRENT_VERSION {
+            return Err(IngestError::Encode(format!(
+                "text index version {} is not one this engine writes",
+                text.version
+            )));
+        }
+        fs_index::TextIndexLimits::new(text.max_bytes_per_row_group, text.max_bytes_per_file)
+            .map(Some)
+            .map_err(IngestError::from)
     }
 }
 
@@ -391,6 +451,53 @@ mod tests {
         let decoded = FlushIntent::from_payload(old.as_bytes()).unwrap();
         assert_eq!(decoded.layout, None);
         assert_eq!(decoded.file, intent.file);
+    }
+
+    #[test]
+    fn a_log_intent_records_its_text_index_sizing() {
+        let limits = fs_index::TextIndexLimits::new(4096, 65536).unwrap();
+        let layout = FileLayout::for_signal(RowSignal::Logs, 64, limits);
+        assert_eq!(
+            layout.text_index,
+            Some(TextIndexLayout {
+                version: TextIndexLayout::CURRENT_VERSION,
+                max_bytes_per_row_group: 4096,
+                max_bytes_per_file: 65536,
+            })
+        );
+        assert_eq!(
+            FileLayout::for_signal(RowSignal::Traces, 64, limits),
+            FileLayout::current(64)
+        );
+        let intent = FlushIntent {
+            tenant: TenantId::new(),
+            file: fs_catalog::FileId::new(),
+            first: fs_wal::Position {
+                segment: 1,
+                offset: 16,
+            },
+            end: fs_wal::Position {
+                segment: 1,
+                offset: 64,
+            },
+            layout: Some(layout),
+            hour: None,
+            signal: RowSignal::Logs,
+        };
+        let decoded =
+            FlushIntent::from_record(&WalRecord::decode(&intent.to_record().encode()).unwrap())
+                .unwrap();
+        assert_eq!(decoded, intent);
+        assert_eq!(decoded.layout.unwrap().text_limits().unwrap(), Some(limits));
+
+        // A span layout, and a log layout logged before text sidecars, say
+        // nothing of them; the latter writes no sidecar.
+        let span = serde_json::to_string(&FileLayout::current(64)).unwrap();
+        assert!(!span.contains("text_index"), "{span}");
+        let before: FileLayout =
+            serde_json::from_str(r#"{"version":4,"row_group_rows":64}"#).unwrap();
+        assert_eq!(before.text_index, None);
+        assert_eq!(before.text_limits().unwrap(), None);
     }
 
     /// An intent of one hour is written under the record version that a

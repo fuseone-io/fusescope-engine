@@ -53,7 +53,7 @@ use crate::auth::Authenticator;
 use crate::buffer::{Bound, Buffers, ConfirmAttempt, Reservation, Snapshot, Stream, TenantBuffer};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
-use crate::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
+use crate::record::{FileLayout, FlushIntent, RecordSignal, RowSignal, WalRecord};
 use crate::server::{LogsReceiver, TraceReceiver};
 use crate::{IngestError, flush};
 
@@ -148,10 +148,13 @@ pub struct FlushStats {
     pub row_groups: AtomicU64,
     /// Bytes of `trace_id` sidecars created.
     pub trace_index_bytes: AtomicU64,
+    /// Bytes of text sidecars created.
+    pub text_index_bytes: AtomicU64,
     /// Flushes given a fresh id because the orphan sweep marked their path
-    /// or the object at their path held other bytes.
+    /// or the object or sidecar at their path held other bytes.
     pub superseded: AtomicU64,
-    /// Retried flushes that met an object with other bytes at their path.
+    /// Retried flushes that met an object or a sidecar with other bytes at
+    /// their path.
     pub replay_mismatch: AtomicU64,
     /// Registration confirmations that failed and wait for a retry.
     pub confirm_failures: AtomicU64,
@@ -301,7 +304,9 @@ impl Shared {
         }
         // Admitted rows must always be writable: besides the batch itself,
         // room for the scratch its flush will reserve stays free.
-        if Buffers::admission_cost(bytes, rows) > buffers.headroom(self.config.max_memory_bytes) {
+        if Buffers::admission_cost(bytes, rows, stream.signal)
+            > buffers.headroom(self.config.max_memory_bytes)
+        {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             return Err(IngestError::Capacity(
                 "ingester memory full, hot-window retention pending",
@@ -503,7 +508,7 @@ impl Shared {
             let Some(first) = buffers.live_first_wal(stream) else {
                 return Ok(None);
             };
-            let layout = FileLayout::current(self.config.row_group_rows);
+            let layout = self.layout(stream.signal);
             let all_hours = buffers.live_hours(stream);
             let hours: Vec<_> = all_hours
                 .iter()
@@ -675,7 +680,7 @@ impl Shared {
                     IngestError::Catalog(CatalogError::ObjectDoomed { .. }) => {
                         self.supersede(stream, file_id).await
                     }
-                    IngestError::ObjectMismatch { .. } => {
+                    IngestError::ObjectMismatch { .. } | IngestError::IndexMismatch { .. } => {
                         self.flush_stats
                             .replay_mismatch
                             .fetch_add(1, Ordering::Relaxed);
@@ -808,18 +813,26 @@ impl Shared {
         Ok((file, created, rows, writer_peak))
     }
 
+    /// The layout a new intent records for rows of `signal`.
+    fn layout(&self, signal: RowSignal) -> FileLayout {
+        FileLayout::for_signal(signal, self.config.row_group_rows, self.config.text_index)
+    }
+
     /// Sidecar upload, with the test-only failure injection in front. A
     /// sidecar already there with other bytes fails the attempt, so the
-    /// file is never registered behind an index that would hide it.
+    /// file is never registered behind an index that would hide it, and
+    /// the rows take a fresh id.
     async fn upload_index(&self, prepared: &flush::Prepared) -> Result<(), IngestError> {
         if take_injected(&self.inject_index_failures) {
             return Err(IngestError::Injected("trace index upload"));
         }
         let outcome = flush::upload_index(self.store.as_ref(), prepared).await?;
         if let (Some(flush::Upload::Created), Some((_, index))) = (outcome, &prepared.index) {
-            self.flush_stats
-                .trace_index_bytes
-                .fetch_add(u64::try_from(index.len()).unwrap_or(0), Ordering::Relaxed);
+            let counter = match prepared.file.signal {
+                fs_catalog::Signal::Logs => &self.flush_stats.text_index_bytes,
+                _ => &self.flush_stats.trace_index_bytes,
+            };
+            counter.fetch_add(u64::try_from(index.len()).unwrap_or(0), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1240,7 +1253,7 @@ impl Shared {
                             origin: file,
                             batches,
                             held,
-                            layout: Some(FileLayout::current(self.config.row_group_rows)),
+                            layout: Some(self.layout(stream.signal)),
                         })
                         .collect();
                     self.spawn_materialize(attempts, permit, None);

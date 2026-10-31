@@ -193,6 +193,15 @@ an older binary fails on any listing that meets it. From then on the
 binary is not rolled back past that version; turning the key off again
 stops new log passes but does not make a rollback safe.
 
+Log files carry a text sidecar (`logs/index/ngram/…/{id}.ngb`). Its
+budgets, `ingest.text_index_max_bytes_per_row_group` and
+`ingest.text_index_max_bytes_per_file`, are recorded in each flush intent,
+so a change applies to new intents only and a replay writes the bytes it
+wrote before. A log flush holds a fourth copy of its input as scratch for
+the sidecar, so the same `ingest.max_memory_bytes` admits fewer log bytes
+than span bytes. A binary without text sidecars ignores them; the files it
+purges leave theirs behind until a newer orphan sweep removes them.
+
 ### Start
 
 | Message | Meaning |

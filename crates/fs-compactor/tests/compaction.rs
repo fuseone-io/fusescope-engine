@@ -280,6 +280,7 @@ async fn three_closed_l0(f: &Fixture, row_group_rows: usize) -> Vec<FileRecord> 
         let layout = FileLayout {
             version,
             row_group_rows,
+            text_index: None,
         };
         files.push(write_l0_with(&f.db.catalog, &f.store, f.tenant, &[req], layout).await);
     }

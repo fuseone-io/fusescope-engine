@@ -605,6 +605,19 @@ pub struct FlushPart {
 /// every live and flushing byte, so a flush can always reserve it.
 pub const FLUSH_SCRATCH_FACTOR: usize = 3;
 
+/// Copies of its input a log flush holds on top of
+/// [`FLUSH_SCRATCH_FACTOR`] for its text sidecar, built in one buffer no
+/// larger than the bodies plus a floor per row group.
+pub const TEXT_INDEX_SCRATCH_FACTOR: usize = 1;
+
+/// Copies of its input the flush of rows of `signal` holds as scratch.
+pub fn scratch_factor(signal: RowSignal) -> usize {
+    match signal {
+        RowSignal::Traces => FLUSH_SCRATCH_FACTOR,
+        RowSignal::Logs => FLUSH_SCRATCH_FACTOR + TEXT_INDEX_SCRATCH_FACTOR,
+    }
+}
+
 /// Longest wait between retries of a failed flush.
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -805,20 +818,25 @@ impl Buffers {
     /// Room the flush of every live byte, and of every flushing byte whose
     /// attempt is not running, would need as scratch: [`FLUSH_SCRATCH_FACTOR`]
     /// copies, which cover the merged rows, the sorted rows, the encoder and
-    /// the file's trace set, since every byte carries its index bound.
+    /// the file's trace set, since every byte carries its index bound, and
+    /// for log rows [`TEXT_INDEX_SCRATCH_FACTOR`] more for the text sidecar.
     /// Admission and the coalescer keep it free, so rows once admitted can
     /// always be written out. A running attempt holds its copies as a lease
     /// instead, so its rows are not counted here too.
     pub fn flush_margin(&self) -> usize {
-        let live: usize = self.tenants.values().map(|b| b.bytes).sum();
+        let live: usize = self
+            .tenants
+            .iter()
+            .map(|(s, b)| b.bytes.saturating_mul(scratch_factor(s.signal)))
+            .sum();
         let waiting: usize = self
             .flushing
-            .values()
-            .flatten()
-            .filter(|f| !f.in_progress)
-            .map(|f| f.buffer.bytes)
+            .iter()
+            .flat_map(|(s, list)| list.iter().map(move |f| (s.signal, f)))
+            .filter(|(_, f)| !f.in_progress)
+            .map(|(signal, f)| f.buffer.bytes.saturating_mul(scratch_factor(signal)))
             .sum();
-        (live + waiting).saturating_mul(FLUSH_SCRATCH_FACTOR)
+        live.saturating_add(waiting)
     }
 
     /// Bytes a batch of `bytes` of Arrow memory and `rows` rows costs every
@@ -829,16 +847,21 @@ impl Buffers {
 
     /// Room an admission needs under the global cap: the batch's cost and
     /// the margin its flush keeps.
-    pub fn admission_cost(bytes: usize, rows: usize) -> usize {
-        Self::batch_cost(bytes, rows).saturating_mul(1 + FLUSH_SCRATCH_FACTOR)
+    pub fn admission_cost(bytes: usize, rows: usize, signal: RowSignal) -> usize {
+        Self::batch_cost(bytes, rows).saturating_mul(1 + scratch_factor(signal))
     }
 
     /// Bytes still admissible under `cap` with the flush margin kept, for
     /// the rows held and for the ones admitted but not pushed yet.
     pub fn headroom(&self, cap: usize) -> usize {
-        let reserved = self
-            .reserved_total()
-            .saturating_mul(1 + FLUSH_SCRATCH_FACTOR);
+        let reserved: usize = self
+            .reserved
+            .iter()
+            .map(|(s, r)| {
+                r.load(Ordering::Relaxed)
+                    .saturating_mul(1 + scratch_factor(s.signal))
+            })
+            .sum();
         cap.saturating_sub(
             self.total_bytes() + reserved + self.scratch_total() + self.flush_margin(),
         )
@@ -1010,7 +1033,7 @@ impl Buffers {
 
     /// Moves the live rows of `tenant` into the flushing state under `file`
     /// and returns them for writing, with the scratch lease of the attempt:
-    /// the margin admission kept for these rows, [`FLUSH_SCRATCH_FACTOR`]
+    /// the margin admission kept for these rows, [`scratch_factor`]
     /// copies, becomes the lease, so the rows are never counted twice. `None`
     /// when nothing is live.
     pub fn begin_flush(
@@ -1023,7 +1046,7 @@ impl Buffers {
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
-        let lease = self.hold_scratch(buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
+        let lease = self.hold_scratch(buffer.bytes.saturating_mul(scratch_factor(tenant.signal)));
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
             buffer,
@@ -1077,7 +1100,7 @@ impl Buffers {
                 continue;
             }
             let batches = part.batches();
-            let held = self.hold_scratch(part.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR));
+            let held = self.hold_scratch(part.bytes.saturating_mul(scratch_factor(tenant.signal)));
             self.flushing.entry(tenant).or_default().push(Flushing {
                 file,
                 buffer: part,
@@ -1220,7 +1243,10 @@ impl Buffers {
                 .find(|f| f.file == file && !f.in_progress)?;
             entry.in_progress = true;
             (
-                entry.buffer.bytes.saturating_mul(FLUSH_SCRATCH_FACTOR),
+                entry
+                    .buffer
+                    .bytes
+                    .saturating_mul(scratch_factor(tenant.signal)),
                 entry.layout,
                 entry.origin,
             )
@@ -1829,6 +1855,55 @@ mod tests {
             "a retry takes the lease too"
         );
         assert_eq!(buffers.flush_margin(), 0);
+        drop(lease);
+    }
+
+    #[test]
+    fn a_log_flush_keeps_one_more_copy_for_its_text_sidecar() {
+        let logs = Stream::logs(TenantId(uuid::Uuid::from_u128(7)));
+        let factor = FLUSH_SCRATCH_FACTOR + TEXT_INDEX_SCRATCH_FACTOR;
+        let mut buffers = Buffers::default();
+        buffers
+            .get_mut(logs)
+            .push(tagged(4, 1), at(10), Instant::now());
+        let live = buffers.total_bytes();
+        assert_eq!(buffers.flush_margin(), live * factor);
+        assert_eq!(buffers.headroom(live * (1 + factor) + 1), 1);
+        assert_eq!(
+            Buffers::admission_cost(10, 0, RowSignal::Logs),
+            Buffers::batch_cost(10, 0) * (1 + factor)
+        );
+        assert_eq!(
+            Buffers::admission_cost(10, 0, RowSignal::Traces),
+            Buffers::batch_cost(10, 0) * (1 + FLUSH_SCRATCH_FACTOR)
+        );
+        let reservation = buffers.reserve(logs, 2, &[]);
+        assert_eq!(
+            buffers.headroom(live * (1 + factor) + 2 * (1 + factor)),
+            0,
+            "a log reservation keeps the log margin"
+        );
+        drop(reservation);
+        let file = FileId(uuid::Uuid::from_u128(1));
+        let (_, lease) = buffers
+            .begin_flush(
+                logs,
+                file,
+                FileLayout::current(8),
+                (at(0), at(u64::MAX)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            buffers.scratch_total(),
+            live * factor,
+            "the lease covers the sidecar"
+        );
+        drop(lease);
+        buffers.flush_failed(logs, file, Instant::now());
+        assert_eq!(buffers.flush_margin(), live * factor);
+        let (_, lease, _, _) = buffers.take_flushing(logs, file).unwrap();
+        assert_eq!(buffers.scratch_total(), live * factor, "a retry too");
         drop(lease);
     }
 

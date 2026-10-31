@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
-use arrow::array::AsArray;
+use arrow::array::{Array, AsArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
@@ -122,7 +122,11 @@ pub fn prepare_stream(
     let mut encode = std::time::Duration::ZERO;
     let mut writer_peak = 0;
     let mut rows = Vec::new();
-    let (mut ts_min, mut ts_max) = (i64::MAX, i64::MIN);
+    let ts_column = schema.index_of(col::TIMESTAMP)?;
+    let ts_min = earliest(&inputs, ts_column);
+    let mut ts_max = i64::MIN;
+    let path = l0_path_of(root, stream, Utc.timestamp_nanos(ts_min.unwrap_or(0)), id);
+    let mut text = text_builder(stream.signal, &layout, path.as_ref(), &inputs)?;
     let mut heads = keys.heads();
     loop {
         let merge_started = std::time::Instant::now();
@@ -134,15 +138,20 @@ pub fn prepare_stream(
         merge += merge_started.elapsed();
 
         let ts = group
-            .column(schema.index_of(col::TIMESTAMP)?)
+            .column(ts_column)
             .as_primitive::<TimestampNanosecondType>();
-        ts_min = ts_min.min(arrow::compute::min(ts).unwrap_or(ts_min));
         ts_max = ts_max.max(arrow::compute::max(ts).unwrap_or(ts_max));
 
         let encode_started = std::time::Instant::now();
         writer.write(&group)?;
         writer_peak = writer_peak.max(writer.memory_size());
         writer.flush()?;
+        if let Some(builder) = text.as_mut() {
+            let bodies = group
+                .column(schema.index_of(fs_schema::logs::col::BODY)?)
+                .as_string::<i32>();
+            builder.add_row_group((0..bodies.len()).map(|i| bodies.value(i).as_bytes()))?;
+        }
         encode += encode_started.elapsed();
 
         let traces = trace_set(&group);
@@ -158,19 +167,11 @@ pub fn prepare_stream(
 
     let row_count: usize = rows.iter().map(|r| r.batch.num_rows()).sum();
     if row_count == 0 {
-        (ts_min, ts_max) = (0, 0);
+        ts_max = 0;
     }
-    let start = Utc.timestamp_nanos(ts_min);
-    let path = l0_path_of(root, stream, start, id);
-    let index = match stream.signal {
-        RowSignal::Traces => {
-            let index_path = fs_index::sidecar_path(path.as_ref())
-                .ok_or(fs_index::IndexError::BadBody("file path has no sidecar"))?;
-            let index = Bytes::from(trace_index(path.as_ref(), &rows)?.encode());
-            Some((index_path, index))
-        }
-        RowSignal::Logs => None,
-    };
+    let start = Utc.timestamp_nanos(ts_min.unwrap_or(0));
+    let content_sha256 = crate::sha256::digest(&bytes);
+    let index = sidecar(stream.signal, path.as_ref(), &rows, text, content_sha256)?;
     let file = NewFile {
         id,
         origin: id,
@@ -186,7 +187,7 @@ pub fn prepare_stream(
         },
         services: keys.services,
         summary: None,
-        content_sha256: Some(crate::sha256::digest(&bytes)),
+        content_sha256: Some(content_sha256),
     };
     Ok(Prepared {
         file,
@@ -198,6 +199,80 @@ pub fn prepare_stream(
         encode,
         writer_peak,
     })
+}
+
+/// The sidecar of the file at `path` and where it goes: the `trace_id`
+/// sidecar of a span file, the text sidecar of a log file whose layout
+/// records one.
+fn sidecar(
+    signal: RowSignal,
+    path: &str,
+    rows: &[HotBatch],
+    text: Option<fs_index::TextIndexBuilder>,
+    content_sha256: [u8; 32],
+) -> Result<Option<(String, Bytes)>, IngestError> {
+    let no_sidecar = || fs_index::IndexError::BadBody("file path has no sidecar");
+    Ok(match (signal, text) {
+        (RowSignal::Traces, _) => {
+            let index_path = fs_index::sidecar_path(path).ok_or_else(no_sidecar)?;
+            Some((index_path, Bytes::from(trace_index(path, rows)?.encode())))
+        }
+        (RowSignal::Logs, Some(builder)) => {
+            let index_path = fs_index::text_index::sidecar_path(path).ok_or_else(no_sidecar)?;
+            Some((index_path, Bytes::from(builder.finish(content_sha256)?)))
+        }
+        (RowSignal::Logs, None) => None,
+    })
+}
+
+/// Earliest timestamp of `inputs`, `None` without rows.
+fn earliest(inputs: &[RecordBatch], ts_column: usize) -> Option<i64> {
+    inputs
+        .iter()
+        .filter_map(|b| {
+            arrow::compute::min(
+                b.column(ts_column)
+                    .as_primitive::<TimestampNanosecondType>(),
+            )
+        })
+        .min()
+}
+
+/// The text sidecar builder of a log file whose layout records one,
+/// reserved for the bodies of `inputs`.
+///
+/// # Errors
+/// A layout naming a text sidecar for spans, an unwritten sidecar
+/// version, or budgets outside their ceilings.
+fn text_builder(
+    signal: RowSignal,
+    layout: &FileLayout,
+    path: &str,
+    inputs: &[RecordBatch],
+) -> Result<Option<fs_index::TextIndexBuilder>, IngestError> {
+    let Some(limits) = layout.text_limits()? else {
+        return Ok(None);
+    };
+    if signal != RowSignal::Logs {
+        return Err(IngestError::Encode(
+            "a text sidecar is only written for log files".into(),
+        ));
+    }
+    let mut body_bytes = 0usize;
+    let mut row_count = 0usize;
+    for batch in inputs {
+        let bodies = batch
+            .column(batch.schema().index_of(fs_schema::logs::col::BODY)?)
+            .as_string::<i32>();
+        let offsets = bodies.value_offsets();
+        let span = offsets.last().copied().unwrap_or(0) - offsets.first().copied().unwrap_or(0);
+        body_bytes += usize::try_from(span).unwrap_or(0);
+        row_count += batch.num_rows();
+    }
+    let row_groups = row_count.div_ceil(layout.row_group_rows.max(1));
+    Ok(Some(fs_index::TextIndexBuilder::new(
+        path, limits, body_bytes, row_groups,
+    )?))
 }
 
 /// The sidecar of one file: every trace of every row group, file index 0.
@@ -364,6 +439,11 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
 pub fn check_layout(layout: &FileLayout, signal: RowSignal) -> Result<(), IngestError> {
     if !FileLayout::written_versions(signal).contains(&layout.version) {
         return Err(unwritten_layout(layout.version, signal));
+    }
+    if layout.text_limits()?.is_some() && signal != RowSignal::Logs {
+        return Err(IngestError::Encode(
+            "a text sidecar is only written for log files".into(),
+        ));
     }
     check_row_group_rows(layout.row_group_rows)
 }
@@ -731,6 +811,7 @@ mod tests {
             let layout = FileLayout {
                 version,
                 row_group_rows: 3,
+                text_index: None,
             };
             prepare(tenant, &Path::from(""), id, &inputs, layout)
         };
@@ -950,6 +1031,7 @@ mod tests {
         let layout = |version| FileLayout {
             version,
             row_group_rows: 8,
+            text_index: None,
         };
         assert!(check_layout(&layout(3), RowSignal::Traces).is_ok());
         assert!(check_layout(&layout(3), RowSignal::Logs).is_err());
@@ -959,6 +1041,64 @@ mod tests {
         let id = FileId(uuid::Uuid::from_u128(2));
         let refused = prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout(3));
         assert!(refused.is_err());
+    }
+
+    /// A log layout with text sizing writes the same Parquet bytes and a
+    /// sidecar bound to them, the same on every attempt; one without, as a
+    /// log intent logged before text sidecars, writes none; a span layout
+    /// naming one is refused.
+    #[test]
+    fn a_log_layout_with_text_sizing_writes_a_sidecar_bound_to_the_file() {
+        let stream = Stream::logs(TenantId(uuid::Uuid::from_u128(0x7e5a)));
+        let id = FileId(uuid::Uuid::from_u128(0xf11e));
+        let limits = fs_index::TextIndexLimits::DEFAULT;
+        let layout = FileLayout::for_signal(RowSignal::Logs, 3, limits);
+        let with = prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout).unwrap();
+        let without = prepare_stream(
+            stream,
+            &Path::from(""),
+            id,
+            &[log_batch()],
+            FileLayout::current(3),
+        )
+        .unwrap();
+        assert_eq!(
+            with.bytes, without.bytes,
+            "the sidecar does not touch the file"
+        );
+        assert!(without.index.is_none());
+        let (path, sidecar) = with.index.clone().unwrap();
+        assert_eq!(
+            Some(path),
+            fs_index::text_index::sidecar_path(&with.file.path)
+        );
+        let index = fs_index::TextIndex::decode(sidecar.as_ref()).unwrap();
+        assert_eq!(index.path(), with.file.path);
+        assert_eq!(Some(*index.content_sha256()), with.file.content_sha256);
+        assert_eq!(index.rows().collect::<Vec<_>>(), [3, 2]);
+        let again = prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout).unwrap();
+        assert_eq!(again.index, with.index, "a replay writes the same sidecar");
+
+        let span_layout = FileLayout {
+            text_index: layout.text_index,
+            ..FileLayout::current(3)
+        };
+        assert!(check_layout(&span_layout, RowSignal::Traces).is_err());
+        let unknown = FileLayout {
+            text_index: layout
+                .text_index
+                .map(|t| crate::record::TextIndexLayout { version: 2, ..t }),
+            ..layout
+        };
+        assert!(check_layout(&unknown, RowSignal::Logs).is_err());
+        let oversized = FileLayout {
+            text_index: layout.text_index.map(|t| crate::record::TextIndexLayout {
+                max_bytes_per_file: fs_index::TextIndexLimits::FILE_CEILING + 1,
+                ..t
+            }),
+            ..layout
+        };
+        assert!(check_layout(&oversized, RowSignal::Logs).is_err());
     }
 
     /// The bytes of a canonical log input, pinned for every layout version
@@ -980,6 +1120,7 @@ mod tests {
             let layout = FileLayout {
                 version,
                 row_group_rows: 3,
+                text_index: None,
             };
             let prepared =
                 prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout).unwrap();
@@ -1005,11 +1146,13 @@ mod tests {
         let future = FileLayout {
             version: FileLayout::CURRENT_VERSION + 1,
             row_group_rows: 8,
+            text_index: None,
         };
         assert!(check_layout(&future, RowSignal::Traces).is_err());
         let past = FileLayout {
             version: 2,
             row_group_rows: 8,
+            text_index: None,
         };
         assert!(
             check_layout(&past, RowSignal::Traces).is_err(),
@@ -1019,6 +1162,7 @@ mod tests {
             let outside = FileLayout {
                 version: FileLayout::CURRENT_VERSION,
                 row_group_rows: rows,
+                text_index: None,
             };
             assert!(
                 check_layout(&outside, RowSignal::Traces).is_err(),
@@ -1078,6 +1222,7 @@ mod tests {
             let layout = FileLayout {
                 version,
                 row_group_rows: 3,
+                text_index: None,
             };
             let prepared = prepare(tenant, &Path::from(""), id, &inputs, layout).unwrap();
             let digest: [u8; 32] = Sha256::digest(&prepared.bytes).into();

@@ -292,6 +292,13 @@ pub struct IngestSection {
     /// Rows per Parquet row group; the writer holds one at a time.
     #[serde(default = "default_row_group_rows")]
     pub row_group_rows: usize,
+    /// Bloom bytes both blooms of one row group of a log file's text
+    /// sidecar may take together; at most 64 MiB.
+    #[serde(default = "default_text_index_bytes_per_row_group")]
+    pub text_index_max_bytes_per_row_group: usize,
+    /// Bloom bytes of one log file's text sidecar; at most 512 MiB.
+    #[serde(default = "default_text_index_bytes_per_file")]
+    pub text_index_max_bytes_per_file: usize,
     /// Refuse a tenant's data when its live and flushing rows would exceed this.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
@@ -368,6 +375,8 @@ impl Default for IngestSection {
             max_confirms: default_max_confirms(),
             confirm_timeout_secs: default_confirm_timeout(),
             row_group_rows: default_row_group_rows(),
+            text_index_max_bytes_per_row_group: default_text_index_bytes_per_row_group(),
+            text_index_max_bytes_per_file: default_text_index_bytes_per_file(),
             max_buffer_bytes: default_max_buffer_bytes(),
             max_tenant_bytes: default_max_tenant_bytes(),
             wal_max_bytes: default_wal_max_bytes(),
@@ -425,10 +434,26 @@ fn default_persisted_retain() -> u64 {
 }
 
 impl IngestSection {
+    /// The text sidecar budgets of log files.
+    ///
+    /// # Errors
+    /// A budget of zero or above its ceiling.
+    pub fn text_index_limits(&self) -> Result<fs_index::TextIndexLimits, ServerError> {
+        fs_index::TextIndexLimits::new(
+            self.text_index_max_bytes_per_row_group,
+            self.text_index_max_bytes_per_file,
+        )
+        .map_err(|_| {
+            ServerError::InvalidConfig(
+                "ingest.text_index_max_bytes_per_row_group must be between 1 and 64 MiB and ingest.text_index_max_bytes_per_file between 1 and 512 MiB".into(),
+            )
+        })
+    }
+
     /// Converts to the ingest crate's configuration.
     ///
     /// # Errors
-    /// Unparsable listen address.
+    /// Unparsable listen address, or text sidecar budgets out of range.
     pub fn to_ingest_config(&self) -> Result<fs_ingest::IngestConfig, ServerError> {
         let listen = self.listen.parse().map_err(|e| {
             ServerError::InvalidConfig(format!("ingest.listen {:?}: {e}", self.listen))
@@ -450,6 +475,7 @@ impl IngestSection {
             max_confirms: self.max_confirms,
             confirm_timeout: std::time::Duration::from_secs(self.confirm_timeout_secs),
             row_group_rows: self.row_group_rows,
+            text_index: self.text_index_limits()?,
             max_buffer_bytes: self.max_buffer_bytes,
             max_tenant_bytes: self.max_tenant_bytes,
             wal_max_bytes: self.wal_max_bytes,
@@ -524,6 +550,14 @@ fn default_max_flushes() -> usize {
 
 fn default_row_group_rows() -> usize {
     fs_ingest::flush::DEFAULT_ROW_GROUP_ROWS
+}
+
+fn default_text_index_bytes_per_row_group() -> usize {
+    fs_index::TextIndexLimits::DEFAULT.max_bytes_per_row_group
+}
+
+fn default_text_index_bytes_per_file() -> usize {
+    fs_index::TextIndexLimits::DEFAULT.max_bytes_per_file
 }
 
 fn default_coalesce_bytes() -> usize {
@@ -1207,6 +1241,7 @@ impl Config {
                 "ingest.max_hours_per_batch must be positive and ingest.max_live_hours at least that",
             );
         }
+        self.ingest.text_index_limits()?;
         Ok(())
     }
 
@@ -1858,6 +1893,41 @@ mod tests {
                 .to_string()
                 .contains("compactor.rebuilds_per_tick must be at most 256")
         );
+    }
+
+    #[test]
+    fn text_index_budgets_default_and_are_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let config = Config::parse(MINIMAL).unwrap();
+        assert_eq!(
+            config.ingest.to_ingest_config().unwrap().text_index,
+            fs_index::TextIndexLimits::DEFAULT
+        );
+        let mib = 1024 * 1024;
+        for (group, file, ok) in [
+            (mib, 8 * mib, true),
+            (64 * mib, 512 * mib, true),
+            (0, 8 * mib, false),
+            (mib, 0, false),
+            (64 * mib + 1, 512 * mib, false),
+            (mib, 512 * mib + 1, false),
+        ] {
+            let config = Config::parse(&format!(
+                "{MINIMAL}[ingest]\ntext_index_max_bytes_per_row_group = {group}\ntext_index_max_bytes_per_file = {file}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.validate(&secrets).is_ok(), ok, "{group} {file}");
+            if ok {
+                let limits = config.ingest.to_ingest_config().unwrap().text_index;
+                assert_eq!(
+                    (limits.max_bytes_per_row_group, limits.max_bytes_per_file),
+                    (group, file)
+                );
+            }
+        }
     }
 
     #[test]

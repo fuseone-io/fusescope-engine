@@ -4071,6 +4071,7 @@ async fn future_layout_version_fails_closed() {
             layout: Some(FileLayout {
                 version: FileLayout::CURRENT_VERSION + 1,
                 row_group_rows: 7,
+                text_index: None,
             }),
             hour: None,
             signal: RowSignal::Traces,
@@ -4122,6 +4123,7 @@ async fn an_intent_of_layout_3_is_written_with_layout_3_after_a_restart() {
     let layout = FileLayout {
         version: 3,
         row_group_rows: 7,
+        text_index: None,
     };
     {
         let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();

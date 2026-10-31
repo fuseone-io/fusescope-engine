@@ -458,7 +458,8 @@ writes one per L0 file, derived from the trace sets of its row groups, after
 the Parquet object and before the catalog row, under the create-once rule: a
 sidecar already there must be byte for byte the one the rows produce, or the
 file is not registered, since a valid sidecar listing other traces would hide
-the file. The compactor will merge them into one per hour. The querier
+the file; the rows then take a fresh id, as for a Parquet object with other
+bytes. The compactor will merge them into one per hour. The querier
 derives the sidecar path from the file path, so the catalog does not list
 sidecars. A lookup that pins trace ids fetches the sidecars of the files the
 catalog keeps, in parallel, and opens only those listing one of the ids in

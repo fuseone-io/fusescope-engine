@@ -40,6 +40,8 @@ pub struct IngestConfig {
     /// Rows per Parquet row group. A flush gathers, writes and flushes one
     /// row group at a time, so this bounds what the writer holds.
     pub row_group_rows: usize,
+    /// Budgets of the text sidecar of log files, recorded in each intent.
+    pub text_index: fs_index::TextIndexLimits,
     /// Refuse new data for a tenant whose live and flushing rows would exceed
     /// this; flushes are failing or falling behind.
     pub max_buffer_bytes: usize,
@@ -49,9 +51,10 @@ pub struct IngestConfig {
     pub max_tenant_bytes: usize,
     /// Refuse new data when everything held in memory, live, flushing and
     /// persisted for the hot window, exceeds this. Live and flushing rows
-    /// also keep room for the scratch their flush will need, three copies,
-    /// so rows once admitted can always be written out. Persisted rows are
-    /// never evicted early to make room: queriers may still need them.
+    /// also keep room for the scratch their flush will need, three copies
+    /// and a fourth for log rows, so rows once admitted can always be
+    /// written out. Persisted rows are never evicted early to make room:
+    /// queriers may still need them.
     pub max_memory_bytes: usize,
     /// Refuse new data when the WAL on disk exceeds this.
     pub wal_max_bytes: u64,
@@ -144,6 +147,7 @@ impl Default for IngestConfig {
             max_coalesces: default_coalesces(),
             max_flushes: 2,
             row_group_rows: crate::flush::DEFAULT_ROW_GROUP_ROWS,
+            text_index: fs_index::TextIndexLimits::DEFAULT,
             max_buffer_bytes: 512 * 1024 * 1024,
             max_tenant_bytes: 1024 * 1024 * 1024,
             max_memory_bytes: 2 * 1024 * 1024 * 1024,
