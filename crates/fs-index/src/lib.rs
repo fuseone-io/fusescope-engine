@@ -9,7 +9,7 @@
 pub mod layout;
 pub mod trace_index;
 
-pub use layout::SpanObject;
+pub use layout::EngineObject;
 pub use trace_index::{TraceIndex, owners_of_sidecar, sidecar_path};
 
 /// Crate version, exposed for diagnostics and the `--version` flag.

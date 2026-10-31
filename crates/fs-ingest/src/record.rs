@@ -15,6 +15,27 @@ pub const VERSION: u8 = 1;
 /// reader of the previous version meets it and fails, rather than reading
 /// the intent as the whole range.
 pub const VERSION_HOUR_INTENT: u8 = 2;
+/// Record format version of an intent of a signal other than traces, with
+/// or without an hour. A reader without that signal meets it and fails,
+/// rather than reading the intent as one over spans.
+pub const VERSION_SIGNAL_INTENT: u8 = 3;
+
+/// Bytes of the seed at the head of a [`RecordSignal::Logs`] payload.
+pub const LOG_SEED_BYTES: usize = 16;
+
+/// The payload of a [`RecordSignal::Logs`] record.
+pub fn log_payload(seed: [u8; LOG_SEED_BYTES], request: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(LOG_SEED_BYTES + request.len());
+    out.extend_from_slice(&seed);
+    out.extend_from_slice(request);
+    Bytes::from(out)
+}
+
+/// The seed and the request of a [`RecordSignal::Logs`] payload, or `None`
+/// when it is shorter than a seed.
+pub fn split_log_payload(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    payload.split_at_checked(LOG_SEED_BYTES)
+}
 
 /// Signal carried by a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +45,10 @@ pub enum RecordSignal {
     Traces = 1,
     /// A [`FlushIntent`]: the exact set of earlier records one file is made of.
     FlushIntent = 2,
+    /// A [`LOG_SEED_BYTES`] seed, then an `ExportLogsServiceRequest`: the
+    /// seed names the request for the ids of its rows, so a replay gives
+    /// them the ids the live conversion did.
+    Logs = 3,
 }
 
 impl RecordSignal {
@@ -31,6 +56,7 @@ impl RecordSignal {
         match b {
             1 => Some(Self::Traces),
             2 => Some(Self::FlushIntent),
+            3 => Some(Self::Logs),
             _ => None,
         }
     }
@@ -60,6 +86,38 @@ pub struct FlushIntent {
     /// file holds every row of the range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hour: Option<i64>,
+    /// Signal of the rows the file holds: an intent covers the tenant's
+    /// records of that signal in its range. Absent in intents of traces.
+    #[serde(default, skip_serializing_if = "RowSignal::is_traces")]
+    pub signal: RowSignal,
+}
+
+/// Signal of a set of rows: what a buffer holds and a [`FlushIntent`] names.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RowSignal {
+    /// Span rows from [`RecordSignal::Traces`] records.
+    #[default]
+    Traces,
+    /// Log rows from [`RecordSignal::Logs`] records.
+    Logs,
+}
+
+impl RowSignal {
+    /// The kind of record whose rows the intent covers.
+    pub fn record(self) -> RecordSignal {
+        match self {
+            Self::Traces => RecordSignal::Traces,
+            Self::Logs => RecordSignal::Logs,
+        }
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_traces(&self) -> bool {
+        *self == Self::Traces
+    }
 }
 
 /// The encoder and its parameters that turn a set of rows into one exact
@@ -96,13 +154,13 @@ impl FileLayout {
 
 impl FlushIntent {
     /// Serialises the intent as a WAL record payload, under the record
-    /// version that an intent of one hour needs.
+    /// version its signal and its hour need.
     pub fn to_record(&self) -> WalRecord {
         WalRecord {
-            version: if self.hour.is_some() {
-                VERSION_HOUR_INTENT
-            } else {
-                VERSION
+            version: match (self.signal, self.hour) {
+                (RowSignal::Logs, _) => VERSION_SIGNAL_INTENT,
+                (RowSignal::Traces, Some(_)) => VERSION_HOUR_INTENT,
+                (RowSignal::Traces, None) => VERSION,
             },
             tenant: self.tenant,
             signal: RecordSignal::FlushIntent,
@@ -111,42 +169,47 @@ impl FlushIntent {
     }
 
     /// Reads an intent from its record, refusing what the record's version
-    /// does not allow: an intent of the first version names no hour, and
-    /// an intent of the hour version names the start of a representable
-    /// hour. Anything else was not written by this engine's cut.
+    /// does not allow: the first version names traces and no hour, the hour
+    /// version traces and an hour, the signal version another signal, with
+    /// or without an hour, and any hour is the start of a representable
+    /// one. Anything else was not written by this engine's cut.
     ///
     /// # Errors
-    /// Not an intent record, a malformed payload, or an hour the version
-    /// does not allow.
+    /// Not an intent record, a malformed payload, or a signal or an hour the
+    /// version does not allow.
     pub fn from_record(record: &WalRecord) -> Result<Self, IngestError> {
         if record.signal != RecordSignal::FlushIntent {
             return Err(IngestError::Record("not a flush intent".into()));
         }
         let intent = Self::from_payload(&record.payload)?;
-        match (record.version, intent.hour) {
-            (VERSION, None) => Ok(intent),
-            (VERSION, Some(_)) => Err(IngestError::Record(
-                "an intent of the first version carries an hour".into(),
-            )),
-            (VERSION_HOUR_INTENT, Some(secs)) => {
-                let representable = chrono::DateTime::from_timestamp(secs, 0)
-                    .and_then(|hour| hour.timestamp_nanos_opt())
-                    .is_some();
-                if secs.rem_euclid(3600) == 0 && representable {
-                    Ok(intent)
-                } else {
-                    Err(IngestError::Record(format!(
-                        "intent hour {secs} is not the start of an hour"
-                    )))
-                }
+        let allowed = match (record.version, intent.signal, intent.hour) {
+            (VERSION, RowSignal::Traces, None)
+            | (VERSION_HOUR_INTENT, RowSignal::Traces, Some(_))
+            | (VERSION_SIGNAL_INTENT, RowSignal::Logs, _) => true,
+            (VERSION | VERSION_HOUR_INTENT | VERSION_SIGNAL_INTENT, _, _) => false,
+            (version, _, _) => {
+                return Err(IngestError::Record(format!(
+                    "unsupported version {version}"
+                )));
             }
-            (VERSION_HOUR_INTENT, None) => Err(IngestError::Record(
-                "an intent of the hour version names no hour".into(),
-            )),
-            (version, _) => Err(IngestError::Record(format!(
-                "unsupported version {version}"
-            ))),
+        };
+        if !allowed {
+            return Err(IngestError::Record(format!(
+                "an intent of version {} names {:?} with hour {:?}",
+                record.version, intent.signal, intent.hour
+            )));
         }
+        if let Some(secs) = intent.hour {
+            let representable = chrono::DateTime::from_timestamp(secs, 0)
+                .and_then(|hour| hour.timestamp_nanos_opt())
+                .is_some();
+            if secs.rem_euclid(3600) != 0 || !representable {
+                return Err(IngestError::Record(format!(
+                    "intent hour {secs} is not the start of an hour"
+                )));
+            }
+        }
+        Ok(intent)
     }
 
     /// The hour the file holds, when the buffer was cut by hour. Always
@@ -165,9 +228,13 @@ impl FlushIntent {
             .map_err(|e| IngestError::Record(format!("bad flush intent: {e}")))
     }
 
-    /// True when a record of this tenant at `position` belongs to the file.
-    pub fn covers(&self, tenant: TenantId, position: fs_wal::Position) -> bool {
-        self.tenant == tenant && position >= self.first && position < self.end
+    /// True when a record of `signal` of this tenant at `position` belongs
+    /// to the file.
+    pub fn covers(&self, tenant: TenantId, signal: RowSignal, position: fs_wal::Position) -> bool {
+        self.tenant == tenant
+            && self.signal == signal
+            && position >= self.first
+            && position < self.end
     }
 }
 
@@ -207,17 +274,17 @@ impl WalRecord {
             .split_at_checked(HEADER_LEN)
             .ok_or_else(|| IngestError::Record(format!("short record: {} bytes", bytes.len())))?;
         let version = header.first().copied().unwrap_or(0);
-        if version != VERSION && version != VERSION_HOUR_INTENT {
+        if ![VERSION, VERSION_HOUR_INTENT, VERSION_SIGNAL_INTENT].contains(&version) {
             return Err(IngestError::Record(format!(
                 "unsupported version {version}"
             )));
         }
         let signal = RecordSignal::from_byte(header.get(1).copied().unwrap_or(0))
             .ok_or_else(|| IngestError::Record("unknown signal".into()))?;
-        if version == VERSION_HOUR_INTENT && signal != RecordSignal::FlushIntent {
-            return Err(IngestError::Record(
-                "the hour version is for flush intents only".into(),
-            ));
+        if version != VERSION && signal != RecordSignal::FlushIntent {
+            return Err(IngestError::Record(format!(
+                "version {version} is for flush intents only"
+            )));
         }
         let uuid = header
             .get(2..18)
@@ -265,6 +332,7 @@ mod tests {
             },
             layout: Some(FileLayout::current(4096)),
             hour: None,
+            signal: RowSignal::Traces,
         };
         let record = intent.to_record();
         assert_eq!(record.signal, RecordSignal::FlushIntent);
@@ -272,6 +340,7 @@ mod tests {
         assert_eq!(FlushIntent::from_payload(&decoded.payload).unwrap(), intent);
         assert!(intent.covers(
             tenant,
+            RowSignal::Traces,
             fs_wal::Position {
                 segment: 1,
                 offset: 16
@@ -279,6 +348,7 @@ mod tests {
         ));
         assert!(intent.covers(
             tenant,
+            RowSignal::Traces,
             fs_wal::Position {
                 segment: 1,
                 offset: 4095
@@ -287,6 +357,7 @@ mod tests {
         assert!(
             !intent.covers(
                 tenant,
+                RowSignal::Traces,
                 fs_wal::Position {
                     segment: 1,
                     offset: 4096
@@ -296,6 +367,7 @@ mod tests {
         );
         assert!(!intent.covers(
             TenantId::new(),
+            RowSignal::Traces,
             fs_wal::Position {
                 segment: 1,
                 offset: 100
@@ -333,6 +405,7 @@ mod tests {
             },
             layout: Some(FileLayout::current(4096)),
             hour: None,
+            signal: RowSignal::Traces,
         };
         let one_hour = FlushIntent {
             hour: Some(1_792_677_600),
@@ -434,5 +507,93 @@ mod tests {
         .encode();
         *bad_signal.get_mut(1).unwrap() = 7;
         assert!(WalRecord::decode(&bad_signal).is_err());
+    }
+
+    fn logs_intent(hour: Option<i64>) -> FlushIntent {
+        FlushIntent {
+            tenant: TenantId::new(),
+            file: fs_catalog::FileId::new(),
+            first: fs_wal::Position {
+                segment: 2,
+                offset: 16,
+            },
+            end: fs_wal::Position {
+                segment: 2,
+                offset: 900,
+            },
+            layout: Some(FileLayout::current(64)),
+            hour,
+            signal: RowSignal::Logs,
+        }
+    }
+
+    /// A log record and a log intent are of their own kinds, which an engine
+    /// without logs refuses as unknown, and a trace intent keeps the bytes
+    /// of the versions before logs.
+    #[test]
+    fn log_records_and_intents_round_trip_under_their_own_codes() {
+        let record = WalRecord {
+            version: VERSION,
+            tenant: TenantId::new(),
+            signal: RecordSignal::Logs,
+            payload: Bytes::from_static(b"otlp logs"),
+        };
+        let bytes = record.encode();
+        assert_eq!(bytes.get(1), Some(&3));
+        assert_eq!(WalRecord::decode(&bytes).unwrap(), record);
+
+        for hour in [None, Some(1_792_677_600)] {
+            let intent = logs_intent(hour);
+            let record = intent.to_record();
+            assert_eq!(record.version, VERSION_SIGNAL_INTENT);
+            let decoded = WalRecord::decode(&record.encode()).unwrap();
+            assert_eq!(FlushIntent::from_record(&decoded).unwrap(), intent);
+        }
+        let bad_hour = logs_intent(Some(1_792_677_601)).to_record();
+        assert!(FlushIntent::from_record(&bad_hour).is_err());
+
+        let traces = FlushIntent {
+            signal: RowSignal::Traces,
+            ..logs_intent(None)
+        };
+        let record = traces.to_record();
+        assert_eq!(record.version, VERSION);
+        let payload = String::from_utf8(record.payload.to_vec()).unwrap();
+        assert!(!payload.contains("signal"), "{payload}");
+    }
+
+    /// Each intent version names one signal: a log intent under a trace
+    /// version, or a trace intent under the signal version, was not written
+    /// by this engine's cut.
+    #[test]
+    fn an_intent_under_the_version_of_another_signal_is_refused() {
+        let logs = logs_intent(None);
+        for version in [VERSION, VERSION_HOUR_INTENT] {
+            let record = WalRecord {
+                version,
+                ..logs.to_record()
+            };
+            assert!(FlushIntent::from_record(&record).is_err(), "{version}");
+        }
+        let traces = FlushIntent {
+            signal: RowSignal::Traces,
+            ..logs_intent(None)
+        };
+        let record = WalRecord {
+            version: VERSION_SIGNAL_INTENT,
+            ..traces.to_record()
+        };
+        assert!(FlushIntent::from_record(&record).is_err());
+        let rows = WalRecord {
+            version: VERSION_SIGNAL_INTENT,
+            tenant: TenantId::new(),
+            signal: RecordSignal::Logs,
+            payload: Bytes::new(),
+        }
+        .encode();
+        assert!(
+            WalRecord::decode(&rows).is_err(),
+            "the signal version is for intents"
+        );
     }
 }

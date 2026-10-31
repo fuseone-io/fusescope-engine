@@ -22,6 +22,7 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_index::TraceIndex;
+use fs_schema::logs::log_schema_v1;
 use fs_schema::spans::{col, span_schema_v1};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -29,8 +30,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 use crate::IngestError;
-use crate::buffer::{HotBatch, trace_set};
-use crate::record::FileLayout;
+use crate::buffer::{HotBatch, Stream, trace_set};
+use crate::record::{FileLayout, RowSignal};
 
 pub use fs_schema::parquet::{DEFAULT_ROW_GROUP_ROWS, MAX_ROW_GROUP_ROWS};
 
@@ -48,10 +49,9 @@ pub struct Prepared {
     pub file: NewFile,
     /// File bytes.
     pub bytes: Bytes,
-    /// The `trace_id` sidecar listing the traces of the file, encoded.
-    pub index: Bytes,
-    /// Where the sidecar goes, derived from the file's path.
-    pub index_path: String,
+    /// The `trace_id` sidecar listing the traces of a span file, encoded,
+    /// and where it goes, derived from the file's path. Log files have none.
+    pub index: Option<(String, Bytes)>,
     /// The rows as written, one batch per row group in file order, each with
     /// its trace ids: what the hot window keeps for the file after
     /// registration.
@@ -70,13 +70,10 @@ pub struct Prepared {
     pub writer_peak: usize,
 }
 
-/// Sorts each of `batches`, merges them into row groups of `row_group_rows`
-/// rows and encodes each as it completes.
-///
-/// CPU bound: callers run it on a blocking thread.
+/// [`prepare_stream`] for span rows.
 ///
 /// # Errors
-/// Arrow or Parquet failures.
+/// See [`prepare_stream`].
 pub fn prepare(
     tenant: TenantId,
     root: &Path,
@@ -84,7 +81,24 @@ pub fn prepare(
     batches: &[RecordBatch],
     layout: FileLayout,
 ) -> Result<Prepared, IngestError> {
-    let schema = span_schema_v1();
+    prepare_stream(Stream::traces(tenant), root, id, batches, layout)
+}
+
+/// Sorts each of `batches`, rows of `stream`, merges them into row groups
+/// of the layout's size and encodes each as it completes.
+///
+/// CPU bound: callers run it on a blocking thread.
+///
+/// # Errors
+/// Arrow or Parquet failures, or a layout this engine does not write.
+pub fn prepare_stream(
+    stream: Stream,
+    root: &Path,
+    id: FileId,
+    batches: &[RecordBatch],
+    layout: FileLayout,
+) -> Result<Prepared, IngestError> {
+    let schema = schema_of(stream.signal);
     check_layout(&layout)?;
     let row_group_rows = layout.row_group_rows;
 
@@ -101,7 +115,7 @@ pub fn prepare(
     let mut writer = ArrowWriter::try_new(
         &mut out,
         Arc::clone(&schema),
-        Some(writer_properties(layout)?),
+        Some(writer_properties(layout, stream.signal)?),
     )?;
 
     let mut merge = std::time::Duration::ZERO;
@@ -147,15 +161,21 @@ pub fn prepare(
         (ts_min, ts_max) = (0, 0);
     }
     let start = Utc.timestamp_nanos(ts_min);
-    let path = l0_path(root, tenant, start, id);
-    let index_path = fs_index::sidecar_path(path.as_ref())
-        .ok_or(fs_index::IndexError::BadBody("file path has no sidecar"))?;
-    let index = Bytes::from(trace_index(path.as_ref(), &rows)?.encode());
+    let path = l0_path_of(root, stream, start, id);
+    let index = match stream.signal {
+        RowSignal::Traces => {
+            let index_path = fs_index::sidecar_path(path.as_ref())
+                .ok_or(fs_index::IndexError::BadBody("file path has no sidecar"))?;
+            let index = Bytes::from(trace_index(path.as_ref(), &rows)?.encode());
+            Some((index_path, index))
+        }
+        RowSignal::Logs => None,
+    };
     let file = NewFile {
         id,
         origin: id,
-        tenant_id: tenant,
-        signal: Signal::Traces,
+        tenant_id: stream.tenant,
+        signal: catalog_signal(stream.signal),
         level: Level::L0,
         path: path.to_string(),
         size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
@@ -172,7 +192,6 @@ pub fn prepare(
         file,
         bytes,
         index,
-        index_path,
         rows,
         concat,
         sort: merge,
@@ -190,12 +209,34 @@ fn trace_index(path: &str, rows: &[HotBatch]) -> Result<TraceIndex, IngestError>
     Ok(TraceIndex::new(vec![path.to_owned()], pairs)?)
 }
 
-fn writer_properties(layout: FileLayout) -> Result<WriterProperties, IngestError> {
+/// The writer of `layout` for rows of `signal`. Log files exist only from
+/// layout 4 on, so every layout writes them alike.
+fn writer_properties(
+    layout: FileLayout,
+    signal: RowSignal,
+) -> Result<WriterProperties, IngestError> {
     let rows = layout.row_group_rows;
-    Ok(match layout.version {
-        3 => fs_schema::parquet::writer_properties_layout_v3(rows)?,
-        _ => fs_schema::parquet::writer_properties(rows)?,
+    Ok(match (signal, layout.version) {
+        (RowSignal::Logs, _) => fs_schema::parquet::log_writer_properties(rows)?,
+        (RowSignal::Traces, 3) => fs_schema::parquet::writer_properties_layout_v3(rows)?,
+        (RowSignal::Traces, _) => fs_schema::parquet::writer_properties(rows)?,
     })
+}
+
+/// The Arrow schema of rows of `signal`.
+pub fn schema_of(signal: RowSignal) -> arrow::datatypes::SchemaRef {
+    match signal {
+        RowSignal::Traces => span_schema_v1(),
+        RowSignal::Logs => log_schema_v1(),
+    }
+}
+
+/// The catalog's signal for files of rows of `signal`.
+pub fn catalog_signal(signal: RowSignal) -> Signal {
+    match signal {
+        RowSignal::Traces => Signal::Traces,
+        RowSignal::Logs => Signal::Logs,
+    }
 }
 
 /// Sort keys of every input, as integers: the rank of the service among all
@@ -397,25 +438,28 @@ pub async fn upload(store: &dyn ObjectStore, prepared: &Prepared) -> Result<Uplo
 pub async fn upload_index(
     store: &dyn ObjectStore,
     prepared: &Prepared,
-) -> Result<Upload, IngestError> {
-    let outcome = put_once(store, &prepared.index_path, prepared.index.clone()).await?;
+) -> Result<Option<Upload>, IngestError> {
+    let Some((index_path, index)) = &prepared.index else {
+        return Ok(None);
+    };
+    let outcome = put_once(store, index_path, index.clone()).await?;
     if let Upload::Existing { size } = outcome {
         let mismatch = || IngestError::IndexMismatch {
-            path: prepared.index_path.clone(),
+            path: index_path.clone(),
         };
-        if size != u64::try_from(prepared.index.len()).unwrap_or(u64::MAX) {
+        if size != u64::try_from(index.len()).unwrap_or(u64::MAX) {
             return Err(mismatch());
         }
         let existing = store
-            .get(&Path::from(prepared.index_path.as_str()))
+            .get(&Path::from(index_path.as_str()))
             .await?
             .bytes()
             .await?;
-        if existing != prepared.index {
+        if existing != *index {
             return Err(mismatch());
         }
     }
-    Ok(outcome)
+    Ok(Some(outcome))
 }
 
 async fn put_once(
@@ -443,9 +487,15 @@ async fn put_once(
 
 /// `{root}/t/{tenant}/traces/l0/dt=YYYY-MM-DD/hr=HH/{id}.parquet`
 pub fn l0_path(root: &Path, tenant: TenantId, start: DateTime<Utc>, id: FileId) -> Path {
+    l0_path_of(root, Stream::traces(tenant), start, id)
+}
+
+/// `{root}/t/{tenant}/{traces|logs}/l0/dt=YYYY-MM-DD/hr=HH/{id}.parquet`
+pub fn l0_path_of(root: &Path, stream: Stream, start: DateTime<Utc>, id: FileId) -> Path {
     let relative = format!(
-        "t/{}/traces/l0/dt={}/hr={:02}/{}.parquet",
-        tenant.0,
+        "t/{}/{}/l0/dt={}/hr={:02}/{}.parquet",
+        stream.tenant.0,
+        catalog_signal(stream.signal).path_name(),
         start.format("%Y-%m-%d"),
         start.format("%H"),
         id.0
@@ -475,9 +525,10 @@ pub fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
     let mut writer = ArrowWriter::try_new(
         &mut out,
         batch.schema(),
-        Some(writer_properties(FileLayout::current(
-            DEFAULT_ROW_GROUP_ROWS,
-        ))?),
+        Some(writer_properties(
+            FileLayout::current(DEFAULT_ROW_GROUP_ROWS),
+            RowSignal::Traces,
+        )?),
     )?;
     writer.write(batch)?;
     writer.close()?;
@@ -741,11 +792,12 @@ mod tests {
             FileLayout::current(2),
         )
         .unwrap();
+        let (index_path, index_bytes) = prepared.index.clone().unwrap();
         assert_eq!(
-            prepared.index_path,
+            index_path,
             fs_index::sidecar_path(&prepared.file.path).unwrap()
         );
-        let index = fs_index::TraceIndex::decode(&prepared.index).unwrap();
+        let index = fs_index::TraceIndex::decode(&index_bytes).unwrap();
         assert_eq!(index.files(), std::slice::from_ref(&prepared.file.path));
         assert_eq!(
             index.len(),
@@ -758,19 +810,16 @@ mod tests {
 
         assert_eq!(
             upload_index(&store, &prepared).await.unwrap(),
-            Upload::Created
+            Some(Upload::Created)
         );
         assert_eq!(
             upload_index(&store, &prepared).await.unwrap(),
-            Upload::Existing {
-                size: prepared.index.len() as u64
-            }
+            Some(Upload::Existing {
+                size: index_bytes.len() as u64
+            })
         );
-        let stored = store
-            .get(&Path::from(prepared.index_path.as_str()))
-            .await
-            .unwrap();
-        assert_eq!(stored.bytes().await.unwrap(), prepared.index);
+        let stored = store.get(&Path::from(index_path.as_str())).await.unwrap();
+        assert_eq!(stored.bytes().await.unwrap(), index_bytes);
     }
 
     #[tokio::test]
@@ -782,26 +831,21 @@ mod tests {
         let id = FileId(uuid::Uuid::from_u128(2));
         let prepared =
             prepare(tenant, &Path::from(""), id, &inputs, FileLayout::current(3)).unwrap();
+        let (index_path, _) = prepared.index.clone().unwrap();
         // Valid, internally consistent, and missing trace 2.
         let partial = fs_index::TraceIndex::new(vec![prepared.file.path.clone()], [([1u8; 16], 0)])
             .unwrap()
             .encode();
         store
-            .put(
-                &Path::from(prepared.index_path.as_str()),
-                partial.clone().into(),
-            )
+            .put(&Path::from(index_path.as_str()), partial.clone().into())
             .await
             .unwrap();
         let err = upload_index(&store, &prepared).await.unwrap_err();
         assert!(
-            matches!(err, IngestError::IndexMismatch { ref path } if *path == prepared.index_path),
+            matches!(err, IngestError::IndexMismatch { ref path } if *path == index_path),
             "{err}"
         );
-        let stored = store
-            .get(&Path::from(prepared.index_path.as_str()))
-            .await
-            .unwrap();
+        let stored = store.get(&Path::from(index_path.as_str())).await.unwrap();
         assert_eq!(
             stored.bytes().await.unwrap(),
             partial,

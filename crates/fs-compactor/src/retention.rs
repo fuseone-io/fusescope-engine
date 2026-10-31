@@ -321,8 +321,8 @@ impl Retention {
         self.config.rebuilds_per_tick
     }
 
-    /// Quarantines up to `files_per_pass` span files beyond their
-    /// tenant's cut, oldest first, under `fence`; `None` when no file is
+    /// Quarantines up to `files_per_pass` span, log or derived files beyond
+    /// their tenant's cut, oldest first, under `fence`; `None` when no file is
     /// beyond its cut.
     ///
     /// # Errors
@@ -332,7 +332,12 @@ impl Retention {
         fence: &LeaseFence,
     ) -> Result<Option<ExpiredFiles>, CompactError> {
         let mut result = Ok(None);
-        for signal in [Signal::Traces, Signal::TraceSummary, Signal::ServiceGraph1m] {
+        for signal in [
+            Signal::Traces,
+            Signal::Logs,
+            Signal::TraceSummary,
+            Signal::ServiceGraph1m,
+        ] {
             result = self
                 .catalog
                 .expire_files_fenced(signal, self.config.files_per_pass, fence)

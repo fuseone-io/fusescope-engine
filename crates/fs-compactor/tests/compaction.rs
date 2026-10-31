@@ -1250,9 +1250,15 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let me = fence(&f).await;
     assert!(c.compact_once(&me).await.is_err());
     let orphan_l1 = l1_objects(&f).await.remove(0);
-    // A stray span file nobody registered, and objects that are not ours.
+    // A stray span file nobody registered, a log file left by a flush that
+    // never registered it, and objects that are not ours.
     let stray = format!(
         "t/{}/traces/l0/dt=2026-10-24/hr=14/{}.parquet",
+        f.tenant.0,
+        uuid::Uuid::new_v4()
+    );
+    let orphan_log = format!(
+        "t/{}/logs/l0/dt=2026-10-24/hr=14/{}.parquet",
         f.tenant.0,
         uuid::Uuid::new_v4()
     );
@@ -1265,7 +1271,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
             uuid::Uuid::new_v4()
         ),
         format!(
-            "t/{}/logs/l0/dt=2026-10-24/hr=14/{}.parquet",
+            "t/{}/logs/l3/dt=2026-10-24/hr=14/{}.parquet",
             f.tenant.0,
             uuid::Uuid::new_v4()
         ),
@@ -1275,7 +1281,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
             uuid::Uuid::new_v4()
         ),
     ];
-    for path in std::iter::once(&stray).chain(&foreign) {
+    for path in [&stray, &orphan_log].into_iter().chain(&foreign) {
         f.store
             .put(&Path::from(path.as_str()), b"x".to_vec().into())
             .await
@@ -1293,26 +1299,26 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         .remove(0);
     let first = sweeper.sweep_once().await.unwrap();
     assert_eq!(
-        first.prefixes, 6,
-        "the tenant's l0, l1, sidecar and three derived days"
+        first.prefixes, 7,
+        "the tenant's l0, l1, sidecar, three derived and log l0 days"
     );
     assert_eq!(
-        first.listed, 12,
+        first.listed, 13,
         "the objects of those partitions, foreign levels and signals not walked"
     );
     assert_eq!(
-        first.seen, 6,
-        "the L1, sidecar, three derived files and the stray; nothing foreign"
+        first.seen, 7,
+        "the L1, sidecar, three derived files, the log file and the stray; nothing foreign"
     );
     assert_eq!(first.deleted, 0, "first sight: nothing deleted");
     assert!(first.wrapped);
-    for path in [&orphan_l1, &stray] {
+    for path in [&orphan_l1, &stray, &orphan_log] {
         assert!(present(&f, path).await, "{path} still there");
     }
     let again = sweeper.sweep_once().await.unwrap();
     assert_eq!(
         (again.seen, again.deleted),
-        (6, 0),
+        (7, 0),
         "seen twice within the TTL: still nothing"
     );
 
@@ -1335,16 +1341,17 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;
     let second = sweeper.sweep_once().await.unwrap();
-    assert_eq!(second.seen, 5, "the stray has a row now");
+    assert_eq!(second.seen, 6, "the stray has a row now");
     assert_eq!(
-        second.deleted, 5,
-        "the L1, its sidecar and the three derived files"
+        second.deleted, 6,
+        "the L1, its sidecar, the three derived files and the log file"
     );
     assert_eq!(second.forgotten, 1, "the stray");
     assert!(!present(&f, &orphan_l1).await);
     assert!(!present(&f, &orphan_keys).await);
     assert!(!present(&f, &orphan_summary).await);
     assert!(!present(&f, &orphan_graph).await);
+    assert!(!present(&f, &orphan_log).await);
     assert!(!present(&f, &fs_index::sidecar_path(&orphan_l1).unwrap()).await);
     assert!(present(&f, &stray).await);
     for path in &foreign {
@@ -1360,7 +1367,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         Vec::<String>::new()
     );
     assert_eq!(stats.sweeps.load(Ordering::Relaxed), 3);
-    assert_eq!(stats.deleted.load(Ordering::Relaxed), 5);
+    assert_eq!(stats.deleted.load(Ordering::Relaxed), 6);
     assert_eq!(stats.forgotten.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }

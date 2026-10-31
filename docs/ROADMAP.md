@@ -173,7 +173,18 @@ C5 landed after C6.
   `a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file`).
 - Logs ingest path reusing the WAL, buffers, coalescer and flush, with its
   own sort key (`service_name, timestamp`) and bloom filters on `trace_id`
-  and `service_name`.
+  and `service_name`. Done: the OTLP logs gRPC service on the ingest
+  listener; buffers, cuts, flushes and intents kept per tenant and signal
+  (`Stream`), the tenant memory cap across both; log records under their own
+  code with a seed for the ids, log intents under record version 3
+  (`RowSignal`); L0 files at `t/{tenant}/logs/l0/` registered as signal 2,
+  no trace sidecar; retention and the orphan sweep cover them;
+  `fusescope_ingest_logs_total`, `_logs_rejected_total`,
+  `_log_bodies_truncated_total`. Crash boundaries in
+  `crates/fs-ingest/tests/logs.rs`: before the intent, after both signals'
+  intents and before the upload, between upload and registration (same
+  bytes), before the confirmation. The hot window and the query surface
+  come with the logs table; compaction of log files later.
 - Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.

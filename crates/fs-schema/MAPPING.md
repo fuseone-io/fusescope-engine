@@ -130,7 +130,7 @@ Logs follow the attribute, resource, scope, fingerprint and limit rules above;
 | timestamp | `time_unix_nano`, else `observed_time_unix_nano`; a record with neither is rejected and counts `logs_rejected` | OTLP `LogRecord`: 0 means unknown, and one-timestamp recipients use the event time if present, otherwise the observed time |
 | observed_timestamp | `observed_time_unix_nano`, else `timestamp` | OTLP `LogRecord` |
 | ts_bucket_start | from `timestamp`, as for spans | engine partition key |
-| id | ULID: big-endian Unix milliseconds of `timestamp`, then 10 bytes of xxh3 over the request's origin and the record's position in the request, rejected records counted | engine internal; ordered as the ULID text the Go backend pages by, and the same on replay |
+| id | ULID: big-endian Unix milliseconds of `timestamp`, then 10 bytes of xxh3 over the request's seed (16 random bytes the ingester logs with the request) and the record's position in the request, rejected records counted | engine internal; ordered as the ULID text the Go backend pages by, and the same on replay |
 | trace_id, span_id | 16 and 8 bytes as given; null when absent, of another length or all zeroes | OTLP `LogRecord`: such ids mean the record is not associated with a trace or span |
 | trace_flags | `flags & 0xff` | OTLP `LogRecordFlags`: the low byte holds the W3C trace flags, the rest is reserved |
 | severity_number | as given; values outside 0 to 255 become 0 | OTLP `SeverityNumber` |

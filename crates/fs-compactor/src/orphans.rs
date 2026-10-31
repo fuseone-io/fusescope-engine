@@ -2,7 +2,7 @@
 //!
 //! A crash between an upload and its registration, or a compaction that
 //! did not publish, leaves objects no row points at. The sweep walks the
-//! engine's prefix, remembers in the catalog the span files and sidecars
+//! engine's prefix, remembers in the catalog the span and log files and sidecars
 //! without a row, and deletes an object only once it has been remembered
 //! for longer than the orphan TTL and the catalog has marked it for
 //! deletion. The mark is what makes the delete safe: it is refused when a
@@ -18,7 +18,7 @@
 //! is deleted again.
 //!
 //! Only paths the engine lays out are considered
-//! ([`fs_index::SpanObject`]), checked again just before an object is
+//! ([`fs_index::EngineObject`]), checked again just before an object is
 //! marked; anything else, in the bucket or remembered by an older
 //! version, is left alone or forgotten. The bucket is walked by
 //! partitions, one tenant, level and day each, found with delimiter
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fs_catalog::{Catalog, Doom};
-use fs_index::SpanObject;
+use fs_index::EngineObject;
 use futures_util::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -49,7 +49,7 @@ use crate::CompactError;
 const CHUNK: usize = 1000;
 
 /// The kinds of partition under a tenant, in walk order.
-const KINDS: [&str; 7] = [
+const KINDS: [&str; 10] = [
     "traces/l0",
     "traces/l1",
     "traces/l2",
@@ -57,6 +57,9 @@ const KINDS: [&str; 7] = [
     "traces/derived/trace_summary",
     "traces/derived/service_graph_1m",
     "derived/attribute_keys",
+    "logs/l0",
+    "logs/l1",
+    "logs/l2",
 ];
 
 /// Bounds of the sweep.
@@ -243,7 +246,7 @@ impl Sweeper {
             .into_iter()
             .filter(|p| {
                 p.parts().next_back().is_some_and(|id| {
-                    SpanObject::parse(&format!(
+                    EngineObject::parse(&format!(
                         "t/{}/traces/l0/dt=2000-01-01/hr=00/00000000-0000-0000-0000-000000000000.parquet",
                         id.as_ref()
                     ))
@@ -412,7 +415,7 @@ impl Sweeper {
     /// under the root.
     fn is_engine_object(&self, path: &str) -> bool {
         self.relative(path)
-            .is_some_and(|relative| SpanObject::parse(relative).is_some())
+            .is_some_and(|relative| EngineObject::parse(relative).is_some())
     }
 
     fn prefix(&self) -> Path {

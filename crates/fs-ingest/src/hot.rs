@@ -349,7 +349,9 @@ impl FlightService for HotService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let scan = HotScanRequest::from_ticket(request.get_ref())?;
-        let (snapshot, live_files) = self.shared.snapshot(scan.tenant).await;
+        // The hot window serves span rows only.
+        let stream = crate::buffer::Stream::traces(scan.tenant);
+        let (snapshot, live_files) = self.shared.snapshot(stream).await;
         let sources = snapshot
             .live
             .iter()

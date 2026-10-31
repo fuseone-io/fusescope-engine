@@ -77,7 +77,7 @@ pub struct IngestConfig {
     /// cut. Bounds the work a cut does under the gate and the files one
     /// cut makes.
     pub max_hours_per_cut: usize,
-    /// Refuse a request whose spans fall in more calendar hours than this.
+    /// Refuse a request whose rows fall in more calendar hours than this.
     pub max_hours_per_batch: usize,
     /// Refuse a tenant's request when its live rows would fall in more
     /// calendar hours than this; the cuts drain them. Bounds the hours a

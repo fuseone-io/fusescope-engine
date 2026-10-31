@@ -129,18 +129,7 @@ impl Metrics {
                 "OTLP export requests accepted",
                 i.requests.load(Ordering::Relaxed),
             );
-            counter(
-                out,
-                "fusescope_ingest_spans_total",
-                "Spans buffered",
-                i.spans.load(Ordering::Relaxed),
-            );
-            counter(
-                out,
-                "fusescope_ingest_spans_rejected_total",
-                "Spans rejected for malformed ids",
-                i.spans_rejected.load(Ordering::Relaxed),
-            );
+            render_ingest_rows(out, i);
             counter(
                 out,
                 "fusescope_ingest_rate_limited_total",
@@ -837,6 +826,40 @@ async fn respond(
     stream.shutdown().await
 }
 
+/// Rows each signal buffered and dropped.
+fn render_ingest_rows(out: &mut String, i: &fs_ingest::IngestStats) {
+    counter(
+        out,
+        "fusescope_ingest_spans_total",
+        "Spans buffered",
+        i.spans.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_ingest_spans_rejected_total",
+        "Spans rejected for malformed ids",
+        i.spans_rejected.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_ingest_logs_total",
+        "Log records buffered",
+        i.logs.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_ingest_logs_rejected_total",
+        "Log records rejected for carrying no time",
+        i.logs_rejected.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_ingest_log_bodies_truncated_total",
+        "Log bodies truncated to the body limit",
+        i.bodies_truncated.load(Ordering::Relaxed),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,12 +933,22 @@ mod tests {
 
         let ingest = Arc::new(fs_ingest::IngestStats::default());
         ingest.requests.fetch_add(3, Ordering::Relaxed);
+        ingest.logs.fetch_add(7, Ordering::Relaxed);
+        ingest.logs_rejected.fetch_add(2, Ordering::Relaxed);
+        ingest.bodies_truncated.fetch_add(1, Ordering::Relaxed);
         metrics.register_ingest(ingest, Arc::new(|| 42));
         let page = metrics.render();
         assert!(
             page.contains("fusescope_ingest_requests_total 3\n"),
             "{page}"
         );
+        for line in [
+            "fusescope_ingest_logs_total 7\n",
+            "fusescope_ingest_logs_rejected_total 2\n",
+            "fusescope_ingest_log_bodies_truncated_total 1\n",
+        ] {
+            assert!(page.contains(line), "{line}{page}");
+        }
         assert!(page.contains("fusescope_ingest_wal_bytes 42\n"), "{page}");
         let writer = Arc::new(fs_ingest::walwriter::WriterStats::default());
         writer.backpressure.fetch_add(5, Ordering::Relaxed);

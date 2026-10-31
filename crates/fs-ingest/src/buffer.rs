@@ -23,7 +23,40 @@ use fs_catalog::{FileId, TenantId};
 use fs_wal::Position;
 
 use crate::IngestError;
-use crate::record::FileLayout;
+use crate::record::{FileLayout, RowSignal};
+
+/// The rows of one signal of one tenant: what a buffer, a flush and a hot
+/// scan are kept by. A tenant's streams share its memory cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Stream {
+    /// Owner.
+    pub tenant: TenantId,
+    /// Signal of the rows.
+    pub signal: RowSignal,
+}
+
+impl Stream {
+    /// The tenant's span rows.
+    pub fn traces(tenant: TenantId) -> Self {
+        Self {
+            tenant,
+            signal: RowSignal::Traces,
+        }
+    }
+
+    /// The tenant's log rows.
+    pub fn logs(tenant: TenantId) -> Self {
+        Self {
+            tenant,
+            signal: RowSignal::Logs,
+        }
+    }
+
+    /// Every stream of `tenant`.
+    pub fn of(tenant: TenantId) -> [Self; 2] {
+        [Self::traces(tenant), Self::logs(tenant)]
+    }
+}
 
 /// Why an entry is in the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,7 +549,7 @@ impl Flushing {
 /// A registered file waiting for its confirmation.
 #[derive(Debug)]
 struct Unconfirmed {
-    tenant: TenantId,
+    tenant: Stream,
     /// First record of the intent, which the checkpoint stays behind.
     first: Position,
     attempts: u32,
@@ -588,14 +621,14 @@ pub struct Reservation {
     bytes: usize,
     tenant: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
-    tenant_id: TenantId,
+    tenant_id: Stream,
     hours: Vec<DateTime<Utc>>,
     reserved_hours: Arc<StdMutex<ReservedHours>>,
 }
 
 /// Hours of requests admitted but not yet pushed, counted per tenant so a
 /// cap on the hours a tenant holds sees them while they travel.
-type ReservedHours = HashMap<TenantId, HashMap<DateTime<Utc>, usize>>;
+type ReservedHours = HashMap<Stream, HashMap<DateTime<Utc>, usize>>;
 
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -693,18 +726,18 @@ pub struct Snapshot {
 /// All tenant buffers.
 #[derive(Debug, Default)]
 pub struct Buffers {
-    tenants: HashMap<TenantId, TenantBuffer>,
-    flushing: HashMap<TenantId, Vec<Flushing>>,
-    persisted: HashMap<TenantId, Vec<Persisted>>,
+    tenants: HashMap<Stream, TenantBuffer>,
+    flushing: HashMap<Stream, Vec<Flushing>>,
+    persisted: HashMap<Stream, Vec<Persisted>>,
     /// Registered files whose confirmation has not landed: the checkpoint
     /// never passes their intent, so a restart replays the flush and
     /// confirms.
     unconfirmed: HashMap<FileId, Unconfirmed>,
-    reserved: HashMap<TenantId, Arc<AtomicUsize>>,
+    reserved: HashMap<Stream, Arc<AtomicUsize>>,
     reserved_hours: Arc<StdMutex<ReservedHours>>,
     /// Tenants refused a request for the hours they hold: due for a cut
     /// whatever their rows, bytes and age, until one takes them.
-    pressed: HashSet<TenantId>,
+    pressed: HashSet<Stream>,
     reserved_total: Arc<AtomicUsize>,
     scratch_total: Arc<AtomicU64>,
     next_coalesce: u64,
@@ -723,7 +756,7 @@ impl Buffers {
     /// Tenants with at least `min` request batches waiting, batches already
     /// taken by a coalesce not counted, or with a request batch larger than
     /// `max_bytes` waiting to be indexed alone.
-    pub fn coalesce_candidates(&self, min: usize, max_bytes: usize) -> Vec<TenantId> {
+    pub fn coalesce_candidates(&self, min: usize, max_bytes: usize) -> Vec<Stream> {
         self.tenants
             .iter()
             .filter(|(_, b)| b.requests >= min || b.has_oversized(max_bytes))
@@ -740,7 +773,7 @@ impl Buffers {
     /// the result is dropped.
     pub fn take_for_coalesce(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         bound: Option<Position>,
         min: usize,
         max_bytes: usize,
@@ -831,7 +864,7 @@ impl Buffers {
     /// the rows are gone or no longer contiguous; the chunk is dropped.
     pub fn finish_coalesce(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         id: u64,
         chunk: RecordBatch,
         traces: Option<TraceSet>,
@@ -870,7 +903,7 @@ impl Buffers {
 
     /// The buffer whose entries coalesce `id` took: the live one, or the
     /// flushing one the rows were cut into meanwhile.
-    fn coalescing_buffer(&mut self, tenant: TenantId, id: u64) -> Option<&mut TenantBuffer> {
+    fn coalescing_buffer(&mut self, tenant: Stream, id: u64) -> Option<&mut TenantBuffer> {
         if self
             .tenants
             .get(&tenant)
@@ -886,19 +919,19 @@ impl Buffers {
     }
 
     /// Gives up coalesce `id`: its batches stay as they are.
-    pub fn cancel_coalesce(&mut self, tenant: TenantId, id: u64) {
+    pub fn cancel_coalesce(&mut self, tenant: Stream, id: u64) {
         if let Some(b) = self.coalescing_buffer(tenant, id) {
             b.cancel_coalesce(id);
         }
     }
 
     /// Live buffer of `tenant`, created on first use.
-    pub fn get_mut(&mut self, tenant: TenantId) -> &mut TenantBuffer {
+    pub fn get_mut(&mut self, tenant: Stream) -> &mut TenantBuffer {
         self.tenants.entry(tenant).or_default()
     }
 
     /// Bytes held for `tenant`, live and flushing.
-    pub fn bytes_of(&self, tenant: TenantId) -> usize {
+    pub fn bytes_of(&self, tenant: Stream) -> usize {
         self.tenants.get(&tenant).map_or(0, |b| b.bytes)
             + self
                 .flushing
@@ -907,7 +940,7 @@ impl Buffers {
     }
 
     /// Bytes held for `tenant` in every state, persisted included.
-    pub fn tenant_total(&self, tenant: TenantId) -> usize {
+    pub fn tenant_total(&self, tenant: Stream) -> usize {
         self.bytes_of(tenant)
             + self
                 .persisted
@@ -916,7 +949,7 @@ impl Buffers {
     }
 
     /// Bytes admitted for `tenant` whose rows are not in a buffer yet.
-    pub fn reserved_of(&self, tenant: TenantId) -> usize {
+    pub fn reserved_of(&self, tenant: Stream) -> usize {
         self.reserved
             .get(&tenant)
             .map_or(0, |r| r.load(Ordering::Relaxed))
@@ -933,7 +966,7 @@ impl Buffers {
     /// admission ever sees the bytes missing from both sides.
     pub fn reserve(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         bytes: usize,
         hours: &[DateTime<Utc>],
     ) -> Reservation {
@@ -958,17 +991,17 @@ impl Buffers {
 
     /// Marks `tenant` as refused for the hours it holds: due for the next
     /// cut whatever its rows, bytes and age.
-    pub fn press(&mut self, tenant: TenantId) {
+    pub fn press(&mut self, tenant: Stream) {
         self.pressed.insert(tenant);
     }
 
     /// The cut of `tenant` is durable: it is no longer due for that.
-    pub fn unpress(&mut self, tenant: TenantId) {
+    pub fn unpress(&mut self, tenant: Stream) {
         self.pressed.remove(&tenant);
     }
 
     /// Smallest WAL position among the live rows of `tenant`, if any.
-    pub fn live_first_wal(&self, tenant: TenantId) -> Option<Position> {
+    pub fn live_first_wal(&self, tenant: Stream) -> Option<Position> {
         self.tenants
             .get(&tenant)
             .filter(|b| !b.is_empty())
@@ -982,7 +1015,7 @@ impl Buffers {
     /// when nothing is live.
     pub fn begin_flush(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         file: FileId,
         layout: FileLayout,
         range: (Position, Position),
@@ -1015,7 +1048,7 @@ impl Buffers {
     /// Rows without the span timestamp column; nothing is cut then.
     pub fn begin_flush_split(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         layout: FileLayout,
         range: (Position, Position),
         parts: &[(FileId, DateTime<Utc>)],
@@ -1068,7 +1101,7 @@ impl Buffers {
     }
 
     /// The hours the live rows of `tenant` fall in, in order.
-    pub fn live_hours(&self, tenant: TenantId) -> Vec<DateTime<Utc>> {
+    pub fn live_hours(&self, tenant: Stream) -> Vec<DateTime<Utc>> {
         self.tenants
             .get(&tenant)
             .map(|b| b.hours().into_iter().collect())
@@ -1080,7 +1113,7 @@ impl Buffers {
     /// may still be on its way to the log and whose rows may come back,
     /// and the requests admitted but not yet pushed, so two requests
     /// admitted together cannot both fit.
-    pub fn live_hours_with(&self, tenant: TenantId, hours: &[DateTime<Utc>]) -> usize {
+    pub fn live_hours_with(&self, tenant: Stream, hours: &[DateTime<Utc>]) -> usize {
         let mut all = self
             .tenants
             .get(&tenant)
@@ -1102,7 +1135,7 @@ impl Buffers {
     /// assigned to `file`.
     pub fn insert_flushing(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         bound: Bound,
         buffer: TenantBuffer,
         origin: FileId,
@@ -1125,7 +1158,7 @@ impl Buffers {
 
     /// The records and layout the pending flush of `file` covers, for an
     /// intent that gives the same rows another id.
-    pub fn flushing_range(&self, tenant: TenantId, file: FileId) -> Option<Bound> {
+    pub fn flushing_range(&self, tenant: Stream, file: FileId) -> Option<Bound> {
         self.flushing
             .get(&tenant)?
             .iter()
@@ -1140,7 +1173,7 @@ impl Buffers {
 
     /// Gives the pending flush of `old` the id `new`, keeping its rows,
     /// attempts and backoff; true when there was one.
-    pub fn rename_flushing(&mut self, tenant: TenantId, old: FileId, new: FileId) -> bool {
+    pub fn rename_flushing(&mut self, tenant: Stream, old: FileId, new: FileId) -> bool {
         match self
             .flushing
             .get_mut(&tenant)
@@ -1158,7 +1191,7 @@ impl Buffers {
     /// `force`, as `(tenant, file)`. A pass takes them one by one through
     /// [`Buffers::take_flushing`], each at most once, so a flush that fails
     /// during the pass waits for its backoff rather than being tried again.
-    pub fn due_flushes(&self, now: Instant, force: bool) -> Vec<(TenantId, FileId)> {
+    pub fn due_flushes(&self, now: Instant, force: bool) -> Vec<(Stream, FileId)> {
         self.flushing
             .iter()
             .flat_map(|(tenant, list)| {
@@ -1176,7 +1209,7 @@ impl Buffers {
     /// running for it.
     pub fn take_flushing(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         file: FileId,
     ) -> Option<(Vec<RecordBatch>, Scratch, Option<FileLayout>, FileId)> {
         let (lease_bytes, layout, origin) = {
@@ -1213,7 +1246,7 @@ impl Buffers {
     }
 
     /// Records a failed attempt and schedules the next one with exponential backoff.
-    pub fn flush_failed(&mut self, tenant: TenantId, file: FileId, now: Instant) {
+    pub fn flush_failed(&mut self, tenant: Stream, file: FileId, now: Instant) {
         if let Some(entry) = self
             .flushing
             .get_mut(&tenant)
@@ -1233,7 +1266,7 @@ impl Buffers {
     /// groups would, the batches as flushed are kept instead.
     pub fn finish_flush(
         &mut self,
-        tenant: TenantId,
+        tenant: Stream,
         file: FileId,
         rows: Vec<HotBatch>,
         now: Instant,
@@ -1270,13 +1303,13 @@ impl Buffers {
     /// The intent could not be logged, so the rows are not bound to the file
     /// yet: they go back in front of the live buffer. Never called once the
     /// intent is durable.
-    pub fn abort_flush(&mut self, tenant: TenantId, file: FileId) {
+    pub fn abort_flush(&mut self, tenant: Stream, file: FileId) {
         if let Some(entry) = self.remove_flushing(tenant, file) {
             self.get_mut(tenant).restore(entry.buffer);
         }
     }
 
-    fn remove_flushing(&mut self, tenant: TenantId, file: FileId) -> Option<Flushing> {
+    fn remove_flushing(&mut self, tenant: Stream, file: FileId) -> Option<Flushing> {
         let list = self.flushing.get_mut(&tenant)?;
         let index = list.iter().position(|f| f.file == file)?;
         let entry = list.swap_remove(index);
@@ -1304,10 +1337,7 @@ impl Buffers {
     /// One confirmation due at `now` and not being attempted, with the
     /// attempt that keeps it so. Callers hold a confirmation permit before
     /// taking, so an attempt in progress always has its call running.
-    pub fn take_confirmation(
-        &mut self,
-        now: Instant,
-    ) -> Option<(TenantId, FileId, ConfirmAttempt)> {
+    pub fn take_confirmation(&mut self, now: Instant) -> Option<(Stream, FileId, ConfirmAttempt)> {
         let (file, entry) = self
             .unconfirmed
             .iter()
@@ -1335,7 +1365,7 @@ impl Buffers {
 
     /// Live, flushing and recently persisted rows of `tenant`. Batches are
     /// shared, not copied.
-    pub fn snapshot(&self, tenant: TenantId) -> Snapshot {
+    pub fn snapshot(&self, tenant: Stream) -> Snapshot {
         let live = self.tenants.get(&tenant);
         Snapshot {
             live: live.map(TenantBuffer::hot_batches).unwrap_or_default(),
@@ -1358,7 +1388,7 @@ impl Buffers {
 
     /// Tenants whose live buffer crossed a threshold, aged past `max_age`
     /// or was refused a request for the hours it holds.
-    pub fn due(&self, rows: usize, bytes: usize, max_age: Duration, now: Instant) -> Vec<TenantId> {
+    pub fn due(&self, rows: usize, bytes: usize, max_age: Duration, now: Instant) -> Vec<Stream> {
         self.tenants
             .iter()
             .filter(|(t, b)| {
@@ -1374,7 +1404,7 @@ impl Buffers {
     }
 
     /// Every tenant with live rows.
-    pub fn all(&self) -> Vec<TenantId> {
+    pub fn all(&self) -> Vec<Stream> {
         self.tenants
             .iter()
             .filter(|(_, b)| !b.is_empty())
@@ -1496,7 +1526,7 @@ mod tests {
     /// aborted part goes back to the live rows in position order.
     #[test]
     fn a_buffer_spanning_hours_is_cut_into_one_flush_per_hour() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let f14 = FileId(uuid::Uuid::from_u128(0x14));
         let f15 = FileId(uuid::Uuid::from_u128(0x15));
@@ -1568,7 +1598,7 @@ mod tests {
 
     #[test]
     fn live_first_wal_survives_an_aborted_flush() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let file = FileId(uuid::Uuid::from_u128(1));
         let mut buffers = Buffers::default();
         buffers
@@ -1600,7 +1630,7 @@ mod tests {
     /// holds the checkpoint until confirmed.
     #[test]
     fn confirmations_are_taken_one_at_a_time_and_given_back_when_dropped() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         let files = [1, 2, 3].map(|i| FileId(uuid::Uuid::from_u128(i)));
@@ -1659,7 +1689,7 @@ mod tests {
     /// only once the attempt has reported its failure.
     #[test]
     fn a_renamed_flush_stays_in_progress_until_it_fails_under_the_new_id() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let old = FileId(uuid::Uuid::from_u128(1));
         let new = FileId(uuid::Uuid::from_u128(2));
         let mut buffers = Buffers::default();
@@ -1709,7 +1739,7 @@ mod tests {
 
     #[test]
     fn scratch_is_reserved_under_the_cap_and_resized_to_the_real_size() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let mut buffers = Buffers::default();
         buffers
             .get_mut(tenant)
@@ -1734,7 +1764,7 @@ mod tests {
 
     #[test]
     fn headroom_keeps_room_for_the_flush_of_every_live_byte() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let mut buffers = Buffers::default();
         buffers
             .get_mut(tenant)
@@ -1824,7 +1854,7 @@ mod tests {
 
     #[test]
     fn coalesce_merges_complete_batches_in_log_order() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         for (offset, tag) in [(30, 3), (10, 1), (40, 4), (20, 2)] {
@@ -1877,7 +1907,7 @@ mod tests {
 
     #[test]
     fn coalesce_result_after_a_cut_lands_in_the_flushing_rows() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let file = FileId(uuid::Uuid::from_u128(1));
         let now = Instant::now();
         let mut buffers = Buffers::default();
@@ -1926,7 +1956,7 @@ mod tests {
 
     #[test]
     fn coalesce_groups_stop_at_the_byte_limit() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4)] {
@@ -1972,7 +2002,7 @@ mod tests {
 
     #[test]
     fn no_headroom_takes_nothing_and_changes_nothing() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4)] {
@@ -2007,7 +2037,7 @@ mod tests {
 
     #[test]
     fn oversized_batch_between_small_ones_does_not_block_the_rest() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         buffers.get_mut(tenant).push(tagged(1, 1), at(10), now);
@@ -2063,7 +2093,7 @@ mod tests {
 
     #[test]
     fn parallel_groups_are_disjoint_and_land_in_order() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6)] {
@@ -2120,7 +2150,7 @@ mod tests {
 
     #[test]
     fn cancelled_group_returns_its_batches_while_another_continues() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let now = Instant::now();
         let mut buffers = Buffers::default();
         for (offset, tag) in [(10, 1), (20, 2), (30, 3), (40, 4)] {
@@ -2167,7 +2197,7 @@ mod tests {
 
     #[test]
     fn replaced_batches_stay_counted_while_an_attempt_holds_them() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let file = FileId(uuid::Uuid::from_u128(1));
         let now = Instant::now();
         let mut buffers = Buffers::default();
@@ -2222,7 +2252,7 @@ mod tests {
 
     #[test]
     fn replaced_batches_are_not_counted_when_no_attempt_holds_them() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let file = FileId(uuid::Uuid::from_u128(1));
         let now = Instant::now();
         let mut buffers = Buffers::default();
@@ -2270,7 +2300,7 @@ mod tests {
 
     #[test]
     fn retention_never_exceeds_what_the_flush_counted() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let file = FileId(uuid::Uuid::from_u128(1));
         let now = Instant::now();
         let mut buffers = Buffers::default();
@@ -2325,7 +2355,7 @@ mod tests {
 
     #[test]
     fn reservations_count_until_dropped() {
-        let tenant = TenantId(uuid::Uuid::from_u128(7));
+        let tenant = Stream::traces(TenantId(uuid::Uuid::from_u128(7)));
         let mut buffers = Buffers::default();
         let first = buffers.reserve(tenant, 100, &[]);
         let second = buffers.reserve(tenant, 50, &[]);

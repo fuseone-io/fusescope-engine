@@ -61,7 +61,9 @@ written twice. Expect a start to take longer the more the WAL holds.
   `ingest: wal record: wal record at … cannot be read by this engine` or
   `ingest: wal record: flush intent at … cannot be read by this engine`:
   a newer engine wrote it. Roll the ingester forward to that version
-  rather than back.
+  rather than back. An engine without logs meets log records and log
+  intents this way: before rolling an ingester back past logs, stop the
+  log senders and let it flush and checkpoint.
 - **A torn tail** after the last commit marker belongs to a batch whose
   sync never finished and whose clients were never acknowledged; it is the
   only damage cut, silently, and appends continue.
@@ -143,6 +145,8 @@ objects are this deployment's.
 
 ### OTLP ingest (gRPC status and message)
 
+The trace and logs services answer alike.
+
 | Status | Message | Meaning | Action |
 |---|---|---|---|
 | `UNAUTHENTICATED` | `missing bearer token`, `malformed token`, `unknown or revoked token` | the collector's token | check the collector's token with `admin token list` |
@@ -153,11 +157,14 @@ objects are this deployment's.
 | `RESOURCE_EXHAUSTED` | `tenant memory full, hot-window retention pending`, `ingester memory full, …` | flushed rows are still served from memory | transient; persistent means memory is too small for the load |
 | `UNAVAILABLE` | `write-ahead log full` | flushes are not moving the checkpoint | see WAL replay and checkpoint |
 | `UNAVAILABLE` | `write-ahead log unavailable` | an append failed | the WAL disk; the log has the cause |
-| `INVALID_ARGUMENT` | `spans fall in N calendar hours, more than the M allowed` | one request spans too many hours | the sender's clock or batching |
+| `INVALID_ARGUMENT` | `rows fall in N calendar hours, more than the M allowed` | one request spans too many hours | the sender's clock or batching |
 | `INTERNAL` | `conversion failed`, `ingest task failed` | a bug | the log has the cause; report it |
 
 A success with `partial_success.rejected_spans` means spans with malformed
-trace or span ids were dropped and the rest stored.
+trace or span ids were dropped and the rest stored; with
+`rejected_log_records`, log records with neither an event nor an observed
+time were dropped (`fusescope_ingest_logs_rejected_total`). Truncated log
+bodies are stored and counted in `fusescope_ingest_log_bodies_truncated_total`.
 
 ### Flight SQL (gRPC status and message)
 

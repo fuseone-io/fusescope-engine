@@ -155,6 +155,16 @@ arriving meanwhile:
   closed on a version and an hour that do not match. The hot window
   announces, for the live rows, the id of every hour they fall in, so a
   querier excludes the files whichever way the cut goes.
+- Spans and logs share the WAL, the flush gate and the checkpoint; buffers,
+  cuts, flushes and intents are kept per tenant and signal, and a tenant's
+  memory cap counts both. A log record has its own record code (3), which an
+  ingester without logs refuses, and carries a random 16 byte seed before
+  the OTLP payload: the rows' ids are derived from it, so the live
+  conversion and a replay give the same ids and the same bytes. A log
+  intent covers the tenant's log records in its range and no span record;
+  it is written under WAL record version 3, the signal version, which an
+  ingester of the previous version fails on. Span intents keep versions 1
+  and 2, so a rollback is safe while no log record is in the log.
 - Uploads never overwrite (conditional create), and registering an existing
   id verifies the immutable fields; a mismatch is an error, never a silent
   accept.
@@ -404,8 +414,9 @@ resource_fingerprint, resources_string, attributes_string, attributes_number,
 attributes_bool, scope_name, scope_version, scope_string, promoted.*.
 
 trace_id and span_id are nullable: a record outside a trace stores null. The
-id is a ULID whose random part is a hash of the request's origin and the
-record's position in it, so a WAL replay produces the same ids. The body is
+id is a ULID whose random part is a hash of the seed the request's WAL
+record carries and the record's position in the request, so a WAL replay
+produces the same ids. The body is
 text; structured bodies are stored as JSON. `service_name` and
 `deployment_environment` are promoted as for spans. Files carry bloom filters
 on `trace_id` and `service_name`. The rules are in `crates/fs-schema/MAPPING.md`.

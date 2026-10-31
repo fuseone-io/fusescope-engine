@@ -34,10 +34,13 @@ use std::time::{Duration, Instant};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use fs_catalog::{Catalog, CatalogError, FileId, TenantId};
+use fs_schema::logs::LogBatchBuilder;
 use fs_schema::spans::SpanBatchBuilder;
 use fs_wal::{Event, Position, Wal};
 use object_store::ObjectStore;
 use object_store::path::Path;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use prost::Message;
@@ -47,11 +50,11 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::buffer::{Bound, Buffers, ConfirmAttempt, Reservation, Snapshot, TenantBuffer};
+use crate::buffer::{Bound, Buffers, ConfirmAttempt, Reservation, Snapshot, Stream, TenantBuffer};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
 use crate::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
-use crate::server::TraceReceiver;
+use crate::server::{LogsReceiver, TraceReceiver};
 use crate::{IngestError, flush};
 
 /// Counters exposed for metrics and tests.
@@ -63,6 +66,12 @@ pub struct IngestStats {
     pub spans: AtomicU64,
     /// Spans rejected for malformed ids.
     pub spans_rejected: AtomicU64,
+    /// Log records buffered.
+    pub logs: AtomicU64,
+    /// Log records rejected for carrying no time.
+    pub logs_rejected: AtomicU64,
+    /// Log bodies truncated to the body limit.
+    pub bodies_truncated: AtomicU64,
     /// Requests refused by the throughput limiter.
     pub rate_limited: AtomicU64,
     /// Requests refused because buffers or WAL were full.
@@ -183,7 +192,7 @@ type Cut = (FileId, Vec<RecordBatch>, crate::buffer::Scratch);
 /// One flush attempt handed to its task: the rows as cut, the scratch lease
 /// held for them and the layout the intent recorded.
 struct Attempt {
-    tenant: TenantId,
+    stream: Stream,
     file: FileId,
     /// The id the rows were first assigned; see `Flushing::origin`.
     origin: FileId,
@@ -253,30 +262,36 @@ impl Shared {
     /// ceilings, not watermarks.
     async fn admit(
         &self,
-        tenant: TenantId,
+        stream: Stream,
         bytes: usize,
         rows: usize,
         hours: &[DateTime<Utc>],
     ) -> Result<Reservation, IngestError> {
         let mut buffers = self.buffers.lock().await;
-        if buffers.live_hours_with(tenant, hours) > self.config.max_live_hours {
+        if buffers.live_hours_with(stream, hours) > self.config.max_live_hours {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
-            buffers.press(tenant);
+            buffers.press(stream);
             self.flush_now.notify_one();
             return Err(IngestError::Capacity(
                 "tenant rows span too many hours, flush pending",
             ));
         }
-        let reserved = buffers.reserved_of(tenant);
         // Every cap sees the batch with the bound of the trace set it will
         // get, which its bytes carry from the push until a chunk replaces it.
         let cost = Buffers::batch_cost(bytes, rows);
-        if buffers.bytes_of(tenant) + reserved + cost > self.config.max_buffer_bytes {
+        if buffers.bytes_of(stream) + buffers.reserved_of(stream) + cost
+            > self.config.max_buffer_bytes
+        {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
             self.flush_now.notify_one();
             return Err(IngestError::Capacity("tenant buffer full, flush pending"));
         }
-        if buffers.tenant_total(tenant) + reserved + cost > self.config.max_tenant_bytes {
+        // The tenant's memory is one budget across its signals.
+        let tenant_total: usize = Stream::of(stream.tenant)
+            .into_iter()
+            .map(|s| buffers.tenant_total(s) + buffers.reserved_of(s))
+            .sum();
+        if tenant_total + cost > self.config.max_tenant_bytes {
             // Persisted rows count and are not evicted: queriers with a stale
             // file list still need them. Admission waits instead.
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
@@ -299,7 +314,7 @@ impl Shared {
             self.flush_now.notify_one();
             return Err(IngestError::WalFull);
         }
-        Ok(buffers.reserve(tenant, cost, hours))
+        Ok(buffers.reserve(stream, cost, hours))
     }
 
     /// Appends through the group-commit writer; resolves once synced. The
@@ -337,7 +352,68 @@ impl Shared {
         let stats = builder.stats();
         let batch = builder.finish()?;
         let accepted = batch.num_rows();
+        self.push_converted(Stream::traces(tenant), batch, slot, record, now)
+            .await?;
+        self.stats
+            .spans
+            .fetch_add(accepted as u64, Ordering::Relaxed);
+        self.stats
+            .spans_rejected
+            .fetch_add(stats.spans_rejected, Ordering::Relaxed);
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
+        Ok(Converted { accepted, rejected })
+    }
+
+    /// [`Self::ingest`] for a logs request, whose rows take their ids from
+    /// `seed`, the seed `record` carries.
+    pub(crate) async fn ingest_logs(
+        &self,
+        tenant: TenantId,
+        message: &ExportLogsServiceRequest,
+        seed: &[u8],
+        record: Vec<u8>,
+        now: Instant,
+    ) -> Result<Converted, IngestError> {
+        let slot = self
+            .conversions
+            .acquire()
+            .await
+            .map_err(|_| IngestError::Backpressure("conversions closed"))?;
+        let mut builder = LogBatchBuilder::new(self.config.limits);
+        builder.append_request(message, seed)?;
+        let stats = builder.stats();
+        let batch = builder.finish()?;
+        let accepted = batch.num_rows();
+        self.push_converted(Stream::logs(tenant), batch, slot, record, now)
+            .await?;
+        self.stats
+            .logs
+            .fetch_add(accepted as u64, Ordering::Relaxed);
+        self.stats
+            .logs_rejected
+            .fetch_add(stats.logs_rejected, Ordering::Relaxed);
+        self.stats
+            .bodies_truncated
+            .fetch_add(stats.bodies_truncated, Ordering::Relaxed);
+        let rejected = usize::try_from(stats.logs_rejected).unwrap_or(usize::MAX);
+        Ok(Converted { accepted, rejected })
+    }
+
+    /// Admits a converted batch against the caps, logs its record and adds
+    /// it to the stream's buffer. The conversion `slot` is given back once
+    /// the batch is admitted. The flush gate is held from the append to the
+    /// push only, so a concurrent flush, checkpoint or hot scan sees either
+    /// both the log record and the rows or neither, and waits for no
+    /// conversion. Conversion comes first: a request the engine cannot
+    /// convert or hold is refused before it reaches the WAL.
+    async fn push_converted(
+        &self,
+        stream: Stream,
+        batch: RecordBatch,
+        slot: tokio::sync::SemaphorePermit<'_>,
+        record: Vec<u8>,
+        now: Instant,
+    ) -> Result<(), IngestError> {
         let hours: Vec<_> = crate::hours::hours_in(std::slice::from_ref(&batch))?
             .into_iter()
             .collect();
@@ -350,7 +426,7 @@ impl Shared {
 
         let reservation = self
             .admit(
-                tenant,
+                stream,
                 batch.get_array_memory_size(),
                 batch.num_rows(),
                 &hours,
@@ -358,7 +434,7 @@ impl Shared {
             .await?;
         drop(slot);
         let _shared = self.gate.read().await;
-        let tracked = self.append_wal(tenant, record).await?;
+        let tracked = self.append_wal(stream.tenant, record).await?;
         if let Some(delay) = self.config.inject_push_delay {
             if self.push_delay_pending.swap(false, Ordering::Relaxed) {
                 tokio::time::sleep(delay).await;
@@ -367,16 +443,16 @@ impl Shared {
 
         let (due, coalesce) = {
             let mut buffers = self.buffers.lock().await;
-            let was_due = self.flush_is_due(buffers.get_mut(tenant));
+            let was_due = self.flush_is_due(buffers.get_mut(stream));
             buffers
-                .get_mut(tenant)
+                .get_mut(stream)
                 .push_with_hours(batch, hours, tracked.position, now);
             // Both released under the lock: no admission runs between the push
             // and the release, and no coalesce takes a run the position
             // belongs in before the batch is there.
             drop(reservation);
             drop(tracked);
-            let live = buffers.get_mut(tenant);
+            let live = buffers.get_mut(stream);
             // Edges, not levels: the flusher is woken once per crossing, not
             // once per request while the backlog lasts.
             (
@@ -391,13 +467,7 @@ impl Shared {
             self.coalesce_now.notify_one();
         }
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .spans
-            .fetch_add(accepted as u64, Ordering::Relaxed);
-        self.stats
-            .spans_rejected
-            .fetch_add(stats.spans_rejected, Ordering::Relaxed);
-        Ok(Converted { accepted, rejected })
+        Ok(())
     }
 
     /// The live buffer crossed a flush threshold.
@@ -415,7 +485,8 @@ impl Shared {
     /// intent of their own hour that never claims the rows of another.
     /// Returns the flushes whose intent is durable, or `None` when nothing
     /// was live.
-    async fn cut_tenant(&self, tenant: TenantId) -> Result<Option<Vec<Cut>>, IngestError> {
+    async fn cut_stream(&self, stream: Stream) -> Result<Option<Vec<Cut>>, IngestError> {
+        let tenant = stream.tenant;
         let (intents, parts) = {
             let _exclusive = self.gate.write().await;
             let end = self
@@ -424,11 +495,11 @@ impl Shared {
                 .map(|w| w.position())
                 .map_err(|_| fs_wal::WalError::EmptyRecord)?;
             let mut buffers = self.buffers.lock().await;
-            let Some(first) = buffers.live_first_wal(tenant) else {
+            let Some(first) = buffers.live_first_wal(stream) else {
                 return Ok(None);
             };
             let layout = FileLayout::current(self.config.row_group_rows);
-            let all_hours = buffers.live_hours(tenant);
+            let all_hours = buffers.live_hours(stream);
             let hours: Vec<_> = all_hours
                 .iter()
                 .copied()
@@ -445,6 +516,7 @@ impl Shared {
                 end,
                 layout: Some(layout),
                 hour: hour.map(|h| h.timestamp()),
+                signal: stream.signal,
             };
             let file_at = |hour: Option<DateTime<Utc>>| match hour {
                 Some(hour) => {
@@ -456,14 +528,14 @@ impl Shared {
                 let hour = hours.first().copied();
                 let file = file_at(hour);
                 let Some((batches, held)) =
-                    buffers.begin_flush(tenant, file, layout, (first, end), hour)
+                    buffers.begin_flush(stream, file, layout, (first, end), hour)
                 else {
                     return Ok(None);
                 };
                 (vec![intent(file, hour)], vec![(file, batches, held)])
             } else {
                 let parts: Vec<_> = hours.iter().map(|h| (file_at(Some(*h)), *h)).collect();
-                let Some(cut) = buffers.begin_flush_split(tenant, layout, (first, end), &parts)?
+                let Some(cut) = buffers.begin_flush_split(stream, layout, (first, end), &parts)?
                 else {
                     return Ok(None);
                 };
@@ -497,7 +569,7 @@ impl Shared {
                 Err(e) => {
                     self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
                     warn!(tenant = %tenant.0, file = %part.0.0, error = %e, "flush intent could not be logged; keeping rows buffered");
-                    self.buffers.lock().await.abort_flush(tenant, part.0);
+                    self.buffers.lock().await.abort_flush(stream, part.0);
                     first_error.get_or_insert(e);
                 }
             }
@@ -505,7 +577,7 @@ impl Shared {
         // The pressure of a refusal outlives a cut whose intent failed: the
         // rows are live again and the next pass cuts them.
         if first_error.is_none() {
-            self.buffers.lock().await.unpress(tenant);
+            self.buffers.lock().await.unpress(stream);
         }
         match (logged.is_empty(), first_error) {
             (true, Some(e)) => Err(e),
@@ -518,7 +590,7 @@ impl Shared {
     /// the rows stay bound to `file_id` and are retried as they are.
     async fn materialize(
         &self,
-        tenant: TenantId,
+        stream: Stream,
         file_id: FileId,
         origin: FileId,
         batches: Vec<RecordBatch>,
@@ -531,7 +603,7 @@ impl Shared {
         let started = Instant::now();
         let mut timing = StageTiming::default();
         let result = self
-            .write_and_register(tenant, file_id, origin, batches, layout, &mut timing)
+            .write_and_register(stream, file_id, origin, batches, layout, &mut timing)
             .await;
         // The lease and the margin trade places under the buffer lock, in
         // both outcomes, so no admission ever sees the room without the
@@ -540,7 +612,8 @@ impl Shared {
             Ok((file, created, rows, writer_peak)) => {
                 self.stats.files_flushed.fetch_add(1, Ordering::Relaxed);
                 info!(
-                    tenant = %tenant.0,
+                    tenant = %stream.tenant.0,
+                    signal = ?stream.signal,
                     path = %file.path,
                     rows = file.row_count,
                     bytes = file.size_bytes,
@@ -551,7 +624,7 @@ impl Shared {
                 let row_groups = rows.len();
                 {
                     let mut buffers = self.buffers.lock().await;
-                    buffers.finish_flush(tenant, file_id, rows, Instant::now());
+                    buffers.finish_flush(stream, file_id, rows, Instant::now());
                     self.publish_unconfirmed(&buffers);
                     drop(held);
                 }
@@ -590,24 +663,24 @@ impl Shared {
                 // retried as they are. Returning them to the live buffer would let
                 // later rows join a file whose object may already exist.
                 self.stats.flush_failures.fetch_add(1, Ordering::Relaxed);
-                warn!(tenant = %tenant.0, file = %file_id.0, error = %e, rows, "flush failed; will retry");
+                warn!(tenant = %stream.tenant.0, signal = ?stream.signal, file = %file_id.0, error = %e, rows, "flush failed; will retry");
                 // The entry is still in progress here, so no retry can take
                 // it under the old id while it changes id.
                 let file_id = match &e {
                     IngestError::Catalog(CatalogError::ObjectDoomed { .. }) => {
-                        self.supersede(tenant, file_id).await
+                        self.supersede(stream, file_id).await
                     }
                     IngestError::ObjectMismatch { .. } => {
                         self.flush_stats
                             .replay_mismatch
                             .fetch_add(1, Ordering::Relaxed);
-                        self.supersede(tenant, file_id).await
+                        self.supersede(stream, file_id).await
                     }
                     _ => file_id,
                 };
                 {
                     let mut buffers = self.buffers.lock().await;
-                    buffers.flush_failed(tenant, file_id, Instant::now());
+                    buffers.flush_failed(stream, file_id, Instant::now());
                     drop(held);
                 }
                 Err(e)
@@ -624,10 +697,11 @@ impl Shared {
     /// since the catalog keeps a deleted path refused as a tombstone.
     /// Called while the flush is still in progress, so no retry takes the
     /// old id meanwhile. Returns the id the rows have afterwards.
-    async fn supersede(&self, tenant: TenantId, old: FileId) -> FileId {
+    async fn supersede(&self, stream: Stream, old: FileId) -> FileId {
+        let tenant = stream.tenant;
         let range = {
             let buffers = self.buffers.lock().await;
-            buffers.flushing_range(tenant, old)
+            buffers.flushing_range(stream, old)
         };
         let Some(bound) = range else {
             return old;
@@ -640,12 +714,13 @@ impl Shared {
             end: bound.range.1,
             layout: bound.layout,
             hour: bound.hour.map(|h| h.timestamp()),
+            signal: stream.signal,
         };
         if let Err(e) = self.append_wal(tenant, intent.to_record().encode()).await {
             warn!(tenant = %tenant.0, file = %old.0, error = %e, "superseding intent could not be logged; keeping the id");
             return old;
         }
-        if self.buffers.lock().await.rename_flushing(tenant, old, new) {
+        if self.buffers.lock().await.rename_flushing(stream, old, new) {
             self.flush_stats.superseded.fetch_add(1, Ordering::Relaxed);
             info!(tenant = %tenant.0, old = %old.0, new = %new.0, "flush takes a fresh id: its object was marked as an orphan");
             new
@@ -659,7 +734,7 @@ impl Shared {
     /// row, whether this attempt created the object and the rows as written.
     async fn write_and_register(
         &self,
-        tenant: TenantId,
+        stream: Stream,
         file_id: FileId,
         origin: FileId,
         batches: Vec<RecordBatch>,
@@ -679,7 +754,7 @@ impl Shared {
         flush::check_layout(&layout)?;
         let root = self.root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            flush::prepare(tenant, &root, file_id, &batches, layout)
+            flush::prepare_stream(stream, &root, file_id, &batches, layout)
         })
         .await??;
         timing.concat = nanos(prepared.concat);
@@ -715,7 +790,7 @@ impl Shared {
                     flush::verify_existing(self.store.as_ref(), &file.path, prepared, legacy)
                         .await?;
                 if registered != ours || digest != prepared {
-                    warn!(tenant = %tenant.0, file = %file_id.0, existing = size, prepared = ours, "legacy intent: registering the object another encoder wrote");
+                    warn!(tenant = %stream.tenant.0, file = %file_id.0, existing = size, prepared = ours, "legacy intent: registering the object another encoder wrote");
                     file.size_bytes = i64::try_from(registered).unwrap_or(i64::MAX);
                     file.content_sha256 = Some(digest);
                 }
@@ -735,11 +810,11 @@ impl Shared {
         if take_injected(&self.inject_index_failures) {
             return Err(IngestError::Injected("trace index upload"));
         }
-        if let flush::Upload::Created = flush::upload_index(self.store.as_ref(), prepared).await? {
-            self.flush_stats.trace_index_bytes.fetch_add(
-                u64::try_from(prepared.index.len()).unwrap_or(0),
-                Ordering::Relaxed,
-            );
+        let outcome = flush::upload_index(self.store.as_ref(), prepared).await?;
+        if let (Some(flush::Upload::Created), Some((_, index))) = (outcome, &prepared.index) {
+            self.flush_stats
+                .trace_index_bytes
+                .fetch_add(u64::try_from(index.len()).unwrap_or(0), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -769,7 +844,7 @@ impl Shared {
     /// entry back untouched.
     async fn confirm(
         &self,
-        tenant: TenantId,
+        stream: Stream,
         file: FileId,
         attempt: ConfirmAttempt,
         mut shutdown: Option<watch::Receiver<bool>>,
@@ -807,14 +882,14 @@ impl Shared {
                 self.flush_stats
                     .confirm_failures
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(tenant = %tenant.0, file = %file.0, error = %e, "registration not confirmed; will retry");
+                warn!(tenant = %stream.tenant.0, file = %file.0, error = %e, "registration not confirmed; will retry");
             }
             Err(_) => {
                 buffers.confirm_failed(file, Instant::now());
                 self.flush_stats
                     .confirm_failures
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(tenant = %tenant.0, file = %file.0, "confirmation timed out; will retry");
+                warn!(tenant = %stream.tenant.0, file = %file.0, "confirmation timed out; will retry");
             }
         }
         self.publish_unconfirmed(&buffers);
@@ -839,13 +914,13 @@ impl Shared {
                 break;
             };
             let taken = self.buffers.lock().await.take_confirmation(Instant::now());
-            let Some((tenant, file, attempt)) = taken else {
+            let Some((stream, file, attempt)) = taken else {
                 break;
             };
             let shared = self.clone();
             let shutdown = shutdown.cloned();
             attempts.spawn(async move {
-                shared.confirm(tenant, file, attempt, shutdown).await;
+                shared.confirm(stream, file, attempt, shutdown).await;
                 drop(permit);
             });
         }
@@ -885,22 +960,22 @@ impl Shared {
     /// never exceed `max_flushes`.
     async fn retry_flushing(self: &Arc<Self>, force: bool) {
         let due = self.buffers.lock().await.due_flushes(Instant::now(), force);
-        for (tenant, file) in due {
+        for (stream, file) in due {
             let Some(permit) = self.flush_permit(force).await else {
                 return;
             };
-            let taken = self.buffers.lock().await.take_flushing(tenant, file);
+            let taken = self.buffers.lock().await.take_flushing(stream, file);
             let Some((batches, held, layout, origin)) = taken else {
                 continue;
             };
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
-            debug!(tenant = %tenant.0, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
+            debug!(tenant = %stream.tenant.0, signal = ?stream.signal, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
             let delay = self
                 .config
                 .inject_retry_delay
                 .filter(|_| self.retry_delay_pending.swap(false, Ordering::Relaxed));
             let attempt = Attempt {
-                tenant,
+                stream,
                 file,
                 origin,
                 batches,
@@ -937,7 +1012,7 @@ impl Shared {
             }
             for attempt in attempts {
                 let Attempt {
-                    tenant,
+                    stream,
                     file,
                     origin,
                     batches,
@@ -945,10 +1020,10 @@ impl Shared {
                     layout,
                 } = attempt;
                 if let Err(e) = shared
-                    .materialize(tenant, file, origin, batches, held, layout)
+                    .materialize(stream, file, origin, batches, held, layout)
                     .await
                 {
-                    error!(tenant = %tenant.0, error = %e, "flush error");
+                    error!(tenant = %stream.tenant.0, signal = ?stream.signal, error = %e, "flush error");
                 }
             }
             drop(permit);
@@ -1016,19 +1091,21 @@ impl Shared {
                 // of it: with no headroom nothing is merged until a flush.
                 let headroom = buffers.headroom(self.config.max_memory_bytes);
                 let candidates = buffers.coalesce_candidates(min, max_bytes);
-                candidates.into_iter().find_map(|tenant| {
-                    let bound = self.writer.stable_bound(tenant);
+                // The tenant's bound covers its records of every signal, so
+                // it is never above the stream's own.
+                candidates.into_iter().find_map(|stream| {
+                    let bound = self.writer.stable_bound(stream.tenant);
                     buffers
-                        .take_for_coalesce(tenant, bound, min, max_bytes, headroom)
-                        .map(|taken| (tenant, taken))
+                        .take_for_coalesce(stream, bound, min, max_bytes, headroom)
+                        .map(|taken| (stream, taken))
                 })
             };
-            let Some((tenant, taken)) = taken else {
+            let Some((stream, taken)) = taken else {
                 return;
             };
             let shared = Arc::clone(self);
             tokio::spawn(async move {
-                shared.coalesce_group(tenant, taken).await;
+                shared.coalesce_group(stream, taken).await;
                 drop(permit);
                 shared.coalesce_now.notify_one();
             });
@@ -1037,7 +1114,7 @@ impl Shared {
 
     /// Builds the chunk of one group and puts it in place. On any failure
     /// the batches stay as they are.
-    async fn coalesce_group(&self, tenant: TenantId, taken: crate::buffer::Taken) {
+    async fn coalesce_group(&self, stream: Stream, taken: crate::buffer::Taken) {
         let crate::buffer::Taken {
             id,
             batches,
@@ -1048,8 +1125,7 @@ impl Shared {
         fs.coalesce_active.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let merged = tokio::task::spawn_blocking(move || {
-            let chunk =
-                arrow::compute::concat_batches(&fs_schema::spans::span_schema_v1(), &batches)?;
+            let chunk = arrow::compute::concat_batches(&flush::schema_of(stream.signal), &batches)?;
             let traces = crate::buffer::trace_set(&chunk);
             Ok::<_, arrow::error::ArrowError>((chunk, traces))
         })
@@ -1060,7 +1136,7 @@ impl Shared {
                     .buffers
                     .lock()
                     .await
-                    .finish_coalesce(tenant, id, chunk, traces)
+                    .finish_coalesce(stream, id, chunk, traces)
                 {
                     fs.coalesces.fetch_add(1, Ordering::Relaxed);
                     fs.coalesced_batches
@@ -1071,12 +1147,12 @@ impl Shared {
                 }
             }
             Ok(Err(e)) => {
-                warn!(tenant = %tenant.0, error = %e, "coalesce failed; batches stay as they are");
-                self.buffers.lock().await.cancel_coalesce(tenant, id);
+                warn!(tenant = %stream.tenant.0, error = %e, "coalesce failed; batches stay as they are");
+                self.buffers.lock().await.cancel_coalesce(stream, id);
             }
             Err(e) => {
-                warn!(tenant = %tenant.0, error = %e, "coalesce task failed; batches stay as they are");
-                self.buffers.lock().await.cancel_coalesce(tenant, id);
+                warn!(tenant = %stream.tenant.0, error = %e, "coalesce task failed; batches stay as they are");
+                self.buffers.lock().await.cancel_coalesce(stream, id);
             }
         }
         fs.coalesce_active.fetch_sub(1, Ordering::Relaxed);
@@ -1088,11 +1164,12 @@ impl Shared {
     /// them. Taken under the exclusive gate: no request is between its
     /// append and its push, so the smallest live position, and with it the
     /// announced ids, is the one the next flush derives from.
-    pub(crate) async fn snapshot(&self, tenant: TenantId) -> (Snapshot, Vec<FileId>) {
+    pub(crate) async fn snapshot(&self, stream: Stream) -> (Snapshot, Vec<FileId>) {
+        let tenant = stream.tenant;
         let started = Instant::now();
         let snapshot = {
             let _exclusive = self.gate.write().await;
-            self.buffers.lock().await.snapshot(tenant)
+            self.buffers.lock().await.snapshot(stream)
         };
         self.stats.hot_scan.observe(started.elapsed());
         let mut live_files = Vec::new();
@@ -1118,7 +1195,7 @@ impl Shared {
     async fn flush_due(self: &Arc<Self>, everything: bool) -> usize {
         let mut cuts = 0;
         let now = Instant::now();
-        let tenants = {
+        let streams = {
             let mut buffers = self.buffers.lock().await;
             buffers.sweep_persisted(self.config.persisted_retain, now);
             let (live, flushing, persisted) = buffers.memory();
@@ -1143,17 +1220,17 @@ impl Shared {
             }
         };
         self.retry_flushing(everything).await;
-        for tenant in tenants {
+        for stream in streams {
             let Some(permit) = self.flush_permit(everything).await else {
                 return cuts;
             };
-            match self.cut_tenant(tenant).await {
+            match self.cut_stream(stream).await {
                 Ok(Some(parts)) => {
                     cuts += parts.len();
                     let attempts = parts
                         .into_iter()
                         .map(|(file, batches, held)| Attempt {
-                            tenant,
+                            stream,
                             file,
                             origin: file,
                             batches,
@@ -1164,7 +1241,9 @@ impl Shared {
                     self.spawn_materialize(attempts, permit, None);
                 }
                 Ok(None) => {}
-                Err(e) => error!(tenant = %tenant.0, error = %e, "flush error"),
+                Err(e) => {
+                    error!(tenant = %stream.tenant.0, signal = ?stream.signal, error = %e, "flush error");
+                }
             }
         }
         if everything {
@@ -1185,7 +1264,7 @@ impl Shared {
 
 /// Everything replay found: rows with their positions, and flush intents.
 struct Replayed {
-    rows: Vec<(TenantId, Position, RecordBatch)>,
+    rows: Vec<(Stream, Position, RecordBatch)>,
     intents: Vec<FlushIntent>,
     records: usize,
     damaged: usize,
@@ -1223,8 +1302,24 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                         };
                         let mut builder = SpanBatchBuilder::new(limits);
                         builder.append_request(&message)?;
-                        out.rows
-                            .push((record.tenant, entry.position, builder.finish()?));
+                        let stream = Stream::traces(record.tenant);
+                        out.rows.push((stream, entry.position, builder.finish()?));
+                    }
+                    RecordSignal::Logs => {
+                        let Some((seed, request)) =
+                            crate::record::split_log_payload(&record.payload)
+                        else {
+                            out.damaged += 1;
+                            continue;
+                        };
+                        let Ok(message) = ExportLogsServiceRequest::decode(request) else {
+                            out.damaged += 1;
+                            continue;
+                        };
+                        let mut builder = LogBatchBuilder::new(limits);
+                        builder.append_request(&message, seed)?;
+                        let stream = Stream::logs(record.tenant);
+                        out.rows.push((stream, entry.position, builder.finish()?));
                     }
                     // An intent this engine cannot read was written by a newer
                     // one. Skipping it would send its rows back to live and
@@ -1285,11 +1380,11 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
         .into_iter()
         .map(|(i, origin)| (i, origin, TenantBuffer::default()))
         .collect();
-    for (tenant, position, batch) in replayed.rows {
+    for (stream, position, batch) in replayed.rows {
         let covering: Vec<usize> = groups
             .iter()
             .enumerate()
-            .filter(|(_, (intent, _, _))| intent.covers(tenant, position))
+            .filter(|(_, (intent, _, _))| intent.covers(stream.tenant, stream.signal, position))
             .map(|(i, _)| i)
             .collect();
         let whole = covering.iter().find(|i| {
@@ -1313,7 +1408,7 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
             })
             .unzip();
         if hours.is_empty() {
-            buffers.get_mut(tenant).push(batch, position, now);
+            buffers.get_mut(stream).push(batch, position, now);
             continue;
         }
         let split = crate::hours::partition(&batch, &hours)?;
@@ -1322,7 +1417,7 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
                 buffer.push(piece, position, now);
             }
         }
-        buffers.get_mut(tenant).push(split.rest, position, now);
+        buffers.get_mut(stream).push(split.rest, position, now);
     }
     for (intent, origin, buffer) in groups {
         let bound = Bound {
@@ -1331,7 +1426,11 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
             layout: intent.layout,
             hour: intent.hour_start(),
         };
-        buffers.insert_flushing(intent.tenant, bound, buffer, origin);
+        let stream = Stream {
+            tenant: intent.tenant,
+            signal: intent.signal,
+        };
+        buffers.insert_flushing(stream, bound, buffer, origin);
     }
     Ok(buffers)
 }
@@ -1520,9 +1619,12 @@ impl Ingester {
 
         let service = TraceServiceServer::new(TraceReceiver::new(self.shared.clone()))
             .max_decoding_message_size(self.shared.config.max_message_bytes);
+        let logs = LogsServiceServer::new(LogsReceiver::new(self.shared.clone()))
+            .max_decoding_message_size(self.shared.config.max_message_bytes);
         let mut server_shutdown = shutdown.clone();
         let server = tonic::transport::Server::builder()
             .add_service(service)
+            .add_service(logs)
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
                 async move {
@@ -1613,7 +1715,8 @@ mod tests {
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{Replayed, confirm_permits, rebuild};
-    use crate::record::FlushIntent;
+    use crate::buffer::Stream;
+    use crate::record::{FlushIntent, RowSignal};
 
     /// 2026-10-22T14:00:00Z.
     const H14: u64 = 1_792_677_600_000_000_000;
@@ -1672,16 +1775,17 @@ mod tests {
             end: at(30),
             layout: None,
             hour: Some(i64::try_from(hour / 1_000_000_000).unwrap()),
+            signal: RowSignal::Traces,
         };
         let replayed = Replayed {
             rows: vec![
                 (
-                    tenant,
+                    Stream::traces(tenant),
                     at(10),
                     span_batch(&[H14 + 1, H14 + HOUR + 1, H14 + 2]),
                 ),
                 (
-                    tenant,
+                    Stream::traces(tenant),
                     at(20),
                     span_batch(&[H14 + HOUR + 2, H14 + 2 * HOUR]),
                 ),
@@ -1693,12 +1797,15 @@ mod tests {
         let mut buffers = rebuild(replayed, Arc::new(AtomicU64::new(0))).unwrap();
         let rows =
             |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        let (b14, _l14, _, _) = buffers.take_flushing(tenant, h14).unwrap();
+        let (b14, _l14, _, _) = buffers.take_flushing(Stream::traces(tenant), h14).unwrap();
         assert_eq!(rows(&b14), 2);
-        let (b15, _l15, _, _) = buffers.take_flushing(tenant, h15).unwrap();
+        let (b15, _l15, _, _) = buffers.take_flushing(Stream::traces(tenant), h15).unwrap();
         assert_eq!(rows(&b15), 2);
         assert_eq!(
-            buffers.flushing_range(tenant, h15).unwrap().hour,
+            buffers
+                .flushing_range(Stream::traces(tenant), h15)
+                .unwrap()
+                .hour,
             Some(
                 chrono::DateTime::from_timestamp(
                     i64::try_from((H14 + HOUR) / 1_000_000_000).unwrap(),
@@ -1709,7 +1816,7 @@ mod tests {
         );
         assert_eq!(
             buffers
-                .snapshot(tenant)
+                .snapshot(Stream::traces(tenant))
                 .live
                 .iter()
                 .map(|b| b.batch.num_rows())
@@ -1717,7 +1824,7 @@ mod tests {
             1,
             "the row of 16:00 belongs to no intent"
         );
-        assert_eq!(buffers.live_first_wal(tenant), Some(at(20)));
+        assert_eq!(buffers.live_first_wal(Stream::traces(tenant)), Some(at(20)));
     }
 
     #[test]
@@ -1757,19 +1864,27 @@ mod tests {
             end: at(30),
             layout: None,
             hour: None,
+            signal: RowSignal::Traces,
         };
         let replayed = Replayed {
-            rows: vec![(tenant, at(10), batch(2)), (tenant, at(20), batch(3))],
+            rows: vec![
+                (Stream::traces(tenant), at(10), batch(2)),
+                (Stream::traces(tenant), at(20), batch(3)),
+            ],
             intents: vec![intent(first), intent(second)],
             records: 2,
             damaged: 0,
         };
         let mut buffers = rebuild(replayed, Arc::new(AtomicU64::new(0))).unwrap();
         assert!(
-            buffers.flushing_range(tenant, first).is_none(),
+            buffers
+                .flushing_range(Stream::traces(tenant), first)
+                .is_none(),
             "the first id was given up"
         );
-        let (batches, _lease, _, origin) = buffers.take_flushing(tenant, second).unwrap();
+        let (batches, _lease, _, origin) = buffers
+            .take_flushing(Stream::traces(tenant), second)
+            .unwrap();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
         assert_eq!(
             origin, first,

@@ -1,8 +1,9 @@
-//! The bucket layout of span files and their sidecars, parsed strictly:
+//! The bucket layout of span and log files and their sidecars, parsed strictly:
 //! anything the engine would not write is not the engine's.
 //!
 //! ```text
 //! t/{tenant uuid}/traces/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
+//! t/{tenant uuid}/logs/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
 //! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/derived/attribute_keys/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
@@ -13,10 +14,10 @@
 
 /// What an object under the engine's prefix is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpanObject {
+pub struct EngineObject {
     /// Tenant id, as written in the path.
     pub tenant: String,
-    /// Compaction level of a span file; `None` for a sidecar.
+    /// Compaction level of a span or log file; `None` for a sidecar.
     pub level: Option<u8>,
     /// `dt=YYYY-MM-DD/hr=HH`.
     pub partition: String,
@@ -28,7 +29,7 @@ pub struct SpanObject {
     pub derived: bool,
 }
 
-impl SpanObject {
+impl EngineObject {
     /// Parses a path relative to the engine root. `None` for anything the
     /// engine does not lay out: another prefix, another signal, a level it
     /// does not write, a malformed partition or id, another extension.
@@ -56,6 +57,12 @@ impl SpanObject {
                     "trace_summary" | "service_graph_1m" => (None, false, true),
                     _ => return None,
                 },
+                _ => return None,
+            },
+            "logs" => match parts.next()? {
+                "l0" => (Some(0), false, false),
+                "l1" => (Some(1), false, false),
+                "l2" => (Some(2), false, false),
                 _ => return None,
             },
             "derived" => {
@@ -156,18 +163,18 @@ mod tests {
 
     #[test]
     fn the_engine_layout_parses() {
-        let file =
-            SpanObject::parse(&format!("t/{T}/traces/l1/dt=2026-10-24/hr=14/{F}.parquet")).unwrap();
+        let file = EngineObject::parse(&format!("t/{T}/traces/l1/dt=2026-10-24/hr=14/{F}.parquet"))
+            .unwrap();
         assert_eq!(file.level, Some(1));
         assert!(!file.sidecar);
         assert_eq!(file.partition, "dt=2026-10-24/hr=14");
         assert_eq!(file.id, F);
         assert!(
-            SpanObject::parse(&format!("t/{T}/traces/l0/dt=2024-02-29/hr=23/{F}.parquet"))
+            EngineObject::parse(&format!("t/{T}/traces/l0/dt=2024-02-29/hr=23/{F}.parquet"))
                 .is_some(),
             "leap day"
         );
-        let tix = SpanObject::parse(&format!(
+        let tix = EngineObject::parse(&format!(
             "t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/{F}.tix"
         ))
         .unwrap();
@@ -175,7 +182,7 @@ mod tests {
         assert_eq!(tix.level, None);
         assert_eq!(tix.tenant, T);
         assert!(!tix.derived);
-        let keys = SpanObject::parse(&format!(
+        let keys = EngineObject::parse(&format!(
             "t/{T}/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.parquet"
         ))
         .unwrap();
@@ -183,8 +190,16 @@ mod tests {
         assert!(!keys.sidecar);
         assert_eq!(keys.level, None);
         assert_eq!(keys.partition, "dt=2026-10-24/hr=14");
+        for level in 0..=2u8 {
+            let logs = EngineObject::parse(&format!(
+                "t/{T}/logs/l{level}/dt=2026-10-24/hr=14/{F}.parquet"
+            ))
+            .unwrap();
+            assert_eq!(logs.level, Some(level));
+            assert!(!logs.sidecar && !logs.derived);
+        }
         for table in ["trace_summary", "service_graph_1m"] {
-            let derived = SpanObject::parse(&format!(
+            let derived = EngineObject::parse(&format!(
                 "t/{T}/traces/derived/{table}/dt=2026-10-24/hr=14/{F}.parquet"
             ))
             .unwrap();
@@ -199,7 +214,10 @@ mod tests {
         for path in [
             "t/notes.parquet",
             "t/notes.txt",
-            &format!("t/{T}/logs/l0/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/logs/l3/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/logs/index/trace_id/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/logs/l0/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/metrics/l0/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l3/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=24/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-1-24/hr=14/{F}.parquet"),
@@ -223,7 +241,7 @@ mod tests {
             ),
             &format!("t/not-a-uuid/traces/l0/dt=2026-10-24/hr=14/{F}.parquet"),
         ] {
-            assert!(SpanObject::parse(path).is_none(), "{path}");
+            assert!(EngineObject::parse(path).is_none(), "{path}");
         }
     }
 }

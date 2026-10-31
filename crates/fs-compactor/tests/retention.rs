@@ -379,10 +379,16 @@ async fn objects_under(f: &Fixture, part: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn retention_expires_trace_and_per_pass_derived_files_with_the_same_day() {
+async fn retention_expires_span_log_and_per_pass_derived_files_with_the_same_day() {
     let Some(f) = fixture().await else { return };
     let before = f.cut - chrono::Duration::hours(2);
-    for signal in [Signal::Traces, Signal::TraceSummary, Signal::ServiceGraph1m] {
+    let signals = [
+        Signal::Traces,
+        Signal::Logs,
+        Signal::TraceSummary,
+        Signal::ServiceGraph1m,
+    ];
+    for signal in signals {
         let id = FileId::new();
         let path = format!(
             "t/{}/{}/dt={}/hr={:02}/{}.parquet",
@@ -416,14 +422,11 @@ async fn retention_expires_trace_and_per_pass_derived_files_with_the_same_day() 
     let retention = retention(&f, retention_config());
     let fence = fence(&f).await;
     let mut expired = Vec::new();
-    for _ in 0..3 {
+    for _ in signals {
         let pass = retention.expire_once(&fence).await.unwrap().unwrap();
         expired.push(pass.files[0].signal);
     }
-    assert_eq!(
-        expired,
-        [Signal::Traces, Signal::TraceSummary, Signal::ServiceGraph1m]
-    );
+    assert_eq!(expired, signals);
     for signal in expired {
         assert_eq!(
             f.db.catalog

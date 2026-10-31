@@ -4025,7 +4025,7 @@ async fn a_path_deleted_while_the_ingester_was_down_is_never_written_again() {
 /// writing other bytes under that id would break every later retry.
 #[tokio::test]
 async fn future_layout_version_fails_closed() {
-    use fs_ingest::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
+    use fs_ingest::record::{FileLayout, FlushIntent, RecordSignal, RowSignal, WalRecord};
 
     let Some(db) = TestDb::new().await else {
         return;
@@ -4058,6 +4058,7 @@ async fn future_layout_version_fails_closed() {
                 row_group_rows: 7,
             }),
             hour: None,
+            signal: RowSignal::Traces,
         };
         wal.append(&intent.to_record().encode()).unwrap();
         wal.sync().unwrap();
@@ -4088,7 +4089,7 @@ async fn future_layout_version_fails_closed() {
 /// current layout.
 #[tokio::test]
 async fn an_intent_of_layout_3_is_written_with_layout_3_after_a_restart() {
-    use fs_ingest::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
+    use fs_ingest::record::{FileLayout, FlushIntent, RecordSignal, RowSignal, WalRecord};
     use fs_schema::spans::SpanBatchBuilder;
 
     let Some(db) = TestDb::new().await else {
@@ -4124,6 +4125,7 @@ async fn an_intent_of_layout_3_is_written_with_layout_3_after_a_restart() {
             end,
             layout: Some(layout),
             hour: None,
+            signal: RowSignal::Traces,
         };
         wal.append(&intent.to_record().encode()).unwrap();
         wal.sync().unwrap();
