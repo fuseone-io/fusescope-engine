@@ -22,11 +22,14 @@ trap 'docker rm -fv "$created" "$name" "$postgres" >/dev/null 2>&1 || true' EXIT
 docker run -d --name "$postgres" \
     -e POSTGRES_USER=fusescope -e POSTGRES_PASSWORD=fusescope -e POSTGRES_DB=fusescope \
     -p 127.0.0.1::5432 postgres:17-alpine >/dev/null
+# Over TCP: the image's init server listens on the socket only and is
+# restarted once the database exists, so socket readiness can be the
+# init server's.
 for _ in $(seq 1 60); do
-    docker exec "$postgres" pg_isready -U fusescope -d fusescope >/dev/null 2>&1 && break
+    docker exec "$postgres" pg_isready -h 127.0.0.1 -U fusescope -d fusescope >/dev/null 2>&1 && break
     sleep 1
 done
-docker exec "$postgres" pg_isready -U fusescope -d fusescope >/dev/null \
+docker exec "$postgres" pg_isready -h 127.0.0.1 -U fusescope -d fusescope >/dev/null \
     || { echo "the throwaway Postgres never became ready" >&2; exit 1; }
 port=$(docker port "$postgres" 5432/tcp | head -n 1 | sed 's/.*://')
 catalog="postgres://fusescope:fusescope@127.0.0.1:$port/fusescope"
