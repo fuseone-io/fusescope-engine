@@ -56,6 +56,8 @@ pub struct CompactionConfig {
     pub service_graph_max_bytes: usize,
     /// Rows per output row group.
     pub row_group_rows: usize,
+    /// Budgets of the text sidecar of each log L1 file.
+    pub text_index: fs_index::TextIndexLimits,
     /// Also compact the L0 files of log rows. Off, no pass takes a new
     /// hour of them; log L1 files and `log_attribute_keys` tables already
     /// written are read, rebuilt, swept and purged all the same.
@@ -367,6 +369,7 @@ impl Compactor {
                 trace_summary_max_bytes: self.config.trace_summary_max_bytes,
                 service_graph_max_spans: self.config.service_graph_max_spans,
                 service_graph_max_bytes: self.config.service_graph_max_bytes,
+                text_index: self.config.text_index,
             },
             table_before,
         )

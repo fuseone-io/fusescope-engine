@@ -48,7 +48,8 @@ pub struct Output {
     pub file: NewFile,
     /// Parquet bytes.
     pub bytes: Bytes,
-    /// Where the `trace_id` sidecar goes and its bytes; spans only.
+    /// Where the sidecar goes and its bytes: the `trace_id` sidecar of a
+    /// span file, the text sidecar of a log file.
     pub index: Option<(String, Bytes)>,
 }
 
@@ -68,6 +69,8 @@ pub struct MergeConfig {
     pub trace_summary_max_bytes: usize,
     /// Most spans retained to resolve the pass's service graph.
     pub service_graph_max_spans: usize,
+    /// Budgets of the text sidecar of each log output.
+    pub text_index: fs_index::TextIndexLimits,
     /// Conservative byte budget for the service-graph builder.
     pub service_graph_max_bytes: usize,
 }
@@ -164,8 +167,9 @@ impl L1Merger {
         if self.done {
             return Ok(None);
         }
-        let mut current =
-            OutputBuilder::new(&self.schema, self.signal, self.config.row_group_rows)?;
+        let id = FileId::new();
+        let path = l1_path(&self.root, self.tenant, self.signal, self.hour, id);
+        let mut current = OutputBuilder::new(&self.schema, self.signal, id, path, &self.config)?;
         while let Some(group) = self
             .merge
             .next_group(&self.schema, self.config.row_group_rows)
@@ -187,14 +191,14 @@ impl L1Merger {
             }
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
-                return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
+                return Ok(Some(current.finish(self.tenant)?));
             }
         }
         self.done = true;
         if current.rows == 0 {
             return Ok(None);
         }
-        Ok(Some(current.finish(&self.root, self.tenant, self.hour)?))
+        Ok(Some(current.finish(self.tenant)?))
     }
 }
 
@@ -519,7 +523,10 @@ impl Merge {
 /// One L1 file being written.
 struct OutputBuilder {
     signal: Signal,
+    id: FileId,
+    path: Path,
     writer: ArrowWriter<Vec<u8>>,
+    text: Option<fs_index::TextIndexBuilder>,
     rows: usize,
     ts_min: i64,
     ts_max: i64,
@@ -528,20 +535,31 @@ struct OutputBuilder {
 }
 
 impl OutputBuilder {
+    /// The output `id` at its L1 `path`.
     fn new(
         schema: &SchemaRef,
         signal: Signal,
-        row_group_rows: usize,
+        id: FileId,
+        path: Path,
+        config: &MergeConfig,
     ) -> Result<Self, CompactError> {
+        let row_group_rows = config.row_group_rows;
         let properties = if signal == Signal::Logs {
             log_writer_properties(row_group_rows)?
         } else {
             writer_properties(row_group_rows)?
         };
         let writer = ArrowWriter::try_new(Vec::new(), Arc::clone(schema), Some(properties))?;
+        // Grows with the row groups; a pass's outputs are not sized ahead.
+        let text = (signal == Signal::Logs)
+            .then(|| fs_index::TextIndexBuilder::new(path.as_ref(), config.text_index, 0, 0))
+            .transpose()?;
         Ok(Self {
             signal,
+            id,
+            path,
             writer,
+            text,
             rows: 0,
             ts_min: i64::MAX,
             ts_max: i64::MIN,
@@ -577,6 +595,12 @@ impl OutputBuilder {
         }
         self.writer.write(group)?;
         self.writer.flush()?;
+        if let Some(text) = self.text.as_mut() {
+            let bodies = group
+                .column(schema.index_of(fs_schema::logs::col::BODY)?)
+                .as_string::<i32>();
+            text.add_row_group((0..bodies.len()).map(|i| bodies.value(i).as_bytes()))?;
+        }
         self.rows += group.num_rows();
         Ok(())
     }
@@ -585,18 +609,17 @@ impl OutputBuilder {
         self.writer.bytes_written()
     }
 
-    fn finish(
-        mut self,
-        root: &Path,
-        tenant: TenantId,
-        hour: DateTime<Utc>,
-    ) -> Result<Output, CompactError> {
+    fn finish(mut self, tenant: TenantId) -> Result<Output, CompactError> {
         let bytes = Bytes::from(self.writer.into_inner()?);
-        let id = FileId::new();
-        let path = l1_path(root, tenant, self.signal, hour, id);
-        let index = if self.signal == Signal::Traces {
-            let index_path = fs_index::sidecar_path(path.as_ref())
-                .ok_or(CompactError::Merge("output path has no sidecar"))?;
+        let (id, path) = (self.id, self.path);
+        let content_sha256 = crate::objects::sha256(&bytes);
+        let no_sidecar = || CompactError::Merge("output path has no sidecar");
+        let index = if let Some(text) = self.text {
+            let index_path =
+                fs_index::text_index::sidecar_path(path.as_ref()).ok_or_else(no_sidecar)?;
+            Some((index_path, Bytes::from(text.finish(content_sha256)?)))
+        } else if self.signal == Signal::Traces {
+            let index_path = fs_index::sidecar_path(path.as_ref()).ok_or_else(no_sidecar)?;
             self.traces.sort_unstable();
             self.traces.dedup();
             let index = TraceIndex::new(
@@ -622,7 +645,7 @@ impl OutputBuilder {
             },
             services: self.services.into_iter().collect(),
             summary: None,
-            content_sha256: Some(crate::objects::sha256(&bytes)),
+            content_sha256: Some(content_sha256),
         };
         Ok(Output { file, bytes, index })
     }

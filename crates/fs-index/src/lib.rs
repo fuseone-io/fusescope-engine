@@ -15,6 +15,14 @@ pub use layout::EngineObject;
 pub use text_index::{TextIndex, TextIndexBuilder, TextIndexLimits};
 pub use trace_index::{TraceIndex, owners_of_sidecar, sidecar_path};
 
+/// Every sidecar a file at `parquet` has: the `trace_id` sidecar of a span
+/// file, the text sidecar of a log file, none for anything else.
+pub fn sidecar_paths(parquet: &str) -> impl Iterator<Item = String> {
+    trace_index::sidecar_path(parquet)
+        .into_iter()
+        .chain(text_index::sidecar_path(parquet))
+}
+
 /// Crate version, exposed for diagnostics and the `--version` flag.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

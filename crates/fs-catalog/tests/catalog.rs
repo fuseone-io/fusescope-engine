@@ -1255,6 +1255,69 @@ async fn orphans_keep_their_first_sighting() {
     db.finish().await;
 }
 
+/// A log file's text sidecar goes with it: the purge dooms both paths,
+/// and a doomed sidecar refuses the file's registration and its upload.
+#[tokio::test]
+async fn a_log_files_text_sidecar_is_doomed_and_refused_with_it() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let c = &db.catalog;
+    let t = c
+        .create_tenant(&NewTenant::with_defaults("logs"))
+        .await
+        .unwrap()
+        .id;
+    let log = file(t, Signal::Logs, 0, 1, &["api"]);
+    let sidecar = fs_index::text_index::sidecar_path(&log.path).unwrap();
+    let old = c.register_file(&log).await.unwrap();
+    c.swap_files(
+        t,
+        Signal::Logs,
+        &[old.id],
+        &[file(t, Signal::Logs, 0, 1, &["api"])],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        c.purge_quarantined(StdDuration::ZERO, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut doomed = c.orphans_doomed(10).await.unwrap();
+    doomed.sort();
+    let mut both = vec![old.path.clone(), sidecar.clone()];
+    both.sort();
+    assert_eq!(doomed, both);
+
+    let pending = file(t, Signal::Logs, 0, 0, &[]);
+    let pending_sidecar = fs_index::text_index::sidecar_path(&pending.path).unwrap();
+    c.orphans_seen(std::slice::from_ref(&pending_sidecar))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.orphan_doom(
+            &pending_sidecar,
+            &fs_index::text_index::owners_of_sidecar(&pending_sidecar)
+        )
+        .await
+        .unwrap(),
+        Doom::Marked
+    );
+    let err = c.register_file(&pending).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ObjectDoomed { ref path } if *path == pending_sidecar),
+        "{err}"
+    );
+    assert_eq!(
+        c.object_refused(&pending.path).await.unwrap(),
+        Some(pending_sidecar)
+    );
+    db.finish().await;
+}
+
 /// The mark and a registration serialise: whichever commits first wins,
 /// a sidecar's mark is refused by a row for the file it belongs to, and a
 /// mark already made is reported as such, never undone.

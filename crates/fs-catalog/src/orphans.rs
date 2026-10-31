@@ -270,7 +270,7 @@ impl Catalog {
     /// Database failure.
     pub async fn object_refused(&self, path: &str) -> Result<Option<String>, CatalogError> {
         let mut paths = vec![path.to_owned()];
-        paths.extend(fs_index::sidecar_path(path));
+        paths.extend(fs_index::sidecar_paths(path));
         let doomed: Option<(String,)> = sqlx::query_as(
             "select path from engine_orphan where path = any($1) and deleting limit 1",
         )
@@ -315,7 +315,7 @@ pub(crate) async fn refuse_doomed(
     path: &str,
 ) -> Result<(), CatalogError> {
     let mut paths = vec![path.to_owned()];
-    paths.extend(fs_index::sidecar_path(path));
+    paths.extend(fs_index::sidecar_paths(path));
     for p in &paths {
         lock_path(tx, p).await?;
     }

@@ -311,7 +311,7 @@ async fn retention_passes(retention: &Retention, leadership: &Leadership) {
 
 /// One purge pass: deletes the catalog rows of quarantined files past
 /// `quarantine_ttl`, each with its paths marked for deletion, then each
-/// file's object and its `trace_id` sidecar under their claims, leaving
+/// file's object and its sidecar, `trace_id` or text, under their claims, leaving
 /// tombstones. An object that fails to delete waits `delete_backoff` and
 /// is finished by the orphan sweep. Returns how many rows went.
 pub async fn purge_once(
@@ -331,7 +331,7 @@ pub async fn purge_once(
     let mut deleted = 0usize;
     for file in &purged {
         let mut paths = vec![file.path.clone()];
-        paths.extend(fs_index::sidecar_path(&file.path));
+        paths.extend(fs_index::sidecar_paths(&file.path));
         for path in paths {
             if delete_claimed(catalog, store, &path, delete_backoff).await {
                 deleted += 1;

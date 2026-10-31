@@ -723,6 +723,13 @@ pub struct CompactorConfig {
     /// never roll back past it after. Off stops new log passes only.
     #[serde(default)]
     pub compact_logs: bool,
+    /// Bloom bytes both blooms of one row group of a log L1 file's text
+    /// sidecar may take together; at most 64 MiB.
+    #[serde(default = "default_text_index_bytes_per_row_group")]
+    pub text_index_max_bytes_per_row_group: usize,
+    /// Bloom bytes of one log L1 file's text sidecar; at most 512 MiB.
+    #[serde(default = "default_text_index_bytes_per_file")]
+    pub text_index_max_bytes_per_file: usize,
     /// How often the bucket is swept for objects without a catalog row.
     #[serde(default = "default_orphan_interval")]
     pub orphan_interval_secs: u64,
@@ -787,6 +794,8 @@ impl Default for CompactorConfig {
             service_graph_max_spans: default_service_graph_max_spans(),
             service_graph_max_bytes: default_service_graph_max_bytes(),
             compact_logs: false,
+            text_index_max_bytes_per_row_group: default_text_index_bytes_per_row_group(),
+            text_index_max_bytes_per_file: default_text_index_bytes_per_file(),
             orphan_interval_secs: default_orphan_interval(),
             orphan_ttl_secs: default_orphan_ttl(),
             sweep_objects_per_pass: default_sweep_objects(),
@@ -803,6 +812,22 @@ impl Default for CompactorConfig {
 }
 
 impl CompactorConfig {
+    /// The text sidecar budgets of log L1 files.
+    ///
+    /// # Errors
+    /// A budget of zero or above its ceiling.
+    pub fn text_index_limits(&self) -> Result<fs_index::TextIndexLimits, ServerError> {
+        fs_index::TextIndexLimits::new(
+            self.text_index_max_bytes_per_row_group,
+            self.text_index_max_bytes_per_file,
+        )
+        .map_err(|_| {
+            ServerError::InvalidConfig(
+                "compactor.text_index_max_bytes_per_row_group must be between 1 and 64 MiB and compactor.text_index_max_bytes_per_file between 1 and 512 MiB".into(),
+            )
+        })
+    }
+
     /// Converts to the compactor crate's settings; outputs use the
     /// ingester's row group size so L0 and L1 files share one layout.
     pub fn to_compactor(&self, row_group_rows: usize) -> fs_compactor::CompactorConfig {
@@ -822,6 +847,7 @@ impl CompactorConfig {
                 service_graph_max_spans: self.service_graph_max_spans,
                 service_graph_max_bytes: self.service_graph_max_bytes,
                 row_group_rows,
+                text_index: self.text_index_limits().unwrap_or_default(),
                 compact_logs: self.compact_logs,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
@@ -1090,6 +1116,7 @@ impl Config {
 
     fn validate_compactor(&self) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
+        self.compactor.text_index_limits()?;
         let derived_bytes = self
             .compactor
             .trace_summary_max_bytes
@@ -1927,7 +1954,32 @@ mod tests {
                     (group, file)
                 );
             }
+            let config = Config::parse(&format!(
+                "{MINIMAL}[compactor]\ntext_index_max_bytes_per_row_group = {group}\ntext_index_max_bytes_per_file = {file}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.validate(&secrets).is_ok(),
+                ok,
+                "compactor {group} {file}"
+            );
+            if ok {
+                let limits = config.compactor.to_compactor(4096).compaction.text_index;
+                assert_eq!(
+                    (limits.max_bytes_per_row_group, limits.max_bytes_per_file),
+                    (group, file)
+                );
+            }
         }
+        assert_eq!(
+            Config::parse(MINIMAL)
+                .unwrap()
+                .compactor
+                .to_compactor(4096)
+                .compaction
+                .text_index,
+            fs_index::TextIndexLimits::DEFAULT
+        );
     }
 
     #[test]

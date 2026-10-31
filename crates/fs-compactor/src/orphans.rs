@@ -49,7 +49,7 @@ use crate::CompactError;
 const CHUNK: usize = 1000;
 
 /// The kinds of partition under a tenant, in walk order.
-const KINDS: [&str; 11] = [
+const KINDS: [&str; 12] = [
     "traces/l0",
     "traces/l1",
     "traces/l2",
@@ -61,6 +61,7 @@ const KINDS: [&str; 11] = [
     "logs/l0",
     "logs/l1",
     "logs/l2",
+    "logs/index/ngram",
 ];
 
 /// Bounds of the sweep.
@@ -436,12 +437,12 @@ impl Sweeper {
     }
 }
 
-/// The file rows that would own `path`: itself for a span file, the span
-/// file of each level for a sidecar.
+/// The file rows that would own `path`: itself for a file, the file of
+/// each level for a sidecar.
 fn owners(path: &str) -> Vec<String> {
-    if path.rsplit_once('.').is_some_and(|(_, ext)| ext == "tix") {
-        fs_index::owners_of_sidecar(path)
-    } else {
-        vec![path.to_owned()]
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("tix") => fs_index::owners_of_sidecar(path),
+        Some("ngb") => fs_index::text_index::owners_of_sidecar(path),
+        _ => vec![path.to_owned()],
     }
 }

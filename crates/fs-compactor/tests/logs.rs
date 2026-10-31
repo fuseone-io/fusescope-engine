@@ -25,9 +25,11 @@ use fs_compactor::{
     CompactError, CompactionConfig, Compactor, CompactorStats, Rebuild, Retention, RetentionConfig,
     RetentionStats,
 };
+use fs_index::text_index::Probe;
+use fs_index::{TextIndex, TextIndexLimits};
 use fs_ingest::buffer::Stream;
 use fs_ingest::flush;
-use fs_ingest::record::FileLayout;
+use fs_ingest::record::{FileLayout, RowSignal};
 use fs_query::{Querier, QueryLimits};
 use fs_schema::attribute_keys::{KeySource, KeyStats, KeyTable};
 use fs_schema::limits::Limits;
@@ -238,7 +240,8 @@ async fn backdate(f: &Fixture, file: &FileRecord) {
     .unwrap();
 }
 
-/// Writes and registers one cold log L0 file of `request`.
+/// Writes and registers one cold log L0 file of `request`, with its text
+/// sidecar.
 async fn write_log_l0(f: &Fixture, request: &ExportLogsServiceRequest) -> FileRecord {
     let mut builder = fs_schema::logs::LogBatchBuilder::new(Limits::default());
     builder
@@ -250,10 +253,13 @@ async fn write_log_l0(f: &Fixture, request: &ExportLogsServiceRequest) -> FileRe
         &Path::from(""),
         fs_catalog::FileId::new(),
         &[batch],
-        FileLayout::current(4),
+        FileLayout::for_signal(RowSignal::Logs, 4, TextIndexLimits::DEFAULT),
     )
     .unwrap();
     flush::upload(f.store.as_ref(), &prepared).await.unwrap();
+    flush::upload_index(f.store.as_ref(), &prepared)
+        .await
+        .unwrap();
     let file = f.db.catalog.register_file(&prepared.file).await.unwrap();
     backdate(f, &file).await;
     file
@@ -309,6 +315,7 @@ fn config(compact_logs: bool) -> CompactionConfig {
         service_graph_max_bytes: 256 << 20,
         row_group_rows: 4,
         compact_logs,
+        text_index: fs_index::TextIndexLimits::DEFAULT,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
@@ -516,13 +523,17 @@ async fn log_l0_files_become_a_log_l1_file_with_their_own_keys() {
     assert_eq!(sorted, expected);
     assert_eq!(sorted.len(), 9);
     assert_eq!(bloom_columns(&path), ["trace_id", "service_name"]);
-    assert_eq!(objects_under(&f, "/logs/index/").await.len(), 0);
+    assert_eq!(
+        objects_under(&f, "/logs/index/ngram/").await.len(),
+        4,
+        "one text sidecar per input and one for the output"
+    );
     assert!(
         objects_under(&f, ".tix")
             .await
             .iter()
             .all(|p| p.contains("/traces/index/")),
-        "no sidecar for log files"
+        "no trace sidecar for log files"
     );
     for input in &inputs {
         assert!(
@@ -569,6 +580,60 @@ async fn log_l0_files_become_a_log_l1_file_with_their_own_keys() {
     f.db.finish().await;
 }
 
+/// A log L1 file gets a text sidecar bound to its bytes and row groups,
+/// built from its own rows; the purge of the inputs takes their sidecars.
+#[tokio::test]
+async fn a_log_l1_file_gets_its_text_sidecar_and_the_purge_takes_the_inputs_ones() {
+    let Some(f) = fixture().await else { return };
+    let inputs = three_log_l0(&f).await;
+    let c = compactor(&f, config(true));
+    let me = fence(&f).await;
+    c.compact_once(&me).await.unwrap().unwrap();
+    let l1 = visible(&f, Signal::Logs).await;
+    assert_eq!(l1.len(), 1);
+    let sidecar = fs_index::text_index::sidecar_path(&l1[0].path).unwrap();
+    let index = TextIndex::decode(std::fs::read(f.dir.path().join(&sidecar)).unwrap()).unwrap();
+    assert_eq!(index.path(), l1[0].path);
+    assert_eq!(Some(*index.content_sha256()), l1[0].content_sha256);
+    let footer = {
+        let file = std::fs::File::open(f.dir.path().join(&l1[0].path)).unwrap();
+        let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
+        parquet::file::reader::FileReader::metadata(&reader)
+            .row_groups()
+            .iter()
+            .map(|g| u64::try_from(g.num_rows()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(index.rows().collect::<Vec<_>>(), footer);
+    assert_eq!(footer, [4, 4, 1]);
+    // api 0..2 then web by time: "web 3" is the last row alone.
+    assert_eq!(index.select(&Probe::token(b"api", false)), [0]);
+    assert_eq!(index.select(&Probe::token(b"3", false)), [2]);
+    assert_eq!(index.select(&Probe::token(b"web", false)), [0, 1, 2]);
+
+    let input_sidecars: Vec<String> = inputs
+        .iter()
+        .map(|x| fs_index::text_index::sidecar_path(&x.path).unwrap())
+        .collect();
+    for path in &input_sidecars {
+        assert!(present(&f, path).await, "{path}");
+    }
+    let purged = fs_compactor::purge_once(
+        &f.db.catalog,
+        f.store.as_ref(),
+        Duration::ZERO,
+        100,
+        Duration::from_secs(600),
+    )
+    .await;
+    assert_eq!(purged, 3, "the three inputs");
+    for path in &input_sidecars {
+        assert!(!present(&f, path).await, "{path}");
+    }
+    assert!(present(&f, &sidecar).await);
+    f.db.finish().await;
+}
+
 /// With log compaction off no pass takes an hour of log files; spans are
 /// compacted as before.
 #[tokio::test]
@@ -599,8 +664,8 @@ async fn with_log_compaction_off_log_files_stay_as_they_are() {
     f.db.finish().await;
 }
 
-/// A log pass cut short before its swap, after its L1 file or between the
-/// L1 file and the table, publishes nothing and leaves the inputs
+/// A log pass cut short before its swap, between its L1 file and its text
+/// sidecar or between the sidecar and the table, publishes nothing and leaves the inputs
 /// visible; what it uploaded is swept as orphans. The next engine
 /// compacts the hour once, and after its swap a restart finds nothing to
 /// do.
@@ -632,14 +697,27 @@ async fn a_log_pass_cut_short_publishes_nothing_and_the_next_one_compacts_once()
             CompactError::Injected("object put"),
             (2, 1),
         ),
+        (
+            CompactionConfig {
+                inject_put_failure_at: Some(2),
+                ..config(true)
+            },
+            CompactError::Injected("object put"),
+            (3, 1),
+        ),
     ];
-    for (config, expected, (l1_objects, table_objects)) in failing {
+    let sidecars = || async { objects_under(&f, "/logs/index/ngram/").await.len() };
+    let input_sidecars = sidecars().await;
+    for ((config, expected, (l1_objects, table_objects)), output_sidecars) in
+        failing.into_iter().zip([1, 1, 2])
+    {
         let c = compactor(&f, config);
         let err = c.compact_once(&me).await.unwrap_err();
         assert_eq!(err.to_string(), expected.to_string());
         assert_eq!(ids(&visible(&f, Signal::Logs).await), ids(&inputs));
         assert_eq!(visible(&f, Signal::LogAttributeKeys).await.len(), 0);
         assert_eq!(objects_under(&f, "/logs/l1/").await.len(), l1_objects);
+        assert_eq!(sidecars().await, input_sidecars + output_sidecars);
         assert_eq!(
             objects_under(&f, "/derived/log_attribute_keys/")
                 .await
@@ -682,8 +760,12 @@ async fn a_log_pass_cut_short_publishes_nothing_and_the_next_one_compacts_once()
         .await
         .unwrap();
     let swept = sweeper.sweep_once().await.unwrap();
-    assert_eq!(swept.deleted, 5, "three log L1 files and two tables");
+    assert_eq!(
+        swept.deleted, 9,
+        "four log L1 files, three of their text sidecars and two tables"
+    );
     assert_eq!(objects_under(&f, "/logs/l1/").await.len(), 0);
+    assert_eq!(sidecars().await, input_sidecars, "the inputs' stay");
     assert_eq!(
         objects_under(&f, "/derived/log_attribute_keys/")
             .await

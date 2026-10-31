@@ -608,6 +608,7 @@ fn no_compaction() -> fs_compactor::CompactionConfig {
         service_graph_max_bytes: 256 << 20,
         row_group_rows: 1024,
         compact_logs: false,
+        text_index: fs_index::TextIndexLimits::DEFAULT,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,

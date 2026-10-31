@@ -348,7 +348,7 @@ impl Catalog {
         older_than: std::time::Duration,
     ) -> Result<bool, CatalogError> {
         let mut paths = vec![file.path.clone()];
-        paths.extend(fs_index::sidecar_path(&file.path));
+        paths.extend(fs_index::sidecar_paths(&file.path));
         let mut tx = self.pool.begin().await?;
         for path in &paths {
             crate::orphans::lock_path(&mut tx, path).await?;
