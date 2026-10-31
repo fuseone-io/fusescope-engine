@@ -17,6 +17,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
 use fs_catalog::{Catalog, NewTenant, Signal, TenantId, TokenScope};
+use fs_ingest::record::RowSignal;
 use fs_ingest::{IngestConfig, Ingester};
 use fs_query::{Querier, QueryLimits};
 use fs_wal::{Wal, WalConfig};
@@ -372,17 +373,20 @@ async fn log_rows_are_read_once_from_live_to_flushing_to_persisted_to_the_catalo
     db.finish().await;
 }
 
-/// An ingester from before logs: it ignores the signal of a hot scan and
-/// answers the tenant's span rows.
-struct SpansOnlyIngester {
-    rows: RecordBatch,
+/// An ingester that answers every hot scan with `schema`, `batches` and
+/// `persisted` as its file header, whatever the signal asked for. With the
+/// span schema it is an ingester from before logs.
+struct FixedIngester {
+    schema: arrow::datatypes::SchemaRef,
+    batches: Vec<RecordBatch>,
+    persisted: &'static str,
 }
 
 type FlightStream<T> =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, tonic::Status>> + Send>>;
 
 #[tonic::async_trait]
-impl arrow_flight::flight_service_server::FlightService for SpansOnlyIngester {
+impl arrow_flight::flight_service_server::FlightService for FixedIngester {
     type HandshakeStream = FlightStream<arrow_flight::HandshakeResponse>;
     type ListFlightsStream = FlightStream<arrow_flight::FlightInfo>;
     type DoGetStream = FlightStream<arrow_flight::FlightData>;
@@ -397,10 +401,17 @@ impl arrow_flight::flight_service_server::FlightService for SpansOnlyIngester {
     ) -> Result<tonic::Response<Self::DoGetStream>, tonic::Status> {
         use futures_util::TryStreamExt;
         let encoded = arrow_flight::encode::FlightDataEncoderBuilder::new()
-            .with_schema(self.rows.schema())
-            .build(futures_util::stream::iter([Ok(self.rows.clone())]))
+            .with_schema(self.schema.clone())
+            .build(futures_util::stream::iter(
+                self.batches.clone().into_iter().map(Ok),
+            ))
             .map_err(|e| tonic::Status::internal(e.to_string()));
-        Ok(tonic::Response::new(Box::pin(encoded)))
+        let mut response = tonic::Response::new(Box::pin(encoded) as Self::DoGetStream);
+        response.metadata_mut().insert(
+            fs_ingest::hot::PERSISTED_FILES_HEADER,
+            self.persisted.parse().unwrap(),
+        );
+        Ok(response)
     }
 
     async fn handshake(
@@ -478,27 +489,16 @@ async fn an_ingester_without_logs_makes_a_log_query_partial_not_wrong() {
         .append_request(&spans("api", now - 1_000_000_000, 4))
         .unwrap();
     let rows = builder.finish().unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(
-                arrow_flight::flight_service_server::FlightServiceServer::new(SpansOnlyIngester {
-                    rows,
-                }),
-            )
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async {
-                    let _ = stopped.await;
-                },
-            ),
-    );
-    db.catalog
-        .heartbeat("ingester-old", &addr.to_string())
-        .await
-        .unwrap();
+    let old = serve(
+        &db.catalog,
+        "ingester-old",
+        FixedIngester {
+            schema: rows.schema(),
+            batches: vec![rows],
+            persisted: "",
+        },
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let querier = Querier::new(db.catalog.clone(), store, None, QueryLimits::default()).unwrap();
@@ -510,7 +510,118 @@ async fn an_ingester_without_logs_makes_a_log_query_partial_not_wrong() {
     let (spans, warnings) = counted(&querier, tenant, SPANS).await;
     assert_eq!(spans, 4, "the old ingester still serves spans");
     assert!(warnings.is_empty(), "{warnings:?}");
-    stop.send(()).unwrap();
-    server.await.unwrap().unwrap();
+    old.stop().await;
+    db.finish().await;
+}
+
+struct Served {
+    stop: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl Served {
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.server.await.unwrap().unwrap();
+    }
+}
+
+/// Serves `ingester` and announces it in `catalog` as `id`.
+async fn serve(catalog: &Catalog, id: &str, ingester: FixedIngester) -> Served {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(ingester))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            ),
+    );
+    catalog.heartbeat(id, &addr.to_string()).await.unwrap();
+    Served { stop, server }
+}
+
+/// An answer without rows still names its signal by the schema it sends:
+/// an old ingester's empty span answer to a log scan is no answer, and the
+/// files it names stay in the log scan.
+#[tokio::test]
+async fn an_empty_answer_is_judged_by_the_schema_it_sends() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let hot = fs_query::hot::HotWindow::new(
+        db.catalog.clone(),
+        fs_query::hot::HotWindowConfig::default(),
+    );
+    let everything = fs_query::prune::Pruning::default();
+    let scan = |signal| hot.scan(tenant, signal, &everything, None, None);
+    let excluded = |ids: &[&str]| {
+        ids.iter()
+            .map(|id| fs_catalog::FileId(id.parse().unwrap()))
+            .collect::<std::collections::HashSet<_>>()
+    };
+
+    let old = serve(
+        &db.catalog,
+        "ingester",
+        FixedIngester {
+            schema: fs_schema::spans::span_schema_v1(),
+            batches: Vec::new(),
+            persisted: "0195f0a0-0000-7000-8000-000000000041",
+        },
+    )
+    .await;
+    let logs = scan(RowSignal::Logs).await.unwrap();
+    assert_eq!(logs.unavailable, ["ingester"]);
+    assert_eq!(
+        logs.excluded_files,
+        excluded(&[]),
+        "its files stay in the log scan"
+    );
+    let spans = scan(RowSignal::Traces).await.unwrap();
+    assert_eq!(spans.unavailable.len(), 0, "{:?}", spans.unavailable);
+    assert_eq!(
+        spans.excluded_files,
+        excluded(&["0195f0a0-0000-7000-8000-000000000041"])
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let querier = Querier::new(db.catalog.clone(), store, None, QueryLimits::default()).unwrap();
+    let (rows, warnings) = counted(&querier, tenant, LOGS).await;
+    assert_eq!(rows, 0);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("ingester"), "{warnings:?}");
+    let (_, warnings) = counted(&querier, tenant, SPANS).await;
+    assert!(warnings.is_empty(), "{warnings:?}");
+    old.stop().await;
+
+    let new = serve(
+        &db.catalog,
+        "ingester",
+        FixedIngester {
+            schema: fs_schema::logs::log_schema_v1(),
+            batches: Vec::new(),
+            persisted: "0195f0a0-0000-7000-8000-000000000042",
+        },
+    )
+    .await;
+    let logs = scan(RowSignal::Logs).await.unwrap();
+    assert_eq!(logs.unavailable.len(), 0, "{:?}", logs.unavailable);
+    assert_eq!(
+        logs.excluded_files,
+        excluded(&["0195f0a0-0000-7000-8000-000000000042"])
+    );
+    new.stop().await;
     db.finish().await;
 }

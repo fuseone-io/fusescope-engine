@@ -195,7 +195,9 @@ C5 landed after C6.
   schema (`spans`, `logs`); `HotScanRequest.signal`, absent meaning spans;
   the querier refuses an answer of another signal
   (`an_answer_of_another_signal_is_refused`,
-  `an_ingester_without_logs_makes_a_log_query_partial_not_wrong`); log rows
+  `an_ingester_without_logs_makes_a_log_query_partial_not_wrong`), by the
+  schema it sent even without rows
+  (`an_empty_answer_is_judged_by_the_schema_it_sends`); log rows
   read once live, while flushing, while registered and retained, and from
   the catalog alone, with tenant isolation and a partial answer once the
   ingester is gone

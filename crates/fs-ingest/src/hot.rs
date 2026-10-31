@@ -95,6 +95,9 @@ impl HotScanRequest {
 pub struct HotScanResponse {
     /// Matching rows, projected.
     pub batches: Vec<RecordBatch>,
+    /// The schema the ingester sent, rows or not; it names the signal the
+    /// ingester answered for.
+    pub schema: Option<arrow::datatypes::SchemaRef>,
     /// Files whose rows are included; the querier must not read them.
     pub persisted_files: Vec<FileId>,
 }
@@ -261,13 +264,15 @@ pub async fn scan_with(
         let stream = response
             .into_inner()
             .map_err(|status| FlightError::Tonic(Box::new(status)));
-        let batches: Vec<RecordBatch> =
-            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream)
-                .try_collect()
-                .await
-                .map_err(|e| fail(e.to_string()))?;
+        let mut stream =
+            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream);
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await.map_err(|e| fail(e.to_string()))? {
+            batches.push(batch);
+        }
         Ok(HotScanResponse {
             batches,
+            schema: stream.schema().cloned(),
             persisted_files,
         })
     };

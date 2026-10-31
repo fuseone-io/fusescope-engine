@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::{Duration as ChronoDuration, Utc};
 use fs_catalog::{Catalog, FileId, TenantId};
 use fs_ingest::flush::schema_of;
-use fs_ingest::hot::{HotScanRequest, scan_with};
+use fs_ingest::hot::{HotScanRequest, HotScanResponse, scan_with};
 use fs_ingest::record::RowSignal;
 use tracing::{debug, warn};
 
@@ -161,7 +161,7 @@ impl HotWindow {
         let mut result = HotResult::default();
         for (id, outcome) in futures_util::future::join_all(calls).await {
             let outcome = outcome.map_err(|e| e.to_string()).and_then(|response| {
-                if answers_signal(&response.batches, signal) {
+                if answers_signal(&response, signal) {
                     Ok(response)
                 } else {
                     Err(format!("answered rows of another signal than {signal:?}"))
@@ -196,23 +196,36 @@ impl HotWindow {
     }
 }
 
-/// True when every batch names `signal` in its schema, as the ingester's
-/// schemas do.
-fn answers_signal(batches: &[RecordBatch], signal: RowSignal) -> bool {
+/// True when the schema the ingester sent, and every batch, names `signal`
+/// as the ingester's schemas do; an answer without a schema names none.
+fn answers_signal(response: &HotScanResponse, signal: RowSignal) -> bool {
     let key = "fusescope.signal";
     let expected = schema_of(signal);
     let expected = expected.metadata().get(key);
-    batches
-        .iter()
-        .all(|b| expected.is_some() && b.schema().metadata().get(key) == expected)
+    let names = |schema: &arrow::datatypes::Schema| {
+        expected.is_some() && schema.metadata().get(key) == expected
+    };
+    response.schema.as_deref().is_some_and(names)
+        && response.batches.iter().all(|b| names(&b.schema()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn answer(
+        schema: Option<arrow::datatypes::SchemaRef>,
+        batches: &[RecordBatch],
+    ) -> HotScanResponse {
+        HotScanResponse {
+            batches: batches.to_vec(),
+            schema,
+            persisted_files: Vec::new(),
+        }
+    }
+
     /// An ingester that predates logs ignores the signal and answers spans:
-    /// those rows never reach a log query.
+    /// those rows never reach a log query, and neither does its empty answer.
     #[test]
     fn an_answer_of_another_signal_is_refused() {
         let spans = fs_schema::spans::SpanBatchBuilder::default()
@@ -222,22 +235,39 @@ mod tests {
             .finish()
             .unwrap();
         let projected = spans.project(&[0, 1]).unwrap();
+        let of_spans = Some(spans.schema());
+        let of_logs = Some(logs.schema());
         assert!(answers_signal(
-            &[spans.clone(), projected],
+            &answer(of_spans.clone(), &[spans.clone(), projected]),
             RowSignal::Traces
         ));
         assert!(!answers_signal(
-            std::slice::from_ref(&spans),
+            &answer(of_spans.clone(), std::slice::from_ref(&spans)),
             RowSignal::Logs
         ));
-        assert!(answers_signal(std::slice::from_ref(&logs), RowSignal::Logs));
-        assert!(!answers_signal(&[logs, spans], RowSignal::Logs));
-        let bare = RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()));
+        assert!(answers_signal(
+            &answer(of_logs.clone(), std::slice::from_ref(&logs)),
+            RowSignal::Logs
+        ));
+        assert!(!answers_signal(
+            &answer(of_logs.clone(), &[logs, spans]),
+            RowSignal::Logs
+        ));
+        assert!(!answers_signal(
+            &answer(of_spans.clone(), &[]),
+            RowSignal::Logs
+        ));
+        assert!(answers_signal(&answer(of_spans, &[]), RowSignal::Traces));
+        assert!(answers_signal(&answer(of_logs, &[]), RowSignal::Logs));
+        let bare = Arc::new(arrow::datatypes::Schema::empty());
         assert!(
-            !answers_signal(&[bare], RowSignal::Traces),
-            "no name, no rows"
+            !answers_signal(&answer(Some(bare), &[]), RowSignal::Traces),
+            "no name"
         );
-        assert!(answers_signal(&[], RowSignal::Logs), "nothing to mix up");
+        assert!(
+            !answers_signal(&answer(None, &[]), RowSignal::Traces),
+            "no schema"
+        );
     }
 
     fn config(enabled: bool) -> HotWindowConfig {

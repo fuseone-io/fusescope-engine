@@ -527,9 +527,10 @@ querier needs it for "last 5 minutes" dashboards.
   from before logs did. The ingester picks the tenant's buffers of that
   signal and checks the projection, filters and `distinct` column against
   that signal's schema, which names the signal in its `fusescope.signal`
-  metadata. The querier accepts only answers of the signal it asked for, so
-  an ingester from before logs, which ignores the field and answers spans,
-  makes a log query partial, never wrong. The SQL tables `spans` and `logs`
+  metadata. The querier accepts only answers of the signal it asked for,
+  judged by the schema the ingester sends even without rows, so an ingester
+  from before logs, which ignores the field and answers spans, makes a log
+  query partial, never wrong, and the files it names stay in the scan. The SQL tables `spans` and `logs`
   are each bound to their signal's files and schema; `logs` reads no trace
   sidecar.
 
