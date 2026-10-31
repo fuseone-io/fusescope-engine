@@ -679,7 +679,7 @@ impl Shared {
         flush::check_layout(&layout)?;
         let root = self.root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            flush::prepare(tenant, &root, file_id, &batches, layout.row_group_rows)
+            flush::prepare(tenant, &root, file_id, &batches, layout)
         })
         .await??;
         timing.concat = nanos(prepared.concat);

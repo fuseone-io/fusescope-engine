@@ -74,10 +74,16 @@ pub struct FileLayout {
 
 impl FileLayout {
     /// Version of the current encoder: per-batch sort, k-way merge, one row
-    /// group at a time, bloom filters sized to the row group. Version 2 was
-    /// the same merge with the writer's limit at twice the group and bloom
-    /// filters sized by it; it never shipped and is refused like any other.
-    pub const CURRENT_VERSION: u32 = 3;
+    /// group at a time, bloom filters sized to the row group on `trace_id`,
+    /// `span_id` and `service_name` alone. Version 3 is the same merge with
+    /// a bloom filter on every column; it is still written for its intents.
+    /// Version 2 had the writer's limit at twice the group and bloom filters
+    /// sized by it; it never shipped and is refused like any other.
+    pub const CURRENT_VERSION: u32 = 4;
+
+    /// Versions this engine writes: the current one and those whose intents
+    /// may still be in a log.
+    pub const WRITTEN_VERSIONS: [u32; 2] = [3, Self::CURRENT_VERSION];
 
     /// The current encoder with `row_group_rows` rows per row group.
     pub fn current(row_group_rows: usize) -> Self {

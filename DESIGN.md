@@ -285,7 +285,7 @@ Rules:
 | Row group | 1 M rows or 128 MB | Pruning granularity without a huge footer |
 | Page index | on | Pruning inside a row group |
 | Dictionary | on for low-cardinality strings | service_name, status, severity |
-| Native bloom | trace_id, span_id, service_name, metric_name | Row-group pruning on equality |
+| Native bloom | spans: trace_id, span_id, service_name; logs: trace_id, service_name; metric_name; each sized to the row group at 1 % false positives, no other column | Row-group pruning on equality |
 | Sort order | traces and logs: (service_name, timestamp); samples: (fingerprint, timestamp) | Locality for the dominant filters |
 | Target size | L0 128 MB, L1 512 MB, L2 1 GB | Fewer footers to fetch, larger sequential reads |
 

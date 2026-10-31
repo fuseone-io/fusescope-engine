@@ -46,15 +46,39 @@ pub fn check_row_group_rows(rows: usize) -> Result<(), SchemaError> {
     }
 }
 
-/// The engine's writer settings for row groups of `row_group_rows`. Row
-/// groups end on an explicit flush, never inside `write`: the writer's own
-/// limit sits one row above any group handed to it, so its memory can be
-/// read while it still holds the whole group. The bloom filters are sized
-/// to the group, not to that limit.
+/// Columns of a span file that carry a bloom filter.
+pub const SPAN_BLOOM_COLUMNS: [&str; 3] = [col::TRACE_ID, col::SPAN_ID, col::SERVICE_NAME];
+
+/// Columns of a log file that carry a bloom filter. Severity has a handful
+/// of values, which the dictionary and the page statistics already prune.
+pub const LOG_BLOOM_COLUMNS: [&str; 2] = [col::TRACE_ID, col::SERVICE_NAME];
+
+/// The engine's writer settings for span row groups of `row_group_rows`.
+/// Row groups end on an explicit flush, never inside `write`: the writer's
+/// own limit sits one row above any group handed to it, so its memory can
+/// be read while it still holds the whole group. Only
+/// [`SPAN_BLOOM_COLUMNS`] carry a bloom filter, sized to the group.
 ///
 /// # Errors
 /// A zstd level the library refuses.
 pub fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
+    Ok(with_blooms(
+        base_properties(row_group_rows)?,
+        &SPAN_BLOOM_COLUMNS,
+        row_group_rows,
+    )
+    .build())
+}
+
+/// The span writer settings of file layout 3, kept so a retried flush of an
+/// intent of that layout reproduces its bytes: the global bloom settings
+/// put a filter sized to the group on every column, while the three
+/// columns enabled one by one get the library's default rate, sized to the
+/// writer's row limit.
+///
+/// # Errors
+/// A zstd level the library refuses.
+pub fn writer_properties_layout_v3(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
     Ok(base_properties(row_group_rows)?
         .set_bloom_filter_max_ndv(u64::try_from(row_group_rows).unwrap_or(u64::MAX))
         .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
@@ -64,22 +88,33 @@ pub fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, Sche
         .build())
 }
 
-/// [`writer_properties`] for log batches, with bloom filters on `trace_id`
-/// and `service_name` alone. Severity has a handful of values, which the
-/// dictionary and the page statistics already prune.
+/// [`writer_properties`] for log batches: only [`LOG_BLOOM_COLUMNS`] carry
+/// a bloom filter.
 ///
 /// # Errors
 /// A zstd level the library refuses.
 pub fn log_writer_properties(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
+    Ok(with_blooms(
+        base_properties(row_group_rows)?,
+        &LOG_BLOOM_COLUMNS,
+        row_group_rows,
+    )
+    .build())
+}
+
+fn with_blooms(
+    mut builder: WriterPropertiesBuilder,
+    columns: &[&str],
+    row_group_rows: usize,
+) -> WriterPropertiesBuilder {
     let ndv = u64::try_from(row_group_rows).unwrap_or(u64::MAX);
-    let mut builder = base_properties(row_group_rows)?;
-    for column in [col::TRACE_ID, col::SERVICE_NAME] {
+    for column in columns {
         builder = builder
-            .set_column_bloom_filter_enabled(ColumnPath::from(column), true)
-            .set_column_bloom_filter_max_ndv(ColumnPath::from(column), ndv)
-            .set_column_bloom_filter_fpp(ColumnPath::from(column), BLOOM_FPP);
+            .set_column_bloom_filter_enabled(ColumnPath::from(*column), true)
+            .set_column_bloom_filter_max_ndv(ColumnPath::from(*column), ndv)
+            .set_column_bloom_filter_fpp(ColumnPath::from(*column), BLOOM_FPP);
     }
-    Ok(builder.build())
+    builder
 }
 
 fn base_properties(row_group_rows: usize) -> Result<WriterPropertiesBuilder, SchemaError> {
@@ -152,23 +187,49 @@ mod tests {
         assert!(check_row_group_rows(MAX_ROW_GROUP_ROWS + 1).is_err());
     }
 
-    #[test]
-    fn log_blooms_are_sized_to_the_group_on_their_columns_alone() {
-        let props = log_writer_properties(1000).unwrap();
-        for column in [col::TRACE_ID, col::SERVICE_NAME] {
+    fn assert_blooms_only_on(props: &WriterProperties, columns: &[&str]) {
+        for column in columns {
             let bloom = props
-                .bloom_filter_properties(&ColumnPath::from(column))
+                .bloom_filter_properties(&ColumnPath::from(*column))
                 .unwrap();
             assert_eq!((bloom.ndv(), bloom.fpp()), (1000, BLOOM_FPP), "{column}");
         }
-        for column in [col::SPAN_ID, "body", "severity_text", "timestamp"] {
-            assert!(
-                props
-                    .bloom_filter_properties(&ColumnPath::from(column))
-                    .is_none(),
-                "{column}"
-            );
+        for column in [
+            col::SPAN_ID,
+            "body",
+            "severity_text",
+            col::TIMESTAMP,
+            "name",
+        ] {
+            if !columns.contains(&column) {
+                assert!(
+                    props
+                        .bloom_filter_properties(&ColumnPath::from(column))
+                        .is_none(),
+                    "{column}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn blooms_are_sized_to_the_group_on_their_columns_alone() {
+        assert_blooms_only_on(&writer_properties(1000).unwrap(), &SPAN_BLOOM_COLUMNS);
+        assert_blooms_only_on(&log_writer_properties(1000).unwrap(), &LOG_BLOOM_COLUMNS);
+    }
+
+    #[test]
+    fn layout_v3_keeps_a_bloom_on_every_column() {
+        let props = writer_properties_layout_v3(1000).unwrap();
+        let other = props
+            .bloom_filter_properties(&ColumnPath::from(col::TIMESTAMP))
+            .unwrap();
+        assert_eq!((other.ndv(), other.fpp()), (1000, BLOOM_FPP));
+        let default = parquet::file::properties::BloomFilterProperties::default();
+        let trace = props
+            .bloom_filter_properties(&ColumnPath::from(col::TRACE_ID))
+            .unwrap();
+        assert_eq!((trace.ndv(), trace.fpp()), (1001, default.fpp()));
     }
 
     #[test]

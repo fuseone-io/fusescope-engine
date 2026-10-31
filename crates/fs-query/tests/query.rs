@@ -154,7 +154,7 @@ async fn write_file(
         &Path::from(""),
         fs_catalog::FileId::new(),
         &[batch],
-        flush::DEFAULT_ROW_GROUP_ROWS,
+        fs_ingest::record::FileLayout::current(flush::DEFAULT_ROW_GROUP_ROWS),
     )
     .unwrap();
     flush::upload(store, &prepared).await.unwrap();
@@ -499,7 +499,7 @@ async fn files_are_excluded_by_their_origin_as_well_as_their_id() {
         &Path::from(""),
         registered,
         &[batch],
-        flush::DEFAULT_ROW_GROUP_ROWS,
+        fs_ingest::record::FileLayout::current(flush::DEFAULT_ROW_GROUP_ROWS),
     )
     .unwrap();
     prepared.file.origin = announced;

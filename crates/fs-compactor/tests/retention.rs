@@ -222,7 +222,7 @@ async fn write_request_l0(
         &Path::from(""),
         fs_catalog::FileId::new(),
         &[batch],
-        4,
+        fs_ingest::record::FileLayout::current(4),
     )
     .unwrap();
     flush::upload(f.store.as_ref(), &prepared).await.unwrap();

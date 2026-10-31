@@ -30,6 +30,7 @@ use parquet::file::properties::WriterProperties;
 
 use crate::IngestError;
 use crate::buffer::{HotBatch, trace_set};
+use crate::record::FileLayout;
 
 pub use fs_schema::parquet::{DEFAULT_ROW_GROUP_ROWS, MAX_ROW_GROUP_ROWS};
 
@@ -81,10 +82,11 @@ pub fn prepare(
     root: &Path,
     id: FileId,
     batches: &[RecordBatch],
-    row_group_rows: usize,
+    layout: FileLayout,
 ) -> Result<Prepared, IngestError> {
     let schema = span_schema_v1();
-    check_row_group_rows(row_group_rows)?;
+    check_layout(&layout)?;
+    let row_group_rows = layout.row_group_rows;
 
     let sort_started = std::time::Instant::now();
     let inputs: Vec<RecordBatch> = batches
@@ -99,7 +101,7 @@ pub fn prepare(
     let mut writer = ArrowWriter::try_new(
         &mut out,
         Arc::clone(&schema),
-        Some(writer_properties(row_group_rows)?),
+        Some(writer_properties(layout)?),
     )?;
 
     let mut merge = std::time::Duration::ZERO;
@@ -188,8 +190,12 @@ fn trace_index(path: &str, rows: &[HotBatch]) -> Result<TraceIndex, IngestError>
     Ok(TraceIndex::new(vec![path.to_owned()], pairs)?)
 }
 
-fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, IngestError> {
-    Ok(fs_schema::parquet::writer_properties(row_group_rows)?)
+fn writer_properties(layout: FileLayout) -> Result<WriterProperties, IngestError> {
+    let rows = layout.row_group_rows;
+    Ok(match layout.version {
+        3 => fs_schema::parquet::writer_properties_layout_v3(rows)?,
+        _ => fs_schema::parquet::writer_properties(rows)?,
+    })
 }
 
 /// Sort keys of every input, as integers: the rank of the service among all
@@ -301,14 +307,14 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
 /// bytes under the same id.
 ///
 /// # Errors
-/// A layout version other than the current one, or a row group size
-/// outside the supported range.
-pub fn check_layout(layout: &crate::record::FileLayout) -> Result<(), IngestError> {
-    if layout.version != crate::record::FileLayout::CURRENT_VERSION {
+/// A layout version outside [`FileLayout::WRITTEN_VERSIONS`], or a row
+/// group size outside the supported range.
+pub fn check_layout(layout: &FileLayout) -> Result<(), IngestError> {
+    if !FileLayout::WRITTEN_VERSIONS.contains(&layout.version) {
         return Err(IngestError::Encode(format!(
-            "file layout version {} is not this engine's {}",
+            "file layout version {} is not one this engine writes ({:?})",
             layout.version,
-            crate::record::FileLayout::CURRENT_VERSION
+            FileLayout::WRITTEN_VERSIONS
         )));
     }
     check_row_group_rows(layout.row_group_rows)
@@ -469,7 +475,9 @@ pub fn encode_parquet(batch: &RecordBatch) -> Result<Bytes, IngestError> {
     let mut writer = ArrowWriter::try_new(
         &mut out,
         batch.schema(),
-        Some(writer_properties(DEFAULT_ROW_GROUP_ROWS)?),
+        Some(writer_properties(FileLayout::current(
+            DEFAULT_ROW_GROUP_ROWS,
+        ))?),
     )?;
     writer.write(batch)?;
     writer.close()?;
@@ -587,7 +595,8 @@ mod tests {
         ];
         let tenant = TenantId(uuid::Uuid::from_u128(1));
         let id = FileId(uuid::Uuid::from_u128(2));
-        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        let prepared =
+            prepare(tenant, &Path::from(""), id, &inputs, FileLayout::current(3)).unwrap();
 
         assert_eq!(prepared.rows.len(), 3, "eight rows in groups of three");
         let rows: Vec<(String, i64, u8)> = prepared
@@ -624,11 +633,65 @@ mod tests {
         assert_eq!(reader.metadata().num_row_groups(), 3);
 
         let whole = arrow::compute::concat_batches(&span_schema_v1(), &inputs).unwrap();
-        let again = prepare(tenant, &Path::from(""), id, &[whole], 3).unwrap();
+        let again = prepare(
+            tenant,
+            &Path::from(""),
+            id,
+            &[whole],
+            FileLayout::current(3),
+        )
+        .unwrap();
         assert_eq!(
             again.bytes, prepared.bytes,
             "batching does not change the file"
         );
+    }
+
+    fn bloom_columns(bytes: &Bytes) -> Vec<String> {
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        reader
+            .metadata()
+            .row_group(0)
+            .columns()
+            .iter()
+            .filter(|c| c.bloom_filter_offset().is_some())
+            .map(|c| c.column_path().string())
+            .collect()
+    }
+
+    /// Layout 3 has a bloom filter on every column, layout 4 on the three
+    /// key columns alone, and a later layout is refused.
+    #[test]
+    fn layouts_put_blooms_on_their_columns() {
+        let inputs = vec![
+            batch("web", 1, &[T0 + 5, T0 + 1, T0 + 3]),
+            batch("api", 2, &[T0 + 2, T0 + 9]),
+        ];
+        let tenant = TenantId(uuid::Uuid::from_u128(1));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let encode = |version| {
+            let layout = FileLayout {
+                version,
+                row_group_rows: 3,
+            };
+            prepare(tenant, &Path::from(""), id, &inputs, layout)
+        };
+
+        let v3 = encode(3).unwrap();
+        let leaves = SerializedFileReader::new(v3.bytes.clone())
+            .unwrap()
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .num_columns();
+        assert_eq!(bloom_columns(&v3.bytes).len(), leaves);
+        let v4 = encode(4).unwrap();
+        assert_eq!(
+            bloom_columns(&v4.bytes),
+            vec![col::TRACE_ID, col::SPAN_ID, col::SERVICE_NAME]
+        );
+        assert!(v4.bytes.len() < v3.bytes.len());
+        assert!(encode(5).is_err());
     }
 
     /// Rows that fill every row group exactly: nothing is left for a partial
@@ -642,7 +705,8 @@ mod tests {
         ];
         let tenant = TenantId(uuid::Uuid::from_u128(1));
         let id = FileId(uuid::Uuid::from_u128(2));
-        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        let prepared =
+            prepare(tenant, &Path::from(""), id, &inputs, FileLayout::current(3)).unwrap();
         assert_eq!(
             prepared.rows.len(),
             2,
@@ -669,7 +733,14 @@ mod tests {
         ];
         let tenant = TenantId(uuid::Uuid::from_u128(1));
         let id = FileId(uuid::Uuid::from_u128(2));
-        let prepared = prepare(tenant, &Path::from("engine"), id, &inputs, 2).unwrap();
+        let prepared = prepare(
+            tenant,
+            &Path::from("engine"),
+            id,
+            &inputs,
+            FileLayout::current(2),
+        )
+        .unwrap();
         assert_eq!(
             prepared.index_path,
             fs_index::sidecar_path(&prepared.file.path).unwrap()
@@ -709,7 +780,8 @@ mod tests {
         let inputs = vec![batch("api", 1, &[T0 + 1]), batch("db", 2, &[T0 + 2])];
         let tenant = TenantId(uuid::Uuid::from_u128(1));
         let id = FileId(uuid::Uuid::from_u128(2));
-        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        let prepared =
+            prepare(tenant, &Path::from(""), id, &inputs, FileLayout::current(3)).unwrap();
         // Valid, internally consistent, and missing trace 2.
         let partial = fs_index::TraceIndex::new(vec![prepared.file.path.clone()], [([1u8; 16], 0)])
             .unwrap()
@@ -744,7 +816,8 @@ mod tests {
         let inputs = vec![batch("api", 1, &[T0 + 1, T0 + 2])];
         let tenant = TenantId(uuid::Uuid::from_u128(1));
         let id = FileId(uuid::Uuid::from_u128(2));
-        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
+        let prepared =
+            prepare(tenant, &Path::from(""), id, &inputs, FileLayout::current(3)).unwrap();
         assert_eq!(upload(&store, &prepared).await.unwrap(), Upload::Created);
         assert_eq!(
             upload(&store, &prepared).await.unwrap(),
@@ -756,7 +829,14 @@ mod tests {
         // Another encoder wrote this id first: the size is reported as is;
         // whether it is accepted is the intent's call.
         let other = FileId(uuid::Uuid::from_u128(3));
-        let mut foreign = prepare(tenant, &Path::from(""), other, &inputs, 3).unwrap();
+        let mut foreign = prepare(
+            tenant,
+            &Path::from(""),
+            other,
+            &inputs,
+            FileLayout::current(3),
+        )
+        .unwrap();
         let path = Path::from(foreign.file.path.as_str());
         store
             .put(&path, PutPayload::from_static(b"not the same bytes"))
@@ -792,7 +872,16 @@ mod tests {
             let inputs = vec![batch("api", 1, &[T0 + 1])];
             let tenant = TenantId(uuid::Uuid::from_u128(1));
             let id = FileId(uuid::Uuid::from_u128(2));
-            assert!(prepare(tenant, &Path::from(""), id, &inputs, rows).is_err());
+            assert!(
+                prepare(
+                    tenant,
+                    &Path::from(""),
+                    id,
+                    &inputs,
+                    FileLayout::current(rows)
+                )
+                .is_err()
+            );
         }
         assert!(
             check_layout(&FileLayout::current(MAX_ROW_GROUP_ROWS)).is_ok(),
@@ -800,13 +889,14 @@ mod tests {
         );
     }
 
-    /// The bytes of a canonical input, pinned with the layout version. When
-    /// an upgrade of the Parquet or compression crates, or a change here,
-    /// gives other bytes, this fails: bump `FileLayout::CURRENT_VERSION` and
-    /// the digest together, never one without the other, because a retry
-    /// after a crash must reproduce what an earlier engine wrote.
+    /// The bytes of a canonical input, pinned for every layout version this
+    /// engine writes. When an upgrade of the Parquet or compression crates,
+    /// or a change here, gives other bytes, this fails: bump
+    /// `FileLayout::CURRENT_VERSION` and pin its digest, keeping the older
+    /// versions' digests, because a retry after a crash must reproduce what
+    /// an earlier engine wrote.
     #[test]
-    fn canonical_input_gives_the_pinned_bytes_for_the_pinned_version() {
+    fn canonical_input_gives_the_pinned_bytes_for_each_version() {
         use sha2::{Digest, Sha256};
         let inputs = vec![
             batch("web", 1, &[T0 + 5, T0 + 1, T0 + 3]),
@@ -815,18 +905,37 @@ mod tests {
         ];
         let tenant = TenantId(uuid::Uuid::from_u128(0x7e5a));
         let id = FileId(uuid::Uuid::from_u128(0xf11e));
-        let prepared = prepare(tenant, &Path::from(""), id, &inputs, 3).unwrap();
-        let digest: [u8; 32] = Sha256::digest(&prepared.bytes).into();
-        let hex = digest.iter().fold(String::new(), |mut out, b| {
-            use std::fmt::Write;
-            let _ = write!(out, "{b:02x}");
-            out
-        });
-        assert_eq!(crate::record::FileLayout::CURRENT_VERSION, 3);
+        let pinned = [
+            (
+                3,
+                "e97e37bb01c1cbf4fdd5d57489da73187111d6cbb18540dc1e583e00be75f68c",
+            ),
+            (
+                4,
+                "a4017dff8ea2fca038f436609dbe549af1fc657f25ae1b76f1a3ff39e203b665",
+            ),
+        ];
         assert_eq!(
-            hex, "e97e37bb01c1cbf4fdd5d57489da73187111d6cbb18540dc1e583e00be75f68c",
-            "layout version 3 bytes changed: bump the version with the digest"
+            pinned.map(|(version, _)| version),
+            FileLayout::WRITTEN_VERSIONS
         );
+        for (version, expected) in pinned {
+            let layout = FileLayout {
+                version,
+                row_group_rows: 3,
+            };
+            let prepared = prepare(tenant, &Path::from(""), id, &inputs, layout).unwrap();
+            let digest: [u8; 32] = Sha256::digest(&prepared.bytes).into();
+            let hex = digest.iter().fold(String::new(), |mut out, b| {
+                use std::fmt::Write;
+                let _ = write!(out, "{b:02x}");
+                out
+            });
+            assert_eq!(
+                hex, expected,
+                "layout version {version} bytes changed: bump the version with the digest"
+            );
+        }
     }
 
     #[test]

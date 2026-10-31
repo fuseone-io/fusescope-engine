@@ -21,6 +21,7 @@ use fs_catalog::{
 };
 use fs_compactor::{CompactError, CompactionConfig, Compactor, CompactorStats};
 use fs_ingest::flush;
+use fs_ingest::record::FileLayout;
 use fs_query::{Querier, QueryLimits};
 use fs_schema::limits::Limits;
 use fs_schema::spans::SpanBatchBuilder;
@@ -137,6 +138,17 @@ async fn write_l0(
     requests: &[ExportTraceServiceRequest],
     row_group_rows: usize,
 ) -> FileRecord {
+    let layout = FileLayout::current(row_group_rows);
+    write_l0_with(catalog, store, tenant, requests, layout).await
+}
+
+async fn write_l0_with(
+    catalog: &Catalog,
+    store: &LocalFileSystem,
+    tenant: TenantId,
+    requests: &[ExportTraceServiceRequest],
+    layout: FileLayout,
+) -> FileRecord {
     let batches: Vec<RecordBatch> = requests
         .iter()
         .map(|r| {
@@ -150,12 +162,24 @@ async fn write_l0(
         &Path::from(""),
         fs_catalog::FileId::new(),
         &batches,
-        row_group_rows,
+        layout,
     )
     .unwrap();
     flush::upload(store, &prepared).await.unwrap();
     flush::upload_index(store, &prepared).await.unwrap();
     catalog.register_file(&prepared.file).await.unwrap()
+}
+
+fn bloom_columns(path: &std::path::Path) -> Vec<String> {
+    let file = std::fs::File::open(path).unwrap();
+    let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
+    parquet::file::reader::FileReader::metadata(&reader)
+        .row_group(0)
+        .columns()
+        .iter()
+        .filter(|c| c.bloom_filter_offset().is_some())
+        .map(|c| c.column_path().string())
+        .collect()
 }
 
 struct Fixture {
@@ -246,9 +270,17 @@ async fn three_closed_l0(f: &Fixture, row_group_rows: usize) -> Vec<FileRecord> 
     let h = nanos(closed_hour());
     let minute = 60_000_000_000u64;
     let mut files = Vec::new();
-    for (service, trace, offset) in [("web", 1u8, 5), ("api", 2, 1), ("web", 3, 2)] {
+    // The first file comes from an engine of layout 3, as in a bucket that
+    // predates layout 4.
+    for (version, service, trace, offset) in
+        [(3, "web", 1u8, 5), (4, "api", 2, 1), (4, "web", 3, 2)]
+    {
         let req = request(service, trace, h + offset * minute, 6);
-        files.push(write_l0(&f.db.catalog, &f.store, f.tenant, &[req], row_group_rows).await);
+        let layout = FileLayout {
+            version,
+            row_group_rows,
+        };
+        files.push(write_l0_with(&f.db.catalog, &f.store, f.tenant, &[req], layout).await);
     }
     registered_an_hour_ago(f, &files).await;
     files
@@ -362,6 +394,15 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     assert_eq!(l1.row_count, 18);
     assert_eq!(l1.services, ["api", "web"]);
     assert_eq!(l1.content_sha256, Some(sha256_of(&f, &l1.path)));
+    assert!(
+        bloom_columns(&f.dir.path().join(&inputs[0].path)).len() > 3,
+        "the first input has layout 3"
+    );
+    assert_eq!(
+        bloom_columns(&f.dir.path().join(&l1.path)),
+        ["trace_id", "span_id", "service_name"],
+        "the output has layout 4"
+    );
     for derived in [
         attribute_keys_files(&f).await,
         trace_summary_files(&f).await,

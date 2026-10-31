@@ -437,14 +437,7 @@ async fn authenticates_buffers_flushes_and_registers() {
         .filter(|c| c.bloom_filter_offset().is_some())
         .map(|c| c.column_path().string())
         .collect();
-    assert!(
-        bloom_columns.contains(&"trace_id".to_owned()),
-        "{bloom_columns:?}"
-    );
-    assert!(
-        bloom_columns.contains(&"service_name".to_owned()),
-        "{bloom_columns:?}"
-    );
+    assert_eq!(bloom_columns, ["trace_id", "span_id", "service_name"]);
 
     let registered = db
         .catalog
@@ -4085,6 +4078,99 @@ async fn future_layout_version_fails_closed() {
         1,
         "the rows are still bound to the intent"
     );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A log left by the previous engine holds an intent of layout 3. The new
+/// engine replays it and writes the bytes the previous one would have: a
+/// bloom filter on every column and the digest of layout 3, not of the
+/// current layout.
+#[tokio::test]
+async fn an_intent_of_layout_3_is_written_with_layout_3_after_a_restart() {
+    use fs_ingest::record::{FileLayout, FlushIntent, RecordSignal, WalRecord};
+    use fs_schema::spans::SpanBatchBuilder;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let dir = tempfile::tempdir().unwrap();
+    let message = request("api", 1, 5);
+    let file = fs_catalog::FileId::new();
+    let layout = FileLayout {
+        version: 3,
+        row_group_rows: 7,
+    };
+    {
+        let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+        let record = WalRecord {
+            version: fs_ingest::record::VERSION,
+            tenant,
+            signal: RecordSignal::Traces,
+            payload: bytes::Bytes::from(message.encode_to_vec()),
+        };
+        let first = wal.append(&record.encode()).unwrap();
+        let end = wal.position();
+        let intent = FlushIntent {
+            tenant,
+            file,
+            first,
+            end,
+            layout: Some(layout),
+            hour: None,
+        };
+        wal.append(&intent.to_record().encode()).unwrap();
+        wal.sync().unwrap();
+    }
+    let mut builder = SpanBatchBuilder::default();
+    builder.append_request(&message).unwrap();
+    let rows = builder.finish().unwrap();
+    let expected = fs_ingest::flush::prepare(
+        tenant,
+        &object_store::path::Path::from(""),
+        file,
+        &[rows],
+        layout,
+    )
+    .unwrap();
+
+    let h = start(&db.catalog, dir, test_config()).await;
+    h.ingester.flush_all().await;
+    let files = parquet_files(&h.dir.path().join("bucket"));
+    assert_eq!(files.len(), 1);
+    let written = std::fs::read(&files[0]).unwrap();
+    let digest: [u8; 32] = Sha256::digest(&expected.bytes).into();
+    assert_eq!(sha256_of(&files[0]), digest);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(written)).unwrap();
+    let blooms = reader
+        .metadata()
+        .row_group(0)
+        .columns()
+        .iter()
+        .filter(|c| c.bloom_filter_offset().is_some())
+        .count();
+    assert_eq!(
+        blooms,
+        reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .num_columns()
+    );
+    let registered = db
+        .catalog
+        .all_visible_files(tenant, Signal::Traces)
+        .await
+        .unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].id, file);
+    assert_eq!(registered[0].content_sha256, Some(digest));
     h.stop().await;
     db.finish().await;
 }

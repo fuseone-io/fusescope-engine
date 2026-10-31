@@ -159,12 +159,18 @@ C5 landed after C6.
   rules, limits and tests as spans. Done: `fs_schema::logs` (`LogBatchBuilder`,
   `log_schema_v1`, `log_id`), `Limits::max_body_bytes`, `log_writer_properties`
   and the Logs section of `MAPPING.md` (`crates/fs-schema/tests/logs_otlp.rs`).
-- Span files carry a bloom filter on every column: the global bloom settings
-  of the Parquet writer enable it everywhere, sized to the row group, while
-  `trace_id`, `span_id` and `service_name` keep the library's default size
-  and 5 % false positive rate. Fixing it changes the bytes a retried flush
-  must reproduce, so it needs a new `FileLayout` version that keeps the old
-  writer for old intents.
+- Span files of layout 3 carry a bloom filter on every column: the global
+  bloom settings of the Parquet writer enable it everywhere, sized to the
+  row group, while `trace_id`, `span_id` and `service_name` get the
+  library's default 5 % false positive rate. Done: layout 4 puts bloom
+  filters sized to the row group at 1 % on those three columns alone
+  (`SPAN_BLOOM_COLUMNS`); new intents and compaction outputs use it, intents
+  of layout 3 are still written with `writer_properties_layout_v3`, and both
+  digests are pinned (`canonical_input_gives_the_pinned_bytes_for_each_version`,
+  `layouts_put_blooms_on_their_columns`,
+  `an_intent_of_layout_3_is_written_with_layout_3_after_a_restart`, the
+  compaction of a layout 3 input in
+  `a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file`).
 - Logs ingest path reusing the WAL, buffers, coalescer and flush, with its
   own sort key (`service_name, timestamp`) and bloom filters on `trace_id`
   and `service_name`.
