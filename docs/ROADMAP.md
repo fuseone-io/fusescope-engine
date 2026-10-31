@@ -183,8 +183,14 @@ C5 landed after C6.
   `_log_bodies_truncated_total`. Crash boundaries in
   `crates/fs-ingest/tests/logs.rs`: before the intent, after both signals'
   intents and before the upload, between upload and registration (same
-  bytes), before the confirmation. The hot window and the query surface
-  come with the logs table; compaction of log files later.
+  bytes), before the confirmation. Review round 1: an export with no row
+  to keep, empty or wholly refused, is answered before the WAL
+  (`an_export_without_rows_to_keep_is_answered_without_the_wal`); layouts
+  are written per signal, logs only from layout 4, with the log digest
+  pinned (`log_layouts_are_versioned_on_their_own`,
+  `canonical_log_input_gives_the_pinned_bytes_for_each_version`). The hot
+  window and the query surface come with the logs table; compaction of log
+  files later.
 - Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.

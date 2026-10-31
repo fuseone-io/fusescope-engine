@@ -1,7 +1,8 @@
 //! WAL record framing: which tenant and signal a raw OTLP payload belongs to.
 //!
-//! The payload is the protobuf exactly as received, so replay runs the same
-//! conversion code as live traffic and produces identical rows.
+//! The payload holds the protobuf exactly as received, after the seed of its
+//! row ids for logs, so replay runs the same conversion code as live traffic
+//! and produces identical rows.
 
 use bytes::Bytes;
 use fs_catalog::TenantId;
@@ -139,9 +140,15 @@ impl FileLayout {
     /// sized by it; it never shipped and is refused like any other.
     pub const CURRENT_VERSION: u32 = 4;
 
-    /// Versions this engine writes: the current one and those whose intents
-    /// may still be in a log.
-    pub const WRITTEN_VERSIONS: [u32; 2] = [3, Self::CURRENT_VERSION];
+    /// Versions this engine writes for rows of `signal`: the current one
+    /// and those whose intents may still be in a log. Log files exist only
+    /// from version 4 on.
+    pub fn written_versions(signal: RowSignal) -> &'static [u32] {
+        match signal {
+            RowSignal::Traces => &[3, 4],
+            RowSignal::Logs => &[4],
+        }
+    }
 
     /// The current encoder with `row_group_rows` rows per row group.
     pub fn current(row_group_rows: usize) -> Self {

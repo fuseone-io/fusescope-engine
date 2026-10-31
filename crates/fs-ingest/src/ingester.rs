@@ -400,8 +400,9 @@ impl Shared {
     }
 
     /// Admits a converted batch against the caps, logs its record and adds
-    /// it to the stream's buffer. The conversion `slot` is given back once
-    /// the batch is admitted. The flush gate is held from the append to the
+    /// it to the stream's buffer. A batch without rows is answered here:
+    /// it never reaches the log, a buffer or a file. The conversion `slot`
+    /// is given back once the batch is admitted. The flush gate is held from the append to the
     /// push only, so a concurrent flush, checkpoint or hot scan sees either
     /// both the log record and the rows or neither, and waits for no
     /// conversion. Conversion comes first: a request the engine cannot
@@ -414,6 +415,10 @@ impl Shared {
         record: Vec<u8>,
         now: Instant,
     ) -> Result<(), IngestError> {
+        if batch.num_rows() == 0 {
+            self.stats.requests.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let hours: Vec<_> = crate::hours::hours_in(std::slice::from_ref(&batch))?
             .into_iter()
             .collect();
@@ -751,7 +756,7 @@ impl Shared {
     > {
         let legacy = layout.is_none();
         let layout = layout.unwrap_or_else(|| FileLayout::current(self.config.row_group_rows));
-        flush::check_layout(&layout)?;
+        flush::check_layout(&layout, stream.signal)?;
         let root = self.root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             flush::prepare_stream(stream, &root, file_id, &batches, layout)

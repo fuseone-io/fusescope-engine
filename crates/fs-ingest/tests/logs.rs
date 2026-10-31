@@ -504,3 +504,35 @@ async fn a_crash_before_the_confirmation_is_replayed_and_confirmed() {
     h.stop().await;
     db.finish().await;
 }
+
+/// Exports with no row to keep, spans or logs, empty or wholly refused,
+/// are answered without reaching the WAL: no record, no object, no row.
+#[tokio::test]
+async fn an_export_without_rows_to_keep_is_answered_without_the_wal() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.export_spans(ExportTraceServiceRequest::default(), &token)
+        .await;
+    assert_eq!(
+        h.export_logs(ExportLogsServiceRequest::default(), &token)
+            .await,
+        0
+    );
+    assert_eq!(h.export_logs(logs("api", 3, 0, 1), &token).await, 3);
+    h.ingester.flush_all().await;
+
+    assert_eq!(h.ingester.writer_stats().records.load(Ordering::Relaxed), 0);
+    assert_eq!(walkdir(&h.bucket()).len(), 0);
+    assert_eq!(db.files(tenant, Signal::Logs).await.len(), 0);
+    assert_eq!(db.files(tenant, Signal::Traces).await.len(), 0);
+    let stats = h.ingester.stats();
+    assert_eq!(stats.requests.load(Ordering::Relaxed), 3);
+    assert_eq!(stats.logs.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.logs_rejected.load(Ordering::Relaxed), 3);
+    assert_eq!(stats.spans.load(Ordering::Relaxed), 0);
+    h.stop().await;
+    db.finish().await;
+}

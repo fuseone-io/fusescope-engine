@@ -99,7 +99,7 @@ pub fn prepare_stream(
     layout: FileLayout,
 ) -> Result<Prepared, IngestError> {
     let schema = schema_of(stream.signal);
-    check_layout(&layout)?;
+    check_layout(&layout, stream.signal)?;
     let row_group_rows = layout.row_group_rows;
 
     let sort_started = std::time::Instant::now();
@@ -209,18 +209,29 @@ fn trace_index(path: &str, rows: &[HotBatch]) -> Result<TraceIndex, IngestError>
     Ok(TraceIndex::new(vec![path.to_owned()], pairs)?)
 }
 
-/// The writer of `layout` for rows of `signal`. Log files exist only from
-/// layout 4 on, so every layout writes them alike.
+/// The writer of `layout` for rows of `signal`; one arm per version in
+/// [`FileLayout::written_versions`], so a new version needs its own.
+///
+/// # Errors
+/// A layout this engine does not write for `signal`.
 fn writer_properties(
     layout: FileLayout,
     signal: RowSignal,
 ) -> Result<WriterProperties, IngestError> {
     let rows = layout.row_group_rows;
     Ok(match (signal, layout.version) {
-        (RowSignal::Logs, _) => fs_schema::parquet::log_writer_properties(rows)?,
         (RowSignal::Traces, 3) => fs_schema::parquet::writer_properties_layout_v3(rows)?,
-        (RowSignal::Traces, _) => fs_schema::parquet::writer_properties(rows)?,
+        (RowSignal::Traces, 4) => fs_schema::parquet::writer_properties(rows)?,
+        (RowSignal::Logs, 4) => fs_schema::parquet::log_writer_properties(rows)?,
+        (_, version) => return Err(unwritten_layout(version, signal)),
     })
+}
+
+fn unwritten_layout(version: u32, signal: RowSignal) -> IngestError {
+    IngestError::Encode(format!(
+        "file layout version {version} is not one this engine writes for {signal:?} ({:?})",
+        FileLayout::written_versions(signal)
+    ))
 }
 
 /// The Arrow schema of rows of `signal`.
@@ -348,15 +359,11 @@ fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, IngestError> {
 /// bytes under the same id.
 ///
 /// # Errors
-/// A layout version outside [`FileLayout::WRITTEN_VERSIONS`], or a row
-/// group size outside the supported range.
-pub fn check_layout(layout: &FileLayout) -> Result<(), IngestError> {
-    if !FileLayout::WRITTEN_VERSIONS.contains(&layout.version) {
-        return Err(IngestError::Encode(format!(
-            "file layout version {} is not one this engine writes ({:?})",
-            layout.version,
-            FileLayout::WRITTEN_VERSIONS
-        )));
+/// A layout version outside [`FileLayout::written_versions`] for `signal`,
+/// or a row group size outside the supported range.
+pub fn check_layout(layout: &FileLayout, signal: RowSignal) -> Result<(), IngestError> {
+    if !FileLayout::written_versions(signal).contains(&layout.version) {
+        return Err(unwritten_layout(layout.version, signal));
     }
     check_row_group_rows(layout.row_group_rows)
 }
@@ -893,26 +900,130 @@ mod tests {
         );
     }
 
+    /// Five log rows of two services, the same on every call.
+    fn log_batch() -> RecordBatch {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        let resource_logs = ["web", "api"]
+            .into_iter()
+            .enumerate()
+            .map(|(r, service)| ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(Value::StringValue(service.into())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Resource::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: (0..2 + r as u64)
+                        .map(|i| LogRecord {
+                            time_unix_nano: T0 + (3 - i) * 1_000,
+                            severity_text: "WARN".into(),
+                            severity_number: 13,
+                            body: Some(AnyValue {
+                                value: Some(Value::StringValue(format!("{service} {i}"))),
+                            }),
+                            trace_id: vec![u8::try_from(i).unwrap() + 1; 16],
+                            ..LogRecord::default()
+                        })
+                        .collect(),
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            })
+            .collect();
+        let request = ExportLogsServiceRequest { resource_logs };
+        let mut builder = fs_schema::logs::LogBatchBuilder::new(Limits::default());
+        builder.append_request(&request, &[7; 16]).unwrap();
+        builder.finish().unwrap()
+    }
+
+    /// Log files exist only from layout 4 on: a log intent of layout 3 was
+    /// not written by this engine's cut, and is refused before any byte.
+    #[test]
+    fn log_layouts_are_versioned_on_their_own() {
+        let layout = |version| FileLayout {
+            version,
+            row_group_rows: 8,
+        };
+        assert!(check_layout(&layout(3), RowSignal::Traces).is_ok());
+        assert!(check_layout(&layout(3), RowSignal::Logs).is_err());
+        assert!(check_layout(&layout(4), RowSignal::Logs).is_ok());
+        assert!(check_layout(&layout(5), RowSignal::Logs).is_err());
+        let stream = Stream::logs(TenantId(uuid::Uuid::from_u128(1)));
+        let id = FileId(uuid::Uuid::from_u128(2));
+        let refused = prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout(3));
+        assert!(refused.is_err());
+    }
+
+    /// The bytes of a canonical log input, pinned for every layout version
+    /// that writes log files; see the span test below for the rule.
+    #[test]
+    fn canonical_log_input_gives_the_pinned_bytes_for_each_version() {
+        use sha2::{Digest, Sha256};
+        let stream = Stream::logs(TenantId(uuid::Uuid::from_u128(0x7e5a)));
+        let id = FileId(uuid::Uuid::from_u128(0xf11e));
+        let pinned = [(
+            4,
+            "ad7cf28ab8322a172c46393ed411977da028bfff0c39a2e67be02316c13b1fbb",
+        )];
+        assert_eq!(
+            pinned.map(|(version, _)| version),
+            FileLayout::written_versions(RowSignal::Logs)
+        );
+        for (version, expected) in pinned {
+            let layout = FileLayout {
+                version,
+                row_group_rows: 3,
+            };
+            let prepared =
+                prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout).unwrap();
+            assert_eq!(prepared.file.row_count, 5);
+            assert!(prepared.index.is_none(), "log files have no trace sidecar");
+            let digest: [u8; 32] = Sha256::digest(&prepared.bytes).into();
+            let hex = digest.iter().fold(String::new(), |mut out, b| {
+                use std::fmt::Write;
+                let _ = write!(out, "{b:02x}");
+                out
+            });
+            assert_eq!(
+                hex, expected,
+                "log layout version {version} bytes changed: bump the version with the digest"
+            );
+        }
+    }
+
     #[test]
     fn unknown_layout_versions_are_refused() {
         use crate::record::FileLayout;
-        assert!(check_layout(&FileLayout::current(8)).is_ok());
+        assert!(check_layout(&FileLayout::current(8), RowSignal::Traces).is_ok());
         let future = FileLayout {
             version: FileLayout::CURRENT_VERSION + 1,
             row_group_rows: 8,
         };
-        assert!(check_layout(&future).is_err());
+        assert!(check_layout(&future, RowSignal::Traces).is_err());
         let past = FileLayout {
             version: 2,
             row_group_rows: 8,
         };
-        assert!(check_layout(&past).is_err(), "version 2 never shipped");
+        assert!(
+            check_layout(&past, RowSignal::Traces).is_err(),
+            "version 2 never shipped"
+        );
         for rows in [0, MAX_ROW_GROUP_ROWS + 1] {
             let outside = FileLayout {
                 version: FileLayout::CURRENT_VERSION,
                 row_group_rows: rows,
             };
-            assert!(check_layout(&outside).is_err(), "{rows} rows per group");
+            assert!(
+                check_layout(&outside, RowSignal::Traces).is_err(),
+                "{rows} rows per group"
+            );
             let inputs = vec![batch("api", 1, &[T0 + 1])];
             let tenant = TenantId(uuid::Uuid::from_u128(1));
             let id = FileId(uuid::Uuid::from_u128(2));
@@ -928,7 +1039,7 @@ mod tests {
             );
         }
         assert!(
-            check_layout(&FileLayout::current(MAX_ROW_GROUP_ROWS)).is_ok(),
+            check_layout(&FileLayout::current(MAX_ROW_GROUP_ROWS), RowSignal::Traces).is_ok(),
             "the bound itself is allowed"
         );
     }
@@ -961,7 +1072,7 @@ mod tests {
         ];
         assert_eq!(
             pinned.map(|(version, _)| version),
-            FileLayout::WRITTEN_VERSIONS
+            FileLayout::written_versions(RowSignal::Traces)
         );
         for (version, expected) in pinned {
             let layout = FileLayout {
