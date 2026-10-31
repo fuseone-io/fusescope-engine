@@ -1,13 +1,11 @@
 //! Converts OTLP `ResourceSpans` into Arrow record batches with [`span_schema_v1`].
 
-use std::sync::Arc;
-
 use arrow::array::{
-    ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder,
-    Int8Builder, Int16Builder, ListBuilder, MapBuilder, StringBuilder, StringDictionaryBuilder,
-    StructBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
+    ArrayBuilder, ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Int8Builder, Int16Builder,
+    ListBuilder, StringBuilder, StructBuilder, TimestampNanosecondBuilder, UInt32Builder,
+    UInt64Builder,
 };
-use arrow::datatypes::{DataType, Int32Type};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
@@ -15,13 +13,15 @@ use opentelemetry_proto::tonic::trace::v1::span::{Event, Link, SpanKind};
 use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
-use super::schema::{
-    PROMOTED, PromotedScope, event_fields, link_fields, list_item_field, map_values_field,
-    span_schema_v1,
-};
+use super::schema::{PROMOTED, PromotedScope, event_fields, link_fields, span_schema_v1};
 use crate::SchemaError;
 use crate::attrs::{TypedAttributes, split_strings, split_typed};
 use crate::bucket::ts_bucket_start;
+use crate::columns::{
+    BoolMapBuilder, DictBuilder, NumberMapBuilder, StringMapBuilder, append_bool_map,
+    append_number_map, append_string_map, bool_map, compact, list_item_field, number_map,
+    string_map, timestamp,
+};
 use crate::fingerprint::resource_fingerprint;
 use crate::limits::{DropStats, Limits};
 
@@ -29,11 +29,6 @@ use crate::limits::{DropStats, Limits};
 const FLAG_HAS_IS_REMOTE: u32 = 0x100;
 /// OTLP `SpanFlags`: bit set when the parent context is remote.
 const FLAG_IS_REMOTE: u32 = 0x200;
-
-type StringMapBuilder = MapBuilder<StringBuilder, StringBuilder>;
-type NumberMapBuilder = MapBuilder<StringBuilder, Float64Builder>;
-type BoolMapBuilder = MapBuilder<StringBuilder, BooleanBuilder>;
-type DictBuilder = StringDictionaryBuilder<Int32Type>;
 
 /// Accumulates spans and produces one [`RecordBatch`] per [`SpanBatchBuilder::finish`].
 ///
@@ -83,25 +78,6 @@ struct ScopeCtx {
     name: String,
     version: String,
     attributes: Vec<(String, String)>,
-}
-
-fn string_map() -> StringMapBuilder {
-    MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
-        .with_values_field(map_values_field(DataType::Utf8))
-}
-
-fn number_map() -> NumberMapBuilder {
-    MapBuilder::new(None, StringBuilder::new(), Float64Builder::new())
-        .with_values_field(map_values_field(DataType::Float64))
-}
-
-fn bool_map() -> BoolMapBuilder {
-    MapBuilder::new(None, StringBuilder::new(), BooleanBuilder::new())
-        .with_values_field(map_values_field(DataType::Boolean))
-}
-
-fn timestamp() -> TimestampNanosecondBuilder {
-    TimestampNanosecondBuilder::new().with_timezone("UTC")
 }
 
 fn event_list() -> ListBuilder<StructBuilder> {
@@ -431,75 +407,6 @@ impl SpanBatchBuilder {
         let batch = RecordBatch::try_new(span_schema_v1(), columns)?;
         compact(&batch)
     }
-}
-
-/// Copies a batch into exactly sized buffers.
-///
-/// Builders over-allocate, and a batch that sits in a buffer for up to a flush
-/// interval would otherwise account for tens of kilobytes per span, tripping
-/// byte thresholds early. `concat` with a single input returns it unchanged, so
-/// an empty slice is added to force the copy. Dictionary columns are rebuilt
-/// through their value type, because concatenating dictionaries allocates a
-/// values buffer with builder-sized capacity.
-fn compact(batch: &RecordBatch) -> Result<RecordBatch, SchemaError> {
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| match column.data_type() {
-            DataType::Dictionary(_, _) => {
-                let dict = column.as_dictionary::<Int32Type>();
-                let keys = exact_copy(dict.keys())?;
-                let values = exact_copy(dict.values().as_ref())?;
-                let keys = keys.as_primitive::<Int32Type>().clone();
-                let rebuilt = arrow::array::DictionaryArray::<Int32Type>::try_new(keys, values)?;
-                Ok(Arc::new(rebuilt) as ArrayRef)
-            }
-            _ => exact_copy(column.as_ref()),
-        })
-        .collect::<Result<Vec<ArrayRef>, arrow::error::ArrowError>>()?;
-    Ok(RecordBatch::try_new(batch.schema(), columns)?)
-}
-
-/// `concat` with a single input returns it unchanged; an empty slice forces a
-/// copy into buffers sized to the data.
-fn exact_copy(array: &dyn arrow::array::Array) -> Result<ArrayRef, arrow::error::ArrowError> {
-    arrow::compute::concat(&[&array.slice(0, 0), array])
-}
-
-fn append_string_map(
-    map: &mut StringMapBuilder,
-    entries: &[(String, String)],
-) -> Result<(), SchemaError> {
-    for (k, v) in entries {
-        map.keys().append_value(k);
-        map.values().append_value(v);
-    }
-    map.append(true)?;
-    Ok(())
-}
-
-fn append_number_map(
-    map: &mut NumberMapBuilder,
-    entries: &[(String, f64)],
-) -> Result<(), SchemaError> {
-    for (k, v) in entries {
-        map.keys().append_value(k);
-        map.values().append_value(*v);
-    }
-    map.append(true)?;
-    Ok(())
-}
-
-fn append_bool_map(
-    map: &mut BoolMapBuilder,
-    entries: &[(String, bool)],
-) -> Result<(), SchemaError> {
-    for (k, v) in entries {
-        map.keys().append_value(k);
-        map.values().append_value(*v);
-    }
-    map.append(true)?;
-    Ok(())
 }
 
 /// A promoted attribute value: the string form, or an integral number rendered

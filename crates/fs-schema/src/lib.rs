@@ -7,6 +7,7 @@
 pub mod attribute_keys;
 pub mod attrs;
 pub mod bucket;
+mod columns;
 pub mod fingerprint;
 pub mod limits;
 pub mod parquet;

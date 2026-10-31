@@ -7,7 +7,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+
+use crate::columns::{dict_utf8, list_type, map_type, timestamp_ns};
 
 /// Version of the span schema produced by this crate.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -175,42 +177,6 @@ pub const PROMOTED: &[Promoted] = &[
     },
 ];
 
-/// Dictionary encoded string, for low cardinality columns.
-pub(crate) fn dict_utf8() -> DataType {
-    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
-}
-
-/// Nanosecond UTC timestamp.
-pub(crate) fn timestamp_ns() -> DataType {
-    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
-}
-
-/// Map with non-null keys and non-null values of `value`, as the arrow
-/// `MapBuilder` produces with its default field names.
-pub(crate) fn map_type(value: DataType) -> DataType {
-    DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(map_entry_fields(value)),
-            false,
-        )),
-        false,
-    )
-}
-
-/// The `keys`/`values` pair inside a map entry.
-pub(crate) fn map_entry_fields(value: DataType) -> Fields {
-    Fields::from(vec![
-        Field::new("keys", DataType::Utf8, false),
-        Field::new("values", value, false),
-    ])
-}
-
-/// Value field passed to `MapBuilder::with_values_field` so values are non-null.
-pub(crate) fn map_values_field(value: DataType) -> FieldRef {
-    Arc::new(Field::new("values", value, false))
-}
-
 /// Fields of one span event.
 pub(crate) fn event_fields() -> Fields {
     Fields::from(vec![
@@ -238,16 +204,6 @@ pub(crate) fn link_fields() -> Fields {
 /// Struct type of one span link.
 pub fn link_struct_type() -> DataType {
     DataType::Struct(link_fields())
-}
-
-/// Non-null list of non-null `item`s, as `ListBuilder::with_field` produces.
-pub(crate) fn list_type(item: DataType) -> DataType {
-    DataType::List(list_item_field(item))
-}
-
-/// Item field for list builders.
-pub(crate) fn list_item_field(item: DataType) -> FieldRef {
-    Arc::new(Field::new("item", item, false))
 }
 
 /// The span schema, version 1. Built once and shared.
