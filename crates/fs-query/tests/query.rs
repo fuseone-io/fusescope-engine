@@ -327,7 +327,7 @@ async fn prunes_files_by_time_and_service_before_reading() {
     let Some(f) = fixture().await else { return };
     let cache = f.querier.cache();
     let budget = u64::MAX;
-    let table = fs_query::spans_table::SpansTable::new(
+    let table = fs_query::signal_table::SignalTable::spans(
         f.tenant,
         cache,
         datafusion::execution::object_store::ObjectStoreUrl::parse(fs_query::STORE_URL).unwrap(),
@@ -368,7 +368,7 @@ async fn prunes_files_by_time_and_service_before_reading() {
 #[tokio::test]
 async fn trace_index_prunes_files_without_the_trace() {
     let Some(f) = fixture().await else { return };
-    let table = fs_query::spans_table::SpansTable::new(
+    let table = fs_query::signal_table::SignalTable::spans(
         f.tenant,
         f.querier.cache(),
         datafusion::execution::object_store::ObjectStoreUrl::parse(fs_query::STORE_URL).unwrap(),
@@ -508,7 +508,7 @@ async fn files_are_excluded_by_their_origin_as_well_as_their_id() {
     let row = f.db.catalog.register_file(&prepared.file).await.unwrap();
     assert_eq!(row.origin, announced);
 
-    let table = fs_query::spans_table::SpansTable::new(
+    let table = fs_query::signal_table::SignalTable::spans(
         f.tenant,
         f.querier.cache(),
         datafusion::execution::object_store::ObjectStoreUrl::parse(fs_query::STORE_URL).unwrap(),
@@ -793,7 +793,9 @@ mod sandbox {
         let Some(f) = fixture().await else { return };
         for sql in [
             "select * from other.public.spans",
+            "select * from other.public.logs",
             "select * from fusescope.other.spans",
+            "select * from fusescope.other.logs",
             "select * from datafusion.public.spans",
             "select * from engine_file",
             "select * from engine_tenant",
@@ -810,14 +812,12 @@ mod sandbox {
             )
             .await
             .unwrap();
-        assert_eq!(
-            strings(&tables, "table_catalog"),
-            ["fusescope", "fusescope", "fusescope", "fusescope"]
-        );
+        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 5]);
         assert_eq!(
             strings(&tables, "table_name"),
             [
                 "attribute_keys",
+                "logs",
                 "service_graph_1m",
                 "spans",
                 "trace_summary"

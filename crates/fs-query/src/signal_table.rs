@@ -1,4 +1,5 @@
-//! DataFusion table over the spans files of one tenant.
+//! DataFusion table over the span or log rows of one tenant: its files in
+//! the catalog and, for a recent range, the ingesters' memory.
 
 use std::sync::Arc;
 
@@ -16,17 +17,21 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::table_schema::TableSchema;
-use fs_catalog::{Signal, TenantId};
-use fs_schema::spans::span_schema_v1;
+use fs_catalog::TenantId;
 use tracing::debug;
+
+use fs_ingest::flush::{catalog_signal, schema_of};
+use fs_ingest::record::RowSignal;
 
 use crate::QueryError;
 use crate::files::FileCache;
 use crate::prune::Pruning;
 
-/// The `spans` table of one tenant.
-pub struct SpansTable {
+/// The `spans` or `logs` table of one tenant, bound to the files and
+/// schema of its signal.
+pub struct SignalTable {
     tenant: TenantId,
+    signal: RowSignal,
     cache: Arc<FileCache>,
     store_url: ObjectStoreUrl,
     bytes_budget: u64,
@@ -37,9 +42,29 @@ pub struct SpansTable {
     trace_index: Option<Arc<crate::trace_index::TraceIndexCache>>,
 }
 
-impl SpansTable {
+impl SignalTable {
     /// Table over `tenant`'s visible span files, reading through `store_url`.
-    pub fn new(
+    pub fn spans(
+        tenant: TenantId,
+        cache: Arc<FileCache>,
+        store_url: ObjectStoreUrl,
+        bytes_budget: u64,
+    ) -> Self {
+        Self::of(RowSignal::Traces, tenant, cache, store_url, bytes_budget)
+    }
+
+    /// Table over `tenant`'s visible log files, reading through `store_url`.
+    pub fn logs(
+        tenant: TenantId,
+        cache: Arc<FileCache>,
+        store_url: ObjectStoreUrl,
+        bytes_budget: u64,
+    ) -> Self {
+        Self::of(RowSignal::Logs, tenant, cache, store_url, bytes_budget)
+    }
+
+    fn of(
+        signal: RowSignal,
         tenant: TenantId,
         cache: Arc<FileCache>,
         store_url: ObjectStoreUrl,
@@ -47,6 +72,7 @@ impl SpansTable {
     ) -> Self {
         Self {
             tenant,
+            signal,
             cache,
             store_url,
             bytes_budget,
@@ -55,10 +81,13 @@ impl SpansTable {
         }
     }
 
-    /// Consults `trace_id` sidecars when the filters pin trace ids.
+    /// Consults `trace_id` sidecars when the filters pin trace ids. Only
+    /// span files have them, so a log table ignores it.
     #[must_use]
     pub fn with_trace_index(mut self, cache: Arc<crate::trace_index::TraceIndexCache>) -> Self {
-        self.trace_index = Some(cache);
+        if self.signal == RowSignal::Traces {
+            self.trace_index = Some(cache);
+        }
         self
     }
 
@@ -99,7 +128,10 @@ impl SpansTable {
         excluded: &std::collections::HashSet<fs_catalog::FileId>,
     ) -> Result<(Vec<PartitionedFile>, u64), QueryError> {
         let pruning = Pruning::from_filters(filters);
-        let all = self.cache.files(self.tenant, Signal::Traces).await?;
+        let all = self
+            .cache
+            .files(self.tenant, catalog_signal(self.signal))
+            .await?;
         let candidates: Vec<&fs_catalog::FileRecord> = all
             .iter()
             .filter(|f| {
@@ -122,6 +154,7 @@ impl SpansTable {
             .collect();
         debug!(
             tenant = %self.tenant.0,
+            signal = ?self.signal,
             candidates = all.len(),
             after_catalog,
             kept = files.len(),
@@ -134,18 +167,19 @@ impl SpansTable {
     }
 }
 
-impl std::fmt::Debug for SpansTable {
+impl std::fmt::Debug for SignalTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpansTable")
+        f.debug_struct("SignalTable")
             .field("tenant", &self.tenant.0)
+            .field("signal", &self.signal)
             .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl TableProvider for SpansTable {
+impl TableProvider for SignalTable {
     fn schema(&self) -> arrow::datatypes::SchemaRef {
-        span_schema_v1()
+        schema_of(self.signal)
     }
 
     fn table_type(&self) -> TableType {
@@ -167,7 +201,7 @@ impl TableProvider for SpansTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let schema = span_schema_v1();
+        let schema = schema_of(self.signal);
         let external = |e: QueryError| datafusion::error::DataFusionError::External(Box::new(e));
 
         // Hot window first: ingesters report which recently flushed files they
@@ -184,7 +218,13 @@ impl TableProvider for SpansTable {
         if let Some((hot, warnings)) = &self.hot {
             if hot.touches_recent(&pruning) {
                 let result = hot
-                    .scan(self.tenant, &pruning, projected_names.clone(), None)
+                    .scan(
+                        self.tenant,
+                        self.signal,
+                        &pruning,
+                        projected_names.clone(),
+                        None,
+                    )
                     .await
                     .map_err(|e| external(e.into()))?;
                 for ingester in &result.unavailable {

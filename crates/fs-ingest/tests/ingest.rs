@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use fs_catalog::{Catalog, NewTenant, Signal, TenantId, TimeRange, TokenScope};
+use fs_ingest::record::RowSignal;
 use fs_ingest::{IngestConfig, Ingester};
 use fs_wal::{Wal, WalConfig};
 use object_store::local::LocalFileSystem;
@@ -640,6 +641,7 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let got = scan(&addr, &all, Duration::from_secs(5)).await.unwrap();
     assert_eq!(
@@ -661,6 +663,7 @@ async fn hot_window_serves_live_and_recently_persisted_rows() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let got = scan(&addr, &api_names, Duration::from_secs(5))
         .await
@@ -1377,6 +1380,7 @@ async fn a_flush_with_spans_across_an_hour_boundary_writes_one_file_per_hour() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2121,6 +2125,7 @@ async fn hot_window_announces_prospective_file_id() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let before = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2381,6 +2386,7 @@ async fn memory_cap_counts_persisted_rows_without_evicting_them() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2510,6 +2516,7 @@ async fn out_of_order_pushes_keep_intent_and_file_id() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2684,6 +2691,7 @@ async fn memory_cap_is_a_ceiling_under_concurrent_requests() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let got = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2746,6 +2754,7 @@ async fn coalesced_flush_matches_replay_byte_for_byte() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let served = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -2897,6 +2906,7 @@ async fn announced_file_id_survives_a_restart_without_intent() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let announced = scan(&h.hot_addr.to_string(), &all, Duration::from_secs(5))
         .await
@@ -3086,6 +3096,7 @@ async fn hot_scan_keeps_only_the_requested_traces_and_spans() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let hot = h.hot_addr.to_string();
 
@@ -3333,6 +3344,7 @@ async fn hot_scan_skips_batches_without_the_trace() {
         trace_ids: Some(vec![vec![trace; 16]]),
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let hot = h.hot_addr.to_string();
 
@@ -3446,6 +3458,7 @@ async fn oversized_requests_are_indexed_alone() {
         trace_ids: Some(vec![vec![2u8; 16]]),
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let got = scan(&h.hot_addr.to_string(), &lookup, Duration::from_secs(5))
         .await
@@ -3534,6 +3547,7 @@ async fn flush_writes_row_groups_and_retains_each() {
         trace_ids: Some(vec![vec![3u8; 16]]),
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let got = scan(&h.hot_addr.to_string(), &lookup, Duration::from_secs(5))
         .await
@@ -3864,6 +3878,7 @@ async fn a_flush_refused_by_the_orphan_sweep_takes_a_fresh_id() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let scanned =
         fs_ingest::hot::scan(&h.hot_addr.to_string(), &everything, Duration::from_secs(5))
@@ -4578,6 +4593,7 @@ async fn the_hot_window_over_mtls_admits_only_certified_queriers() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: RowSignal::Traces,
     };
     let ca_a = std::fs::read(tls_fixture("ca-a.pem")).unwrap();
     let querier_dir = tempfile::tempdir().unwrap();

@@ -181,7 +181,10 @@ bodies are stored and counted in `fusescope_ingest_log_bodies_truncated_total`.
 
 A result carrying the `x-fusescope-partial` header is complete for what it
 read but missed something, named in the header, such as an ingester whose
-hot window did not answer.
+hot window did not answer. An ingester of a version without logs answers a
+`logs` query with span rows; the querier leaves them out and marks the
+`logs` result partial until that ingester is rolled forward, so ingesters
+go first in a rollout.
 
 ### Start
 

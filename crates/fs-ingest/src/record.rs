@@ -115,8 +115,9 @@ impl RowSignal {
         }
     }
 
+    /// True for spans; the form serde's `skip_serializing_if` calls.
     #[allow(clippy::trivially_copy_pass_by_ref)]
-    fn is_traces(&self) -> bool {
+    pub(crate) fn is_traces(&self) -> bool {
         *self == Self::Traces
     }
 }

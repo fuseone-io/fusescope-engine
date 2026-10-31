@@ -104,6 +104,7 @@ struct Harness {
     dir: tempfile::TempDir,
     ingester: Arc<Ingester>,
     addr: std::net::SocketAddr,
+    hot_addr: std::net::SocketAddr,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<(), fs_ingest::IngestError>>,
 }
@@ -116,11 +117,16 @@ async fn start(catalog: &Catalog, dir: tempfile::TempDir, config: IngestConfig) 
         Arc::new(Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap());
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let (hot_tx, hot_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn({
         let ingester = ingester.clone();
-        async move { ingester.run(rx, Some(bound_tx), None).await }
+        async move { ingester.run(rx, Some(bound_tx), Some(hot_tx)).await }
     });
     let addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let hot_addr = tokio::time::timeout(Duration::from_secs(5), hot_rx)
         .await
         .unwrap()
         .unwrap();
@@ -128,6 +134,7 @@ async fn start(catalog: &Catalog, dir: tempfile::TempDir, config: IngestConfig) 
         dir,
         ingester,
         addr,
+        hot_addr,
         shutdown,
         task,
     }
@@ -185,7 +192,7 @@ fn authed<T>(message: T, token: &str) -> Request<T> {
 fn test_config() -> IngestConfig {
     IngestConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        hot_listen: None,
+        hot_listen: Some("127.0.0.1:0".parse().unwrap()),
         flush_interval: Duration::from_secs(3600),
         persisted_retain: Duration::from_secs(2),
         ..IngestConfig::default()
@@ -533,6 +540,112 @@ async fn an_export_without_rows_to_keep_is_answered_without_the_wal() {
     assert_eq!(stats.logs.load(Ordering::Relaxed), 0);
     assert_eq!(stats.logs_rejected.load(Ordering::Relaxed), 3);
     assert_eq!(stats.spans.load(Ordering::Relaxed), 0);
+    h.stop().await;
+    db.finish().await;
+}
+
+/// The hot window answers a scan of logs with log rows in the log schema,
+/// its projection, filters and distinct values checked against that
+/// schema; a scan that names no signal still gets span rows only.
+#[tokio::test]
+async fn the_hot_window_serves_log_rows_by_their_schema() {
+    use arrow::array::AsArray;
+    use arrow::record_batch::RecordBatch;
+    use fs_ingest::hot::{HotScanRequest, scan};
+    use fs_ingest::record::RowSignal;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    h.export_spans(spans("api", 3), &token).await;
+    h.export_logs(logs("api", 6, 0, 0), &token).await;
+    h.export_logs(logs("web", 2, 10, 0), &token).await;
+    let addr = h.hot_addr.to_string();
+    let rows = |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let wait = Duration::from_secs(5);
+
+    let spans_only = HotScanRequest {
+        tenant,
+        ts_min: None,
+        ts_max: None,
+        services: None,
+        columns: None,
+        trace_ids: None,
+        span_ids: None,
+        distinct: None,
+        signal: RowSignal::Traces,
+    };
+    let got = scan(&addr, &spans_only, wait).await.unwrap();
+    assert_eq!(rows(&got.batches), 3);
+    assert_eq!(
+        got.batches[0].schema().metadata()["fusescope.signal"],
+        "spans"
+    );
+
+    let api_bodies = HotScanRequest {
+        signal: RowSignal::Logs,
+        services: Some(vec!["api".into()]),
+        columns: Some(vec![
+            "timestamp".into(),
+            "body".into(),
+            "severity_text".into(),
+        ]),
+        trace_ids: Some(vec![vec![2; 16], vec![5; 16]]),
+        ..spans_only.clone()
+    };
+    let got = scan(&addr, &api_bodies, wait).await.unwrap();
+    assert_eq!(rows(&got.batches), 2, "lines 1 and 4 of api");
+    assert_eq!(got.batches[0].num_columns(), 3);
+    assert_eq!(
+        got.batches[0].schema().metadata()["fusescope.signal"],
+        "logs"
+    );
+    let bodies: Vec<&str> = got.batches[0]
+        .column(1)
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .collect();
+    assert_eq!(bodies, ["api line 1", "api line 4"]);
+    assert_eq!(
+        got.persisted_files.len(),
+        1,
+        "the id the live log rows will get"
+    );
+
+    let levels = HotScanRequest {
+        signal: RowSignal::Logs,
+        columns: Some(vec!["severity_text".into()]),
+        distinct: Some(10),
+        ..spans_only.clone()
+    };
+    let got = scan(&addr, &levels, wait).await.unwrap();
+    assert_eq!(got.batches.len(), 1);
+    // Flight hydrates dictionaries in transit; the querier casts them back.
+    let column =
+        arrow::compute::cast(got.batches[0].column(0), &arrow::datatypes::DataType::Utf8).unwrap();
+    let values: Vec<&str> = column.as_string::<i32>().iter().flatten().collect();
+    assert_eq!(values, ["INFO"], "once, whatever the rows");
+    let span_distinct = HotScanRequest {
+        columns: Some(vec!["kind_string".into()]),
+        ..levels.clone()
+    };
+    assert!(
+        scan(&addr, &span_distinct, wait).await.is_err(),
+        "a span column"
+    );
+
+    let span_column = HotScanRequest {
+        signal: RowSignal::Logs,
+        columns: Some(vec!["name".into()]),
+        ..spans_only.clone()
+    };
+    assert!(
+        scan(&addr, &span_column, wait).await.is_err(),
+        "logs have no name"
+    );
     h.stop().await;
     db.finish().await;
 }

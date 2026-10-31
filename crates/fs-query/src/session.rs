@@ -22,7 +22,7 @@ use fs_schema::{service_graph, trace_summary};
 use crate::QueryError;
 use crate::derived_table::{DerivedTable, VerifiedPaths};
 use crate::files::FileCache;
-use crate::spans_table::SpansTable;
+use crate::signal_table::SignalTable;
 
 /// Catalog and schema names every tenant sees.
 pub const CATALOG: &str = "fusescope";
@@ -30,6 +30,8 @@ pub const CATALOG: &str = "fusescope";
 pub const SCHEMA: &str = "public";
 /// Name of the spans table in every session.
 pub const SPANS_TABLE: &str = "spans";
+/// Name of the logs table in every session.
+pub const LOGS_TABLE: &str = "logs";
 
 /// Builds a session that only sees `tenant`'s tables and cannot write.
 ///
@@ -70,9 +72,16 @@ pub fn tenant_session(
     schema.register_table(
         SPANS_TABLE.into(),
         Arc::new(
-            SpansTable::new(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
-                .with_hot_window(hot, warnings)
+            SignalTable::spans(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
+                .with_hot_window(Arc::clone(&hot), Arc::clone(&warnings))
                 .with_trace_index(trace_index),
+        ),
+    )?;
+    schema.register_table(
+        LOGS_TABLE.into(),
+        Arc::new(
+            SignalTable::logs(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
+                .with_hot_window(hot, warnings),
         ),
     )?;
     schema.register_table(

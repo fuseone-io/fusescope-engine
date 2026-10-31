@@ -2,8 +2,9 @@
 //! internal Arrow Flight endpoint.
 //!
 //! The querier sends a [`HotScanRequest`] as the ticket. The ingester filters
-//! its buffers by time and service, projects the requested columns and streams
-//! the result. The response header [`PERSISTED_FILES_HEADER`] lists the ids of
+//! the buffers of the requested signal by time and service, projects the
+//! requested columns of that signal's schema and streams the result; the
+//! schema it sends names the signal in its `fusescope.signal` metadata. The response header [`PERSISTED_FILES_HEADER`] lists the ids of
 //! every file whose rows are included: already registered, being written, or
 //! the id the live rows will get. The querier drops those files from its own
 //! scan and reads neither twice nor never, whatever the catalog shows at the
@@ -29,7 +30,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use fs_catalog::{FileId, TenantId};
-use fs_schema::spans::{col, span_schema_v1};
+use fs_schema::spans::col;
 use futures_util::{Stream, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -37,7 +38,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
 
 use crate::IngestError;
+use crate::flush::schema_of;
 use crate::ingester::Shared;
+use crate::record::RowSignal;
 
 /// Response header: comma-separated file ids whose rows are included.
 pub const PERSISTED_FILES_HEADER: &str = "x-fusescope-persisted-files";
@@ -66,6 +69,9 @@ pub struct HotScanRequest {
     /// no more than that. Absent in older tickets.
     #[serde(default)]
     pub distinct: Option<usize>,
+    /// Whose rows: spans when absent, as in tickets from before logs.
+    #[serde(default, skip_serializing_if = "RowSignal::is_traces")]
+    pub signal: RowSignal,
 }
 
 impl HotScanRequest {
@@ -281,6 +287,7 @@ struct Distinct {
     column: String,
     cap: usize,
     values: std::collections::BTreeSet<String>,
+    schema: arrow::datatypes::SchemaRef,
 }
 
 impl Distinct {
@@ -290,6 +297,7 @@ impl Distinct {
                 column: column.clone(),
                 cap,
                 values: std::collections::BTreeSet::new(),
+                schema: schema_of(scan.signal),
             }),
             _ => Err(Status::invalid_argument(
                 "a distinct scan projects exactly one column",
@@ -319,8 +327,8 @@ impl Distinct {
             return Ok(None);
         }
         let internal = |e: arrow::error::ArrowError| Status::internal(e.to_string());
-        let full = span_schema_v1();
-        let field = full
+        let field = self
+            .schema
             .field_with_name(&self.column)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let values = arrow::array::StringArray::from_iter_values(self.values);
@@ -349,8 +357,10 @@ impl FlightService for HotService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let scan = HotScanRequest::from_ticket(request.get_ref())?;
-        // The hot window serves span rows only.
-        let stream = crate::buffer::Stream::traces(scan.tenant);
+        let stream = crate::buffer::Stream {
+            tenant: scan.tenant,
+            signal: scan.signal,
+        };
         let (snapshot, live_files) = self.shared.snapshot(stream).await;
         let sources = snapshot
             .live
@@ -405,11 +415,11 @@ impl FlightService for HotService {
             .map(|id| id.0.to_string())
             .collect();
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        debug!(tenant = %scan.tenant.0, rows, persisted = persisted.len(), "hot scan");
+        debug!(tenant = %scan.tenant.0, signal = ?scan.signal, rows, persisted = persisted.len(), "hot scan");
 
+        let full = schema_of(scan.signal);
         let schema = match &scan.columns {
             Some(columns) => {
-                let full = span_schema_v1();
                 let indices = columns
                     .iter()
                     .map(|c| full.index_of(c))
@@ -420,7 +430,7 @@ impl FlightService for HotService {
                         .map_err(|e| Status::invalid_argument(e.to_string()))?,
                 )
             }
-            None => span_schema_v1(),
+            None => full,
         };
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -506,6 +516,7 @@ mod tests {
             trace_ids: None,
             span_ids: None,
             distinct: None,
+            signal: RowSignal::Traces,
         };
         assert_eq!(
             HotScanRequest::from_ticket(&request.to_ticket()).unwrap(),
@@ -523,5 +534,31 @@ mod tests {
         assert_eq!(decoded.trace_ids, None);
         assert_eq!(decoded.span_ids, None);
         assert_eq!(decoded.distinct, None);
+        assert_eq!(decoded.signal, RowSignal::Traces, "spans, as before logs");
+    }
+
+    /// A scan of logs names its signal; one of spans keeps the ticket an
+    /// ingester without logs reads.
+    #[test]
+    fn a_ticket_names_its_signal_only_for_logs() {
+        let spans = HotScanRequest {
+            tenant: TenantId::new(),
+            ts_min: None,
+            ts_max: None,
+            services: None,
+            columns: None,
+            trace_ids: None,
+            span_ids: None,
+            distinct: None,
+            signal: RowSignal::Traces,
+        };
+        let encoded = String::from_utf8(spans.to_ticket().ticket.to_vec()).unwrap();
+        assert!(!encoded.contains("signal"), "{encoded}");
+        let logs = HotScanRequest {
+            signal: RowSignal::Logs,
+            ..spans
+        };
+        let decoded = HotScanRequest::from_ticket(&logs.to_ticket()).unwrap();
+        assert_eq!(decoded, logs);
     }
 }

@@ -188,9 +188,20 @@ C5 landed after C6.
   (`an_export_without_rows_to_keep_is_answered_without_the_wal`); layouts
   are written per signal, logs only from layout 4, with the log digest
   pinned (`log_layouts_are_versioned_on_their_own`,
-  `canonical_log_input_gives_the_pinned_bytes_for_each_version`). The hot
-  window and the query surface come with the logs table; compaction of log
-  files later.
+  `canonical_log_input_gives_the_pinned_bytes_for_each_version`).
+  Compaction of log files later.
+- The `logs` SQL table over log files and the hot window. Done:
+  `fs_query::signal_table::SignalTable` bound to one signal's files and
+  schema (`spans`, `logs`); `HotScanRequest.signal`, absent meaning spans;
+  the querier refuses an answer of another signal
+  (`an_answer_of_another_signal_is_refused`,
+  `an_ingester_without_logs_makes_a_log_query_partial_not_wrong`); log rows
+  read once live, while flushing, while registered and retained, and from
+  the catalog alone, with tenant isolation and a partial answer once the
+  ingester is gone
+  (`log_rows_are_read_once_from_live_to_flushing_to_persisted_to_the_catalog`);
+  the ingester checks projection, filters and `distinct` against the log
+  schema (`the_hot_window_serves_log_rows_by_their_schema`).
 - Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.

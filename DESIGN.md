@@ -523,6 +523,15 @@ querier needs it for "last 5 minutes" dashboards.
 - Ingesters are discovered through the catalog (heartbeat every 2 s in
   `engine_ingester`). An ingester silent for 10 s is skipped and the querier
   marks the result as partial in a Flight header.
+- The scan names its signal; a ticket without one asks for spans, as tickets
+  from before logs did. The ingester picks the tenant's buffers of that
+  signal and checks the projection, filters and `distinct` column against
+  that signal's schema, which names the signal in its `fusescope.signal`
+  metadata. The querier accepts only answers of the signal it asked for, so
+  an ingester from before logs, which ignores the field and answers spans,
+  makes a log query partial, never wrong. The SQL tables `spans` and `logs`
+  are each bound to their signal's files and schema; `logs` reads no trace
+  sidecar.
 
 ## 7. Compaction and derived tables
 

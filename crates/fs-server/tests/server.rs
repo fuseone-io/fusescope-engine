@@ -827,6 +827,7 @@ async fn with_tls_on_each_flight_admits_only_its_own_clients() {
         trace_ids: None,
         span_ids: None,
         distinct: None,
+        signal: fs_ingest::record::RowSignal::Traces,
     };
     let timeout = Duration::from_secs(5);
 
