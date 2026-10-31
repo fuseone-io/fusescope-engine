@@ -97,6 +97,7 @@ impl Metrics {
         self.render_flush(&mut out);
         self.render_query(&mut out);
         self.render_query_latency(&mut out);
+        self.render_text_search(&mut out);
         self.render_compactor(&mut out);
         if let Some(stats) = self.tls.get() {
             crate::tls::render(&mut out, stats);
@@ -408,6 +409,62 @@ impl Metrics {
                 "fusescope_query_seconds",
                 "Flight executions of an authenticated caller, request to end of stream",
                 &q.latency.0,
+            );
+        }
+    }
+
+    fn render_text_search(&self, out: &mut String) {
+        if let Some(q) = self.query.get() {
+            counter(
+                out,
+                "fusescope_query_text_index_fetches_total",
+                "Text sidecars fetched from the bucket",
+                q.text_index_fetches.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_text_index_misses_total",
+                "Files a body search read whole for want of a usable text sidecar",
+                q.text_index_misses.load(Ordering::Relaxed),
+            );
+            counter(
+                out,
+                "fusescope_query_text_searches_total",
+                "Body searches the text index could prune whose scan reached its end",
+                q.text_searches.load(Ordering::Relaxed),
+            );
+            labelled_counter(
+                out,
+                "fusescope_query_text_files_total",
+                "Files of those searches after the catalog, after the text index and with a matching row",
+                "stage",
+                &[
+                    ("catalog", q.text_files_catalog.load(Ordering::Relaxed)),
+                    ("index", q.text_files_index.load(Ordering::Relaxed)),
+                    ("matched", q.text_files_matched.load(Ordering::Relaxed)),
+                ],
+            );
+            labelled_counter(
+                out,
+                "fusescope_query_text_row_groups_total",
+                "Row groups of those searches' files with a checked sidecar, after the catalog and after the text index",
+                "stage",
+                &[
+                    ("catalog", q.text_row_groups_catalog.load(Ordering::Relaxed)),
+                    ("index", q.text_row_groups_index.load(Ordering::Relaxed)),
+                ],
+            );
+            histogram(
+                out,
+                "fusescope_query_text_precision_ratio",
+                "Per body search, files with a matching row over files the text index kept",
+                &q.text_precision.0,
+            );
+            histogram(
+                out,
+                "fusescope_query_text_seconds",
+                "Per body search, from planning its scan to the scan's end",
+                &q.text_latency.0,
             );
         }
     }
@@ -738,6 +795,13 @@ fn histogram(out: &mut String, name: &str, help: &str, h: &fs_ingest::histogram:
         std::time::Duration::from_nanos(h.sum_nanos()).as_secs_f64(),
         h.count()
     );
+}
+
+fn labelled_counter(out: &mut String, name: &str, help: &str, label: &str, values: &[(&str, u64)]) {
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} counter");
+    for (value, count) in values {
+        let _ = writeln!(out, "{name}{{{label}=\"{value}\"}} {count}");
+    }
 }
 
 pub(crate) fn gauge(out: &mut String, name: &str, help: &str, value: u64) {

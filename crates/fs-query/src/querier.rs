@@ -77,6 +77,30 @@ impl Default for QueryLatency {
     }
 }
 
+/// Upper bounds of the precision buckets of a text search.
+const PRECISION_BOUNDS: [f64; 10] = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+
+/// Precision of text searches: files with a matching row over files the
+/// text index kept, between 0 and 1, on the histogram's scale of seconds.
+#[derive(Debug)]
+pub struct TextPrecision(pub fs_ingest::histogram::Histogram);
+
+impl Default for TextPrecision {
+    fn default() -> Self {
+        Self(fs_ingest::histogram::Histogram::with_bounds(
+            &PRECISION_BOUNDS,
+        ))
+    }
+}
+
+impl TextPrecision {
+    /// Records one search's precision, clamped to `[0, 1]`.
+    pub fn observe(&self, precision: f64) {
+        self.0
+            .observe(Duration::from_secs_f64(precision.clamp(0.0, 1.0)));
+    }
+}
+
 /// Counters exposed for metrics.
 #[derive(Debug, Default)]
 pub struct QueryStats {
@@ -118,6 +142,27 @@ pub struct QueryStats {
     pub trace_index_misses: std::sync::atomic::AtomicU64,
     /// Files a trace lookup skipped because their sidecar lacked the trace.
     pub trace_index_pruned: std::sync::atomic::AtomicU64,
+    /// Text sidecars fetched from the bucket.
+    pub text_index_fetches: std::sync::atomic::AtomicU64,
+    /// Files a body search read whole for want of a usable text sidecar.
+    pub text_index_misses: std::sync::atomic::AtomicU64,
+    /// Body searches the text index could prune whose scan reached its
+    /// end; the counters and histograms below cover exactly these.
+    pub text_searches: std::sync::atomic::AtomicU64,
+    /// Files the catalog kept for those searches.
+    pub text_files_catalog: std::sync::atomic::AtomicU64,
+    /// Files the text index kept of them.
+    pub text_files_index: std::sync::atomic::AtomicU64,
+    /// Files kept with a row matching the query's filters.
+    pub text_files_matched: std::sync::atomic::AtomicU64,
+    /// Row groups of the files whose geometry the text index checked.
+    pub text_row_groups_catalog: std::sync::atomic::AtomicU64,
+    /// Of those, row groups the text index kept.
+    pub text_row_groups_index: std::sync::atomic::AtomicU64,
+    /// Precision of each search.
+    pub text_precision: TextPrecision,
+    /// Time of each search, from planning its scan to the scan's end.
+    pub text_latency: QueryLatency,
 }
 
 /// Resource limits applied to every query.
@@ -136,6 +181,9 @@ pub struct QueryLimits {
     /// Decoded `trace_id` sidecars kept in memory for trace lookups. Zero
     /// disables the sidecars.
     pub trace_index_cache_bytes: usize,
+    /// Text sidecars, their bytes and descriptors, kept in memory for body
+    /// searches of log files. Zero disables them.
+    pub text_index_cache_bytes: usize,
     /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
     /// oldest is dropped and its ticket plans again.
     pub prepared_plans: usize,
@@ -157,6 +205,7 @@ impl Default for QueryLimits {
             batch_size: 8192,
             hot_window: crate::hot::HotWindowConfig::default(),
             trace_index_cache_bytes: 256 * 1024 * 1024,
+            text_index_cache_bytes: 256 * 1024 * 1024,
             prepared_plans: 1024,
             prepared_bytes: 64 * 1024 * 1024,
             prepared_ttl: Duration::from_secs(60),
@@ -189,6 +238,7 @@ pub struct Querier {
     cache: Arc<FileCache>,
     hot: Arc<crate::hot::HotWindow>,
     trace_index: Arc<crate::trace_index::TraceIndexCache>,
+    text_index: Arc<dyn crate::file_index::FileIndex>,
     runtime: Arc<RuntimeEnv>,
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
@@ -234,7 +284,14 @@ impl Querier {
         let cache = Arc::new(FileCache::new(catalog.clone()));
         let stats = Arc::new(QueryStats::default());
         let trace_index = Arc::new(
-            crate::trace_index::TraceIndexCache::new(store, limits.trace_index_cache_bytes)
+            crate::trace_index::TraceIndexCache::new(
+                Arc::clone(&store),
+                limits.trace_index_cache_bytes,
+            )
+            .with_stats(Arc::clone(&stats)),
+        );
+        let text_index = Arc::new(
+            crate::text_index::TextIndexCache::new(store, limits.text_index_cache_bytes)
                 .with_stats(Arc::clone(&stats)),
         );
         let hot = Arc::new(
@@ -246,6 +303,7 @@ impl Querier {
             timeout = ?limits.timeout,
             hot_window = limits.hot_window.enabled,
             trace_index_cache_bytes = limits.trace_index_cache_bytes,
+            text_index_cache_bytes = limits.text_index_cache_bytes,
             "querier ready"
         );
         Ok(Self {
@@ -253,6 +311,7 @@ impl Querier {
             cache,
             hot,
             trace_index,
+            text_index,
             runtime,
             store_url,
             limits,
@@ -272,6 +331,14 @@ impl Querier {
     /// The sidecar cache trace lookups consult.
     pub fn trace_index(&self) -> Arc<crate::trace_index::TraceIndexCache> {
         Arc::clone(&self.trace_index)
+    }
+
+    /// Consults `index` instead of the text sidecars for body searches;
+    /// a test double of the contract.
+    #[must_use]
+    pub fn with_text_index(mut self, index: Arc<dyn crate::file_index::FileIndex>) -> Self {
+        self.text_index = index;
+        self
     }
 
     /// Limits in force.
@@ -332,6 +399,7 @@ impl Querier {
             Arc::clone(&self.cache),
             Arc::clone(&self.hot),
             Arc::clone(&self.trace_index),
+            (Arc::clone(&self.text_index), Arc::clone(&self.stats)),
             Arc::clone(&warnings),
             Arc::clone(&self.runtime),
             &self.store_url,

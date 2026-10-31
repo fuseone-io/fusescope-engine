@@ -519,25 +519,31 @@ needle or one that is not a single token gives false; a case-insensitive
 search is `has_token(lower(body), lower(t))`.
 
 The index answers through `FileIndex::select`, one `FileSelection` per file:
-`All`, `Skip`, or the row groups to read, sorted, unique and within the
-file's geometry; a file missing from the answer, answered twice or out of
-range is read whole. A sidecar is used only when its path, digest and total
-rows match the catalog row and its row groups match the file's footer, read
-once as the sidecar enters the cache; a file without a digest is read
-whole. Decoded sidecars stay within `query.text_index_cache_bytes`
-(256 MiB, 0 disables) under the lease rule of the trace sidecar, footer
-included.
+`All`, `Skip`, or the row groups to read, sorted, unique and a strict
+subset of the file's, with the row-group count it checked; a file missing
+from the answer, answered twice or out of range is read whole. Chosen row
+groups reach the Parquet reader as a `ParquetAccessPlan`. A sidecar is used
+only when its path, digest and total rows match the catalog row and its
+row groups match the file's footer, read once as the sidecar enters the
+cache; a file without a digest is read whole. Sidecars stay within
+`query.text_index_cache_bytes` (256 MiB, 0 disables) under the lease rule
+of the trace sidecar, which `sidecar_cache` implements for both, the
+footer's decoding included.
 
-For an eligible search, one the index can prune, the querier counts the
-files after the catalog, after the index and with a matching row
-(`fusescope_query_text_files_total{stage}`), the row groups after the
-catalog and after the index (`fusescope_query_text_row_groups_total{stage}`),
-and observes the precision, files matched over files kept
-(`fusescope_query_text_precision_ratio`), and the query time
-(`fusescope_query_text_seconds`). All are published together, only when
-every partition of the scan reached its end; a scan cut by a limit,
-cancelled or failed publishes none. They feed the Tantivy trigger of
-ADR 0009.
+For an eligible search, one the index can prune, the scan reads each file
+with a hidden partition column holding its position, and `TextScanExec`
+evaluates the query's filters on every batch to note the files with a
+matching row before it drops the column. The querier counts the files
+after the catalog, after the index and with a matching row
+(`fusescope_query_text_files_total{stage}`), the row groups of files with a
+checked sidecar after the catalog and after the index
+(`fusescope_query_text_row_groups_total{stage}`), and observes the
+precision, files matched over files kept, 1 when none was kept
+(`fusescope_query_text_precision_ratio`), and the time from planning the
+scan to its end (`fusescope_query_text_seconds`). All are published
+together, only when every partition of the scan reached its end; a scan
+cut short, by a limit, a cancellation or an error, publishes none. They
+feed the Tantivy trigger of ADR 0009.
 
 ### 5.1 One compactor per deployment
 
@@ -999,7 +1005,7 @@ of the same ticket, or on another querier than the one that prepared it.
 `fusescope_query_prepared_plans` and `fusescope_query_prepared_bytes` show
 what waits. Dialect: DataFusion, close to PostgreSQL. Functions registered
 by the engine: `attr_string(attributes, 'http.method')`, `attr_number(...)`,
-`attr_bool(...)`, `has_attr(...)`, `body_contains(body, 'text')`,
+`attr_bool(...)`, `has_attr(...)`, `has_token(body, 'token')` (section 5),
 `time_bucket(interval, ts)`, `quantile_tdigest(col, 0.99)`.
 
 **Typed DoAction** for hot paths where SQL only gets in the way:

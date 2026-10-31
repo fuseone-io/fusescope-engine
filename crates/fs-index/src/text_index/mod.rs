@@ -126,6 +126,11 @@ impl<B: AsRef<[u8]>> TextIndex<B> {
             .is_some_and(|g| g.flags & INDEXED != 0)
     }
 
+    /// Bytes of the encoded sidecar the index reads from.
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.as_ref().len()
+    }
+
     /// Heap the decoded index keeps besides its bytes.
     pub fn heap_bytes(&self) -> usize {
         self.groups.capacity() * std::mem::size_of::<Group>()

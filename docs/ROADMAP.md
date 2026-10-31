@@ -226,8 +226,18 @@ C5 landed after C6.
   ([ADR 0009](adr/0009-text-bloom-per-row-group-tantivy-by-measure.md),
   superseding 0003) for `LIKE`, `ILIKE`, `contains` and `has_token`, behind
   one index contract, with the pruning metrics that decide on Tantivy
-  (issue #1). In progress: the format, the L0 sidecar at flush, the L1
-  sidecar at compaction, then the querier.
+  (issue #1). Done: `fs_index::text_index` format v1 with the fixture
+  `text_index_v1.ngb`; the L0 sidecar at flush, its sizing recorded in the
+  intent (`FileLayout.text_index`) and a fourth scratch copy for log
+  flushes, with crash tests before the sidecar, between it and the
+  registration, after the registration and against a sidecar of other
+  bytes (`crates/fs-ingest/tests/logs.rs`); the L1 sidecar at compaction,
+  purged, doomed and swept with its file; the querier's `FileIndex`
+  contract with a test double, `TextIndexCache` checking path, digest,
+  rows and footer, row groups through `ParquetAccessPlan`, the
+  `has_token` UDF and the `fusescope_query_text_*` metrics, with a
+  differential test of every recognised form against an unindexed
+  querier (`crates/fs-query/tests/text_search.rs`).
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two

@@ -599,6 +599,10 @@ pub struct QuerySection {
     /// disables the sidecars and every lookup opens every overlapping file.
     #[serde(default = "default_trace_index_cache_bytes")]
     pub trace_index_cache_bytes: usize,
+    /// Text sidecars kept in memory for body searches of log files. Zero
+    /// disables them and every search reads every file the catalog keeps.
+    #[serde(default = "default_text_index_cache_bytes")]
+    pub text_index_cache_bytes: usize,
     /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
     /// oldest is dropped and its ticket plans again.
     #[serde(default = "default_prepared_plans")]
@@ -620,6 +624,7 @@ impl Default for QuerySection {
             max_rows: default_query_max_rows(),
             spill_dir: None,
             trace_index_cache_bytes: default_trace_index_cache_bytes(),
+            text_index_cache_bytes: default_text_index_cache_bytes(),
             prepared_plans: default_prepared_plans(),
             prepared_bytes: default_prepared_bytes(),
             prepared_ttl_secs: default_prepared_ttl(),
@@ -635,6 +640,7 @@ impl QuerySection {
             timeout: std::time::Duration::from_secs(self.timeout_secs),
             max_rows: self.max_rows,
             trace_index_cache_bytes: self.trace_index_cache_bytes,
+            text_index_cache_bytes: self.text_index_cache_bytes,
             prepared_plans: self.prepared_plans,
             prepared_bytes: self.prepared_bytes,
             prepared_ttl: std::time::Duration::from_secs(self.prepared_ttl_secs),
@@ -644,6 +650,10 @@ impl QuerySection {
 }
 
 fn default_trace_index_cache_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
+fn default_text_index_cache_bytes() -> usize {
     256 * 1024 * 1024
 }
 

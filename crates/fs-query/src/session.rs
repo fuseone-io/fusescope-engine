@@ -49,6 +49,10 @@ pub fn tenant_session(
     cache: Arc<FileCache>,
     hot: Arc<crate::hot::HotWindow>,
     trace_index: Arc<crate::trace_index::TraceIndexCache>,
+    text_index: (
+        Arc<dyn crate::file_index::FileIndex>,
+        Arc<crate::querier::QueryStats>,
+    ),
     warnings: Arc<crate::querier::QueryWarnings>,
     runtime: Arc<RuntimeEnv>,
     store_url: &ObjectStoreUrl,
@@ -87,7 +91,8 @@ pub fn tenant_session(
         LOGS_TABLE.into(),
         Arc::new(
             SignalTable::logs(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
-                .with_hot_window(hot, warnings),
+                .with_hot_window(hot, warnings)
+                .with_text_index(text_index.0, text_index.1),
         ),
     )?;
     for table in [KeyTable::Spans, KeyTable::Logs] {
@@ -139,6 +144,7 @@ pub fn tenant_session(
     catalog.register_schema(SCHEMA, schema)?;
     ctx.register_catalog(CATALOG, catalog);
     ctx.register_udaf(crate::tdigest::quantile_tdigest());
+    ctx.register_udf(crate::has_token::udf());
     Ok(ctx)
 }
 

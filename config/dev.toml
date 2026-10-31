@@ -44,6 +44,8 @@ max_rows = 1000000
 spill_dir = "./data/spill"
 # Decoded trace_id sidecars kept for trace lookups; 0 opens every overlapping file.
 trace_index_cache_bytes = 268435456
+# Text sidecars kept for body searches of log files; 0 reads every file the catalog keeps.
+text_index_cache_bytes = 268435456
 
 [compactor]
 purge_interval_secs = 60

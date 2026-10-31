@@ -24,8 +24,12 @@ use fs_ingest::flush::{catalog_signal, schema_of};
 use fs_ingest::record::RowSignal;
 
 use crate::QueryError;
+use crate::file_index::FileIndex;
 use crate::files::FileCache;
 use crate::prune::Pruning;
+use crate::querier::QueryStats;
+use crate::text_scan::{TextScanExec, TextTally};
+use fs_index::text_index::Probe;
 
 /// The `spans` or `logs` table of one tenant, bound to the files and
 /// schema of its signal.
@@ -40,6 +44,15 @@ pub struct SignalTable {
         Arc<crate::querier::QueryWarnings>,
     )>,
     trace_index: Option<Arc<crate::trace_index::TraceIndexCache>>,
+    text_index: Option<(Arc<dyn FileIndex>, Arc<QueryStats>)>,
+}
+
+/// The files a scan opens and what the text index made of them.
+struct Planned {
+    files: Vec<PartitionedFile>,
+    bytes: u64,
+    /// Counts of an eligible body search; `None` for any other scan.
+    text: Option<TextTally>,
 }
 
 impl SignalTable {
@@ -78,6 +91,7 @@ impl SignalTable {
             bytes_budget,
             hot: None,
             trace_index: None,
+            text_index: None,
         }
     }
 
@@ -87,6 +101,17 @@ impl SignalTable {
     pub fn with_trace_index(mut self, cache: Arc<crate::trace_index::TraceIndexCache>) -> Self {
         if self.signal == RowSignal::Traces {
             self.trace_index = Some(cache);
+        }
+        self
+    }
+
+    /// Consults `index` when the filters search the body, publishing what
+    /// it pruned to `stats`. Only log files have text sidecars, so a span
+    /// table ignores it.
+    #[must_use]
+    pub fn with_text_index(mut self, index: Arc<dyn FileIndex>, stats: Arc<QueryStats>) -> Self {
+        if self.signal == RowSignal::Logs {
+            self.text_index = Some((index, stats));
         }
         self
     }
@@ -127,6 +152,15 @@ impl SignalTable {
         filters: &[Expr],
         excluded: &std::collections::HashSet<fs_catalog::FileId>,
     ) -> Result<(Vec<PartitionedFile>, u64), QueryError> {
+        let planned = self.plan(filters, excluded).await?;
+        Ok((planned.files, planned.bytes))
+    }
+
+    async fn plan(
+        &self,
+        filters: &[Expr],
+        excluded: &std::collections::HashSet<fs_catalog::FileId>,
+    ) -> Result<Planned, QueryError> {
         let pruning = Pruning::from_filters(filters);
         let all = self
             .cache
@@ -143,15 +177,25 @@ impl SignalTable {
             (Some(index), Some(traces)) => index.files_holding(candidates, &traces).await,
             _ => candidates,
         };
-        let mut bytes = 0u64;
-        let files: Vec<PartitionedFile> = candidates
-            .into_iter()
-            .map(|f| {
-                let size = u64::try_from(f.size_bytes).unwrap_or(0);
-                bytes = bytes.saturating_add(size);
-                PartitionedFile::new(f.path.clone(), size)
-            })
-            .collect();
+        let (files, text) = if let Some((index, probe)) = self.text_search(filters) {
+            let owned: Vec<fs_catalog::FileRecord> =
+                candidates.iter().map(|f| (*f).clone()).collect();
+            let answers = index.select(&owned, &probe).await;
+            let selections = crate::file_index::resolve(&owned, answers);
+            let (files, tally) = crate::text_scan::apply(&candidates, &selections);
+            (files, Some(tally))
+        } else {
+            let files = candidates
+                .into_iter()
+                .map(|f| {
+                    PartitionedFile::new(f.path.clone(), u64::try_from(f.size_bytes).unwrap_or(0))
+                })
+                .collect();
+            (files, None)
+        };
+        let bytes = files
+            .iter()
+            .fold(0u64, |sum, f| sum.saturating_add(f.object_meta.size));
         debug!(
             tenant = %self.tenant.0,
             signal = ?self.signal,
@@ -161,9 +205,17 @@ impl SignalTable {
             excluded = excluded.len(),
             bytes,
             ?pruning,
+            ?text,
             "catalog pruning"
         );
-        Ok((files, bytes))
+        Ok(Planned { files, bytes, text })
+    }
+
+    /// The text index and the probe of a body search it can prune.
+    fn text_search(&self, filters: &[Expr]) -> Option<(&Arc<dyn FileIndex>, Probe)> {
+        let (index, _) = self.text_index.as_ref()?;
+        let probe = crate::text_probe::probe(filters);
+        probe.prunes().then_some((index, probe))
     }
 }
 
@@ -237,13 +289,10 @@ impl TableProvider for SignalTable {
             }
         }
 
-        let (files, bytes) = self
-            .plan_files_excluding(filters, &excluded)
-            .await
-            .map_err(external)?;
-        if bytes > self.bytes_budget {
+        let planned = self.plan(filters, &excluded).await.map_err(external)?;
+        if planned.bytes > self.bytes_budget {
             return Err(external(QueryError::OverBudget {
-                bytes,
+                bytes: planned.bytes,
                 budget: self.bytes_budget,
             }));
         }
@@ -266,29 +315,79 @@ impl TableProvider for SignalTable {
                 None,
             )?)
         };
-        if files.is_empty() {
-            return Ok(hot_exec.unwrap_or_else(|| Arc::new(EmptyExec::new(projected_schema))));
-        }
-
-        let mut source = ParquetSource::new(TableSchema::from(Arc::clone(&schema)))
-            .with_pushdown_filters(true)
-            .with_enable_page_index(true)
-            .with_bloom_filter_on_read(true);
-        if let Some(predicate) = conjunction(filters.iter().cloned()) {
-            let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
-            let physical = state.create_physical_expr(predicate, &df_schema)?;
-            source = source.with_predicate(physical);
-        }
-        let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
-            .with_file_group(FileGroup::new(files))
-            .with_projection_indices(projection.cloned())?
-            .with_limit(limit)
-            .build();
-        let files_exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
-        Ok(match hot_exec {
-            Some(hot) => UnionExec::try_new(vec![files_exec, hot])?,
-            None => files_exec,
+        let files_exec = self.files_exec(state, projection, filters, limit, planned)?;
+        Ok(match (files_exec, hot_exec) {
+            (Some(files), Some(hot)) => UnionExec::try_new(vec![files, hot])?,
+            (Some(files), None) => files,
+            (None, Some(hot)) => hot,
+            (None, None) => Arc::new(EmptyExec::new(projected_schema)),
         })
+    }
+}
+
+impl SignalTable {
+    /// The scan of the planned files; `None` when there is none to read
+    /// and no body search to account for. A body search reads them with
+    /// the hidden file column, under a [`TextScanExec`] that drops it.
+    fn files_exec(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        planned: Planned,
+    ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+        let schema = schema_of(self.signal);
+        let text = planned
+            .text
+            .zip(self.text_index.as_ref().map(|(_, stats)| Arc::clone(stats)));
+        if planned.files.is_empty() && text.is_none() {
+            return Ok(None);
+        }
+        let mut projection = projection.cloned();
+        let table_schema = if text.is_some() {
+            let all = schema.fields().len();
+            projection
+                .get_or_insert_with(|| (0..all).collect())
+                .push(all);
+            TableSchema::builder(Arc::clone(&schema))
+                .with_table_partition_cols(vec![crate::text_scan::file_field()])
+                .build()
+        } else {
+            TableSchema::from(Arc::clone(&schema))
+        };
+        let scanned: Arc<dyn ExecutionPlan> = if planned.files.is_empty() {
+            let full = table_schema.table_schema();
+            let indices = projection.clone().unwrap_or_default();
+            Arc::new(EmptyExec::new(Arc::new(full.project(&indices)?)))
+        } else {
+            let mut source = ParquetSource::new(table_schema)
+                .with_pushdown_filters(true)
+                .with_enable_page_index(true)
+                .with_bloom_filter_on_read(true);
+            if let Some(predicate) = conjunction(filters.iter().cloned()) {
+                let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
+                let physical = state.create_physical_expr(predicate, &df_schema)?;
+                source = source.with_predicate(physical);
+            }
+            let config = FileScanConfigBuilder::new(self.store_url.clone(), Arc::new(source))
+                .with_file_group(FileGroup::new(planned.files))
+                .with_projection_indices(projection)?
+                .with_limit(limit)
+                .build();
+            DataSourceExec::from_data_source(config)
+        };
+        let Some((tally, published_to)) = text else {
+            return Ok(Some(scanned));
+        };
+        // Columns the filters need are in the projection: they stay above
+        // the scan, so a filter that cannot be planned here counts no match.
+        let matches = conjunction(filters.iter().cloned()).and_then(|predicate| {
+            let df_schema = DFSchema::try_from(scanned.schema()).ok()?;
+            state.create_physical_expr(predicate, &df_schema).ok()
+        });
+        let measured = TextScanExec::new(scanned, matches, tally, published_to, limit.is_some())?;
+        Ok(Some(Arc::new(measured)))
     }
 }
 
