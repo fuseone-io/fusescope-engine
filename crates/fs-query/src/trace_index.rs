@@ -16,10 +16,9 @@
 //! on a timeout or a cancelled query, returns everything it reserved. A
 //! download that cannot fit is not read; its file is scanned.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::Arc;
 
-use fs_catalog::{FileId, FileRecord};
+use fs_catalog::FileRecord;
 use fs_index::TraceIndex;
 use futures_util::future::join_all;
 use object_store::path::Path;
@@ -27,73 +26,18 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use tracing::{debug, warn};
 
 use crate::querier::QueryStats;
+use crate::sidecar_cache::{Entry, Lease, MISS_BYTES, Reserve, Shared};
+
+type Held = crate::sidecar_cache::Held<TraceIndex>;
 
 /// Sidecar fetches in flight for one query.
 const FETCH_PARALLELISM: usize = 8;
-
-/// Bytes charged for remembering that a file has no usable sidecar.
-const MISS_BYTES: usize = 64;
 
 /// Shared sidecar cache.
 pub struct TraceIndexCache {
     store: Arc<dyn ObjectStore>,
     stats: Option<Arc<QueryStats>>,
-    shared: Arc<Shared>,
-}
-
-struct Shared {
-    max_bytes: usize,
-    inner: Mutex<Inner>,
-}
-
-#[derive(Default)]
-struct Inner {
-    entries: HashMap<FileId, Slot>,
-    /// Bytes of decoded sidecars alive and of misses remembered.
-    bytes: usize,
-    /// Bytes reserved by downloads in flight.
-    inflight: usize,
-    fetching: HashSet<FileId>,
-    clock: u64,
-}
-
-struct Slot {
-    index: Option<Arc<Held>>,
-    /// Bytes charged to the slot itself: a remembered miss. A decoded
-    /// index charges its own bytes for as long as it is alive.
-    charged: usize,
-    used: u64,
-}
-
-/// A decoded sidecar that holds its bytes against the budget until the
-/// last query using it lets go.
-pub struct Held {
-    index: TraceIndex,
-    bytes: usize,
-    /// Weak, so entries never keep the cache alive.
-    shared: Weak<Shared>,
-}
-
-impl std::ops::Deref for Held {
-    type Target = TraceIndex;
-
-    fn deref(&self) -> &TraceIndex {
-        &self.index
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        if let Some(shared) = self.shared.upgrade() {
-            shared.lock().bytes -= self.bytes;
-        }
-    }
-}
-
-impl Shared {
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+    shared: Arc<Shared<TraceIndex>>,
 }
 
 impl TraceIndexCache {
@@ -103,10 +47,7 @@ impl TraceIndexCache {
         Self {
             store,
             stats: None,
-            shared: Arc::new(Shared {
-                max_bytes,
-                inner: Mutex::new(Inner::default()),
-            }),
+            shared: Shared::new(max_bytes),
         }
     }
 
@@ -124,13 +65,12 @@ impl TraceIndexCache {
 
     /// Bytes of decoded sidecars alive and misses remembered.
     pub fn bytes(&self) -> usize {
-        self.shared.lock().bytes
+        self.shared.bytes()
     }
 
     /// Bytes alive plus bytes reserved by downloads in flight.
     pub fn committed_bytes(&self) -> usize {
-        let inner = self.shared.lock();
-        inner.bytes + inner.inflight
+        self.shared.committed_bytes()
     }
 
     /// The subset of `files` that may hold one of `traces`: those whose
@@ -165,7 +105,7 @@ impl TraceIndexCache {
     /// The file's sidecar, fetched on a first sight. `None` when the file
     /// has none this engine can use, or none it can hold right now.
     async fn lookup(&self, file: &FileRecord) -> Option<Arc<Held>> {
-        match self.cached(file.id) {
+        match self.shared.cached(file.id) {
             Some(Entry::Index(index)) => return Some(index),
             Some(Entry::Miss) => return None,
             None => {}
@@ -185,17 +125,7 @@ impl TraceIndexCache {
         }
     }
 
-    /// A cache hit, or `None` when the file was never looked up.
-    fn cached(&self, id: FileId) -> Option<Entry> {
-        let mut inner = self.shared.lock();
-        inner.clock += 1;
-        let clock = inner.clock;
-        let slot = inner.entries.get_mut(&id)?;
-        slot.used = clock;
-        Some(slot.index.clone().map_or(Entry::Miss, Entry::Index))
-    }
-
-    async fn fetch(&self, file: &FileRecord, lease: &mut Lease) -> Fetched {
+    async fn fetch(&self, file: &FileRecord, lease: &mut Lease<TraceIndex>) -> Fetched {
         let Some(path) = fs_index::sidecar_path(&file.path) else {
             return self.miss();
         };
@@ -281,161 +211,6 @@ impl TraceIndexCache {
     }
 }
 
-/// Evicts the least recently used entry from the map: `None` when there
-/// is none, else the decoded index it held, if any. That index keeps
-/// charging its bytes until every query using it lets go, so the caller
-/// drops it outside the lock.
-fn evict_one(inner: &mut Inner) -> Option<Entry> {
-    let (&victim, _) = inner.entries.iter().min_by_key(|(_, s)| s.used)?;
-    let slot = inner.entries.remove(&victim)?;
-    inner.bytes -= slot.charged;
-    Some(slot.index.map_or(Entry::Miss, Entry::Index))
-}
-
-/// What a slot holds.
-enum Entry {
-    Index(Arc<Held>),
-    /// The file has no sidecar this engine can use.
-    Miss,
-}
-
-/// Evicts until `extra` more bytes fit or nothing is left to evict. An
-/// evicted index charges its bytes until dropped, which happens outside
-/// the lock, so the bytes an eviction frees are counted here: those of
-/// indexes no query still uses.
-fn make_room(inner: &mut Inner, max_bytes: usize, extra: usize) -> Evicted {
-    let mut evicted = Evicted::default();
-    while inner.bytes - evicted.freed + inner.inflight + extra > max_bytes {
-        match evict_one(inner) {
-            Some(Entry::Index(held)) => {
-                if Arc::strong_count(&held) == 1 {
-                    evicted.freed += held.bytes;
-                }
-                evicted.held.push(held);
-            }
-            Some(Entry::Miss) => {}
-            None => break,
-        }
-    }
-    evicted
-}
-
-/// Indexes evicted under the lock, dropped after it.
-#[derive(Default)]
-struct Evicted {
-    held: Vec<Arc<Held>>,
-    /// Bytes that drop will return.
-    freed: usize,
-}
-
-impl Evicted {
-    fn fits(&self, inner: &Inner, max_bytes: usize, extra: usize) -> bool {
-        inner.bytes - self.freed + inner.inflight + extra <= max_bytes
-    }
-}
-
-/// One download's claim on the cache: the per-file mark and the bytes it
-/// reserved. Dropped, it returns both; committed, it becomes an entry.
-struct Lease {
-    shared: Arc<Shared>,
-    id: FileId,
-    reserved: usize,
-}
-
-impl Lease {
-    /// Marks a download of `id` as in flight. `None` when one already is.
-    fn begin(shared: &Arc<Shared>, id: FileId) -> Option<Self> {
-        if !shared.lock().fetching.insert(id) {
-            return None;
-        }
-        Some(Self {
-            shared: Arc::clone(shared),
-            id,
-            reserved: 0,
-        })
-    }
-
-    /// Reserves `size` more bytes of the budget, evicting idle entries to
-    /// make room.
-    fn reserve(&mut self, size: usize) -> Reserve {
-        let evicted;
-        {
-            let mut inner = self.shared.lock();
-            if size > self.shared.max_bytes {
-                return Reserve::TooLarge;
-            }
-            evicted = make_room(&mut inner, self.shared.max_bytes, size);
-            if !evicted.fits(&inner, self.shared.max_bytes, size) {
-                drop(inner);
-                drop(evicted);
-                return Reserve::Busy;
-            }
-            inner.inflight += size;
-            self.reserved += size;
-        }
-        drop(evicted);
-        Reserve::Fits
-    }
-
-    /// Turns the lease into an entry charging `charged` bytes: a decoded
-    /// index that charges them while alive, or a remembered miss.
-    fn commit(mut self, index: Option<TraceIndex>, charged: usize) -> Option<Arc<Held>> {
-        let held = index.map(|index| {
-            Arc::new(Held {
-                index,
-                bytes: charged,
-                shared: Arc::downgrade(&self.shared),
-            })
-        });
-        let slot_charge = if held.is_some() { 0 } else { charged };
-        let evicted;
-        {
-            let mut inner = self.shared.lock();
-            inner.inflight -= self.reserved;
-            inner.fetching.remove(&self.id);
-            self.reserved = 0;
-            inner.clock += 1;
-            let used = inner.clock;
-            let mut old = Vec::new();
-            if let Some(previous) = inner.entries.insert(
-                self.id,
-                Slot {
-                    index: held.clone(),
-                    charged: slot_charge,
-                    used,
-                },
-            ) {
-                inner.bytes -= previous.charged;
-                old.extend(previous.index);
-            }
-            inner.bytes += charged;
-            evicted = make_room(&mut inner, self.shared.max_bytes, 0);
-            drop(inner);
-            drop(old);
-        }
-        drop(evicted);
-        held
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let mut inner = self.shared.lock();
-        inner.inflight -= self.reserved;
-        inner.fetching.remove(&self.id);
-    }
-}
-
-/// Whether a download's bytes fit the budget.
-#[derive(Debug, PartialEq, Eq)]
-enum Reserve {
-    Fits,
-    /// Larger than the whole budget: never fits, remembered as a miss.
-    TooLarge,
-    /// Held by entries or downloads in use right now: tried again next time.
-    Busy,
-}
-
 enum Fetched {
     Index(TraceIndex, usize),
     Unusable,
@@ -456,7 +231,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
-    use fs_catalog::{FileState, Level, Signal, TenantId, TimeRange};
+    use fs_catalog::{FileId, FileState, Level, Signal, TenantId, TimeRange};
     use object_store::memory::InMemory;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
@@ -682,11 +457,7 @@ mod tests {
             cache.lookup(&two).await.is_none(),
             "busy while one is in use"
         );
-        assert_eq!(
-            cache.shared.lock().entries.len(),
-            0,
-            "one was evicted from the map"
-        );
+        assert_eq!(cache.shared.entries(), 0, "one was evicted from the map");
         assert_eq!(cache.bytes(), heap, "and still counts");
         assert_eq!(stats(&cache), (2, 1, 0));
 
@@ -735,10 +506,7 @@ mod tests {
         query.abort();
         assert!(query.await.unwrap_err().is_cancelled());
         assert_eq!(cache.committed_bytes(), 0, "the lease went with the future");
-        assert!(
-            cache.shared.lock().fetching.is_empty(),
-            "and so did the mark"
-        );
+        assert!(cache.shared.idle(), "and so did the mark");
 
         let kept = cache.files_holding(vec![&file], &[[1u8; 16]]).await;
         assert_eq!(kept.len(), 1, "a fresh download works and finds the trace");

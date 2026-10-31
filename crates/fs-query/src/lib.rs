@@ -17,6 +17,7 @@ pub mod hot;
 pub mod prune;
 pub mod querier;
 pub mod session;
+mod sidecar_cache;
 pub mod signal_table;
 mod tdigest;
 pub mod trace_index;
