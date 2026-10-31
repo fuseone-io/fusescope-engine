@@ -266,7 +266,8 @@ s3://fusescope/
       derived/duration_sort/dt=.../{ulid}.parquet
       index/trace_id/dt=2026-10-24/hr=14/{ulid}.tix   # trace_id → files
     logs/
-      l0/ l1/ l2/ derived/ index/ngram/...
+      l0/ l1/ l2/
+      index/ngram/dt=2026-10-24/hr=14/{ulid}.ngb      # text bloom per row group
     metrics/
       series/dt=.../{ulid}.parquet                # fingerprint, labels
       samples/l0/ l1/ l2/...                      # fingerprint, ts, value
@@ -444,9 +445,9 @@ compactor** at every level. They are never the source of truth.
 | Native Parquet bloom | inside the file | equality on trace_id, span_id, service_name, metric_name | parquet-rs |
 | `.idx` sidecar | xor filter per column + min/max of promoted columns | file pruning without opening the footer | Tempo |
 | `index/trace_id/*.tix` | sorted table trace_id → file list, per hour | open two or three files for a trace instead of thousands | Tempo |
-| `index/ngram/*.ngb` | ngram (n=3) and token bloom over body, per file | `LIKE`, `contains`, log text search | ClickHouse ngrambf_v1 |
+| `logs/index/ngram/*.ngb` | trigram and token bloom over body, per row group of each log file | `LIKE`, `ILIKE`, `contains`, `has_token` | ClickHouse ngrambf_v1 |
 | `index/postings/*.pst` | roaring bitmaps, label=value → fingerprints, per hour | PromQL matcher resolution | Prometheus TSDB |
-| Tantivy (phase 2) | inverted index per file | full-text search with ranking and phrases | Quickwit |
+| Tantivy (when measured, [ADR 0009](docs/adr/0009-text-bloom-per-row-group-tantivy-by-measure.md)) | inverted index per L1/L2 file | full-text search with ranking and phrases | Quickwit |
 
 Every sidecar carries a header with version, length and an xxh3 checksum. A
 corrupt or missing sidecar degrades to a file scan, never to an error.
@@ -475,6 +476,67 @@ budget is never read, and one that finds the budget busy is skipped for that
 query. A file whose sidecar is missing, unreadable, too large or naming other
 files is remembered as such and scanned. Fetches, misses and pruned files are
 counted.
+
+The text sidecar (`fs-index::text_index`, format version 1, ADR 0009)
+serves search in log bodies. One `.ngb` per log file holds, per Parquet row
+group, a trigram bloom and a token bloom under normalization 1: ASCII
+letters lowercased, every other byte kept; trigrams are windows of three
+bytes, tokens maximal runs of `[A-Za-z0-9]`, any other byte, non-ASCII ones
+included, separating them. It names its file's path and the SHA-256 of its
+bytes, the rows of each row group, whether the group's bodies are all
+ASCII, and per bloom its bits, hashes and bytes. Sizing counts occurrences
+rather than distinct terms, so building needs constant memory besides the
+blooms: 10 bits per occurrence and 7 hashes, about 1 % false positives on
+distinct terms, oversized when terms repeat. A group's two blooms share at
+most `text_index_max_bytes_per_row_group` (8 MiB, never more than the
+group's body bytes) and a file's at most `text_index_max_bytes_per_file`
+(64 MiB); hard ceilings are 64 MiB and 512 MiB. A group left without budget
+carries no bloom and is always read.
+
+The flush builds the sidecar of a log L0 file from the row groups it
+encodes, in place in its output buffer, after the Parquet object and before
+the catalog row. Log flushes hold one more copy of their input in the lease
+for it (`TEXT_INDEX_SCRATCH_FACTOR`), and admission keeps that room for log
+rows. The intent records the sizing (`FileLayout.text_index`), so a replay
+writes the same bytes; an intent logged without it writes no sidecar. A
+sidecar already there with other bytes gives the rows a fresh id, like a
+Parquet object with other bytes. The compactor builds one for each log L1
+file from its output row groups with its own `compactor.text_index_*`
+sizing; purge, retention and the orphan sweep remove it with its file.
+
+The querier recognises, on `body` or `lower(body)`: `LIKE` and `ILIKE`
+(escape `\` unless another is given, in which case nothing is pruned),
+`contains`, `strpos(…) > 0` and `has_token`. Under `AND` any recognised
+condition prunes; an `OR` with an unrecognised branch and any `NOT` read
+everything. A fragment shorter than three bytes gives no trigram; a
+`has_token` needle is one token of any length. Case-sensitive forms probe
+the lowercased blooms, a superset of what they match; case-insensitive
+ones (`ILIKE`, `lower(body)`) prune only groups marked all-ASCII and only
+for an ASCII literal. `has_token(body, t)` is true when `t` is exactly one
+token of `body`, case-sensitive; a `NULL` argument gives `NULL`; an empty
+needle or one that is not a single token gives false; a case-insensitive
+search is `has_token(lower(body), lower(t))`.
+
+The index answers through `FileIndex::select`, one `FileSelection` per file:
+`All`, `Skip`, or the row groups to read, sorted, unique and within the
+file's geometry; a file missing from the answer, answered twice or out of
+range is read whole. A sidecar is used only when its path, digest and total
+rows match the catalog row and its row groups match the file's footer, read
+once as the sidecar enters the cache; a file without a digest is read
+whole. Decoded sidecars stay within `query.text_index_cache_bytes`
+(256 MiB, 0 disables) under the lease rule of the trace sidecar, footer
+included.
+
+For an eligible search, one the index can prune, the querier counts the
+files after the catalog, after the index and with a matching row
+(`fusescope_query_text_files_total{stage}`), the row groups after the
+catalog and after the index (`fusescope_query_text_row_groups_total{stage}`),
+and observes the precision, files matched over files kept
+(`fusescope_query_text_precision_ratio`), and the query time
+(`fusescope_query_text_seconds`). All are published together, only when
+every partition of the scan reached its end; a scan cut by a limit,
+cancelled or failed publishes none. They feed the Tantivy trigger of
+ADR 0009.
 
 ### 5.1 One compactor per deployment
 
@@ -1306,6 +1368,7 @@ decision, not inertia.
 | 001 | Own catalog in Postgres; Iceberg only as L2 export | Iceberg as primary catalog: commit contention and manifest bloat under frequent flushes |
 | 002 | PromQL stays in the Go Prometheus engine; the engine exposes Select | PromQL in Rust: reimplementation with no functional gain |
 | 003 | Ngram bloom for log text in phase 2; Tantivy later | Tantivy from day one: complexity without proven product demand |
+| 009 | Text bloom per row group; Tantivy at L1/L2 once metrics demand it | bloom per file: no pruning inside large files; Tantivy now: no measured need |
 | 004 | Single binary with roles | One binary per role: worse for development and small installs |
 | 005 | Legacy query-service v3/v4 is not ported | Porting: code upstream is retiring |
 | 006 | Collector exports standard OTLP to the ingester | Keeping an adapted ClickHouse exporter: schema stays in the AGPL repository |

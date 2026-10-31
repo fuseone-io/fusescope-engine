@@ -222,7 +222,12 @@ C5 landed after C6.
   (`a_key_row_of_the_other_tables_source_fails_the_query`); a table refuses
   to merge or rebuild from one of the other kind
   (`a_table_of_shared_sources_keeps_its_kind`).
-- Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
+- Text bloom sidecars per row group of each log file
+  ([ADR 0009](adr/0009-text-bloom-per-row-group-tantivy-by-measure.md),
+  superseding 0003) for `LIKE`, `ILIKE`, `contains` and `has_token`, behind
+  one index contract, with the pruning metrics that decide on Tantivy
+  (issue #1). In progress: the format, the L0 sidecar at flush, the L1
+  sidecar at compaction, then the querier.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two

@@ -1,6 +1,6 @@
 # 0003 · Ngram bloom for log text first, Tantivy later
 
-- Status: accepted
+- Status: superseded by [0009](0009-text-bloom-per-row-group-tantivy-by-measure.md)
 - Date: 2026-10-24
 
 ## Context
