@@ -189,7 +189,6 @@ C5 landed after C6.
   are written per signal, logs only from layout 4, with the log digest
   pinned (`log_layouts_are_versioned_on_their_own`,
   `canonical_log_input_gives_the_pinned_bytes_for_each_version`).
-  Compaction of log files later.
 - The `logs` SQL table over log files and the hot window. Done:
   `fs_query::signal_table::SignalTable` bound to one signal's files and
   schema (`spans`, `logs`); `HotScanRequest.signal`, absent meaning spans;
@@ -204,6 +203,20 @@ C5 landed after C6.
   (`log_rows_are_read_once_from_live_to_flushing_to_persisted_to_the_catalog`);
   the ingester checks projection, filters and `distinct` against the log
   schema (`the_hot_window_serves_log_rows_by_their_schema`).
+- Compaction of log files and their attribute keys. Done: a pass takes the
+  oldest cold hour of spans or logs (`compaction_inputs` over both
+  signals), log L1 files at `t/{tenant}/logs/l1/` through the log writer,
+  no sidecar; `log_attribute_keys` as signal 17, format v1 with `source`
+  `resource`, `log` or `scope`, read and written only by log passes, with
+  its own `max_keys_hour`; the rebuild walks both kinds in turns, backoff
+  per table; `metadata.keys` and SQL over it; `compactor.compact_logs`,
+  off by default. Tests in `crates/fs-compactor/tests/logs.rs` (crash
+  before the swap, between the L1 file and the table, a lost lease, the
+  sweep, a restart after the swap; budgets per signal; a capped hour not
+  blocking the other signal; the rebuild and the purge with the knob off;
+  a damaged span table not holding back the log one), the fixtures
+  `attribute_keys_v2.parquet` and `log_attribute_keys_v1.parquet`, and
+  `metadata_keys_lists_log_keys_from_their_own_table`.
 - Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.

@@ -218,6 +218,7 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         service_graph_max_spans: 4_000_000,
         service_graph_max_bytes: 256 << 20,
         row_group_rows,
+        compact_logs: false,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
@@ -1706,7 +1707,8 @@ async fn service_graph_files(f: &Fixture) -> Vec<FileRecord> {
 
 fn attribute_keys_of(f: &Fixture, file: &FileRecord) -> fs_schema::attribute_keys::KeyStats {
     let bytes = std::fs::read(f.dir.path().join(&file.path)).unwrap();
-    fs_schema::attribute_keys::decode(bytes.into()).unwrap()
+    fs_schema::attribute_keys::decode(bytes.into(), fs_schema::attribute_keys::KeyTable::Spans)
+        .unwrap()
 }
 
 fn request_with_attribute(

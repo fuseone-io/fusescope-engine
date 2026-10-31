@@ -126,12 +126,14 @@ pub enum Signal {
     DurationSort,
     /// Derived: usage per hour.
     Usage1h,
-    /// Derived: attribute keys.
+    /// Derived: attribute keys of spans.
     AttributeKeys,
     /// Derived: 5 minute metric rollup.
     Rollup5m,
     /// Derived: 30 minute metric rollup.
     Rollup30m,
+    /// Derived: attribute keys of log rows.
+    LogAttributeKeys,
 }
 
 impl Signal {
@@ -149,6 +151,7 @@ impl Signal {
             Signal::AttributeKeys => 14,
             Signal::Rollup5m => 15,
             Signal::Rollup30m => 16,
+            Signal::LogAttributeKeys => 17,
         }
     }
 
@@ -169,6 +172,7 @@ impl Signal {
             14 => Signal::AttributeKeys,
             15 => Signal::Rollup5m,
             16 => Signal::Rollup30m,
+            17 => Signal::LogAttributeKeys,
             other => {
                 return Err(CatalogError::InvalidValue {
                     column: "signal",
@@ -192,6 +196,7 @@ impl Signal {
             Signal::AttributeKeys => "derived/attribute_keys",
             Signal::Rollup5m => "metrics/derived/rollup_5m",
             Signal::Rollup30m => "metrics/derived/rollup_30m",
+            Signal::LogAttributeKeys => "derived/log_attribute_keys",
         }
     }
 }
@@ -507,6 +512,7 @@ mod tests {
             Signal::AttributeKeys,
             Signal::Rollup5m,
             Signal::Rollup30m,
+            Signal::LogAttributeKeys,
         ] {
             assert_eq!(Signal::from_code(s.code()).unwrap(), s);
         }

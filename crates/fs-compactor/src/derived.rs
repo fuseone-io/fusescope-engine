@@ -1,9 +1,10 @@
-//! The `attribute_keys` table as an object: read whole, written whole.
+//! The `attribute_keys` and `log_attribute_keys` tables as objects: read
+//! whole, written whole.
 
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
-use fs_schema::attribute_keys::KeyStats;
+use fs_schema::attribute_keys::{KeyStats, KeyTable};
 use fs_schema::service_graph::ServiceGraph;
 use fs_schema::trace_summary::TraceSummaries;
 use object_store::path::Path;
@@ -12,19 +13,37 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use crate::CompactError;
 use crate::merge::{attribute_keys_path, service_graph_path, trace_summary_path};
 
-/// The table at `path`, decoded.
+/// The table of keys of the rows of `data`, and the catalog signal of its
+/// files; `None` for a signal whose keys are not listed.
+pub(crate) fn key_table(data: Signal) -> Option<(KeyTable, Signal)> {
+    match data {
+        Signal::Traces => Some((KeyTable::Spans, Signal::AttributeKeys)),
+        Signal::Logs => Some((KeyTable::Logs, Signal::LogAttributeKeys)),
+        _ => None,
+    }
+}
+
+fn file_signal(table: KeyTable) -> Signal {
+    match table {
+        KeyTable::Spans => Signal::AttributeKeys,
+        KeyTable::Logs => Signal::LogAttributeKeys,
+    }
+}
+
+/// The `table` at `path`, decoded.
 ///
 /// # Errors
-/// A store failure, or bytes that are not a readable table.
+/// A store failure, or bytes that are not a readable `table`.
 pub(crate) async fn read_table(
     store: &dyn ObjectStore,
     path: &str,
+    table: KeyTable,
 ) -> Result<KeyStats, CompactError> {
     let bytes = store.get(&Path::from(path)).await?.bytes().await?;
-    Ok(fs_schema::attribute_keys::decode(bytes)?)
+    Ok(fs_schema::attribute_keys::decode(bytes, table)?)
 }
 
-/// `keys` encoded as the table of `tenant` with its catalog row, placed
+/// `keys` encoded as their table of `tenant` with its catalog row, placed
 /// in the partition of `hour`; `None` when there is nothing to list.
 ///
 /// # Errors
@@ -40,12 +59,13 @@ pub(crate) fn table_file(
     };
     let bytes = Bytes::from(fs_schema::attribute_keys::encode(keys)?);
     let id = FileId::new();
-    let path = attribute_keys_path(root, tenant, hour, id);
+    let signal = file_signal(keys.table());
+    let path = attribute_keys_path(root, tenant, signal, hour, id);
     let file = NewFile {
         id,
         origin: id,
         tenant_id: tenant,
-        signal: Signal::AttributeKeys,
+        signal,
         level: Level::L1,
         path: path.to_string(),
         size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),

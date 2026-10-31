@@ -22,9 +22,10 @@
 //! how many spans carry each, most frequent first.
 //!
 //! `metadata.keys`: `{"signal": "traces", "prefix": "http.", "limit": n}`;
-//! the rows of the `attribute_keys` table whose key starts with `prefix`,
-//! most frequent first.
+//! the rows of the `attribute_keys` table, or of `log_attribute_keys` for
+//! `"logs"`, whose key starts with `prefix`, most frequent first.
 
+use fs_schema::attribute_keys::KeyTable;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -218,7 +219,7 @@ impl OperationsLookup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysLookup {
-    /// The signal whose keys to list; only `traces` has a table so far.
+    /// The signal whose keys to list: `traces` or `logs`.
     pub signal: String,
     /// Keep the keys starting with this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,6 +232,8 @@ pub struct KeysLookup {
 /// A key listing with its fields checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeysQuery {
+    /// The table to list.
+    pub table: KeyTable,
     /// Keep the keys starting with this.
     pub prefix: Option<String>,
     /// Most rows to answer.
@@ -250,15 +253,19 @@ impl KeysLookup {
     /// Checks the signal and the limit.
     ///
     /// # Errors
-    /// A signal without an `attribute_keys` table, or a limit of zero.
+    /// A signal without a table of attribute keys, or a limit of zero.
     pub fn query(&self) -> Result<KeysQuery, QueryError> {
-        if self.signal != "traces" {
-            return Err(QueryError::InvalidAction(format!(
-                "signal {:?} has no attribute_keys table",
-                self.signal
-            )));
-        }
+        let table = match self.signal.as_str() {
+            "traces" => KeyTable::Spans,
+            "logs" => KeyTable::Logs,
+            other => {
+                return Err(QueryError::InvalidAction(format!(
+                    "signal {other:?} has no table of attribute keys"
+                )));
+            }
+        };
         Ok(KeysQuery {
+            table,
             prefix: self.prefix.clone(),
             limit: limit_of(self.limit)?,
         })
@@ -393,13 +400,19 @@ mod tests {
 
         let keys = KeysLookup::parse(br#"{"signal":"traces","prefix":"http."}"#).unwrap();
         let query = keys.query().unwrap();
+        assert_eq!(query.table, KeyTable::Spans);
         assert_eq!(query.prefix.as_deref(), Some("http."));
         assert_eq!(query.limit, DEFAULT_LIST_LIMIT);
-        let err = KeysLookup::parse(br#"{"signal":"logs"}"#)
-            .unwrap()
-            .query()
-            .unwrap_err();
-        assert!(matches!(err, QueryError::InvalidAction(_)), "{err}");
+        let logs = KeysLookup::parse(br#"{"signal":"logs"}"#).unwrap();
+        assert_eq!(logs.query().unwrap().table, KeyTable::Logs);
+        for signal in ["metrics", "spans", "Logs", ""] {
+            let body = format!(r#"{{"signal":"{signal}"}}"#);
+            let err = KeysLookup::parse(body.as_bytes())
+                .unwrap()
+                .query()
+                .unwrap_err();
+            assert!(matches!(err, QueryError::InvalidAction(_)), "{err}");
+        }
         assert!(
             KeysLookup::parse(br#"{"prefix":"x"}"#).is_err(),
             "signal is required"

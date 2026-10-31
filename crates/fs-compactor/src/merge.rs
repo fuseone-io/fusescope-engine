@@ -1,4 +1,5 @@
-//! The k-way merge of sorted L0 files into sorted L1 files.
+//! The k-way merge of sorted L0 files of one signal, spans or log rows,
+//! into sorted L1 files of that signal.
 //!
 //! Every input is sorted by `(service_name, timestamp)` with ties in log
 //! order, so one row group per input is enough to produce the output in
@@ -24,7 +25,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, FileRecord, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_index::TraceIndex;
 use fs_schema::attribute_keys::KeyStats;
-use fs_schema::parquet::{gather, writer_properties};
+use fs_schema::logs::log_schema_v1;
+use fs_schema::parquet::{gather, log_writer_properties, writer_properties};
 use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::spans::{TRACE_ID_BYTES, col, span_schema_v1, trace_ids};
 use fs_schema::trace_summary::TraceSummaries;
@@ -46,10 +48,8 @@ pub struct Output {
     pub file: NewFile,
     /// Parquet bytes.
     pub bytes: Bytes,
-    /// Encoded `trace_id` sidecar.
-    pub index: Bytes,
-    /// Where the sidecar goes.
-    pub index_path: String,
+    /// Where the `trace_id` sidecar goes and its bytes; spans only.
+    pub index: Option<(String, Bytes)>,
 }
 
 /// Bounds of one merge.
@@ -72,8 +72,10 @@ pub struct MergeConfig {
     pub service_graph_max_bytes: usize,
 }
 
-/// Merges L0 files of one tenant and hour into L1 outputs, one at a time.
+/// Merges L0 files of one tenant, signal and hour into L1 outputs, one at
+/// a time.
 pub struct L1Merger {
+    signal: Signal,
     schema: SchemaRef,
     merge: Merge,
     root: Path,
@@ -90,27 +92,37 @@ pub struct L1Merger {
 }
 
 impl L1Merger {
-    /// Opens `inputs`, all L0 files of `tenant` in the hour starting at
-    /// `hour`; outputs go under `root`. `keys` is the tenant's
-    /// `attribute_keys` table before, which the merge counts into.
+    /// Opens `inputs`, all L0 files of `signal` of `tenant` in the hour
+    /// starting at `hour`; outputs go under `root`. `keys` is the tenant's
+    /// table of attribute keys of that signal before, which the merge
+    /// counts into. Trace summaries and the service graph are built from
+    /// spans only.
     ///
     /// # Errors
-    /// Store or Parquet failures opening an input.
+    /// A signal without L1 files, or store or Parquet failures opening an
+    /// input.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         store: Arc<dyn ObjectStore>,
         root: &Path,
         tenant: TenantId,
+        signal: Signal,
         hour: DateTime<Utc>,
         inputs: &[FileRecord],
         config: MergeConfig,
         keys: KeyStats,
     ) -> Result<Self, CompactError> {
-        let schema = span_schema_v1();
+        let schema = match signal {
+            Signal::Traces => span_schema_v1(),
+            Signal::Logs => log_schema_v1(),
+            _ => return Err(CompactError::Merge("a signal without L1 files")),
+        };
         let merge = Merge::open(store, inputs, &schema, config.row_group_rows).await?;
         let hour_ns = hour
             .timestamp_nanos_opt()
             .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
         Ok(Self {
+            signal,
             schema,
             merge,
             root: root.clone(),
@@ -147,12 +159,13 @@ impl L1Merger {
     ///
     /// # Errors
     /// Store, Parquet or Arrow failures, or an input whose columns are not
-    /// the span schema.
+    /// the signal's schema.
     pub async fn next_output(&mut self) -> Result<Option<Output>, CompactError> {
         if self.done {
             return Ok(None);
         }
-        let mut current = OutputBuilder::new(&self.schema, self.config.row_group_rows)?;
+        let mut current =
+            OutputBuilder::new(&self.schema, self.signal, self.config.row_group_rows)?;
         while let Some(group) = self
             .merge
             .next_group(&self.schema, self.config.row_group_rows)
@@ -160,16 +173,18 @@ impl L1Merger {
         {
             self.keys
                 .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
-            self.summaries.absorb(
-                &group,
-                self.config.trace_summary_max_traces,
-                self.config.trace_summary_max_bytes,
-            )?;
-            self.graph.absorb(
-                &group,
-                self.config.service_graph_max_spans,
-                self.config.service_graph_max_bytes,
-            )?;
+            if self.signal == Signal::Traces {
+                self.summaries.absorb(
+                    &group,
+                    self.config.trace_summary_max_traces,
+                    self.config.trace_summary_max_bytes,
+                )?;
+                self.graph.absorb(
+                    &group,
+                    self.config.service_graph_max_spans,
+                    self.config.service_graph_max_bytes,
+                )?;
+            }
             current.write(&group)?;
             if current.bytes_written() >= self.config.target_bytes {
                 return Ok(Some(current.finish(&self.root, self.tenant, self.hour)?));
@@ -183,15 +198,29 @@ impl L1Merger {
     }
 }
 
-/// `{root}/t/{tenant}/traces/l1/dt=YYYY-MM-DD/hr=HH/{id}.parquet`
-pub fn l1_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
-    partitioned_path(root, tenant, "traces/l1", hour, id)
+/// `{root}/t/{tenant}/{traces|logs}/l1/dt=YYYY-MM-DD/hr=HH/{id}.parquet`
+pub fn l1_path(
+    root: &Path,
+    tenant: TenantId,
+    signal: Signal,
+    hour: DateTime<Utc>,
+    id: FileId,
+) -> Path {
+    let kind = format!("{}/l1", signal.path_name());
+    partitioned_path(root, tenant, &kind, hour, id)
 }
 
-/// `{root}/t/{tenant}/derived/attribute_keys/dt=YYYY-MM-DD/hr=HH/{id}.parquet`,
-/// partitioned by the hour of the pass that rebuilt the table.
-pub fn attribute_keys_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
-    partitioned_path(root, tenant, "derived/attribute_keys", hour, id)
+/// `{root}/t/{tenant}/derived/{attribute_keys|log_attribute_keys}/dt=YYYY-MM-DD/hr=HH/{id}.parquet`,
+/// the table of `keys`, partitioned by the hour of the pass that rebuilt
+/// the table.
+pub fn attribute_keys_path(
+    root: &Path,
+    tenant: TenantId,
+    keys: Signal,
+    hour: DateTime<Utc>,
+    id: FileId,
+) -> Path {
+    partitioned_path(root, tenant, keys.path_name(), hour, id)
 }
 
 /// Path of a per-pass trace summary contribution.
@@ -489,6 +518,7 @@ impl Merge {
 
 /// One L1 file being written.
 struct OutputBuilder {
+    signal: Signal,
     writer: ArrowWriter<Vec<u8>>,
     rows: usize,
     ts_min: i64,
@@ -498,13 +528,19 @@ struct OutputBuilder {
 }
 
 impl OutputBuilder {
-    fn new(schema: &SchemaRef, row_group_rows: usize) -> Result<Self, CompactError> {
-        let writer = ArrowWriter::try_new(
-            Vec::new(),
-            Arc::clone(schema),
-            Some(writer_properties(row_group_rows)?),
-        )?;
+    fn new(
+        schema: &SchemaRef,
+        signal: Signal,
+        row_group_rows: usize,
+    ) -> Result<Self, CompactError> {
+        let properties = if signal == Signal::Logs {
+            log_writer_properties(row_group_rows)?
+        } else {
+            writer_properties(row_group_rows)?
+        };
+        let writer = ArrowWriter::try_new(Vec::new(), Arc::clone(schema), Some(properties))?;
         Ok(Self {
+            signal,
             writer,
             rows: 0,
             ts_min: i64::MAX,
@@ -534,8 +570,10 @@ impl OutputBuilder {
                 self.services.insert(value.to_owned());
             }
         }
-        if let Some(ids) = trace_ids(group) {
-            self.traces.extend(ids);
+        if self.signal == Signal::Traces {
+            if let Some(ids) = trace_ids(group) {
+                self.traces.extend(ids);
+            }
         }
         self.writer.write(group)?;
         self.writer.flush()?;
@@ -555,20 +593,25 @@ impl OutputBuilder {
     ) -> Result<Output, CompactError> {
         let bytes = Bytes::from(self.writer.into_inner()?);
         let id = FileId::new();
-        let path = l1_path(root, tenant, hour, id);
-        let index_path = fs_index::sidecar_path(path.as_ref())
-            .ok_or(CompactError::Merge("output path has no sidecar"))?;
-        self.traces.sort_unstable();
-        self.traces.dedup();
-        let index = TraceIndex::new(
-            vec![path.to_string()],
-            self.traces.iter().map(|t| (*t, 0u32)),
-        )?;
+        let path = l1_path(root, tenant, self.signal, hour, id);
+        let index = if self.signal == Signal::Traces {
+            let index_path = fs_index::sidecar_path(path.as_ref())
+                .ok_or(CompactError::Merge("output path has no sidecar"))?;
+            self.traces.sort_unstable();
+            self.traces.dedup();
+            let index = TraceIndex::new(
+                vec![path.to_string()],
+                self.traces.iter().map(|t| (*t, 0u32)),
+            )?;
+            Some((index_path, Bytes::from(index.encode())))
+        } else {
+            None
+        };
         let file = NewFile {
             id,
             origin: id,
             tenant_id: tenant,
-            signal: Signal::Traces,
+            signal: self.signal,
             level: Level::L1,
             path: path.to_string(),
             size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
@@ -581,11 +624,6 @@ impl OutputBuilder {
             summary: None,
             content_sha256: Some(crate::objects::sha256(&bytes)),
         };
-        Ok(Output {
-            file,
-            bytes,
-            index: Bytes::from(index.encode()),
-            index_path,
-        })
+        Ok(Output { file, bytes, index })
     }
 }

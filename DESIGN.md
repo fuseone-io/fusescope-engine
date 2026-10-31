@@ -305,7 +305,7 @@ Rules:
 create table engine_file (
   id             uuid primary key,
   tenant_id      uuid not null,
-  signal         smallint not null,           -- 1 traces, 2 logs, 3 metric samples, 4 metric series, 10+ derived
+  signal         smallint not null,           -- 1 traces, 2 logs, 3 metric samples, 4 metric series, 10+ derived (17 log_attribute_keys)
   level          smallint not null,           -- 0, 1, 2
   path           text not null unique,
   size_bytes     bigint not null,
@@ -554,8 +554,9 @@ At every level the compactor:
 
 ### 7.1 L0 to L1
 
-A pass takes the oldest cold hour, across tenants: one whose visible L0
-files number at least two and all ended, and were confirmed, more than
+A pass takes the oldest cold hour, across tenants and signals, spans before
+logs within an hour, of one signal: one whose visible L0 files of that
+signal number at least two and all ended, and were confirmed, more than
 `compactor.hour_close_delay_secs` ago, so the hot window has let go of them
 and late data is no longer arriving. The ingester confirms a registration
 in a second statement once the rows are retained in memory for it, so the
@@ -578,7 +579,8 @@ repeatable-read snapshot, so a file registered meanwhile is neither counted
 nor taken. It merges the hour's oldest files up to
 `compactor.max_inputs_per_pass` and `compactor.max_input_bytes`, a ceiling:
 an hour whose two oldest files do not fit is passed over, reported once, and
-the next cold hour is tried, so one oversized hour never blocks the queue;
+the next cold hour of either signal is tried, so one oversized hour never
+blocks the queue;
 the server refuses a cap under twice the ingest buffer so two L0 files
 normally fit. A large hour closes over
 several passes; an hour left with a single L0 file keeps it. A pass runs
@@ -591,8 +593,16 @@ name as the inputs sorted it; an L1 file closes once it reaches
 before the next one starts, so memory holds one decoded row group per
 input, the row group being gathered and the compressed bytes of the one
 file being written. Outputs go to `traces/l1/dt=…/hr=…/{id}.parquet`, each
-with its own `trace_id` sidecar; once all are in the bucket, one fenced
-swap quarantines the inputs and publishes the outputs. A crash or failure
+with its own `trace_id` sidecar, or to `logs/l1/dt=…/hr=…/{id}.parquet`
+through the log writer settings, without a sidecar; once all are in the
+bucket, one fenced swap quarantines the inputs and publishes the outputs.
+Log hours are taken only with `compactor.compact_logs`, off by default: a
+binary from before log compaction fails on a catalog that holds
+`log_attribute_keys` rows (signal 17), so it is turned on once every
+compactor and querier runs this version, and from then on the binary is
+not rolled back past it. Off, no pass takes a new hour of log files;
+reading, the purge, the orphan sweep, retention and the rebuild of what
+log passes wrote run regardless. A crash or failure
 before the swap commits leaves the inputs visible and every object created
 so far as an orphan for the orphan sweep, counted whatever the failure; a
 swap refused for a conflict or a lost lease leaves them the same way; a
@@ -612,6 +622,7 @@ Derived tables replacing the ClickHouse materialized views:
 | duration_sort | durationSort | top-k per service and operation, per hour |
 | usage_1h | usage | bytes and rows per tenant, signal, service, hour |
 | attribute_keys | tag_attributes, span_attributes_keys | key, type, count, first and last seen |
+| log_attribute_keys | logs_attribute_keys, logs_resource_keys | as attribute_keys, of log rows |
 | rollup_5m, rollup_30m | samples_v4_agg_5m, samples_v4_agg_30m | fingerprint, window: min, max, sum, count, last |
 
 `trace_summary` and `service_graph_1m` are immutable contributions of one
@@ -717,6 +728,20 @@ queries that meet a new path at the same time, since an object is never
 rewritten, and refuse anything else, so an older engine never rewrites a
 newer table and a file is never read as a version it is not.
 
+`log_attribute_keys` is the same table for log rows, its own one per
+tenant: catalog signal 17, files under
+`t/{tenant}/derived/log_attribute_keys/…`, format v1 laid out as
+`attribute_keys` v2 with its own `fusescope.signal`, and `source` one of
+`resource`, `log` or `scope`. A log pass reads and replaces only it, a span
+pass only `attribute_keys`, so neither rewrites the other's history, and
+`max_keys_hour` bounds each table on its own: a tenant may gain up to twice
+that many keys in an hour, half of them per signal. Readers check the
+source against the table as well as the footer: the compactor's decoder
+refuses a row of the other table's source and the encoder never writes
+one; SQL checks the footer alone. Both formats have a committed fixture,
+`attribute_keys_v2.parquet`, which the current encoder must still produce
+byte for byte, and `log_attribute_keys_v1.parquet`.
+
 Retention: every `compactor.retention_interval_secs` the leader quarantines
 the files beyond their tenant's `retention_days`, first in the catalog,
 then in the bucket. The cut is a UTC day boundary on the catalog's clock,
@@ -752,6 +777,12 @@ examines at most `compactor.rebuilds_per_tick` stale tables, 256 at most
 and clamped there by the compactor itself, a table passed over counting
 like one rebuilt, so the leader's purge, compaction and sweep are never
 long behind the rebuilds whatever is held back or over a cap.
+`log_attribute_keys` tables are rebuilt the same way from the log L1
+files: the two kinds have a walk each, the calls take turns between them,
+and the tick's budget counts tables of both together; a round ends once
+both walks have. Backoff and the report of a cap are per table, a tenant
+and a kind, so a damaged `attribute_keys` never holds back the tenant's
+`log_attribute_keys`, nor the other way round.
 The stale tables are walked by earliest sighting with a keyset cursor
 that outlives calls and ticks and wraps around at the end
 (`stale_derived_table`), each table once a round whether its rebuild
@@ -948,7 +979,9 @@ service with their span counts, most frequent first, through the spans
 table like SQL would. `metadata.keys` takes `{"signal": "traces",
 "prefix": p, "limit": n}` and answers the rows of the `attribute_keys`
 table (section 7) whose key starts with the prefix, most frequent first;
-the table is also `attribute_keys` in SQL. A listing answers at most
+the table is also `attribute_keys` in SQL. `"signal": "logs"` answers the
+rows of `log_attribute_keys`, also a SQL table, and any other signal is
+`INVALID_ARGUMENT`. A listing answers at most
 `limit` rows, 1000 when absent, never more than `query.max_rows`
 (`fusescope_query_metadata_lookups_total`). An unknown action is
 `UNIMPLEMENTED`, a malformed body or a field the action does not know

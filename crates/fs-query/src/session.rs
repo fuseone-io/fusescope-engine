@@ -16,7 +16,7 @@ use datafusion::prelude::SessionConfig;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use fs_catalog::{Signal, TenantId};
-use fs_schema::attribute_keys;
+use fs_schema::attribute_keys::{self, KeyTable};
 use fs_schema::{service_graph, trace_summary};
 
 use crate::QueryError;
@@ -92,7 +92,19 @@ pub fn tenant_session(
             store_url.clone(),
             Signal::AttributeKeys,
             attribute_keys::table_schema(),
-            |schema| attribute_keys::check_schema(schema).map(|_| ()),
+            |schema| attribute_keys::check_schema(schema, KeyTable::Spans).map(|_| ()),
+            Arc::clone(&verified),
+        )),
+    )?;
+    schema.register_table(
+        KeyTable::Logs.name().into(),
+        Arc::new(DerivedTable::new(
+            tenant,
+            Arc::clone(&cache),
+            store_url.clone(),
+            Signal::LogAttributeKeys,
+            KeyTable::Logs.session_schema(),
+            |schema| attribute_keys::check_schema(schema, KeyTable::Logs).map(|_| ()),
             Arc::clone(&verified),
         )),
     )?;

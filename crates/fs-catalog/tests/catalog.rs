@@ -999,6 +999,77 @@ async fn registered_an_hour_ago(db: &TestDb, ids: &[FileId]) {
     .unwrap();
 }
 
+/// One snapshot over the signals asked: the oldest cold hour of any of
+/// them comes first, spans before logs in the same hour, and an hour is
+/// only ever the files of its own signal.
+#[tokio::test]
+async fn compaction_inputs_take_the_oldest_hour_of_the_signals_asked() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let t = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("t"))
+        .await
+        .unwrap()
+        .id;
+    let closed = StdDuration::from_secs(60);
+    let mut ids = Vec::new();
+    for (signal, h, n) in [
+        (Signal::Traces, 1, 1),
+        (Signal::Logs, 1, 2),
+        (Signal::Traces, 2, 2),
+        (Signal::Logs, 2, 3),
+    ] {
+        for _ in 0..n {
+            ids.push(
+                db.catalog
+                    .register_file(&file(t, signal, h, h, &[]))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+    }
+    registered_an_hour_ago(&db, &ids).await;
+    let at = |signals: &'static [Signal], skip: i64| {
+        let catalog = db.catalog.clone();
+        async move {
+            catalog
+                .compaction_inputs(signals, closed, 2, skip)
+                .await
+                .unwrap()
+                .map(|c| {
+                    assert!(c.files.iter().all(|f| f.signal == c.signal));
+                    (c.signal, c.hour, c.files.len())
+                })
+        }
+    };
+    assert_eq!(
+        at(&[Signal::Traces, Signal::Logs], 0).await,
+        Some((Signal::Logs, hour(1), 2))
+    );
+    assert_eq!(
+        at(&[Signal::Traces, Signal::Logs], 1).await,
+        Some((Signal::Traces, hour(2), 2))
+    );
+    assert_eq!(
+        at(&[Signal::Traces, Signal::Logs], 2).await,
+        Some((Signal::Logs, hour(2), 3))
+    );
+    assert_eq!(at(&[Signal::Traces, Signal::Logs], 3).await, None);
+    assert_eq!(
+        at(&[Signal::Traces], 0).await,
+        Some((Signal::Traces, hour(2), 2))
+    );
+    assert_eq!(
+        at(&[Signal::Logs], 1).await,
+        Some((Signal::Logs, hour(2), 3))
+    );
+    assert_eq!(at(&[], 0).await, None);
+    db.finish().await;
+}
+
 /// The oldest cold hour with enough L0 files comes first, with every L0
 /// file of that hour; an hour with a file that ended or was registered
 /// recently is not cold; other levels do not count.
@@ -1014,7 +1085,10 @@ async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
         .unwrap()
         .id;
     let closed = StdDuration::from_secs(60);
-    let inputs = |min: i64| db.catalog.compaction_inputs(Signal::Traces, closed, min, 0);
+    let inputs = |min: i64| {
+        db.catalog
+            .compaction_inputs(&[Signal::Traces], closed, min, 0)
+    };
     assert!(inputs(2).await.unwrap().is_none());
 
     // Hour 1 has two files, hour 0 one, hour 2 three; all ended long ago.
@@ -1059,7 +1133,7 @@ async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
     );
     let second = db
         .catalog
-        .compaction_inputs(Signal::Traces, closed, 2, 1)
+        .compaction_inputs(&[Signal::Traces], closed, 2, 1)
         .await
         .unwrap()
         .unwrap();
@@ -1067,7 +1141,7 @@ async fn compaction_inputs_are_the_l0_files_of_the_oldest_cold_hour() {
     assert_eq!(second.files.len(), 3);
     assert!(
         db.catalog
-            .compaction_inputs(Signal::Traces, closed, 2, 2)
+            .compaction_inputs(&[Signal::Traces], closed, 2, 2)
             .await
             .unwrap()
             .is_none()
@@ -1634,7 +1708,10 @@ async fn an_hour_closes_only_after_its_registrations_were_confirmed() {
         .unwrap()
         .id;
     let closed = StdDuration::from_secs(1);
-    let inputs = || db.catalog.compaction_inputs(Signal::Traces, closed, 2, 0);
+    let inputs = || {
+        db.catalog
+            .compaction_inputs(&[Signal::Traces], closed, 2, 0)
+    };
 
     // Every row written from here on waits in its transaction for longer
     // than `closed` before it commits.

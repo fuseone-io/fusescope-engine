@@ -303,6 +303,7 @@ fn compactor(f: &Fixture) -> Compactor {
             service_graph_max_spans: 4_000_000,
             service_graph_max_bytes: 256 << 20,
             row_group_rows: 4,
+            compact_logs: false,
             inject_swap_failures: 0,
             inject_put_failure_at: None,
             inject_put_hold: None,
@@ -355,7 +356,8 @@ async fn tables_of(f: &Fixture, tenant: TenantId) -> Vec<FileRecord> {
 
 fn keys_of(f: &Fixture, file: &FileRecord) -> KeyStats {
     let bytes = std::fs::read(f.dir.path().join(&file.path)).unwrap();
-    fs_schema::attribute_keys::decode(bytes.into()).unwrap()
+    fs_schema::attribute_keys::decode(bytes.into(), fs_schema::attribute_keys::KeyTable::Spans)
+        .unwrap()
 }
 
 async fn present(f: &Fixture, path: &str) -> bool {
@@ -1069,6 +1071,7 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
                 service_graph_max_spans: 4_000_000,
                 service_graph_max_bytes: 256 << 20,
                 row_group_rows: 4,
+                compact_logs: false,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
                 inject_put_hold: None,

@@ -186,6 +186,13 @@ hot window did not answer. An ingester of a version without logs answers a
 `logs` result partial until that ingester is rolled forward, so ingesters
 go first in a rollout.
 
+Log compaction (`compactor.compact_logs`) is off by default. Turn it on
+only once every compactor and querier runs a version that has it: the
+first log pass writes a `log_attribute_keys` row, catalog signal 17, and
+an older binary fails on any listing that meets it. From then on the
+binary is not rolled back past that version; turning the key off again
+stops new log passes but does not make a rollback safe.
+
 ### Start
 
 | Message | Meaning |

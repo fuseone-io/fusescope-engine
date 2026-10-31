@@ -16,6 +16,12 @@
 //! required, `admitted_hour` always the start of an hour. Every reader
 //! checks signal, version and layout with [`check_schema`] and refuses
 //! anything else, so a file is never read as a version it is not.
+//!
+//! The keys of log rows are a table of their own, `log_attribute_keys`
+//! ([`KeyTable::Logs`]): format v1 is laid out as `attribute_keys` v2,
+//! under `derived/log_attribute_keys`, with its own signal in the
+//! metadata and `source` one of `resource`, `log` or `scope`. A source of
+//! the other table, read or written, is refused.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -43,15 +49,99 @@ pub const SIGNAL: &str = "attribute_keys";
 /// Nanoseconds in an hour.
 const HOUR_NS: i64 = 3_600_000_000_000;
 
-/// Where a key lives on a span.
+/// Which rows a table lists the keys of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum KeyTable {
+    /// `attribute_keys`, the keys of spans.
+    #[default]
+    Spans,
+    /// `log_attribute_keys`, the keys of log rows.
+    Logs,
+}
+
+impl KeyTable {
+    /// Name of the table in a query session, also its `fusescope.signal`.
+    pub fn name(self) -> &'static str {
+        match self {
+            KeyTable::Spans => SIGNAL,
+            KeyTable::Logs => "log_attribute_keys",
+        }
+    }
+
+    /// Version of the layout this engine writes.
+    pub fn version(self) -> u32 {
+        match self {
+            KeyTable::Spans => SCHEMA_VERSION,
+            KeyTable::Logs => 1,
+        }
+    }
+
+    /// Versions this engine reads.
+    pub fn readable_versions(self) -> &'static [u32] {
+        match self {
+            KeyTable::Spans => &READABLE_VERSIONS,
+            KeyTable::Logs => &[1],
+        }
+    }
+
+    /// Schema of a file this engine writes; `admitted_hour` is never null.
+    pub fn file_schema(self) -> SchemaRef {
+        with_metadata(self, self.version(), false)
+    }
+
+    /// The table as a query session reads it, with `admitted_hour`
+    /// nullable where a readable version lacks it. A logical schema only.
+    pub fn session_schema(self) -> SchemaRef {
+        let lacking = self
+            .readable_versions()
+            .iter()
+            .any(|v| !self.has_admission(*v));
+        with_metadata(self, self.version(), lacking)
+    }
+
+    fn has_admission(self, version: u32) -> bool {
+        match self {
+            KeyTable::Spans => version >= 2,
+            KeyTable::Logs => true,
+        }
+    }
+
+    /// Where the attributes of a row of this table live.
+    fn row_source(self) -> KeySource {
+        match self {
+            KeyTable::Spans => KeySource::Span,
+            KeyTable::Logs => KeySource::Log,
+        }
+    }
+
+    fn lists(self, source: KeySource) -> bool {
+        matches!(source, KeySource::Resource | KeySource::Scope) || source == self.row_source()
+    }
+
+    /// The map columns of the rows and what their keys are.
+    fn map_columns(self) -> [(&'static str, KeySource, KeyType); 5] {
+        let row = self.row_source();
+        [
+            (col::RESOURCES_STRING, KeySource::Resource, KeyType::String),
+            (col::ATTRIBUTES_STRING, row, KeyType::String),
+            (col::ATTRIBUTES_NUMBER, row, KeyType::Number),
+            (col::ATTRIBUTES_BOOL, row, KeyType::Bool),
+            (col::SCOPE_STRING, KeySource::Scope, KeyType::String),
+        ]
+    }
+}
+
+/// Where a key lives on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeySource {
     /// Resource attribute.
     Resource,
-    /// Span attribute.
+    /// Span attribute; only in `attribute_keys`.
     Span,
     /// Instrumentation scope attribute.
     Scope,
+    /// Log record attribute; only in `log_attribute_keys`.
+    Log,
 }
 
 impl KeySource {
@@ -61,6 +151,7 @@ impl KeySource {
             KeySource::Resource => "resource",
             KeySource::Span => "span",
             KeySource::Scope => "scope",
+            KeySource::Log => "log",
         }
     }
 
@@ -69,6 +160,7 @@ impl KeySource {
             "resource" => Some(KeySource::Resource),
             "span" => Some(KeySource::Span),
             "scope" => Some(KeySource::Scope),
+            "log" => Some(KeySource::Log),
             _ => None,
         }
     }
@@ -108,11 +200,11 @@ impl KeyType {
 /// What is known about one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySeen {
-    /// Spans carrying the key.
+    /// Rows carrying the key.
     pub count: u64,
-    /// Earliest `timestamp` of a span carrying it, nanoseconds.
+    /// Earliest `timestamp` of a row carrying it, nanoseconds.
     pub first_seen: i64,
-    /// Latest `timestamp` of a span carrying it, nanoseconds.
+    /// Latest `timestamp` of a row carrying it, nanoseconds.
     pub last_seen: i64,
     /// Start of the hour whose budget admitted the key, nanoseconds.
     /// Fixed once admitted: late data of an earlier hour widens the count
@@ -129,29 +221,21 @@ impl KeySeen {
     }
 }
 
-/// Keys of one tenant, in table order. Keys seen since the stats were
-/// built, decoded or settled count as new, against the cap [`absorb`] is
-/// given.
+/// Keys of one tenant in one [`KeyTable`], in table order. Keys seen
+/// since the stats were built, decoded or settled count as new, against
+/// the cap [`absorb`] is given. The default is an empty `attribute_keys`.
 ///
 /// [`absorb`]: KeyStats::absorb
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyStats {
+    table: KeyTable,
     keys: BTreeMap<(KeySource, KeyType), BTreeMap<String, KeySeen>>,
     new_keys: usize,
     dropped: u64,
 }
 
-/// The map columns of the span schema and what their keys are.
-const MAP_COLUMNS: [(&str, KeySource, KeyType); 5] = [
-    (col::RESOURCES_STRING, KeySource::Resource, KeyType::String),
-    (col::ATTRIBUTES_STRING, KeySource::Span, KeyType::String),
-    (col::ATTRIBUTES_NUMBER, KeySource::Span, KeyType::Number),
-    (col::ATTRIBUTES_BOOL, KeySource::Span, KeyType::Bool),
-    (col::SCOPE_STRING, KeySource::Scope, KeyType::String),
-];
-
-/// The span columns [`KeyStats::absorb`] reads: a batch projected to
-/// these is enough.
+/// The columns [`KeyStats::absorb`] reads, the same in spans and log
+/// rows: a batch projected to these is enough.
 pub const READ_COLUMNS: [&str; 6] = [
     col::TIMESTAMP,
     col::RESOURCES_STRING,
@@ -200,8 +284,21 @@ impl Admission<'_> {
 }
 
 impl KeyStats {
-    /// Counts the keys of every span in `batch`, a batch of the span
-    /// schema, once per span however often a span repeats a key. A key
+    /// An empty table of `table`.
+    pub fn new(table: KeyTable) -> Self {
+        Self {
+            table,
+            ..Self::default()
+        }
+    }
+
+    /// The table these are the keys of.
+    pub fn table(&self) -> KeyTable {
+        self.table
+    }
+
+    /// Counts the keys of every row in `batch`, a batch of the span or
+    /// log schema as the table is, once per row however often a span repeats a key. A key
     /// not seen before is admitted on `hour`'s budget while fewer than
     /// `max_new_keys` were admitted since the stats were built, decoded
     /// or settled; beyond that its entries are dropped and counted,
@@ -245,6 +342,7 @@ impl KeyStats {
         admission: &Admission<'_>,
     ) -> Result<(), SchemaError> {
         let Self {
+            table,
             keys,
             new_keys,
             dropped,
@@ -255,7 +353,7 @@ impl KeyStats {
             .as_primitive_opt::<TimestampNanosecondType>()
             .ok_or(SchemaError::Layout("timestamp"))?;
         let mut in_row: HashSet<&str> = HashSet::new();
-        for (name, source, kind) in MAP_COLUMNS {
+        for (name, source, kind) in table.map_columns() {
             let map = batch
                 .column(schema.index_of(name)?)
                 .as_map_opt()
@@ -366,11 +464,18 @@ impl KeyStats {
         })
     }
 
-    /// The table as one batch of [`attribute_keys_schema_v2`].
+    /// The table as one batch of its [`KeyTable::file_schema`].
     ///
     /// # Errors
-    /// Arrow refusing the arrays, which cannot happen for a consistent map.
+    /// A source the table does not list, merged in from the other table.
     pub fn to_batch(&self) -> Result<RecordBatch, SchemaError> {
+        if self
+            .keys
+            .keys()
+            .any(|(source, _)| !self.table.lists(*source))
+        {
+            return Err(SchemaError::Layout("attribute key source of another table"));
+        }
         let rows = self.len();
         let mut keys = Vec::with_capacity(rows);
         let mut sources = Vec::with_capacity(rows);
@@ -389,7 +494,7 @@ impl KeyStats {
             admitted.push(seen.admitted_hour);
         }
         Ok(RecordBatch::try_new(
-            attribute_keys_schema_v2(),
+            self.table.file_schema(),
             vec![
                 Arc::new(StringArray::from(keys)),
                 Arc::new(StringArray::from(sources)),
@@ -402,14 +507,22 @@ impl KeyStats {
         )?)
     }
 
-    /// Reads a batch of the table at `version`, exactly as that version
-    /// lays it out; nothing read counts as new.
+    /// Reads a batch of `table` at `version`, exactly as that version lays
+    /// it out; nothing read counts as new.
     ///
     /// # Errors
-    /// A batch missing a column of its version, carrying one it does not
-    /// have, with a null `admitted_hour` or one that is not the start of
-    /// an hour, or with a source or type the version does not know.
-    pub fn from_batch(batch: &RecordBatch, version: u32) -> Result<Self, SchemaError> {
+    /// A version the table does not have, a batch missing a column of its
+    /// version, carrying one it does not have, with a null
+    /// `admitted_hour` or one that is not the start of an hour, or with a
+    /// source the table does not list or a type the version does not know.
+    pub fn from_batch(
+        batch: &RecordBatch,
+        table: KeyTable,
+        version: u32,
+    ) -> Result<Self, SchemaError> {
+        if !table.readable_versions().contains(&version) {
+            return Err(SchemaError::Layout("attribute_keys schema version"));
+        }
         let schema = batch.schema();
         let column = |name: &str| -> Result<&arrow::array::ArrayRef, SchemaError> {
             Ok(batch.column(schema.index_of(name)?))
@@ -432,17 +545,22 @@ impl KeyStats {
         let lasts = column(col_names::LAST_SEEN)?
             .as_primitive_opt::<TimestampNanosecondType>()
             .ok_or(SchemaError::Layout("last_seen"))?;
-        let admitted = match (version, schema.index_of(col_names::ADMITTED_HOUR).ok()) {
-            (1, None) => None,
-            (1, Some(_)) => return Err(SchemaError::Layout("admitted_hour in a v1 table")),
-            (2, None) => return Err(SchemaError::Layout("admitted_hour missing from a v2 table")),
-            (2, Some(index)) => {
+        let admitted = match (
+            table.has_admission(version),
+            schema.index_of(col_names::ADMITTED_HOUR).ok(),
+        ) {
+            (false, None) => None,
+            (false, Some(_)) => {
+                return Err(SchemaError::Layout("admitted_hour in a version without it"));
+            }
+            (true, None) => return Err(SchemaError::Layout("admitted_hour missing")),
+            (true, Some(index)) => {
                 let admitted = batch
                     .column(index)
                     .as_primitive_opt::<TimestampNanosecondType>()
                     .ok_or(SchemaError::Layout("admitted_hour"))?;
                 if admitted.null_count() > 0 {
-                    return Err(SchemaError::Layout("null admitted_hour in a v2 table"));
+                    return Err(SchemaError::Layout("null admitted_hour"));
                 }
                 if admitted.values().iter().any(|a| a.rem_euclid(HOUR_NS) != 0) {
                     return Err(SchemaError::Layout(
@@ -451,12 +569,12 @@ impl KeyStats {
                 }
                 Some(admitted)
             }
-            _ => return Err(SchemaError::Layout("attribute_keys schema version")),
         };
-        let mut out = KeyStats::default();
+        let mut out = KeyStats::new(table);
         for row in 0..batch.num_rows() {
-            let source =
-                KeySource::parse(sources.value(row)).ok_or(SchemaError::Layout("source"))?;
+            let source = KeySource::parse(sources.value(row))
+                .filter(|source| table.lists(*source))
+                .ok_or(SchemaError::Layout("source"))?;
             let kind = KeyType::parse(kinds.value(row)).ok_or(SchemaError::Layout("type"))?;
             let first_seen = firsts.value(row);
             let seen = KeySeen {
@@ -485,17 +603,18 @@ fn hour_of(ns: i64) -> i64 {
 pub mod col_names {
     /// The attribute key.
     pub const KEY: &str = "key";
-    /// Where it lives: `resource`, `span` or `scope`.
+    /// Where it lives: `resource`, `scope`, and `span` or `log`.
     pub const SOURCE: &str = "source";
     /// Its type: `string`, `number` or `bool`.
     pub const TYPE: &str = "type";
-    /// Spans carrying it.
+    /// Rows carrying it.
     pub const COUNT: &str = "count";
-    /// Earliest span carrying it.
+    /// Earliest row carrying it.
     pub const FIRST_SEEN: &str = "first_seen";
-    /// Latest span carrying it.
+    /// Latest row carrying it.
     pub const LAST_SEEN: &str = "last_seen";
-    /// Start of the hour whose budget admitted it; absent in v1.
+    /// Start of the hour whose budget admitted it; absent in
+    /// `attribute_keys` v1.
     pub const ADMITTED_HOUR: &str = "admitted_hour";
 }
 
@@ -505,18 +624,18 @@ pub const TABLE: &str = "attribute_keys";
 /// Schema of the table, version 2, as written: `admitted_hour` is never
 /// null.
 pub fn attribute_keys_schema_v2() -> SchemaRef {
-    with_metadata(SCHEMA_VERSION, false)
+    KeyTable::Spans.file_schema()
 }
 
 /// The table as a query session reads it: v2, with `admitted_hour`
 /// nullable so a v1 file, which lacks it, reads with it null. A logical
 /// schema only: a file laid out like it is refused by [`check_schema`].
 pub fn table_schema() -> SchemaRef {
-    with_metadata(SCHEMA_VERSION, true)
+    KeyTable::Spans.session_schema()
 }
 
-/// The columns of `version`, in order, as (name, type).
-fn layout(version: u32) -> Vec<(&'static str, DataType)> {
+/// The columns of `table` at `version`, in order, as (name, type).
+fn layout(table: KeyTable, version: u32) -> Vec<(&'static str, DataType)> {
     let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
     let mut columns = vec![
         (col_names::KEY, DataType::Utf8),
@@ -526,18 +645,18 @@ fn layout(version: u32) -> Vec<(&'static str, DataType)> {
         (col_names::FIRST_SEEN, timestamp.clone()),
         (col_names::LAST_SEEN, timestamp.clone()),
     ];
-    if version >= 2 {
+    if table.has_admission(version) {
         columns.push((col_names::ADMITTED_HOUR, timestamp));
     }
     columns
 }
 
-fn with_metadata(version: u32, admission_nullable: bool) -> SchemaRef {
+fn with_metadata(table: KeyTable, version: u32, admission_nullable: bool) -> SchemaRef {
     let metadata = [
-        ("fusescope.signal".to_owned(), SIGNAL.to_owned()),
+        ("fusescope.signal".to_owned(), table.name().to_owned()),
         ("fusescope.schema_version".to_owned(), version.to_string()),
     ];
-    let fields = layout(version)
+    let fields = layout(table, version)
         .into_iter()
         .map(|(name, data_type)| {
             let nullable = name == col_names::ADMITTED_HOUR && admission_nullable;
@@ -550,24 +669,24 @@ fn with_metadata(version: u32, admission_nullable: bool) -> SchemaRef {
     ))
 }
 
-/// Refuses a file schema that is not this table at a version this engine
+/// Refuses a file schema that is not `table` at a version this engine
 /// reads, laid out exactly as that version is, every column required;
 /// returns the version.
 ///
 /// # Errors
 /// Another signal, a version this engine does not read, no version, or
 /// columns other than the version's, by name, order, type or nullability.
-pub fn check_schema(schema: &Schema) -> Result<u32, SchemaError> {
+pub fn check_schema(schema: &Schema, table: KeyTable) -> Result<u32, SchemaError> {
     let metadata = schema.metadata();
-    if metadata.get("fusescope.signal").map(String::as_str) != Some(SIGNAL) {
+    if metadata.get("fusescope.signal").map(String::as_str) != Some(table.name()) {
         return Err(SchemaError::Layout("attribute_keys signal"));
     }
     let version = metadata
         .get("fusescope.schema_version")
         .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| READABLE_VERSIONS.contains(v))
+        .filter(|v| table.readable_versions().contains(v))
         .ok_or(SchemaError::Layout("attribute_keys schema version"))?;
-    let expected = layout(version);
+    let expected = layout(table, version);
     let same = schema.fields().len() == expected.len()
         && schema
             .fields()
@@ -584,10 +703,10 @@ pub fn check_schema(schema: &Schema) -> Result<u32, SchemaError> {
     Ok(version)
 }
 
-/// Encodes `stats` as one Parquet file of the table.
+/// Encodes `stats` as one Parquet file of its table.
 ///
 /// # Errors
-/// Parquet or Arrow failure.
+/// Parquet or Arrow failure, or a source the table does not list.
 pub fn encode(stats: &KeyStats) -> Result<Vec<u8>, SchemaError> {
     let batch = stats.to_batch()?;
     let properties = WriterProperties::builder()
@@ -600,17 +719,17 @@ pub fn encode(stats: &KeyStats) -> Result<Vec<u8>, SchemaError> {
     Ok(writer.into_inner()?)
 }
 
-/// Reads a Parquet file of the table, refusing another signal or a
-/// version this engine does not read.
+/// Reads a Parquet file of `table`, refusing another signal, a version
+/// this engine does not read or a source the table does not list.
 ///
 /// # Errors
-/// Not a Parquet file of this table at a readable version.
-pub fn decode(bytes: bytes::Bytes) -> Result<KeyStats, SchemaError> {
+/// Not a Parquet file of `table` at a readable version.
+pub fn decode(bytes: bytes::Bytes, table: KeyTable) -> Result<KeyStats, SchemaError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
-    let version = check_schema(builder.schema())?;
-    let mut out = KeyStats::default();
+    let version = check_schema(builder.schema(), table)?;
+    let mut out = KeyStats::new(table);
     for batch in builder.build()? {
-        out.merge(KeyStats::from_batch(&batch?, version)?);
+        out.merge(KeyStats::from_batch(&batch?, table, version)?);
     }
     Ok(out.settled())
 }
@@ -692,6 +811,198 @@ mod tests {
         }
     }
 
+    fn fixture_stats() -> KeyStats {
+        let batch = batch_with(vec![
+            span(
+                H14 + 1_000,
+                vec![
+                    kv("http.method", string("GET")),
+                    kv("http.status", Value::IntValue(200)),
+                    kv("retry", Value::BoolValue(true)),
+                ],
+            ),
+            span(H15 + 3_000, vec![kv("http.method", string("POST"))]),
+        ]);
+        let mut stats = KeyStats::default();
+        stats.absorb(&batch, H14, usize::MAX).unwrap();
+        stats
+    }
+
+    #[test]
+    fn committed_v2_fixture_is_what_the_encoder_still_writes() {
+        let fixture = bytes::Bytes::from_static(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/attribute_keys_v2.parquet"
+        )));
+        let stats = fixture_stats();
+        assert_eq!(encode(&stats).unwrap(), fixture.to_vec());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(fixture.clone()).unwrap();
+        assert_eq!(builder.schema(), &attribute_keys_schema_v2());
+        assert_eq!(decode(fixture, KeyTable::Spans).unwrap(), stats.settled());
+    }
+
+    fn log_batch(records: Vec<(i64, Vec<KeyValue>)>) -> RecordBatch {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", string("api"))],
+                    ..Resource::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "lib".into(),
+                        attributes: vec![kv("lib.flavour", string("x"))],
+                        ..InstrumentationScope::default()
+                    }),
+                    log_records: records
+                        .into_iter()
+                        .map(|(at, attributes)| LogRecord {
+                            time_unix_nano: u64::try_from(at).unwrap(),
+                            attributes,
+                            ..LogRecord::default()
+                        })
+                        .collect(),
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut builder = crate::logs::LogBatchBuilder::new(Limits::default());
+        builder.append_request(&request, &[7; 16]).unwrap();
+        builder.finish().unwrap()
+    }
+
+    fn log_fixture_stats() -> KeyStats {
+        let batch = log_batch(vec![
+            (
+                H14 + 1_000,
+                vec![
+                    kv("http.method", string("GET")),
+                    kv("http.status", Value::IntValue(200)),
+                    kv("retry", Value::BoolValue(true)),
+                ],
+            ),
+            (H15 + 3_000, vec![kv("http.method", string("POST"))]),
+        ]);
+        let mut stats = KeyStats::new(KeyTable::Logs);
+        stats.absorb(&batch, H14, usize::MAX).unwrap();
+        stats
+    }
+
+    #[test]
+    fn committed_log_v1_fixture_remains_readable() {
+        let fixture = bytes::Bytes::from_static(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/log_attribute_keys_v1.parquet"
+        )));
+        let builder = ParquetRecordBatchReaderBuilder::try_new(fixture.clone()).unwrap();
+        assert_eq!(builder.schema(), &KeyTable::Logs.file_schema());
+        assert_eq!(
+            decode(fixture, KeyTable::Logs).unwrap(),
+            log_fixture_stats().settled()
+        );
+    }
+
+    #[test]
+    fn log_keys_are_listed_as_log_sources_in_their_own_table() {
+        let stats = log_fixture_stats();
+        let rows: Vec<_> = stats
+            .iter()
+            .map(|(source, key, kind, seen)| (source, key, kind, seen.count))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (KeySource::Resource, "service.name", KeyType::String, 2),
+                (KeySource::Scope, "lib.flavour", KeyType::String, 2),
+                (KeySource::Log, "http.method", KeyType::String, 2),
+                (KeySource::Log, "http.status", KeyType::Number, 1),
+                (KeySource::Log, "retry", KeyType::Bool, 1),
+            ]
+        );
+        let bytes = bytes::Bytes::from(encode(&stats).unwrap());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+        assert_eq!(builder.schema(), &KeyTable::Logs.file_schema());
+        assert_eq!(
+            builder.schema().metadata()["fusescope.signal"],
+            "log_attribute_keys"
+        );
+        assert_eq!(builder.schema().metadata()["fusescope.schema_version"], "1");
+        assert_eq!(
+            builder.schema().fields().len(),
+            attribute_keys_schema_v2().fields().len(),
+            "laid out as attribute_keys v2"
+        );
+        assert_eq!(
+            decode(bytes.clone(), KeyTable::Logs).unwrap(),
+            stats.clone().settled()
+        );
+        assert!(matches!(
+            decode(bytes, KeyTable::Spans).unwrap_err(),
+            SchemaError::Layout(_)
+        ));
+        let spans = bytes::Bytes::from(encode(&fixture_stats()).unwrap());
+        assert!(matches!(
+            decode(spans, KeyTable::Logs).unwrap_err(),
+            SchemaError::Layout(_)
+        ));
+        assert!(!KeyTable::Logs.session_schema().field(6).is_nullable());
+        assert!(KeyTable::Spans.session_schema().field(6).is_nullable());
+    }
+
+    /// `batch` relabelled with `table`'s metadata at `version` and written.
+    fn relabelled(batch: &RecordBatch, table: KeyTable, version: &str) -> bytes::Bytes {
+        let mut metadata = batch.schema().metadata().clone();
+        metadata.insert("fusescope.signal".into(), table.name().into());
+        metadata.insert("fusescope.schema_version".into(), version.into());
+        let schema = Arc::new(Schema::new_with_metadata(
+            batch.schema().fields().clone(),
+            metadata,
+        ));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        bytes::Bytes::from(writer.into_inner().unwrap())
+    }
+
+    #[test]
+    fn a_source_of_the_other_table_is_refused() {
+        let spans = fixture_stats().to_batch().unwrap();
+        let logs = log_fixture_stats().to_batch().unwrap();
+        let err = decode(relabelled(&spans, KeyTable::Logs, "1"), KeyTable::Logs).unwrap_err();
+        assert!(matches!(err, SchemaError::Layout("source")), "{err}");
+        let err = decode(relabelled(&logs, KeyTable::Spans, "2"), KeyTable::Spans).unwrap_err();
+        assert!(matches!(err, SchemaError::Layout("source")), "{err}");
+        assert_eq!(
+            decode(relabelled(&logs, KeyTable::Logs, "1"), KeyTable::Logs)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(
+            matches!(
+                check_schema(&relabelled_schema(&logs, "2"), KeyTable::Logs),
+                Err(SchemaError::Layout(_))
+            ),
+            "logs have no v2"
+        );
+
+        let mut mixed = KeyStats::new(KeyTable::Logs);
+        mixed.merge(fixture_stats());
+        assert!(
+            matches!(encode(&mixed), Err(SchemaError::Layout(_))),
+            "never written"
+        );
+    }
+
+    fn relabelled_schema(batch: &RecordBatch, version: &str) -> Schema {
+        let mut metadata = batch.schema().metadata().clone();
+        metadata.insert("fusescope.schema_version".into(), version.into());
+        Schema::new_with_metadata(batch.schema().fields().clone(), metadata)
+    }
+
     #[test]
     fn keys_are_counted_once_per_span_by_source_and_type_with_their_sightings() {
         let batch = batch_with(vec![
@@ -771,7 +1082,7 @@ mod tests {
 
         // Decoded keys are not new: a cap of one admits one more key on
         // the next hour's budget and keeps counting the known ones.
-        let table = decode(bytes::Bytes::from(encode(&stats).unwrap())).unwrap();
+        let table = decode(bytes::Bytes::from(encode(&stats).unwrap()), KeyTable::Spans).unwrap();
         assert_eq!(table.new_keys(), 0);
         assert_eq!(table.admitted_in(H14), 3, "the budget survives the file");
         let mut table = table;
@@ -841,7 +1152,7 @@ mod tests {
         assert_eq!(first.len(), 5);
 
         let bytes = encode(&first).unwrap();
-        let back = decode(bytes::Bytes::from(bytes)).unwrap();
+        let back = decode(bytes::Bytes::from(bytes), KeyTable::Spans).unwrap();
         let rows: Vec<_> = back.iter().collect();
         assert_eq!(rows, first.iter().collect::<Vec<_>>());
         assert_eq!(
@@ -869,7 +1180,11 @@ mod tests {
             .unwrap();
         let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
         writer.write(&v1).unwrap();
-        let read = decode(bytes::Bytes::from(writer.into_inner().unwrap())).unwrap();
+        let read = decode(
+            bytes::Bytes::from(writer.into_inner().unwrap()),
+            KeyTable::Spans,
+        )
+        .unwrap();
         assert_eq!(read.len(), 4);
         assert!(
             read.iter().all(|(_, _, _, seen)| seen.admitted_hour == H15),
@@ -890,23 +1205,32 @@ mod tests {
                 batch.schema().fields().clone(),
                 metadata,
             ));
-            assert!(matches!(check_schema(&schema), Err(SchemaError::Layout(_))));
+            assert!(matches!(
+                check_schema(&schema, KeyTable::Spans),
+                Err(SchemaError::Layout(_))
+            ));
             let foreign =
                 RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
             let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
             writer.write(&foreign).unwrap();
             let bytes = writer.into_inner().unwrap();
-            let err = decode(bytes::Bytes::from(bytes)).unwrap_err();
+            let err = decode(bytes::Bytes::from(bytes), KeyTable::Spans).unwrap_err();
             assert!(matches!(err, SchemaError::Layout(_)), "{err}");
         }
-        assert_eq!(check_schema(&attribute_keys_schema_v2()).unwrap(), 2);
+        assert_eq!(
+            check_schema(&attribute_keys_schema_v2(), KeyTable::Spans).unwrap(),
+            2
+        );
         assert!(
-            matches!(check_schema(&table_schema()), Err(SchemaError::Layout(_))),
+            matches!(
+                check_schema(&table_schema(), KeyTable::Spans),
+                Err(SchemaError::Layout(_))
+            ),
             "the logical schema of a session is not a physical layout"
         );
         assert!(
             matches!(
-                KeyStats::from_batch(&batch_with(Vec::new()), 2).unwrap_err(),
+                KeyStats::from_batch(&batch_with(Vec::new()), KeyTable::Spans, 2).unwrap_err(),
                 SchemaError::Arrow(_)
             ),
             "a span batch is not the table"
@@ -956,14 +1280,14 @@ mod tests {
     #[test]
     fn each_version_reads_only_its_own_layout() {
         assert_eq!(
-            decode(bytes::Bytes::from(file_of("1", 6, None)))
+            decode(bytes::Bytes::from(file_of("1", 6, None)), KeyTable::Spans)
                 .unwrap()
                 .len(),
             4,
             "v1: six columns"
         );
         assert_eq!(
-            decode(bytes::Bytes::from(file_of("2", 7, None)))
+            decode(bytes::Bytes::from(file_of("2", 7, None)), KeyTable::Spans)
                 .unwrap()
                 .len(),
             4,
@@ -989,10 +1313,13 @@ mod tests {
             let bytes = bytes::Bytes::from(bytes);
             let footer = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
             assert!(
-                matches!(check_schema(footer.schema()), Err(SchemaError::Layout(_))),
+                matches!(
+                    check_schema(footer.schema(), KeyTable::Spans),
+                    Err(SchemaError::Layout(_))
+                ),
                 "{what}: the footer alone tells"
             );
-            let err = decode(bytes).unwrap_err();
+            let err = decode(bytes, KeyTable::Spans).unwrap_err();
             assert!(matches!(err, SchemaError::Layout(_)), "{what}: {err}");
         }
 
@@ -1004,10 +1331,14 @@ mod tests {
             Some((vec![Some(H14), Some(H14 + 1), Some(H14), Some(H14)], false)),
         ));
         let footer = ParquetRecordBatchReaderBuilder::try_new(misaligned.clone()).unwrap();
-        assert_eq!(check_schema(footer.schema()).unwrap(), 2);
-        let err = decode(misaligned).unwrap_err();
+        assert_eq!(check_schema(footer.schema(), KeyTable::Spans).unwrap(), 2);
+        let err = decode(misaligned, KeyTable::Spans).unwrap_err();
         assert!(matches!(err, SchemaError::Layout(_)), "{err}");
-        let aligned = decode(bytes::Bytes::from(file_of("2", 7, Some((aligned, false))))).unwrap();
+        let aligned = decode(
+            bytes::Bytes::from(file_of("2", 7, Some((aligned, false)))),
+            KeyTable::Spans,
+        )
+        .unwrap();
         assert_eq!(
             (aligned.admitted_in(H14), aligned.new_keys()),
             (4, 0),

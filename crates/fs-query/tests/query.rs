@@ -786,7 +786,7 @@ mod sandbox {
         f.db.finish().await;
     }
 
-    /// A session sees its tenant's four tables and nothing else: no other
+    /// A session sees its tenant's tables and nothing else: no other
     /// catalog, no other schema, and `information_schema` lists only them.
     #[tokio::test]
     async fn only_the_tenants_tables_exist() {
@@ -794,6 +794,7 @@ mod sandbox {
         for sql in [
             "select * from other.public.spans",
             "select * from other.public.logs",
+            "select * from other.public.log_attribute_keys",
             "select * from fusescope.other.spans",
             "select * from fusescope.other.logs",
             "select * from datafusion.public.spans",
@@ -812,11 +813,12 @@ mod sandbox {
             )
             .await
             .unwrap();
-        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 5]);
+        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 6]);
         assert_eq!(
             strings(&tables, "table_name"),
             [
                 "attribute_keys",
+                "log_attribute_keys",
                 "logs",
                 "service_graph_1m",
                 "spans",
@@ -1765,7 +1767,8 @@ async fn metadata_operations_action_lists_the_operations_of_a_service() {
 
 /// `metadata.keys` reads the tenant's `attribute_keys` table, most
 /// frequent first, narrowed by a prefix; SQL reads the same table; a tenant
-/// without one gets an empty answer; another signal is refused.
+/// without one gets an empty answer, and so do logs without theirs; a
+/// signal without a table is refused.
 #[tokio::test]
 async fn metadata_keys_action_reads_the_attribute_keys_table() {
     let Some(f) = fixture().await else { return };
@@ -1842,10 +1845,14 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
     .await
     .unwrap();
     assert_eq!(strings(&http, "key"), ["http.request.method"]);
-    let err = action(&mut client, METADATA_KEYS, r#"{"signal": "logs"}"#)
+    let logs = action(&mut client, METADATA_KEYS, r#"{"signal": "logs"}"#)
         .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+        .unwrap();
+    assert_eq!(logs.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    for body in [r#"{"signal": "metrics"}"#, r#"{"signal": "spans"}"#] {
+        let err = action(&mut client, METADATA_KEYS, body).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{body}: {err}");
+    }
 
     let by_sql = f
         .querier
@@ -2031,6 +2038,140 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         "{err}"
     );
 
+    stop(shutdown, server).await;
+    f.db.finish().await;
+}
+
+/// Registers `bytes` as a `log_attribute_keys` file of `tenant`.
+async fn register_log_keys(f: &Fixture, tenant: TenantId, bytes: &[u8], rows: i64) {
+    let id = FileId::new();
+    let path = format!(
+        "t/{}/derived/log_attribute_keys/dt=2026-10-22/hr=14/{}.parquet",
+        tenant.0, id.0
+    );
+    let target = f.dir.path().join("bucket").join(&path);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(target, bytes).unwrap();
+    f.db.catalog
+        .register_file(&NewFile {
+            id,
+            origin: id,
+            tenant_id: tenant,
+            signal: Signal::LogAttributeKeys,
+            level: Level::L1,
+            path,
+            size_bytes: i64::try_from(bytes.len()).unwrap(),
+            row_count: rows,
+            range: TimeRange {
+                start: chrono::Utc.timestamp_nanos(i64::try_from(T0).unwrap()),
+                end: chrono::Utc.timestamp_nanos(i64::try_from(T0).unwrap()),
+            },
+            services: vec![],
+            summary: None,
+            content_sha256: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// `metadata.keys` for logs reads the tenant's `log_attribute_keys`
+/// table alone, as SQL does; a file of span keys registered as one is not
+/// read as log keys.
+#[tokio::test]
+async fn metadata_keys_lists_log_keys_from_their_own_table() {
+    use fs_schema::attribute_keys::{KeyStats, KeyTable};
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    let Some(f) = fixture().await else { return };
+    let log_request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "api")],
+                ..Resource::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: (0..3)
+                    .map(|i| LogRecord {
+                        time_unix_nano: T0 + i,
+                        attributes: vec![kv("log.file", "app.log")],
+                        ..LogRecord::default()
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let mut builder = fs_schema::logs::LogBatchBuilder::new(Limits::default());
+    builder.append_request(&log_request, &[1; 16]).unwrap();
+    let mut stats = KeyStats::new(KeyTable::Logs);
+    stats
+        .absorb(
+            &builder.finish().unwrap(),
+            i64::try_from(T0 - T0 % HOUR).unwrap(),
+            usize::MAX,
+        )
+        .unwrap();
+    let bytes = fs_schema::attribute_keys::encode(&stats).unwrap();
+    register_log_keys(&f, f.tenant, &bytes, 2).await;
+    let mut spans = SpanBatchBuilder::new(Limits::default());
+    spans.append_request(&request("api", 1, T0, 3)).unwrap();
+    let mut span_keys = KeyStats::default();
+    span_keys
+        .absorb(
+            &spans.finish().unwrap(),
+            i64::try_from(T0 - T0 % HOUR).unwrap(),
+            usize::MAX,
+        )
+        .unwrap();
+    let foreign = fs_schema::attribute_keys::encode(&span_keys).unwrap();
+    register_log_keys(&f, f.other_tenant, &foreign, 2).await;
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (other_token, _) =
+        f.db.catalog
+            .create_token(f.other_tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+
+    let logs = action(&mut client, METADATA_KEYS, r#"{"signal": "logs"}"#)
+        .await
+        .unwrap();
+    assert_eq!(strings(&logs, "key"), ["log.file", "service.name"]);
+    assert_eq!(strings(&logs, "source"), ["log", "resource"]);
+    assert_eq!(counts(&logs, "count"), [3, 3]);
+    let traces = action(&mut client, METADATA_KEYS, r#"{"signal": "traces"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        traces.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        0,
+        "log keys are not span keys"
+    );
+    let by_sql = f
+        .querier
+        .collect(
+            f.tenant,
+            "select key from log_attribute_keys where source = 'log'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&by_sql, "key"), ["log.file"]);
+
+    let mut other = sql_client(addr, &other_token).await;
+    let err = action(&mut other, METADATA_KEYS, r#"{"signal": "logs"}"#)
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("not readable by this version"),
+        "{err}"
+    );
     stop(shutdown, server).await;
     f.db.finish().await;
 }

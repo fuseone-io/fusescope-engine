@@ -17,7 +17,7 @@ use datafusion::logical_expr::{LogicalPlan, cast, col, lit};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use fs_catalog::{Catalog, Signal, TenantId};
-use fs_schema::attribute_keys::{self, col_names as key_col};
+use fs_schema::attribute_keys::col_names as key_col;
 use fs_schema::spans::col as span_col;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
@@ -492,8 +492,9 @@ impl Querier {
         Ok((frame.execute_stream().await?, warnings))
     }
 
-    /// The rows of the tenant's `attribute_keys` table whose key starts
-    /// with `query.prefix`, most frequent first, `query.limit` at most.
+    /// The rows of the tenant's `query.table`, `attribute_keys` or
+    /// `log_attribute_keys`, whose key starts with `query.prefix`, most
+    /// frequent first, `query.limit` at most.
     ///
     /// # Errors
     /// Unknown tenant, planning or execution failure.
@@ -506,7 +507,7 @@ impl Querier {
         self.stats
             .metadata_lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut frame = ctx.table(attribute_keys::TABLE).await?;
+        let mut frame = ctx.table(query.table.name()).await?;
         if let Some(prefix) = &query.prefix {
             frame = frame.filter(starts_with(col(key_col::KEY), lit(prefix.as_str())))?;
         }

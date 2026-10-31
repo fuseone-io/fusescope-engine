@@ -1,6 +1,8 @@
-//! One compaction pass: the oldest cold hour with enough L0 files is
-//! merged into L1 files, each uploaded as it closes, then swapped in under
-//! the leader's fence. Without a fence there is no pass.
+//! One compaction pass: the oldest cold hour with enough L0 files of one
+//! signal, spans or, when enabled, log rows, is merged into L1 files of
+//! that signal, each uploaded as it closes, then swapped in under the
+//! leader's fence with the signal's table of attribute keys. Without a
+//! fence there is no pass.
 //!
 //! A crash before the swap leaves the inputs visible and the outputs as
 //! objects without rows, which the orphan sweep removes; a crash after it
@@ -16,7 +18,7 @@ use bytes::Bytes;
 use fs_catalog::{
     Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, NewFile, Signal,
 };
-use fs_schema::attribute_keys::KeyStats;
+use fs_schema::attribute_keys::{KeyStats, KeyTable};
 use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::trace_summary::TraceSummaries;
 use object_store::ObjectStore;
@@ -24,7 +26,7 @@ use object_store::path::Path;
 use tracing::{info, warn};
 
 use crate::CompactError;
-use crate::derived::{read_table, table_file};
+use crate::derived::{key_table, read_table, table_file};
 use crate::merge::{L1Merger, MergeConfig};
 use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
 
@@ -54,6 +56,10 @@ pub struct CompactionConfig {
     pub service_graph_max_bytes: usize,
     /// Rows per output row group.
     pub row_group_rows: usize,
+    /// Also compact the L0 files of log rows. Off, no pass takes a new
+    /// hour of them; log L1 files and `log_attribute_keys` tables already
+    /// written are read, rebuilt, swept and purged all the same.
+    pub compact_logs: bool,
     /// Make this many swaps fail artificially after the outputs are
     /// uploaded. Zero in production; tests use it to crash before the swap.
     pub inject_swap_failures: u32,
@@ -91,9 +97,10 @@ pub struct CompactorStats {
     pub orphaned: AtomicU64,
     /// Hours skipped because their two oldest files exceed the input cap.
     pub skipped: AtomicU64,
-    /// `attribute_keys` tables rebuilt by completed passes.
+    /// `attribute_keys` and `log_attribute_keys` tables rebuilt by
+    /// completed passes.
     pub derived: AtomicU64,
-    /// Passes aborted because the `attribute_keys` table before could not
+    /// Passes aborted because the table of attribute keys before could not
     /// be read; inputs and table stay as they were.
     pub derived_unreadable: AtomicU64,
     /// Entries of keys beyond the tenant's `max_keys_hour` a pass did not
@@ -169,9 +176,9 @@ pub struct Compactor {
     config: CompactionConfig,
     stats: Arc<CompactorStats>,
     inject_swap_failures: AtomicU32,
-    /// Hours already reported as exceeding the input cap.
+    /// Hours of a signal already reported as exceeding the input cap.
     reported: std::sync::Mutex<
-        std::collections::HashSet<(fs_catalog::TenantId, chrono::DateTime<chrono::Utc>)>,
+        std::collections::HashSet<(fs_catalog::TenantId, Signal, chrono::DateTime<chrono::Utc>)>,
     >,
     /// Derived contributions already reported as crossing a cap.
     derived_reported: std::sync::Mutex<
@@ -217,10 +224,12 @@ impl Compactor {
         Arc::clone(&self.stats)
     }
 
-    /// Compacts the oldest cold hour with at least two L0 files, up to the
-    /// configured inputs, and swaps the outputs in under `fence`. An hour
-    /// whose two oldest files exceed the input cap is passed over, reported
-    /// once, and the next hour is tried. `None` when nothing qualifies.
+    /// Compacts the oldest cold hour with at least two L0 files of one
+    /// signal, spans before logs within an hour, up to the configured
+    /// inputs, and swaps the outputs in under `fence`. An hour whose two
+    /// oldest files exceed the input cap is passed over, reported once,
+    /// and the next hour of either signal is tried. `None` when nothing
+    /// qualifies.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
@@ -229,11 +238,16 @@ impl Compactor {
         &self,
         fence: &LeaseFence,
     ) -> Result<Option<Compaction>, CompactError> {
+        let signals: &[Signal] = if self.config.compact_logs {
+            &[Signal::Traces, Signal::Logs]
+        } else {
+            &[Signal::Traces]
+        };
         let mut skip = 0;
         let (candidate, inputs) = loop {
             let Some(candidate) = self
                 .catalog
-                .compaction_inputs(Signal::Traces, self.config.hour_close_delay, 2, skip)
+                .compaction_inputs(signals, self.config.hour_close_delay, 2, skip)
                 .await?
             else {
                 return Ok(None);
@@ -242,12 +256,18 @@ impl Compactor {
             if taken >= 2 {
                 break (candidate, taken);
             }
-            self.report_over_cap(candidate.tenant_id, candidate.hour);
+            self.report_over_cap(candidate.tenant_id, candidate.signal, candidate.hour);
             skip += 1;
         };
         let inputs = candidate.files.get(..inputs).unwrap_or(&[]);
         let result = self
-            .compact_inputs(candidate.tenant_id, candidate.hour, inputs, fence)
+            .compact_inputs(
+                candidate.tenant_id,
+                candidate.signal,
+                candidate.hour,
+                inputs,
+                fence,
+            )
             .await;
         match &result {
             Ok(_) => {}
@@ -264,18 +284,25 @@ impl Compactor {
         result.map(Some)
     }
 
-    /// Counts and warns once per hour whose two oldest files exceed the cap.
-    fn report_over_cap(&self, tenant: fs_catalog::TenantId, hour: chrono::DateTime<chrono::Utc>) {
+    /// Counts and warns once per hour of a signal whose two oldest files
+    /// exceed the cap.
+    fn report_over_cap(
+        &self,
+        tenant: fs_catalog::TenantId,
+        signal: Signal,
+        hour: chrono::DateTime<chrono::Utc>,
+    ) {
         let first_time = self
             .reported
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((tenant, hour));
+            .insert((tenant, signal, hour));
         if first_time {
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
             warn!(
                 role = "compactor",
                 tenant = %tenant.0,
+                ?signal,
                 hour = %hour,
                 cap = self.config.max_input_bytes,
                 "the hour's two oldest files exceed the input cap; passed over"
@@ -305,18 +332,20 @@ impl Compactor {
     async fn compact_inputs(
         &self,
         tenant: fs_catalog::TenantId,
+        signal: Signal,
         hour: chrono::DateTime<chrono::Utc>,
         inputs: &[FileRecord],
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         let owned: Vec<FileRecord> = inputs.to_vec();
+        let keys_of = key_table(signal).ok_or(CompactError::Merge("a signal without L1 files"))?;
         let max_keys_hour = self
             .catalog
             .tenant(tenant)
             .await?
             .ok_or(CompactError::TenantGone(tenant))
             .map(|t| usize::try_from(t.max_keys_hour).unwrap_or(0))?;
-        let (table_before, replaced) = self.table_before(tenant).await?;
+        let (table_before, replaced) = self.table_before(tenant, keys_of).await?;
         // The hour's budget is what the table remembers admitting on it,
         // so passes of one hour share it, across restarts and pass sizes.
         let hour_ns = hour
@@ -327,6 +356,7 @@ impl Compactor {
             Arc::clone(&self.store),
             &self.root,
             tenant,
+            signal,
             hour,
             &owned,
             MergeConfig {
@@ -358,8 +388,9 @@ impl Compactor {
             self.put_once(&output.file.path, output.bytes.clone(), &mut puts)
                 .await?;
             guard.created += 1;
-            self.put_once(&output.index_path, output.index.clone(), &mut puts)
-                .await?;
+            if let Some((path, index)) = &output.index {
+                self.put_once(path, index.clone(), &mut puts).await?;
+            }
             outputs.push(Published {
                 bytes: output.bytes.len() as u64,
                 file: output.file,
@@ -371,12 +402,12 @@ impl Compactor {
             service_graph: merger.take_service_graph(),
         };
         drop(merger);
-        self.report_dropped_keys(tenant, hour, &contributions.keys);
+        self.report_dropped_keys(tenant, signal, hour, &contributions.keys);
         let derived = self
             .publish_derived(tenant, hour, contributions, &mut guard, &mut puts)
             .await?;
         let compaction = self
-            .swap(tenant, &owned, &replaced, &outputs, &derived, fence)
+            .swap(tenant, signal, &owned, &replaced, &outputs, &derived, fence)
             .await?;
         guard.armed = false;
         self.count(&owned, &outputs);
@@ -384,6 +415,7 @@ impl Compactor {
         info!(
             role = "compactor",
             tenant = %tenant.0,
+            ?signal,
             hour = %hour,
             inputs = owned.len(),
             outputs = outputs.len(),
@@ -395,22 +427,21 @@ impl Compactor {
         Ok(compaction)
     }
 
-    /// The tenant's `attribute_keys` table before this pass, read whole,
-    /// and the rows the pass will replace. Any failure to read it ends the
-    /// pass before anything is created, so inputs and table stay as they
-    /// are: the history of the table is never replaced by one pass's view.
+    /// The tenant's table of keys of the pass's signal before this pass,
+    /// read whole, and the rows the pass will replace. Any failure to read
+    /// it ends the pass before anything is created, so inputs and table
+    /// stay as they are: the history of the table is never replaced by one
+    /// pass's view.
     async fn table_before(
         &self,
         tenant: fs_catalog::TenantId,
+        (table, files): (KeyTable, Signal),
     ) -> Result<(KeyStats, Vec<(Signal, FileId)>), CompactError> {
-        let previous = self
-            .catalog
-            .all_visible_files(tenant, Signal::AttributeKeys)
-            .await?;
-        let mut keys = KeyStats::default();
+        let previous = self.catalog.all_visible_files(tenant, files).await?;
+        let mut keys = KeyStats::new(table);
         let mut replaced = Vec::with_capacity(previous.len());
         for file in &previous {
-            match read_table(self.store.as_ref(), &file.path).await {
+            match read_table(self.store.as_ref(), &file.path, table).await {
                 Ok(known) => keys.merge(known),
                 Err(e) => {
                     self.stats
@@ -419,14 +450,15 @@ impl Compactor {
                     warn!(
                         role = "compactor",
                         tenant = %tenant.0,
+                        table = table.name(),
                         path = %file.path,
                         error = %e,
-                        "attribute_keys table unreadable; pass aborted"
+                        "attribute keys table unreadable; pass aborted"
                     );
                     return Err(e);
                 }
             }
-            replaced.push((Signal::AttributeKeys, file.id));
+            replaced.push((files, file.id));
         }
         Ok((keys.settled(), replaced))
     }
@@ -434,6 +466,7 @@ impl Compactor {
     fn report_dropped_keys(
         &self,
         tenant: fs_catalog::TenantId,
+        signal: Signal,
         hour: chrono::DateTime<chrono::Utc>,
         keys: &KeyStats,
     ) {
@@ -446,6 +479,7 @@ impl Compactor {
         warn!(
             role = "compactor",
             tenant = %tenant.0,
+            ?signal,
             hour = %hour,
             admitted = keys.new_keys(),
             dropped = keys.dropped(),
@@ -573,9 +607,11 @@ impl Compactor {
         Ok(Some(file))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn swap(
         &self,
         tenant: fs_catalog::TenantId,
+        signal: Signal,
         inputs: &[FileRecord],
         replaced: &[(Signal, FileId)],
         outputs: &[Published],
@@ -595,7 +631,7 @@ impl Compactor {
             .collect();
         Ok(self
             .catalog
-            .swap_files_fenced(tenant, Signal::Traces, &ids, replaced, &files, Some(fence))
+            .swap_files_fenced(tenant, signal, &ids, replaced, &files, Some(fence))
             .await?)
     }
 

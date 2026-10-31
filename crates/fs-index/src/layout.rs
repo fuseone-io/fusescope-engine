@@ -6,7 +6,7 @@
 //! t/{tenant uuid}/logs/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
 //! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
-//! t/{tenant uuid}/derived/attribute_keys/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
+//! t/{tenant uuid}/derived/{attribute_keys|log_attribute_keys}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
 //!
 //! A derived table is partitioned by the hour of the compaction pass that
@@ -65,12 +65,10 @@ impl EngineObject {
                 "l2" => (Some(2), false, false),
                 _ => return None,
             },
-            "derived" => {
-                if parts.next()? != "attribute_keys" {
-                    return None;
-                }
-                (None, false, true)
-            }
+            "derived" => match parts.next()? {
+                "attribute_keys" | "log_attribute_keys" => (None, false, true),
+                _ => return None,
+            },
             _ => return None,
         };
         let date = parts.next()?;
@@ -182,14 +180,16 @@ mod tests {
         assert_eq!(tix.level, None);
         assert_eq!(tix.tenant, T);
         assert!(!tix.derived);
-        let keys = EngineObject::parse(&format!(
-            "t/{T}/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.parquet"
-        ))
-        .unwrap();
-        assert!(keys.derived);
-        assert!(!keys.sidecar);
-        assert_eq!(keys.level, None);
-        assert_eq!(keys.partition, "dt=2026-10-24/hr=14");
+        for table in ["attribute_keys", "log_attribute_keys"] {
+            let keys = EngineObject::parse(&format!(
+                "t/{T}/derived/{table}/dt=2026-10-24/hr=14/{F}.parquet"
+            ))
+            .unwrap();
+            assert!(keys.derived);
+            assert!(!keys.sidecar);
+            assert_eq!(keys.level, None);
+            assert_eq!(keys.partition, "dt=2026-10-24/hr=14");
+        }
         for level in 0..=2u8 {
             let logs = EngineObject::parse(&format!(
                 "t/{T}/logs/l{level}/dt=2026-10-24/hr=14/{F}.parquet"
@@ -234,6 +234,7 @@ mod tests {
             &format!("t/{T}/traces/derived/other/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/derived/attribute_keys/{F}.parquet"),
+            &format!("t/{T}/logs/derived/attribute_keys/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("x/{T}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!(
                 "t/{}/traces/l0/dt=2026-10-24/hr=14/{F}.parquet",

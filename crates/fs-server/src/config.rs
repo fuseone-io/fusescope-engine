@@ -682,6 +682,13 @@ pub struct CompactorConfig {
     /// Conservative bytes retained for one pass's `service_graph_1m` builder.
     #[serde(default = "default_service_graph_max_bytes")]
     pub service_graph_max_bytes: usize,
+    /// Also compact log L0 files into log L1 files with their
+    /// `log_attribute_keys`. Off by default: a binary from before logs
+    /// compaction cannot read a catalog that holds `log_attribute_keys`,
+    /// so turn it on once every compactor and querier is upgraded, and
+    /// never roll back past it after. Off stops new log passes only.
+    #[serde(default)]
+    pub compact_logs: bool,
     /// How often the bucket is swept for objects without a catalog row.
     #[serde(default = "default_orphan_interval")]
     pub orphan_interval_secs: u64,
@@ -745,6 +752,7 @@ impl Default for CompactorConfig {
             trace_summary_max_bytes: default_trace_summary_max_bytes(),
             service_graph_max_spans: default_service_graph_max_spans(),
             service_graph_max_bytes: default_service_graph_max_bytes(),
+            compact_logs: false,
             orphan_interval_secs: default_orphan_interval(),
             orphan_ttl_secs: default_orphan_ttl(),
             sweep_objects_per_pass: default_sweep_objects(),
@@ -780,6 +788,7 @@ impl CompactorConfig {
                 service_graph_max_spans: self.service_graph_max_spans,
                 service_graph_max_bytes: self.service_graph_max_bytes,
                 row_group_rows,
+                compact_logs: self.compact_logs,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
                 inject_put_hold: None,
@@ -1849,6 +1858,23 @@ mod tests {
                 .to_string()
                 .contains("compactor.rebuilds_per_tick must be at most 256")
         );
+    }
+
+    #[test]
+    fn log_compaction_is_off_unless_asked_for() {
+        let config = Config::parse(MINIMAL).unwrap();
+        assert!(
+            !config
+                .compactor
+                .to_compactor(config.ingest.row_group_rows)
+                .compaction
+                .compact_logs
+        );
+        let on = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[compactor]\ncompact_logs = true\n",
+        )
+        .unwrap();
+        assert!(on.compactor.to_compactor(4).compaction.compact_logs);
     }
 
     #[test]

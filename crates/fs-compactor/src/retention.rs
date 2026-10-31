@@ -9,7 +9,10 @@
 //! compacted; once the tenant's expired files are gone it still lists what
 //! they carried, so it is rebuilt from the L1 files that remain, with the
 //! admissions of the table before, and swapped in under the fence, the
-//! table before quarantined with it. A rebuild that does not commit, for
+//! table before quarantined with it. The `log_attribute_keys` table is
+//! rebuilt the same way from the log L1 files: each kind has its own walk,
+//! the calls take turns between them, and a tenant held back or reported
+//! for one kind is not for the other. A rebuild that does not commit, for
 //! any reason, leaves the table before in place and the new table an
 //! orphan. The stale tables are walked in rounds by a cursor that outlives
 //! calls and ticks, each table once a round whether its rebuild went or
@@ -32,7 +35,7 @@ use fs_catalog::{
     Catalog, CatalogError, Compaction, ExpiredFiles, FileRecord, LeaseFence, Level, RebuildInput,
     Signal, StaleKey, StaleTable, TenantId,
 };
-use fs_schema::attribute_keys::{KeyStats, READ_COLUMNS};
+use fs_schema::attribute_keys::{KeyStats, KeyTable, READ_COLUMNS};
 use fs_schema::limits::Limits;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
@@ -41,7 +44,7 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use tracing::{info, warn};
 
 use crate::CompactError;
-use crate::derived::{read_table, table_file};
+use crate::derived::{key_table, read_table, table_file};
 use crate::merge::ObjectReader;
 use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
 
@@ -64,6 +67,10 @@ const INPUT_PAGE: i64 = 1000;
 /// A tenant's backoff grows with each failure up to this many times the
 /// configured one.
 const MAX_BACKOFF_STEPS: u32 = 6;
+
+/// The signals whose tables of attribute keys are rebuilt, each walked on
+/// its own.
+const KINDS: [Signal; 2] = [Signal::Traces, Signal::Logs];
 
 /// Most stale tables a tick may be configured to examine, so the leader's
 /// other passes are never long behind the rebuilds; a configuration
@@ -154,13 +161,34 @@ pub struct Retention {
     stats: Arc<RetentionStats>,
     inject_swap_failures: AtomicU32,
     inject_list_failures: AtomicU32,
-    /// Tenants already reported as exceeding a cap.
-    reported: Mutex<HashSet<TenantId>>,
-    /// Tenants whose rebuild failed, passed over until their backoff ends.
-    failed: Mutex<HashMap<TenantId, Failure>>,
-    /// Where the walk of the stale tables is; `None` at the start of a
-    /// round.
-    cursor: Mutex<Option<StaleKey>>,
+    /// Tables of a tenant, by their catalog signal, already reported as
+    /// exceeding a cap.
+    reported: Mutex<HashSet<(TenantId, Signal)>>,
+    /// Tables of a tenant, by their catalog signal, whose rebuild failed,
+    /// passed over until their backoff ends.
+    failed: Mutex<HashMap<(TenantId, Signal), Failure>>,
+    /// Where the walks of the stale tables are.
+    walk: Mutex<Walk>,
+}
+
+/// One walk per kind of [`KINDS`]: its cursor, `None` at the start of its
+/// round, and whether its round ended; and which kind the next call
+/// examines. A round ends once every kind's has.
+#[derive(Debug, Default)]
+struct Walk {
+    cursors: [Option<StaleKey>; KINDS.len()],
+    ended: [bool; KINDS.len()],
+    turn: usize,
+}
+
+impl Walk {
+    /// The kind whose turn it is, or the other while the turn's round is
+    /// over; `None` once every round is.
+    fn next(&self) -> Option<usize> {
+        (0..KINDS.len())
+            .map(|i| (self.turn + i) % KINDS.len())
+            .find(|kind| !self.ended.get(*kind).copied().unwrap_or(true))
+    }
 }
 
 /// A tenant's failed rebuilds and when the next try is due.
@@ -175,6 +203,7 @@ struct Failure {
 /// the call, it puts the walk back where it was.
 struct Advance<'a> {
     retention: &'a Retention,
+    kind: usize,
     before: Option<StaleKey>,
     confirmed: bool,
 }
@@ -188,7 +217,7 @@ impl Advance<'_> {
 impl Drop for Advance<'_> {
     fn drop(&mut self) {
         if !self.confirmed {
-            self.retention.set_cursor(self.before);
+            self.retention.set_cursor(self.kind, self.before);
         }
     }
 }
@@ -307,7 +336,7 @@ impl Retention {
             inject_list_failures: AtomicU32::new(inject_list),
             reported: Mutex::new(HashSet::new()),
             failed: Mutex::new(HashMap::new()),
-            cursor: Mutex::new(None),
+            walk: Mutex::new(Walk::default()),
         }
     }
 
@@ -371,37 +400,59 @@ impl Retention {
         Ok(result?)
     }
 
-    /// Examines the next stale `attribute_keys` table after the one last
-    /// examined, by earliest sighting: rebuilds it from the L1 files that
-    /// remain at or after the tenant's cut and swaps it in under `fence`,
-    /// or passes it over when its tenant is held back, its remaining L1
-    /// files exceed the input cap or its rebuild would exceed the memory
-    /// budget, reported once. One table per call, so a caller's budget
-    /// bounds the work; at the end of the round the walk goes back to the
-    /// start for the next call. A lost lease or a catalog failure, not
-    /// the tenant's, leaves the walk where it was.
+    /// Examines the next stale table of attribute keys, `attribute_keys`
+    /// and `log_attribute_keys` taking turns, after the one of its kind
+    /// last examined, by earliest sighting: rebuilds it from the L1 files
+    /// of its signal that remain at or after the tenant's cut and swaps it
+    /// in under `fence`, or passes it over when it is held back, its
+    /// remaining L1 files exceed the input cap or its rebuild would exceed
+    /// the memory budget, reported once. One table per call, whatever its
+    /// kind, so a caller's budget bounds the work; once both walks reach
+    /// their end the round is over and the next call starts another. A
+    /// lost lease or a catalog failure, not the tenant's, leaves the walk
+    /// where it was.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
     /// catalog failure, the table before or an L1 file unreadable
     /// included. The counters record which, and the tenant is held back.
     pub async fn rebuild_once(&self, fence: &LeaseFence) -> Result<Rebuild, CompactError> {
-        let before = self.cursor();
-        let found = self
-            .catalog
-            .stale_derived_table(Signal::AttributeKeys, Signal::Traces, before)
-            .await?;
-        let Some(stale) = found else {
-            self.set_cursor(None);
-            return Ok(Rebuild::End);
-        };
-        self.set_cursor(Some(stale.key()));
-        let mut advance = Advance {
-            retention: self,
-            before,
-            confirmed: false,
-        };
-        if self.held_back(stale.tenant_id) {
+        loop {
+            let next = self.lock_walk().next();
+            let Some(kind) = next else { break };
+            let data = KINDS.get(kind).copied().unwrap_or(Signal::Traces);
+            let (_, files) =
+                key_table(data).ok_or(CompactError::Merge("a signal without attribute keys"))?;
+            let before = self.cursor(kind);
+            let found = self
+                .catalog
+                .stale_derived_table(files, data, before)
+                .await?;
+            self.step(kind, found.as_ref());
+            let Some(stale) = found else { continue };
+            let advance = Advance {
+                retention: self,
+                kind,
+                before,
+                confirmed: false,
+            };
+            return self.examine(data, &stale, advance, fence).await;
+        }
+        *self.lock_walk() = Walk::default();
+        Ok(Rebuild::End)
+    }
+
+    /// Rebuilds, or passes over, `stale`, a table of the keys of `data`
+    /// rows, confirming `advance` unless the failure is not the tenant's.
+    async fn examine(
+        &self,
+        data: Signal,
+        stale: &StaleTable,
+        mut advance: Advance<'_>,
+        fence: &LeaseFence,
+    ) -> Result<Rebuild, CompactError> {
+        let table = (stale.tenant_id, stale.table.signal);
+        if self.held_back(table) {
             advance.confirm();
             return Ok(Rebuild::Skipped);
         }
@@ -413,7 +464,7 @@ impl Retention {
             .catalog
             .rebuild_inputs(
                 stale.tenant_id,
-                Signal::Traces,
+                data,
                 Level::L1,
                 stale.cutoff,
                 INPUT_PAGE,
@@ -422,18 +473,18 @@ impl Retention {
             .await?;
         let Some(inputs) = inputs else {
             let (what, bytes, cap) = budget.over.unwrap_or(("memory", 0, 0));
-            self.report_over_cap(stale.tenant_id, what, bytes, cap);
+            self.report_over_cap(table, what, bytes, cap);
             advance.confirm();
             return Ok(Rebuild::Skipped);
         };
-        let result = self.rebuild(&stale, &inputs, fence).await;
+        let result = self.rebuild(data, stale, &inputs, fence).await;
         match &result {
             Ok(_) => {
                 self.stats.rebuilds.fetch_add(1, Ordering::Relaxed);
                 self.failed
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&stale.tenant_id);
+                    .remove(&table);
                 advance.confirm();
             }
             Err(CompactError::Catalog(CatalogError::LeaseLost { .. })) => {
@@ -450,43 +501,56 @@ impl Retention {
             }
             Err(_) => {
                 self.stats.rebuild_failures.fetch_add(1, Ordering::Relaxed);
-                self.hold_back(stale.tenant_id);
+                self.hold_back(table);
                 advance.confirm();
             }
         }
         result.map(Rebuild::Done)
     }
 
-    fn cursor(&self) -> Option<StaleKey> {
-        *self
-            .cursor
+    /// Moves the walk of `kind` onto `found`, its next stale table, and
+    /// the turn to the other kind; with nothing found, ends its round.
+    fn step(&self, kind: usize, found: Option<&StaleTable>) {
+        let mut walk = self.lock_walk();
+        let Some(stale) = found else {
+            set(&mut walk.ended, kind, true);
+            set(&mut walk.cursors, kind, None);
+            return;
+        };
+        set(&mut walk.cursors, kind, Some(stale.key()));
+        walk.turn = (kind + 1) % KINDS.len();
+    }
+
+    fn lock_walk(&self) -> std::sync::MutexGuard<'_, Walk> {
+        self.walk
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn set_cursor(&self, at: Option<StaleKey>) {
-        *self
-            .cursor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = at;
+    fn cursor(&self, kind: usize) -> Option<StaleKey> {
+        self.lock_walk().cursors.get(kind).copied().flatten()
     }
 
-    fn held_back(&self, tenant: TenantId) -> bool {
+    fn set_cursor(&self, kind: usize, at: Option<StaleKey>) {
+        set(&mut self.lock_walk().cursors, kind, at);
+    }
+
+    fn held_back(&self, table: (TenantId, Signal)) -> bool {
         self.failed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&tenant)
+            .get(&table)
             .is_some_and(|failure| failure.until > Instant::now())
     }
 
-    /// Puts `tenant` off for its backoff times its failures so far.
-    fn hold_back(&self, tenant: TenantId) {
+    /// Puts `table` off for its backoff times its failures so far.
+    fn hold_back(&self, table: (TenantId, Signal)) {
         let now = Instant::now();
         let mut failed = self
             .failed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let failure = failed.entry(tenant).or_insert(Failure {
+        let failure = failed.entry(table).or_insert(Failure {
             count: 0,
             until: now,
         });
@@ -499,41 +563,51 @@ impl Retention {
         failure.until = now.checked_add(wait).unwrap_or(now);
     }
 
-    fn report_over_cap(&self, tenant: TenantId, what: &'static str, bytes: u64, cap: u64) {
+    fn report_over_cap(
+        &self,
+        (tenant, files): (TenantId, Signal),
+        what: &'static str,
+        bytes: u64,
+        cap: u64,
+    ) {
         let first_time = self
             .reported
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(tenant);
+            .insert((tenant, files));
         if first_time {
             self.stats.rebuild_skipped.fetch_add(1, Ordering::Relaxed);
             warn!(
                 role = "compactor",
                 tenant = %tenant.0,
+                table = files.path_name(),
                 what,
                 bytes,
                 cap,
-                "the tenant's attribute_keys rebuild exceeds its cap; the table is kept as it is"
+                "the tenant's attribute keys rebuild exceeds its cap; the table is kept as it is"
             );
         }
     }
 
     async fn rebuild(
         &self,
+        data: Signal,
         stale: &StaleTable,
         inputs: &[RebuildInput],
         fence: &LeaseFence,
     ) -> Result<Compaction, CompactError> {
         let tenant = stale.tenant_id;
+        let (table, files) =
+            key_table(data).ok_or(CompactError::Merge("a signal without attribute keys"))?;
         let keys = if inputs.is_empty() {
-            KeyStats::default()
+            KeyStats::new(table)
         } else {
-            self.count_remaining(stale, inputs).await?
+            self.count_remaining(table, stale, inputs).await?
         };
         let mut guard = OrphanGuard {
             stats: Arc::clone(&self.stats),
             tenant,
-            work: "attribute_keys rebuild".to_owned(),
+            work: format!("{} rebuild", table.name()),
             created: 0,
             armed: true,
         };
@@ -550,9 +624,9 @@ impl Retention {
             .catalog
             .swap_files_fenced(
                 tenant,
-                Signal::Traces,
+                data,
                 &[],
-                &[(Signal::AttributeKeys, stale.table.id)],
+                &[(files, stale.table.id)],
                 &outputs,
                 Some(fence),
             )
@@ -561,32 +635,35 @@ impl Retention {
         info!(
             role = "compactor",
             tenant = %tenant.0,
+            table = table.name(),
             cutoff = %stale.cutoff,
             inputs = inputs.len(),
             keys = keys.len(),
-            "attribute_keys table rebuilt"
+            "attribute keys table rebuilt"
         );
         Ok(done)
     }
 
-    /// The table before, with the sightings of `inputs` alone.
+    /// The table before, a `table`, with the sightings of `inputs` alone.
     async fn count_remaining(
         &self,
+        table: KeyTable,
         stale: &StaleTable,
         inputs: &[RebuildInput],
     ) -> Result<KeyStats, CompactError> {
-        let before = read_table(self.store.as_ref(), &stale.table.path)
+        let before = read_table(self.store.as_ref(), &stale.table.path, table)
             .await
             .inspect_err(|e| {
                 warn!(
                     role = "compactor",
                     tenant = %stale.tenant_id.0,
+                    table = table.name(),
                     path = %stale.table.path,
                     error = %e,
-                    "attribute_keys table unreadable; rebuild aborted"
+                    "attribute keys table unreadable; rebuild aborted"
                 );
             })?;
-        let mut keys = KeyStats::default();
+        let mut keys = KeyStats::new(table);
         for file in inputs {
             self.absorb(&mut keys, &before, file).await?;
         }
@@ -627,6 +704,12 @@ impl Retention {
             keys.absorb_known(&batch?, before)?;
         }
         Ok(())
+    }
+}
+
+fn set<T>(slots: &mut [T], at: usize, value: T) {
+    if let Some(slot) = slots.get_mut(at) {
+        *slot = value;
     }
 }
 
