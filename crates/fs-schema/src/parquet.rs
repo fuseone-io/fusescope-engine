@@ -10,7 +10,9 @@ use arrow::compute::{SortColumn, interleave, lexsort_to_indices, take_record_bat
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::file::properties::{
+    EnabledStatistics, WriterProperties, WriterPropertiesBuilder, WriterVersion,
+};
 use parquet::schema::types::ColumnPath;
 
 use crate::SchemaError;
@@ -28,6 +30,9 @@ pub const MAX_ROW_GROUP_ROWS: usize = 1_048_576;
 
 /// zstd level at L0 and L1: fast; the compactor recompresses at L2.
 pub const ZSTD_LEVEL: i32 = 3;
+
+/// False positive rate of every bloom filter.
+const BLOOM_FPP: f64 = 0.01;
 
 /// Refuses a row group size outside `1..=MAX_ROW_GROUP_ROWS`.
 ///
@@ -50,17 +55,39 @@ pub fn check_row_group_rows(rows: usize) -> Result<(), SchemaError> {
 /// # Errors
 /// A zstd level the library refuses.
 pub fn writer_properties(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
+    Ok(base_properties(row_group_rows)?
+        .set_bloom_filter_max_ndv(u64::try_from(row_group_rows).unwrap_or(u64::MAX))
+        .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from(col::SPAN_ID), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from(col::SERVICE_NAME), true)
+        .set_bloom_filter_fpp(BLOOM_FPP)
+        .build())
+}
+
+/// [`writer_properties`] for log batches, with bloom filters on `trace_id`
+/// and `service_name` alone. Severity has a handful of values, which the
+/// dictionary and the page statistics already prune.
+///
+/// # Errors
+/// A zstd level the library refuses.
+pub fn log_writer_properties(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
+    let ndv = u64::try_from(row_group_rows).unwrap_or(u64::MAX);
+    let mut builder = base_properties(row_group_rows)?;
+    for column in [col::TRACE_ID, col::SERVICE_NAME] {
+        builder = builder
+            .set_column_bloom_filter_enabled(ColumnPath::from(column), true)
+            .set_column_bloom_filter_max_ndv(ColumnPath::from(column), ndv)
+            .set_column_bloom_filter_fpp(ColumnPath::from(column), BLOOM_FPP);
+    }
+    Ok(builder.build())
+}
+
+fn base_properties(row_group_rows: usize) -> Result<WriterPropertiesBuilder, SchemaError> {
     Ok(WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_LEVEL)?))
         .set_max_row_group_row_count(Some(row_group_rows.saturating_add(1)))
-        .set_bloom_filter_max_ndv(u64::try_from(row_group_rows).unwrap_or(u64::MAX))
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::TRACE_ID), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::SPAN_ID), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from(col::SERVICE_NAME), true)
-        .set_bloom_filter_fpp(0.01)
-        .build())
+        .set_statistics_enabled(EnabledStatistics::Page))
 }
 
 /// Sorts one batch by `(service_name, timestamp, row)`: a total order, so
@@ -123,6 +150,25 @@ mod tests {
         assert!(check_row_group_rows(MAX_ROW_GROUP_ROWS).is_ok());
         assert!(check_row_group_rows(0).is_err());
         assert!(check_row_group_rows(MAX_ROW_GROUP_ROWS + 1).is_err());
+    }
+
+    #[test]
+    fn log_blooms_are_sized_to_the_group_on_their_columns_alone() {
+        let props = log_writer_properties(1000).unwrap();
+        for column in [col::TRACE_ID, col::SERVICE_NAME] {
+            let bloom = props
+                .bloom_filter_properties(&ColumnPath::from(column))
+                .unwrap();
+            assert_eq!((bloom.ndv(), bloom.fpp()), (1000, BLOOM_FPP), "{column}");
+        }
+        for column in [col::SPAN_ID, "body", "severity_text", "timestamp"] {
+            assert!(
+                props
+                    .bloom_filter_properties(&ColumnPath::from(column))
+                    .is_none(),
+                "{column}"
+            );
+        }
     }
 
     #[test]

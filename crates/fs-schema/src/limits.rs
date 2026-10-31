@@ -19,6 +19,9 @@ pub struct Limits {
     pub max_events: usize,
     /// Maximum links per span. Extra links are dropped.
     pub max_links: usize,
+    /// Maximum log body length in bytes, after rendering to text. Longer bodies
+    /// are truncated on a UTF-8 boundary.
+    pub max_body_bytes: usize,
 }
 
 impl Default for Limits {
@@ -29,6 +32,7 @@ impl Default for Limits {
             max_value_bytes: 8 * 1024,
             max_events: 128,
             max_links: 128,
+            max_body_bytes: 64 * 1024,
         }
     }
 }
@@ -46,6 +50,10 @@ pub struct DropStats {
     pub links_dropped: u64,
     /// Spans rejected for carrying a trace or span id of the wrong length.
     pub spans_rejected: u64,
+    /// Log records rejected for carrying neither an event nor an observed time.
+    pub logs_rejected: u64,
+    /// Log bodies truncated to `max_body_bytes`.
+    pub bodies_truncated: u64,
 }
 
 impl DropStats {

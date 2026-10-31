@@ -125,7 +125,7 @@ fn bounded(value: &str, limits: &Limits, stats: &mut DropStats) -> String {
 
 /// Text form of any value. Scalars render plainly; bytes as base64; arrays and
 /// key-value lists as JSON.
-fn render_any(value: &Value) -> String {
+pub(crate) fn render_any(value: &Value) -> String {
     match value {
         Value::StringValue(s) => s.clone(),
         Value::BoolValue(b) => b.to_string(),

@@ -403,6 +403,13 @@ severity_text (Dictionary), severity_number (UInt8), body (Utf8),
 resource_fingerprint, resources_string, attributes_string, attributes_number,
 attributes_bool, scope_name, scope_version, scope_string, promoted.*.
 
+trace_id and span_id are nullable: a record outside a trace stores null. The
+id is a ULID whose random part is a hash of the request's origin and the
+record's position in it, so a WAL replay produces the same ids. The body is
+text; structured bodies are stored as JSON. `service_name` and
+`deployment_environment` are promoted as for spans. Files carry bloom filters
+on `trace_id` and `service_name`. The rules are in `crates/fs-schema/MAPPING.md`.
+
 ### Metrics
 
 `series`: fingerprint (UInt64), metric_name (Dictionary), temporality

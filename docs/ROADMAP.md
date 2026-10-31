@@ -156,10 +156,18 @@ C5 landed after C6.
 ## M2 · logs and compactor (phase 2)
 
 - Log schema v1 and OTLP logs conversion, with the same clean-room mapping
-  rules, limits and tests as spans.
+  rules, limits and tests as spans. Done: `fs_schema::logs` (`LogBatchBuilder`,
+  `log_schema_v1`, `log_id`), `Limits::max_body_bytes`, `log_writer_properties`
+  and the Logs section of `MAPPING.md` (`crates/fs-schema/tests/logs_otlp.rs`).
+- Span files carry a bloom filter on every column: the global bloom settings
+  of the Parquet writer enable it everywhere, sized to the row group, while
+  `trace_id`, `span_id` and `service_name` keep the library's default size
+  and 5 % false positive rate. Fixing it changes the bytes a retried flush
+  must reproduce, so it needs a new `FileLayout` version that keeps the old
+  writer for old intents.
 - Logs ingest path reusing the WAL, buffers, coalescer and flush, with its
   own sort key (`service_name, timestamp`) and bloom filters on `trace_id`
-  and `severity`.
+  and `service_name`.
 - Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.

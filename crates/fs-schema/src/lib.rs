@@ -10,6 +10,7 @@ pub mod bucket;
 mod columns;
 pub mod fingerprint;
 pub mod limits;
+pub mod logs;
 pub mod parquet;
 pub mod service_graph;
 pub mod spans;
