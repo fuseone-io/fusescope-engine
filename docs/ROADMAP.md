@@ -216,7 +216,12 @@ C5 landed after C6.
   blocking the other signal; the rebuild and the purge with the knob off;
   a damaged span table not holding back the log one), the fixtures
   `attribute_keys_v2.parquet` and `log_attribute_keys_v1.parquet`, and
-  `metadata_keys_lists_log_keys_from_their_own_table`.
+  `metadata_keys_lists_log_keys_from_their_own_table`. Review round 1: SQL
+  and `metadata.keys` read the `source` and `type` of each file once and
+  fail on a row of the other table
+  (`a_key_row_of_the_other_tables_source_fails_the_query`); a table refuses
+  to merge or rebuild from one of the other kind
+  (`a_table_of_shared_sources_keeps_its_kind`).
 - Ngram and token bloom sidecars ([ADR 0003](adr/0003-ngram-bloom-before-tantivy.md)) for `LIKE` and `contains`.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.

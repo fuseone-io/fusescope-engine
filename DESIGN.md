@@ -738,7 +738,10 @@ pass only `attribute_keys`, so neither rewrites the other's history, and
 that many keys in an hour, half of them per signal. Readers check the
 source against the table as well as the footer: the compactor's decoder
 refuses a row of the other table's source and the encoder never writes
-one; SQL checks the footer alone. Both formats have a committed fixture,
+one, nor does a table take in or rebuild from the other's keys, even of
+the sources both list; SQL and `metadata.keys` read the `source` and
+`type` columns of a file with its footer, once per path, and fail the
+query on a row of another table. Both formats have a committed fixture,
 `attribute_keys_v2.parquet`, which the current encoder must still produce
 byte for byte, and `log_attribute_keys_v1.parquet`.
 

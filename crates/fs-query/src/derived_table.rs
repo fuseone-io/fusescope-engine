@@ -3,9 +3,10 @@
 //! columns. There is no hot-window contribution here: compaction publishes
 //! immutable partial files, and queries aggregate the files that overlap
 //! their range. Every file's schema metadata is checked before the scan,
-//! from its footer alone and once per path, since objects are created once
-//! and never rewritten, so a file of another version or signal fails the
-//! query instead of being misread.
+//! from its footer and once per path, since objects are created once and
+//! never rewritten, so a file of another version or signal fails the
+//! query instead of being misread; a table whose rows can be of another
+//! table under a good footer also has those columns read and checked then.
 
 use std::sync::Arc;
 
@@ -17,8 +18,10 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, Pa
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, utils::conjunction};
-use datafusion::parquet::arrow::async_reader::MetadataFetch;
+use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
+use datafusion::parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use datafusion::parquet::arrow::parquet_to_arrow_schema;
+use datafusion::parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use datafusion::parquet::file::metadata::ParquetMetaDataReader;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -27,8 +30,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::table_schema::TableSchema;
 use fs_catalog::{FileRecord, Signal, TenantId};
 use fs_schema::SchemaError;
-use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -39,7 +42,17 @@ use crate::prune::Pruning;
 /// Refuses a file schema the table's reader does not know.
 pub type SchemaCheck = fn(&arrow::datatypes::Schema) -> Result<(), SchemaError>;
 
-/// Per path, whether its footer passed the check, shared by every
+/// Refuses rows the table's reader would misread: `check` sees every
+/// batch of a file projected to `columns`.
+#[derive(Clone, Copy)]
+pub struct RowCheck {
+    /// The columns `check` reads.
+    pub columns: &'static [&'static str],
+    /// Refuses a batch.
+    pub check: fn(&arrow::record_batch::RecordBatch) -> Result<(), SchemaError>,
+}
+
+/// Per path, whether its footer and rows passed the checks, shared by every
 /// session; a path never changes content, so once is enough. Each path
 /// has its own async lock, held while its footer is fetched, so queries
 /// meeting a new path at the same time fetch it once between them.
@@ -58,6 +71,7 @@ pub struct DerivedTable {
     signal: Signal,
     schema: SchemaRef,
     check: SchemaCheck,
+    rows: Option<RowCheck>,
     verified: VerifiedPaths,
     time_columns: &'static [&'static str],
 }
@@ -82,9 +96,18 @@ impl DerivedTable {
             signal,
             schema,
             check,
+            rows: None,
             verified,
             time_columns: &[],
         }
+    }
+
+    /// Also reads `rows.columns` of every file, once per path with its
+    /// footer, and refuses the file when `rows.check` refuses a batch.
+    #[must_use]
+    pub fn with_row_check(mut self, rows: RowCheck) -> Self {
+        self.rows = Some(rows);
+        self
     }
 
     /// Enables conservative file pruning from predicates on these time
@@ -96,7 +119,8 @@ impl DerivedTable {
     }
 
     /// Refuses `file` unless its footer, fetched by ranges and only the
-    /// first time the path is met, carries a schema `check` accepts.
+    /// first time the path is met, carries a schema `check` accepts and,
+    /// with a row check, its rows pass it.
     async fn check_file(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -117,6 +141,7 @@ impl DerivedTable {
         let footer = Footer {
             store: Arc::clone(store),
             path: Path::from(file.path.as_str()),
+            size,
         };
         let metadata = ParquetMetaDataReader::new()
             .load_and_finish(footer, size)
@@ -132,15 +157,79 @@ impl DerivedTable {
             path: file.path.clone(),
             source,
         })?;
+        if let Some(rows) = self.rows {
+            check_rows(store, file, size, rows).await?;
+        }
         *done = true;
         Ok(())
     }
 }
 
-/// Fetches byte ranges of one object for the Parquet footer reader.
+/// Streams `rows.columns` of `file`, `size` bytes, through `rows.check`.
+async fn check_rows(
+    store: &Arc<dyn ObjectStore>,
+    file: &FileRecord,
+    size: u64,
+    rows: RowCheck,
+) -> Result<(), QueryError> {
+    let reader = Footer {
+        store: Arc::clone(store),
+        path: Path::from(file.path.as_str()),
+        size,
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(datafusion::error::DataFusionError::from)?;
+    let mask = ProjectionMask::columns(builder.parquet_schema(), rows.columns.iter().copied());
+    let mut stream = builder
+        .with_projection(mask)
+        .build()
+        .map_err(datafusion::error::DataFusionError::from)?;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(datafusion::error::DataFusionError::from)?;
+        (rows.check)(&batch).map_err(|source| QueryError::DerivedTable {
+            path: file.path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Fetches byte ranges of one object of `size` bytes for the Parquet
+/// readers.
 struct Footer {
     store: Arc<dyn ObjectStore>,
     path: Path,
+    size: u64,
+}
+
+impl AsyncFileReader for Footer {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> BoxFuture<'_, datafusion::parquet::errors::Result<bytes::Bytes>> {
+        self.fetch(range)
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<
+        'a,
+        datafusion::parquet::errors::Result<
+            Arc<datafusion::parquet::file::metadata::ParquetMetaData>,
+        >,
+    > {
+        async move {
+            let size = self.size;
+            let metadata = ParquetMetaDataReader::new()
+                .with_arrow_reader_options(options)
+                .load_and_finish(self, size)
+                .await?;
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
 }
 
 impl MetadataFetch for Footer {

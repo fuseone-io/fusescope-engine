@@ -2176,6 +2176,141 @@ async fn metadata_keys_lists_log_keys_from_their_own_table() {
     f.db.finish().await;
 }
 
+/// `stats` encoded with every `source` replaced by `source`, under the
+/// footer of its own table: a file a reader of the footer alone would
+/// take for a good one.
+fn with_source(stats: &fs_schema::attribute_keys::KeyStats, source: &str) -> Vec<u8> {
+    let batch = stats.to_batch().unwrap();
+    let index = batch.schema().index_of("source").unwrap();
+    let mut columns = batch.columns().to_vec();
+    columns[index] = Arc::new(arrow::array::StringArray::from(vec![
+        source;
+        batch.num_rows()
+    ]));
+    let relabelled = RecordBatch::try_new(batch.schema(), columns).unwrap();
+    let mut writer =
+        datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
+    writer.write(&relabelled).unwrap();
+    writer.into_inner().unwrap()
+}
+
+/// A table whose footer is right but whose rows carry the other table's
+/// source fails the query, over SQL and `metadata.keys` alike, for log
+/// keys and span keys.
+#[tokio::test]
+async fn a_key_row_of_the_other_tables_source_fails_the_query() {
+    use fs_schema::attribute_keys::KeyStats;
+    let Some(f) = fixture().await else { return };
+    let mut spans = SpanBatchBuilder::new(Limits::default());
+    spans.append_request(&request("api", 1, T0, 3)).unwrap();
+    let hour = i64::try_from(T0 - T0 % HOUR).unwrap();
+    let batch = spans.finish().unwrap();
+    let mut span_keys = KeyStats::default();
+    span_keys.absorb(&batch, hour, usize::MAX).unwrap();
+    register_log_keys(&f, f.tenant, &with_source(&log_keys(), "span"), 2).await;
+    let id = FileId::new();
+    let path = format!(
+        "t/{}/derived/attribute_keys/dt=2026-10-22/hr=14/{}.parquet",
+        f.other_tenant.0, id.0
+    );
+    let bytes = with_source(&span_keys, "log");
+    let target = f.dir.path().join("bucket").join(&path);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(target, &bytes).unwrap();
+    f.db.catalog
+        .register_file(&NewFile {
+            id,
+            origin: id,
+            tenant_id: f.other_tenant,
+            signal: Signal::AttributeKeys,
+            level: Level::L1,
+            path,
+            size_bytes: i64::try_from(bytes.len()).unwrap(),
+            row_count: 2,
+            range: TimeRange {
+                start: chrono::Utc.timestamp_nanos(hour),
+                end: chrono::Utc.timestamp_nanos(hour),
+            },
+            services: vec![],
+            summary: None,
+            content_sha256: None,
+        })
+        .await
+        .unwrap();
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (other_token, _) =
+        f.db.catalog
+            .create_token(f.other_tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    for (tenant, token, signal, table) in [
+        (f.tenant, &token, "logs", "log_attribute_keys"),
+        (f.other_tenant, &other_token, "traces", "attribute_keys"),
+    ] {
+        let mut client = sql_client(addr, token).await;
+        let body = format!(r#"{{"signal": "{signal}"}}"#);
+        let err = action(&mut client, METADATA_KEYS, &body).await.unwrap_err();
+        assert!(
+            err.message().contains("not readable by this version"),
+            "{table}: {err}"
+        );
+        let err = f
+            .querier
+            .collect(tenant, &format!("select count(*) from {table}"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not readable by this version"),
+            "{table}: {err}"
+        );
+    }
+    stop(shutdown, server).await;
+    f.db.finish().await;
+}
+
+/// Log keys of three records of `api` at `T0`, each with `log.file`.
+fn log_keys() -> fs_schema::attribute_keys::KeyStats {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    let log_request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "api")],
+                ..Resource::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: (0..3)
+                    .map(|i| LogRecord {
+                        time_unix_nano: T0 + i,
+                        attributes: vec![kv("log.file", "app.log")],
+                        ..LogRecord::default()
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let mut builder = fs_schema::logs::LogBatchBuilder::new(Limits::default());
+    builder.append_request(&log_request, &[1; 16]).unwrap();
+    let mut stats =
+        fs_schema::attribute_keys::KeyStats::new(fs_schema::attribute_keys::KeyTable::Logs);
+    stats
+        .absorb(
+            &builder.finish().unwrap(),
+            i64::try_from(T0 - T0 % HOUR).unwrap(),
+            usize::MAX,
+        )
+        .unwrap();
+    stats
+}
+
 #[tokio::test]
 async fn derived_contributions_are_pruned_by_time_and_unknown_versions_fail_closed() {
     let Some(f) = fixture().await else { return };

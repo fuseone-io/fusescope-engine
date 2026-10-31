@@ -20,7 +20,7 @@ use fs_schema::attribute_keys::{self, KeyTable};
 use fs_schema::{service_graph, trace_summary};
 
 use crate::QueryError;
-use crate::derived_table::{DerivedTable, VerifiedPaths};
+use crate::derived_table::{DerivedTable, RowCheck, SchemaCheck, VerifiedPaths};
 use crate::files::FileCache;
 use crate::signal_table::SignalTable;
 
@@ -32,6 +32,12 @@ pub const SCHEMA: &str = "public";
 pub const SPANS_TABLE: &str = "spans";
 /// Name of the logs table in every session.
 pub const LOGS_TABLE: &str = "logs";
+
+/// The columns of an attribute keys file read to check its rows.
+const KEY_ROW_COLUMNS: &[&str] = &[
+    attribute_keys::col_names::SOURCE,
+    attribute_keys::col_names::TYPE,
+];
 
 /// Builds a session that only sees `tenant`'s tables and cannot write.
 ///
@@ -84,30 +90,18 @@ pub fn tenant_session(
                 .with_hot_window(hot, warnings),
         ),
     )?;
-    schema.register_table(
-        attribute_keys::TABLE.into(),
-        Arc::new(DerivedTable::new(
-            tenant,
-            Arc::clone(&cache),
-            store_url.clone(),
-            Signal::AttributeKeys,
-            attribute_keys::table_schema(),
-            |schema| attribute_keys::check_schema(schema, KeyTable::Spans).map(|_| ()),
-            Arc::clone(&verified),
-        )),
-    )?;
-    schema.register_table(
-        KeyTable::Logs.name().into(),
-        Arc::new(DerivedTable::new(
-            tenant,
-            Arc::clone(&cache),
-            store_url.clone(),
-            Signal::LogAttributeKeys,
-            KeyTable::Logs.session_schema(),
-            |schema| attribute_keys::check_schema(schema, KeyTable::Logs).map(|_| ()),
-            Arc::clone(&verified),
-        )),
-    )?;
+    for table in [KeyTable::Spans, KeyTable::Logs] {
+        schema.register_table(
+            table.name().into(),
+            Arc::new(keys_table(
+                tenant,
+                Arc::clone(&cache),
+                store_url.clone(),
+                table,
+                Arc::clone(&verified),
+            )),
+        )?;
+    }
     schema.register_table(
         trace_summary::TABLE.into(),
         Arc::new(
@@ -146,6 +140,45 @@ pub fn tenant_session(
     ctx.register_catalog(CATALOG, catalog);
     ctx.register_udaf(crate::tdigest::quantile_tdigest());
     Ok(ctx)
+}
+
+/// The tenant's `table` of attribute keys, each file's footer and rows
+/// checked against it once per path.
+fn keys_table(
+    tenant: TenantId,
+    cache: Arc<FileCache>,
+    store_url: ObjectStoreUrl,
+    table: KeyTable,
+    verified: VerifiedPaths,
+) -> DerivedTable {
+    let (signal, check, rows): (_, SchemaCheck, RowCheck) = match table {
+        KeyTable::Spans => (
+            Signal::AttributeKeys,
+            |schema| attribute_keys::check_schema(schema, KeyTable::Spans).map(|_| ()),
+            RowCheck {
+                columns: KEY_ROW_COLUMNS,
+                check: |batch| attribute_keys::check_rows(batch, KeyTable::Spans),
+            },
+        ),
+        KeyTable::Logs => (
+            Signal::LogAttributeKeys,
+            |schema| attribute_keys::check_schema(schema, KeyTable::Logs).map(|_| ()),
+            RowCheck {
+                columns: KEY_ROW_COLUMNS,
+                check: |batch| attribute_keys::check_rows(batch, KeyTable::Logs),
+            },
+        ),
+    };
+    DerivedTable::new(
+        tenant,
+        cache,
+        store_url,
+        signal,
+        table.session_schema(),
+        check,
+        verified,
+    )
+    .with_row_check(rows)
 }
 
 /// Parses and plans `sql`, refusing anything that is not a read: the

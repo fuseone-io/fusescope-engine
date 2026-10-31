@@ -327,12 +327,13 @@ impl KeyStats {
     /// neither counted as new nor as dropped.
     ///
     /// # Errors
-    /// As [`absorb`](Self::absorb).
+    /// As [`absorb`](Self::absorb), or `known` of another table.
     pub fn absorb_known(
         &mut self,
         batch: &RecordBatch,
         known: &KeyStats,
     ) -> Result<(), SchemaError> {
+        self.same_table(known)?;
         self.absorb_with(batch, &Admission::Known(known))
     }
 
@@ -396,7 +397,11 @@ impl KeyStats {
     }
 
     /// Adds everything `other` knows; its keys count as new here.
-    pub fn merge(&mut self, other: KeyStats) {
+    ///
+    /// # Errors
+    /// `other` of another table; nothing is added.
+    pub fn merge(&mut self, other: KeyStats) -> Result<(), SchemaError> {
+        self.same_table(&other)?;
         for ((source, kind), keys) in other.keys {
             let known = self.keys.entry((source, kind)).or_default();
             for (key, seen) in keys {
@@ -409,6 +414,15 @@ impl KeyStats {
             }
         }
         self.dropped = self.dropped.saturating_add(other.dropped);
+        Ok(())
+    }
+
+    fn same_table(&self, other: &KeyStats) -> Result<(), SchemaError> {
+        if self.table == other.table {
+            Ok(())
+        } else {
+            Err(SchemaError::Layout("attribute keys of another table"))
+        }
     }
 
     /// Distinct (source, key, type) rows.
@@ -703,6 +717,41 @@ pub fn check_schema(schema: &Schema, table: KeyTable) -> Result<u32, SchemaError
     Ok(version)
 }
 
+/// Refuses rows of `batch`, a batch of `table` with at least its `source`
+/// column, whose source the table does not list or, where the batch has
+/// it, whose type is unknown: what a reader that does not decode the
+/// table checks before serving it.
+///
+/// # Errors
+/// No `source` column, a column of another type, or such a row.
+pub fn check_rows(batch: &RecordBatch, table: KeyTable) -> Result<(), SchemaError> {
+    let schema = batch.schema();
+    let sources = batch
+        .column(schema.index_of(col_names::SOURCE)?)
+        .as_string_opt::<i32>()
+        .ok_or(SchemaError::Layout("source"))?;
+    let listed = |name: Option<&str>| {
+        name.and_then(KeySource::parse)
+            .is_some_and(|source| table.lists(source))
+    };
+    if !sources.iter().all(listed) {
+        return Err(SchemaError::Layout("source"));
+    }
+    if let Ok(index) = schema.index_of(col_names::TYPE) {
+        let kinds = batch
+            .column(index)
+            .as_string_opt::<i32>()
+            .ok_or(SchemaError::Layout("type"))?;
+        if !kinds
+            .iter()
+            .all(|kind| kind.and_then(KeyType::parse).is_some())
+        {
+            return Err(SchemaError::Layout("type"));
+        }
+    }
+    Ok(())
+}
+
 /// Encodes `stats` as one Parquet file of its table.
 ///
 /// # Errors
@@ -729,7 +778,7 @@ pub fn decode(bytes: bytes::Bytes, table: KeyTable) -> Result<KeyStats, SchemaEr
     let version = check_schema(builder.schema(), table)?;
     let mut out = KeyStats::new(table);
     for batch in builder.build()? {
-        out.merge(KeyStats::from_batch(&batch?, table, version)?);
+        out.merge(KeyStats::from_batch(&batch?, table, version)?)?;
     }
     Ok(out.settled())
 }
@@ -990,11 +1039,54 @@ mod tests {
         );
 
         let mut mixed = KeyStats::new(KeyTable::Logs);
-        mixed.merge(fixture_stats());
+        assert!(matches!(
+            mixed.merge(fixture_stats()),
+            Err(SchemaError::Layout(_))
+        ));
+        assert_eq!(mixed.len(), 0, "nothing taken in");
+        assert!(check_rows(&spans, KeyTable::Logs).is_err());
+        assert!(check_rows(&logs, KeyTable::Spans).is_err());
+        assert!(check_rows(&spans, KeyTable::Spans).is_ok());
+        assert!(check_rows(&logs.project(&[1]).unwrap(), KeyTable::Logs).is_ok());
+    }
+
+    /// Resources and scopes are listed by both tables, so a table of only
+    /// those is told apart by its kind alone: neither merge nor a rebuild
+    /// relabels one as the other.
+    #[test]
+    fn a_table_of_shared_sources_keeps_its_kind() {
+        let logs_only_shared = {
+            let mut stats = KeyStats::new(KeyTable::Logs);
+            stats
+                .absorb(&log_batch(vec![(H14 + 1, Vec::new())]), H14, usize::MAX)
+                .unwrap();
+            stats
+        };
         assert!(
-            matches!(encode(&mixed), Err(SchemaError::Layout(_))),
-            "never written"
+            logs_only_shared
+                .iter()
+                .all(|(source, ..)| matches!(source, KeySource::Resource | KeySource::Scope))
         );
+        assert_eq!(logs_only_shared.len(), 2);
+        let mut spans = KeyStats::default();
+        assert!(matches!(
+            spans.merge(logs_only_shared.clone()),
+            Err(SchemaError::Layout(_))
+        ));
+        assert!(matches!(
+            spans.absorb_known(
+                &batch_with(vec![span(H14 + 2, Vec::new())]),
+                &logs_only_shared
+            ),
+            Err(SchemaError::Layout(_))
+        ));
+        assert_eq!(spans.len(), 0);
+        let mut logs = KeyStats::new(KeyTable::Logs);
+        logs.merge(logs_only_shared.clone()).unwrap();
+        logs.absorb_known(&log_batch(vec![(H14 + 3, Vec::new())]), &logs_only_shared)
+            .unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs.table(), KeyTable::Logs);
     }
 
     fn relabelled_schema(batch: &RecordBatch, version: &str) -> Schema {
@@ -1138,7 +1230,7 @@ mod tests {
                 usize::MAX,
             )
             .unwrap();
-        first.merge(second);
+        first.merge(second).unwrap();
         let method = first
             .iter()
             .find(|(_, key, _, _)| *key == "http.method")

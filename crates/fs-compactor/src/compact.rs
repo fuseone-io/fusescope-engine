@@ -441,8 +441,11 @@ impl Compactor {
         let mut keys = KeyStats::new(table);
         let mut replaced = Vec::with_capacity(previous.len());
         for file in &previous {
-            match read_table(self.store.as_ref(), &file.path, table).await {
-                Ok(known) => keys.merge(known),
+            let read = read_table(self.store.as_ref(), &file.path, table)
+                .await
+                .and_then(|known| Ok(keys.merge(known)?));
+            match read {
+                Ok(()) => {}
                 Err(e) => {
                     self.stats
                         .derived_unreadable
