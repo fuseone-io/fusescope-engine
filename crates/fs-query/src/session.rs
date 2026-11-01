@@ -33,6 +33,10 @@ pub const SCHEMA: &str = "public";
 pub const SPANS_TABLE: &str = "spans";
 /// Name of the logs table in every session.
 pub const LOGS_TABLE: &str = "logs";
+/// Name of the metric samples table in every session.
+pub const SAMPLES_TABLE: &str = "samples";
+/// Name of the metric series table in every session.
+pub const SERIES_TABLE: &str = "time_series";
 
 /// The columns of an attribute keys file read to check its rows.
 const KEY_ROW_COLUMNS: &[&str] = &[
@@ -80,21 +84,13 @@ pub fn tenant_session(
     let ctx = SessionContext::new_with_state(state);
 
     let schema = Arc::new(MemorySchemaProvider::new());
-    schema.register_table(
-        SPANS_TABLE.into(),
-        Arc::new(
-            SignalTable::spans(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
-                .with_hot_window(Arc::clone(&hot), Arc::clone(&warnings))
-                .with_trace_index(trace_index),
-        ),
-    )?;
-    schema.register_table(
-        LOGS_TABLE.into(),
-        Arc::new(
-            SignalTable::logs(tenant, Arc::clone(&cache), store_url.clone(), bytes_budget)
-                .with_hot_window(hot, warnings)
-                .with_text_index(text_index.0, text_index.1),
-        ),
+    register_signal_tables(
+        &schema,
+        tenant,
+        (&cache, store_url, bytes_budget),
+        (hot, warnings),
+        trace_index,
+        text_index,
     )?;
     for table in [KeyTable::Spans, KeyTable::Logs] {
         schema.register_table(
@@ -151,6 +147,59 @@ pub fn tenant_session(
     ctx.register_udaf(crate::tdigest::quantile_tdigest());
     ctx.register_udf(crate::has_token::udf());
     Ok(ctx)
+}
+
+/// Registers the tenant's `spans`, `logs`, `samples` and `time_series`,
+/// each over its files and the hot window.
+fn register_signal_tables(
+    schema: &MemorySchemaProvider,
+    tenant: TenantId,
+    (cache, store_url, bytes_budget): (&Arc<FileCache>, &ObjectStoreUrl, u64),
+    (hot, warnings): (
+        Arc<crate::hot::HotWindow>,
+        Arc<crate::querier::QueryWarnings>,
+    ),
+    trace_index: Arc<crate::trace_index::TraceIndexCache>,
+    text_index: (
+        Arc<dyn crate::file_index::FileIndex>,
+        Arc<crate::querier::QueryStats>,
+    ),
+) -> Result<(), QueryError> {
+    for (name, table) in [
+        (SAMPLES_TABLE, fs_ingest::hot::MetricTable::Samples),
+        (SERIES_TABLE, fs_ingest::hot::MetricTable::Series),
+    ] {
+        schema.register_table(
+            name.into(),
+            Arc::new(
+                SignalTable::metrics(
+                    table,
+                    tenant,
+                    Arc::clone(cache),
+                    store_url.clone(),
+                    bytes_budget,
+                )
+                .with_hot_window(Arc::clone(&hot), Arc::clone(&warnings)),
+            ),
+        )?;
+    }
+    schema.register_table(
+        SPANS_TABLE.into(),
+        Arc::new(
+            SignalTable::spans(tenant, Arc::clone(cache), store_url.clone(), bytes_budget)
+                .with_hot_window(Arc::clone(&hot), Arc::clone(&warnings))
+                .with_trace_index(trace_index),
+        ),
+    )?;
+    schema.register_table(
+        LOGS_TABLE.into(),
+        Arc::new(
+            SignalTable::logs(tenant, Arc::clone(cache), store_url.clone(), bytes_budget)
+                .with_hot_window(hot, warnings)
+                .with_text_index(text_index.0, text_index.1),
+        ),
+    )?;
+    Ok(())
 }
 
 /// The tenant's `usage_1h`: every contribution summed, one row per

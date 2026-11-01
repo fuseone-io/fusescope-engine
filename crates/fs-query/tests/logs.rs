@@ -564,7 +564,7 @@ async fn an_empty_answer_is_judged_by_the_schema_it_sends() {
         fs_query::hot::HotWindowConfig::default(),
     );
     let everything = fs_query::prune::Pruning::default();
-    let scan = |signal| hot.scan(tenant, signal, &everything, None, None);
+    let scan = |signal| hot.scan(tenant, (signal, None), &everything, None, None);
     let excluded = |ids: &[&str]| {
         ids.iter()
             .map(|id| fs_catalog::FileId(id.parse().unwrap()))

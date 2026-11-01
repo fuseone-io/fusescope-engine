@@ -497,7 +497,7 @@ impl Querier {
                 .hot
                 .scan(
                     tenant,
-                    fs_ingest::record::RowSignal::Traces,
+                    (fs_ingest::record::RowSignal::Traces, None),
                     &pruning,
                     Some(vec![span_col::SERVICE_NAME.to_owned()]),
                     Some(limit.saturating_add(1)),

@@ -1,5 +1,6 @@
-//! DataFusion table over the span or log rows of one tenant: its files in
-//! the catalog and, for a recent range, the ingesters' memory.
+//! DataFusion table over the span or log rows, or the metric samples or
+//! series, of one tenant: its files in the catalog and, for a recent range,
+//! the ingesters' memory.
 
 use std::sync::Arc;
 
@@ -20,7 +21,9 @@ use datafusion_datasource::table_schema::TableSchema;
 use fs_catalog::TenantId;
 use tracing::debug;
 
+use fs_catalog::Signal;
 use fs_ingest::flush::{catalog_signal, schema_of};
+use fs_ingest::hot::MetricTable;
 use fs_ingest::record::RowSignal;
 
 use crate::QueryError;
@@ -36,6 +39,8 @@ use fs_index::text_index::Probe;
 pub struct SignalTable {
     tenant: TenantId,
     signal: RowSignal,
+    /// For metrics: the samples or the series.
+    table: Option<MetricTable>,
     cache: Arc<FileCache>,
     store_url: ObjectStoreUrl,
     bytes_budget: u64,
@@ -76,6 +81,21 @@ impl SignalTable {
         Self::of(RowSignal::Logs, tenant, cache, store_url, bytes_budget)
     }
 
+    /// Table over `tenant`'s visible metric samples or series files,
+    /// reading through `store_url`.
+    pub fn metrics(
+        table: MetricTable,
+        tenant: TenantId,
+        cache: Arc<FileCache>,
+        store_url: ObjectStoreUrl,
+        bytes_budget: u64,
+    ) -> Self {
+        Self {
+            table: Some(table),
+            ..Self::of(RowSignal::Metrics, tenant, cache, store_url, bytes_budget)
+        }
+    }
+
     fn of(
         signal: RowSignal,
         tenant: TenantId,
@@ -86,6 +106,7 @@ impl SignalTable {
         Self {
             tenant,
             signal,
+            table: None,
             cache,
             store_url,
             bytes_budget,
@@ -161,11 +182,8 @@ impl SignalTable {
         filters: &[Expr],
         excluded: &std::collections::HashSet<fs_catalog::FileId>,
     ) -> Result<Planned, QueryError> {
-        let pruning = Pruning::from_filters(filters);
-        let all = self
-            .cache
-            .files(self.tenant, catalog_signal(self.signal))
-            .await?;
+        let pruning = self.pruning(filters);
+        let all = self.cache.files(self.tenant, self.catalog_signal()).await?;
         let candidates: Vec<&fs_catalog::FileRecord> = all
             .iter()
             .filter(|f| {
@@ -211,6 +229,41 @@ impl SignalTable {
         Ok(Planned { files, bytes, text })
     }
 
+    /// The schema the table shows: its signal's, for metrics its table's,
+    /// without the samples' source order, which no query sees.
+    fn table_schema(&self) -> arrow::datatypes::SchemaRef {
+        match self.table {
+            Some(MetricTable::Series) => fs_schema::metrics::series_schema_v1(),
+            Some(MetricTable::Samples) => {
+                let full = fs_schema::metrics::samples_schema_v1();
+                let shown: Vec<usize> = (0..full.fields().len())
+                    .filter(|i| full.field(*i).name() != fs_schema::metrics::col::SOURCE_ORDER)
+                    .collect();
+                full.project(&shown).map(Arc::new).unwrap_or(full)
+            }
+            None => schema_of(self.signal),
+        }
+    }
+
+    /// The catalog's signal for the table's files.
+    fn catalog_signal(&self) -> Signal {
+        match self.table {
+            Some(MetricTable::Series) => Signal::MetricSeries,
+            Some(MetricTable::Samples) => Signal::MetricSamples,
+            None => catalog_signal(self.signal),
+        }
+    }
+
+    /// What `filters` say about the table's files: metric rows are timed
+    /// by `unix_milli`.
+    fn pruning(&self, filters: &[Expr]) -> Pruning {
+        if self.table.is_some() {
+            Pruning::from_metric_filters(filters)
+        } else {
+            Pruning::from_filters(filters)
+        }
+    }
+
     /// The text index and the probe of a body search it can prune.
     fn text_search(&self, filters: &[Expr]) -> Option<(&Arc<dyn FileIndex>, Probe)> {
         let (index, _) = self.text_index.as_ref()?;
@@ -231,7 +284,7 @@ impl std::fmt::Debug for SignalTable {
 #[async_trait]
 impl TableProvider for SignalTable {
     fn schema(&self) -> arrow::datatypes::SchemaRef {
-        schema_of(self.signal)
+        self.table_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -254,12 +307,12 @@ impl TableProvider for SignalTable {
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let started = std::time::Instant::now();
-        let schema = schema_of(self.signal);
+        let schema = self.table_schema();
         let external = |e: QueryError| datafusion::error::DataFusionError::External(Box::new(e));
 
         // Hot window first: ingesters report which recently flushed files they
         // still serve, and those leave the file scan.
-        let pruning = Pruning::from_filters(filters);
+        let pruning = self.pruning(filters);
         let projected_names: Option<Vec<String>> = projection.map(|indices| {
             indices
                 .iter()
@@ -273,7 +326,7 @@ impl TableProvider for SignalTable {
                 let result = hot
                     .scan(
                         self.tenant,
-                        self.signal,
+                        (self.signal, self.table),
                         &pruning,
                         projected_names.clone(),
                         None,
@@ -339,7 +392,7 @@ impl SignalTable {
         planned: Planned,
         started: std::time::Instant,
     ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-        let schema = schema_of(self.signal);
+        let schema = self.table_schema();
         let text = planned
             .text
             .zip(self.text_index.as_ref().map(|(_, stats)| Arc::clone(stats)));

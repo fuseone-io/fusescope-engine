@@ -35,6 +35,11 @@ impl Pruning {
         Self::from_filters_on(filters, &[col::TIMESTAMP])
     }
 
+    /// Derives bounds from `filters` on metric rows, timed by `unix_milli`.
+    pub fn from_metric_filters(filters: &[Expr]) -> Self {
+        Self::from_filters_on(filters, &[fs_schema::metrics::col::UNIX_MILLI])
+    }
+
     /// Derives time bounds from any column in `time_columns`; the other
     /// span-specific predicates remain recognised as usual.
     pub fn from_filters_on(filters: &[Expr], time_columns: &[&str]) -> Self {
@@ -102,7 +107,13 @@ impl Pruning {
     ) {
         match column {
             name if time_columns.contains(&name) => {
-                if let Some(ns) = timestamp_nanos(literal) {
+                // `unix_milli` holds milliseconds as an integer.
+                let ns = timestamp_nanos(literal).or_else(|| {
+                    (name == fs_schema::metrics::col::UNIX_MILLI)
+                        .then(|| integer(literal)?.checked_mul(1_000_000))
+                        .flatten()
+                });
+                if let Some(ns) = ns {
                     self.bound(op, ns);
                 }
             }
@@ -412,5 +423,23 @@ mod tests {
         assert_eq!(pruning.ts_min, Some(500));
         assert!(!pruning.keeps(&file(0, 499, &[])));
         assert!(pruning.keeps(&file(500, 900, &[])));
+    }
+
+    #[test]
+    fn unix_milli_bounds_metric_files_in_milliseconds() {
+        let filters = [
+            dfcol("unix_milli").gt_eq(lit(2_000i64)),
+            dfcol("unix_milli").lt_eq(lit(5_000i64)),
+        ];
+        let pruning = Pruning::from_metric_filters(&filters);
+        assert_eq!(pruning.ts_min, Some(2_000_000_000));
+        assert_eq!(pruning.ts_max, Some(5_000_000_000));
+        assert!(pruning.keeps(&file(4_000_000_000, 6_000_000_000, &[])));
+        assert!(!pruning.keeps(&file(6_000_000_000, 7_000_000_000, &[])));
+        assert_eq!(
+            Pruning::from_filters(&filters).ts_min,
+            None,
+            "not a span column"
+        );
     }
 }

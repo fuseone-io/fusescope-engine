@@ -470,6 +470,10 @@ sequence of compactions, whichever ingesters wrote them. Sorted by name,
 fingerprint, time and source order; a bloom filter on `metric_name`. The
 `env` column of `samples_v4` is not carried over; it is a label.
 
+A tenant's SQL session has both as tables, `samples` and `time_series`,
+over the files of complete sets and the hot window; `unix_milli` prunes
+files and hours, and a file whose partner is not visible is not read.
+
 The fingerprint (version 1) hashes the resource, scope and point levels
 apart, then the series' name, type, unit, temporality, monotonicity and
 `le` or `quantile`: series whose labels match only because one level

@@ -8,8 +8,7 @@ use std::time::Duration;
 use arrow::record_batch::RecordBatch;
 use chrono::{Duration as ChronoDuration, Utc};
 use fs_catalog::{Catalog, FileId, TenantId};
-use fs_ingest::flush::schema_of;
-use fs_ingest::hot::{HotScanRequest, HotScanResponse, scan_with};
+use fs_ingest::hot::{HotScanRequest, HotScanResponse, MetricTable, scan_schema, scan_with};
 use fs_ingest::record::RowSignal;
 use tracing::{debug, warn};
 
@@ -120,7 +119,7 @@ impl HotWindow {
     pub async fn scan(
         &self,
         tenant: TenantId,
-        signal: RowSignal,
+        (signal, table): (RowSignal, Option<MetricTable>),
         pruning: &Pruning,
         columns: Option<Vec<String>>,
         distinct: Option<usize>,
@@ -141,7 +140,7 @@ impl HotWindow {
             span_ids: pruning.span_ids.clone(),
             distinct,
             signal,
-            table: None,
+            table,
         };
         let calls = ingesters.iter().map(|ingester| {
             let request = request.clone();
@@ -162,7 +161,7 @@ impl HotWindow {
         let mut result = HotResult::default();
         for (id, outcome) in futures_util::future::join_all(calls).await {
             let outcome = outcome.map_err(|e| e.to_string()).and_then(|response| {
-                if answers_signal(&response, signal) {
+                if answers_signal(&response, &request) {
                     Ok(response)
                 } else {
                     Err(format!("answered rows of another signal than {signal:?}"))
@@ -197,11 +196,12 @@ impl HotWindow {
     }
 }
 
-/// True when the schema the ingester sent, and every batch, names `signal`
-/// as the ingester's schemas do; an answer without a schema names none.
-fn answers_signal(response: &HotScanResponse, signal: RowSignal) -> bool {
+/// True when the schema the ingester sent, and every batch, names the
+/// signal, or for metrics the table, `request` asked for, as the
+/// ingester's schemas do; an answer without a schema names none.
+fn answers_signal(response: &HotScanResponse, request: &HotScanRequest) -> bool {
     let key = "fusescope.signal";
-    let expected = schema_of(signal);
+    let expected = scan_schema(request);
     let expected = expected.metadata().get(key);
     let names = |schema: &arrow::datatypes::Schema| {
         expected.is_some() && schema.metadata().get(key) == expected
@@ -213,6 +213,54 @@ fn answers_signal(response: &HotScanResponse, signal: RowSignal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask(signal: RowSignal, table: Option<MetricTable>) -> HotScanRequest {
+        HotScanRequest {
+            tenant: TenantId::new(),
+            ts_min: None,
+            ts_max: None,
+            services: None,
+            columns: None,
+            trace_ids: None,
+            span_ids: None,
+            distinct: None,
+            signal,
+            table,
+        }
+    }
+
+    fn answers(response: &HotScanResponse, signal: RowSignal) -> bool {
+        answers_signal(response, &ask(signal, None))
+    }
+
+    /// A metric scan names its table: series rows do not answer a samples
+    /// scan, nor the reverse, and an ingester's empty answer names one too.
+    #[test]
+    fn a_metric_answer_names_its_table() {
+        let samples = Some(fs_schema::metrics::samples_schema_v1());
+        let series = Some(fs_schema::metrics::series_schema_v1());
+        let of = |table| ask(RowSignal::Metrics, Some(table));
+        assert!(answers_signal(
+            &answer(samples.clone(), &[]),
+            &of(MetricTable::Samples)
+        ));
+        assert!(answers_signal(
+            &answer(series.clone(), &[]),
+            &of(MetricTable::Series)
+        ));
+        assert!(!answers_signal(
+            &answer(series, &[]),
+            &of(MetricTable::Samples)
+        ));
+        assert!(!answers_signal(
+            &answer(samples, &[]),
+            &of(MetricTable::Series)
+        ));
+        assert!(!answers_signal(
+            &answer(None, &[]),
+            &of(MetricTable::Series)
+        ));
+    }
 
     fn answer(
         schema: Option<arrow::datatypes::SchemaRef>,
@@ -238,37 +286,31 @@ mod tests {
         let projected = spans.project(&[0, 1]).unwrap();
         let of_spans = Some(spans.schema());
         let of_logs = Some(logs.schema());
-        assert!(answers_signal(
+        assert!(answers(
             &answer(of_spans.clone(), &[spans.clone(), projected]),
             RowSignal::Traces
         ));
-        assert!(!answers_signal(
+        assert!(!answers(
             &answer(of_spans.clone(), std::slice::from_ref(&spans)),
             RowSignal::Logs
         ));
-        assert!(answers_signal(
+        assert!(answers(
             &answer(of_logs.clone(), std::slice::from_ref(&logs)),
             RowSignal::Logs
         ));
-        assert!(!answers_signal(
+        assert!(!answers(
             &answer(of_logs.clone(), &[logs, spans]),
             RowSignal::Logs
         ));
-        assert!(!answers_signal(
-            &answer(of_spans.clone(), &[]),
-            RowSignal::Logs
-        ));
-        assert!(answers_signal(&answer(of_spans, &[]), RowSignal::Traces));
-        assert!(answers_signal(&answer(of_logs, &[]), RowSignal::Logs));
+        assert!(!answers(&answer(of_spans.clone(), &[]), RowSignal::Logs));
+        assert!(answers(&answer(of_spans, &[]), RowSignal::Traces));
+        assert!(answers(&answer(of_logs, &[]), RowSignal::Logs));
         let bare = Arc::new(arrow::datatypes::Schema::empty());
         assert!(
-            !answers_signal(&answer(Some(bare), &[]), RowSignal::Traces),
+            !answers(&answer(Some(bare), &[]), RowSignal::Traces),
             "no name"
         );
-        assert!(
-            !answers_signal(&answer(None, &[]), RowSignal::Traces),
-            "no schema"
-        );
+        assert!(!answers(&answer(None, &[]), RowSignal::Traces), "no schema");
     }
 
     fn config(enabled: bool) -> HotWindowConfig {
