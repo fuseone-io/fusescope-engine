@@ -6,8 +6,10 @@
 //! filters on every batch to note the files with a matching row, drops the
 //! column and, once every partition reached its end, publishes the files
 //! and row groups after the catalog, after the index and matched, the
-//! precision and the time since planning, all together. A scan cut short,
-//! by a limit, a cancellation or an error, publishes nothing.
+//! precision and the time since the scan's planning began, index lookup
+//! included, all together. A scan cut short, by a limit, a cancellation or
+//! an error, or one whose filters could not be planned to tell a match,
+//! publishes nothing.
 
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -165,8 +167,9 @@ impl std::fmt::Debug for SharedHandle {
 }
 
 impl TextScanExec {
-    /// Wraps `input`. `predicate`, over `input`'s schema, decides a match;
-    /// `None` counts no match. A `limited` scan never publishes.
+    /// Wraps `input` for a search whose planning began at `started`.
+    /// `predicate`, over `input`'s schema, decides a match; without one, as
+    /// for a `limited` scan, nothing is published.
     ///
     /// # Errors
     /// An input whose last column is not [`FILE_COLUMN`].
@@ -175,6 +178,7 @@ impl TextScanExec {
         predicate: Option<Arc<dyn PhysicalExpr>>,
         tally: TextTally,
         stats: Arc<QueryStats>,
+        started: Instant,
         limited: bool,
     ) -> DfResult<Self> {
         let full = input.schema();
@@ -195,8 +199,8 @@ impl TextScanExec {
         let shared = Shared {
             tally,
             stats,
-            started: Instant::now(),
-            publishable: AtomicBool::new(!limited),
+            started,
+            publishable: AtomicBool::new(!limited && predicate.is_some()),
             running: AtomicUsize::new(partitions),
             matched: Mutex::new(HashSet::new()),
         };
@@ -248,6 +252,7 @@ impl ExecutionPlan for TextScanExec {
             self.predicate.clone(),
             shared.tally,
             Arc::clone(&shared.stats),
+            shared.started,
             !shared.publishable.load(Ordering::Acquire),
         )?))
     }
@@ -378,7 +383,15 @@ mod tests {
             row_groups_catalog: 6,
             row_groups_index: 2,
         };
-        TextScanExec::new(input, Some(predicate), tally, Arc::clone(stats), limited).unwrap()
+        TextScanExec::new(
+            input,
+            Some(predicate),
+            tally,
+            Arc::clone(stats),
+            Instant::now(),
+            limited,
+        )
+        .unwrap()
     }
 
     async fn drain(exec: &TextScanExec, partition: usize) -> Vec<RecordBatch> {
@@ -431,6 +444,37 @@ mod tests {
         drain(&limited, 0).await;
         drain(&limited, 1).await;
         assert_eq!(published(&stats), [0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_cannot_tell_a_match_publishes_nothing() {
+        let stats = Arc::new(QueryStats::default());
+        let parts = vec![vec![batch(&["hit"], 0)]];
+        let input = MemorySourceConfig::try_new_exec(&parts, batch(&[], 0).schema(), None).unwrap();
+        let exec = TextScanExec::new(
+            input,
+            None,
+            TextTally::default(),
+            Arc::clone(&stats),
+            Instant::now(),
+            false,
+        )
+        .unwrap();
+        drain(&exec, 0).await;
+        assert_eq!(published(&stats), [0, 0, 0, 0], "not a precision of zero");
+    }
+
+    #[tokio::test]
+    async fn a_perfect_precision_lands_in_a_finite_bucket() {
+        let stats = Arc::new(QueryStats::default());
+        let exec = exec(&stats, false);
+        drain(&exec, 0).await;
+        drain(&exec, 1).await;
+        stats.text_precision.observe(1.0);
+        let h = &stats.text_precision.0;
+        let finite = h.cumulative()[h.bounds().len() - 1];
+        assert_eq!(h.bounds().last(), Some(&1.0));
+        assert_eq!(finite, h.count(), "no precision falls in +Inf");
     }
 
     #[test]

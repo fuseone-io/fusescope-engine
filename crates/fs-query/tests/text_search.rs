@@ -506,3 +506,41 @@ async fn the_querier_follows_a_test_double_of_the_index() {
     assert_eq!(stage(&nonsense.stats())[1..3], [4, 4], "read whole");
     f.db.finish().await;
 }
+
+/// An index that takes its time before reading every file whole, as a
+/// cold cache downloading sidecars and footers would.
+#[derive(Debug)]
+struct Slow;
+
+#[async_trait]
+impl FileIndex for Slow {
+    async fn select(&self, files: &[FileRecord], _: &Probe) -> Vec<FileSelection> {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        files
+            .iter()
+            .map(|file| FileSelection {
+                file: file.id,
+                selection: Selection::Skip,
+                row_groups: None,
+            })
+            .collect()
+    }
+}
+
+/// The time of a search includes the index lookup, even when the index
+/// then prunes every file.
+#[tokio::test]
+async fn the_time_of_a_search_includes_its_index_lookup() {
+    let Some(mut f) = fixture().await else { return };
+    four_files(&mut f).await;
+    let q = querier(&f, 0).with_text_index(Arc::new(Slow));
+    assert_eq!(bodies(&q, f.tenant, "body LIKE '%timeout%'").await.len(), 0);
+    let latency = &q.stats().text_latency.0;
+    assert_eq!(latency.count(), 1);
+    assert!(
+        latency.sum_nanos() >= 300_000_000,
+        "{} ns leaves the index lookup out",
+        latency.sum_nanos()
+    );
+    f.db.finish().await;
+}

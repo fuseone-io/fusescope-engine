@@ -78,7 +78,7 @@ impl Default for QueryLatency {
 }
 
 /// Upper bounds of the precision buckets of a text search.
-const PRECISION_BOUNDS: [f64; 10] = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+const PRECISION_BOUNDS: [f64; 11] = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
 /// Precision of text searches: files with a matching row over files the
 /// text index kept, between 0 and 1, on the histogram's scale of seconds.
@@ -161,7 +161,8 @@ pub struct QueryStats {
     pub text_row_groups_index: std::sync::atomic::AtomicU64,
     /// Precision of each search.
     pub text_precision: TextPrecision,
-    /// Time of each search, from planning its scan to the scan's end.
+    /// Time of each search, from the start of its scan's planning, hot
+    /// window and index lookup included, to the scan's end.
     pub text_latency: QueryLatency,
 }
 

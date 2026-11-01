@@ -495,10 +495,14 @@ group's body bytes) and a file's at most `text_index_max_bytes_per_file`
 carries no bloom and is always read.
 
 The flush builds the sidecar of a log L0 file from the row groups it
-encodes, in place in its output buffer, after the Parquet object and before
-the catalog row. Log flushes hold one more copy of their input in the lease
+encodes, in its output buffer, after the Parquet object and before the
+catalog row. Log flushes hold one more copy of their input in the lease
 for it (`TEXT_INDEX_SCRATCH_FACTOR`), and admission keeps that room for log
-rows. The intent records the sizing (`FileLayout.text_index`), so a replay
+rows; whatever the builder may hold beyond that copy, its row-group
+descriptors and the folded copy of the longest body included
+(`TextIndexBuilder::memory_bound`), is held as scratch for the attempt. A
+sidecar already in place is compared with the prepared one chunk by chunk
+as it is read, never held whole beside it. The intent records the sizing (`FileLayout.text_index`), so a replay
 writes the same bytes; an intent logged without it writes no sidecar. A
 sidecar already there with other bytes gives the rows a fresh id, like a
 Parquet object with other bytes. The compactor builds one for each log L1
@@ -539,10 +543,12 @@ after the catalog, after the index and with a matching row
 checked sidecar after the catalog and after the index
 (`fusescope_query_text_row_groups_total{stage}`), and observes the
 precision, files matched over files kept, 1 when none was kept
-(`fusescope_query_text_precision_ratio`), and the time from planning the
-scan to its end (`fusescope_query_text_seconds`). All are published
+(`fusescope_query_text_precision_ratio`, buckets up to 1), and the time
+from the start of the scan's planning, hot window and index lookup
+included, to its end (`fusescope_query_text_seconds`). All are published
 together, only when every partition of the scan reached its end; a scan
-cut short, by a limit, a cancellation or an error, publishes none. They
+cut short, by a limit, a cancellation or an error, or one whose filters
+cannot be planned to tell a match, publishes none. They
 feed the Tantivy trigger of ADR 0009.
 
 ### 5.1 One compactor per deployment

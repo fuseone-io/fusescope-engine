@@ -253,6 +253,7 @@ impl TableProvider for SignalTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let started = std::time::Instant::now();
         let schema = schema_of(self.signal);
         let external = |e: QueryError| datafusion::error::DataFusionError::External(Box::new(e));
 
@@ -315,7 +316,7 @@ impl TableProvider for SignalTable {
                 None,
             )?)
         };
-        let files_exec = self.files_exec(state, projection, filters, limit, planned)?;
+        let files_exec = self.files_exec(state, projection, filters, limit, planned, started)?;
         Ok(match (files_exec, hot_exec) {
             (Some(files), Some(hot)) => UnionExec::try_new(vec![files, hot])?,
             (Some(files), None) => files,
@@ -336,6 +337,7 @@ impl SignalTable {
         filters: &[Expr],
         limit: Option<usize>,
         planned: Planned,
+        started: std::time::Instant,
     ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
         let schema = schema_of(self.signal);
         let text = planned
@@ -380,13 +382,21 @@ impl SignalTable {
         let Some((tally, published_to)) = text else {
             return Ok(Some(scanned));
         };
-        // Columns the filters need are in the projection: they stay above
-        // the scan, so a filter that cannot be planned here counts no match.
+        // Columns the filters need are in the projection, since the filters
+        // stay above the scan; if they cannot be planned here anyway, the
+        // search is not measured rather than measured as matching nothing.
         let matches = conjunction(filters.iter().cloned()).and_then(|predicate| {
             let df_schema = DFSchema::try_from(scanned.schema()).ok()?;
             state.create_physical_expr(predicate, &df_schema).ok()
         });
-        let measured = TextScanExec::new(scanned, matches, tally, published_to, limit.is_some())?;
+        let measured = TextScanExec::new(
+            scanned,
+            matches,
+            tally,
+            published_to,
+            started,
+            limit.is_some(),
+        )?;
         Ok(Some(Arc::new(measured)))
     }
 }

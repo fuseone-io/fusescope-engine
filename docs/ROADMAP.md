@@ -237,7 +237,14 @@ C5 landed after C6.
   rows and footer, row groups through `ParquetAccessPlan`, the
   `has_token` UDF and the `fusescope_query_text_*` metrics, with a
   differential test of every recognised form against an unindexed
-  querier (`crates/fs-query/tests/text_search.rs`).
+  querier (`crates/fs-query/tests/text_search.rs`). Review round 1: an
+  existing sidecar is compared in streaming and the builder's memory beyond
+  the lease is held as scratch (`the_builder_allocates_within_its_memory_bound`,
+  `a_growing_body_does_not_double_the_folded_copy`,
+  `an_existing_object_is_compared_chunk_by_chunk`); the search time starts
+  before the index lookup (`the_time_of_a_search_includes_its_index_lookup`);
+  a search that cannot be measured publishes nothing; precision 1 has a
+  finite bucket.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two
