@@ -813,7 +813,7 @@ mod sandbox {
             )
             .await
             .unwrap();
-        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 6]);
+        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 7]);
         assert_eq!(
             strings(&tables, "table_name"),
             [
@@ -822,7 +822,8 @@ mod sandbox {
                 "logs",
                 "service_graph_1m",
                 "spans",
-                "trace_summary"
+                "trace_summary",
+                "usage_1h"
             ]
         );
         f.db.finish().await;

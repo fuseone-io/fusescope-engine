@@ -7,6 +7,7 @@ use datafusion::catalog::{
 };
 use datafusion::common::tree_node::TreeNode;
 use datafusion::config::Dialect;
+use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -17,7 +18,7 @@ use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use fs_catalog::{Signal, TenantId};
 use fs_schema::attribute_keys::{self, KeyTable};
-use fs_schema::{service_graph, trace_summary};
+use fs_schema::{service_graph, trace_summary, usage};
 
 use crate::QueryError;
 use crate::derived_table::{DerivedTable, RowCheck, SchemaCheck, VerifiedPaths};
@@ -130,15 +131,19 @@ pub fn tenant_session(
         Arc::new(
             DerivedTable::new(
                 tenant,
-                cache,
+                Arc::clone(&cache),
                 store_url.clone(),
                 Signal::ServiceGraph1m,
                 service_graph::schema(),
                 service_graph::check_schema,
-                verified,
+                Arc::clone(&verified),
             )
             .with_time_columns(&[service_graph::columns::MINUTE]),
         ),
+    )?;
+    schema.register_table(
+        usage::TABLE.into(),
+        usage_table(tenant, cache, store_url.clone(), verified)?,
     )?;
     let catalog = Arc::new(MemoryCatalogProvider::new());
     catalog.register_schema(SCHEMA, schema)?;
@@ -146,6 +151,48 @@ pub fn tenant_session(
     ctx.register_udaf(crate::tdigest::quantile_tdigest());
     ctx.register_udf(crate::has_token::udf());
     Ok(ctx)
+}
+
+/// The tenant's `usage_1h`: every contribution summed, one row per
+/// signal, service and hour.
+fn usage_table(
+    tenant: TenantId,
+    cache: Arc<FileCache>,
+    store_url: ObjectStoreUrl,
+    verified: VerifiedPaths,
+) -> Result<Arc<dyn TableProvider>, QueryError> {
+    use datafusion::functions_aggregate::expr_fn::sum;
+    use datafusion::logical_expr::{LogicalPlanBuilder, cast, col};
+    use usage::columns;
+
+    let contributions = DerivedTable::new(
+        tenant,
+        cache,
+        store_url,
+        Signal::Usage1h,
+        usage::schema(),
+        usage::check_schema,
+        verified,
+    )
+    .with_time_columns(&[columns::HOUR]);
+    let total = |column: &'static str| {
+        cast(sum(col(column)), arrow::datatypes::DataType::UInt64).alias(column)
+    };
+    let plan = LogicalPlanBuilder::scan(
+        usage::TABLE,
+        datafusion::datasource::provider_as_source(Arc::new(contributions)),
+        None,
+    )?
+    .aggregate(
+        vec![
+            col(columns::SIGNAL),
+            col(columns::SERVICE_NAME),
+            col(columns::HOUR),
+        ],
+        vec![total(columns::ROWS), total(columns::BYTES)],
+    )?
+    .build()?;
+    Ok(Arc::new(datafusion::datasource::ViewTable::new(plan, None)))
 }
 
 /// The tenant's `table` of attribute keys, each file's footer and rows
