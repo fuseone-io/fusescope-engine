@@ -31,6 +31,9 @@ pub const MAX_ROW_GROUP_ROWS: usize = 1_048_576;
 /// zstd level at L0 and L1: fast; the compactor recompresses at L2.
 pub const ZSTD_LEVEL: i32 = 3;
 
+/// zstd level at L2: closed days, written once and kept, so smaller.
+pub const L2_ZSTD_LEVEL: i32 = 7;
+
 /// False positive rate of every bloom filter.
 const BLOOM_FPP: f64 = 0.01;
 
@@ -97,6 +100,29 @@ pub fn log_writer_properties(row_group_rows: usize) -> Result<WriterProperties, 
     Ok(with_blooms(
         base_properties(row_group_rows)?,
         &LOG_BLOOM_COLUMNS,
+        row_group_rows,
+    )
+    .build())
+}
+
+/// [`writer_properties`] or [`log_writer_properties`] at
+/// [`L2_ZSTD_LEVEL`], for `logs` or span rows.
+///
+/// # Errors
+/// A zstd level the library refuses.
+pub fn l2_writer_properties(
+    logs: bool,
+    row_group_rows: usize,
+) -> Result<WriterProperties, SchemaError> {
+    let columns: &[&str] = if logs {
+        &LOG_BLOOM_COLUMNS
+    } else {
+        &SPAN_BLOOM_COLUMNS
+    };
+    Ok(with_blooms(
+        base_properties(row_group_rows)?
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(L2_ZSTD_LEVEL)?)),
+        columns,
         row_group_rows,
     )
     .build())
@@ -177,6 +203,30 @@ pub fn gather(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn l2_files_are_written_at_zstd_7_with_the_level_one_blooms() {
+        use parquet::schema::types::ColumnPath;
+        for logs in [false, true] {
+            let l2 = l2_writer_properties(logs, 1024).unwrap();
+            let l1 = if logs {
+                log_writer_properties(1024).unwrap()
+            } else {
+                writer_properties(1024).unwrap()
+            };
+            let column = ColumnPath::from(col::TRACE_ID);
+            assert_eq!(
+                l2.compression(&column),
+                Compression::ZSTD(ZstdLevel::try_new(L2_ZSTD_LEVEL).unwrap())
+            );
+            assert_eq!(
+                l2.bloom_filter_properties(&column),
+                l1.bloom_filter_properties(&column)
+            );
+            assert_eq!(l2.max_row_group_row_count(), l1.max_row_group_row_count());
+        }
+    }
+
     use super::*;
 
     #[test]
