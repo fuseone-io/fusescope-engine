@@ -357,3 +357,20 @@ fn a_growing_body_does_not_double_the_folded_copy() {
         builder.allocated()
     );
 }
+
+#[test]
+fn an_l2_file_has_a_sidecar_of_its_day() {
+    let l2 = "t/x/logs/l2/dt=2026-10-31/00000000-0000-0000-0000-0000000000aa.parquet";
+    let ngb = sidecar_path(l2).unwrap();
+    assert_eq!(
+        ngb,
+        "t/x/logs/index/ngram/dt=2026-10-31/00000000-0000-0000-0000-0000000000aa.ngb"
+    );
+    assert!(owners_of_sidecar(&ngb).contains(&l2.to_owned()));
+    let tix = crate::sidecar_path(&l2.replace("/logs/", "/traces/")).unwrap();
+    assert_eq!(
+        tix,
+        "t/x/traces/index/trace_id/dt=2026-10-31/00000000-0000-0000-0000-0000000000aa.tix"
+    );
+    assert!(crate::owners_of_sidecar(&tix).contains(&l2.replace("/logs/", "/traces/")));
+}

@@ -2,10 +2,10 @@
 //! anything the engine would not write is not the engine's.
 //!
 //! ```text
-//! t/{tenant uuid}/traces/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
-//! t/{tenant uuid}/logs/l{0|1|2}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
-//! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
-//! t/{tenant uuid}/logs/index/ngram/dt=YYYY-MM-DD/hr=HH/{file uuid}.ngb
+//! t/{tenant uuid}/{traces|logs}/l{0|1}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
+//! t/{tenant uuid}/{traces|logs}/l2/dt=YYYY-MM-DD/{file uuid}.parquet
+//! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD[/hr=HH]/{file uuid}.tix
+//! t/{tenant uuid}/logs/index/ngram/dt=YYYY-MM-DD[/hr=HH]/{file uuid}.ngb
 //! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/derived/{attribute_keys|log_attribute_keys|usage_1h}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
@@ -20,7 +20,8 @@ pub struct EngineObject {
     pub tenant: String,
     /// Compaction level of a span or log file; `None` for a sidecar.
     pub level: Option<u8>,
-    /// `dt=YYYY-MM-DD/hr=HH`.
+    /// `dt=YYYY-MM-DD/hr=HH`, or `dt=YYYY-MM-DD` for an L2 file and its
+    /// sidecar.
     pub partition: String,
     /// File id, as written in the path.
     pub id: String,
@@ -79,14 +80,18 @@ impl EngineObject {
             _ => return None,
         };
         let date = parts.next()?;
-        let hour = parts.next()?;
-        if !is_date(date) || !is_hour(hour) {
+        if !is_date(date) {
             return None;
         }
-        let file = parts.next()?;
-        if parts.next().is_some() {
-            return None;
-        }
+        let rest: Vec<&str> = parts.collect();
+        // A closed day at L2, and the sidecar of an L2 file, have no hour.
+        let (hour, file) = match (level, rest.as_slice()) {
+            (Some(2), [file]) => (None, *file),
+            (Some(2), _) => return None,
+            (None, [file]) if sidecar => (None, *file),
+            (_, [hour, file]) if is_hour(hour) => (Some(*hour), *file),
+            _ => return None,
+        };
         let (id, ext) = file.rsplit_once('.')?;
         let expected = match (sidecar, path.split('/').nth(2) == Some("logs")) {
             (false, _) => "parquet",
@@ -99,7 +104,7 @@ impl EngineObject {
         Some(Self {
             tenant: tenant.to_owned(),
             level,
-            partition: format!("{date}/{hour}"),
+            partition: hour.map_or_else(|| date.to_owned(), |hour| format!("{date}/{hour}")),
             id: id.to_owned(),
             sidecar,
             derived,
@@ -208,13 +213,29 @@ mod tests {
             assert_eq!(keys.level, None);
             assert_eq!(keys.partition, "dt=2026-10-24/hr=14");
         }
-        for level in 0..=2u8 {
+        for level in 0..=1u8 {
             let logs = EngineObject::parse(&format!(
                 "t/{T}/logs/l{level}/dt=2026-10-24/hr=14/{F}.parquet"
             ))
             .unwrap();
             assert_eq!(logs.level, Some(level));
             assert!(!logs.sidecar && !logs.derived);
+        }
+        for signal in ["traces", "logs"] {
+            let l2 = EngineObject::parse(&format!("t/{T}/{signal}/l2/dt=2026-10-24/{F}.parquet"))
+                .unwrap();
+            assert_eq!(
+                (l2.level, l2.partition.as_str()),
+                (Some(2), "dt=2026-10-24")
+            );
+        }
+        for sidecar in [
+            format!("t/{T}/traces/index/trace_id/dt=2026-10-24/{F}.tix"),
+            format!("t/{T}/logs/index/ngram/dt=2026-10-24/{F}.ngb"),
+        ] {
+            let day = EngineObject::parse(&sidecar).unwrap();
+            assert!(day.sidecar, "{sidecar}");
+            assert_eq!(day.partition, "dt=2026-10-24");
         }
         for table in ["trace_summary", "service_graph_1m"] {
             let derived = EngineObject::parse(&format!(
@@ -233,6 +254,12 @@ mod tests {
             "t/notes.parquet",
             "t/notes.txt",
             &format!("t/{T}/logs/l3/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/logs/l2/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/l2/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/traces/l1/dt=2026-10-24/{F}.parquet"),
+            &format!("t/{T}/traces/l0/dt=2026-10-24/{F}.parquet"),
+            &format!("t/{T}/derived/usage_1h/dt=2026-10-24/{F}.parquet"),
+            &format!("t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/x/{F}.tix"),
             &format!("t/{T}/logs/index/trace_id/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/logs/l0/dt=2026-10-24/hr=14/{F}.tix"),
             &format!("t/{T}/logs/l0/dt=2026-10-24/hr=14/{F}.ngb"),
