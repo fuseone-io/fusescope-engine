@@ -49,7 +49,7 @@ use crate::CompactError;
 const CHUNK: usize = 1000;
 
 /// The kinds of partition under a tenant, in walk order.
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 13] = [
     "traces/l0",
     "traces/l1",
     "traces/l2",
@@ -58,6 +58,7 @@ const KINDS: [&str; 12] = [
     "traces/derived/service_graph_1m",
     "derived/attribute_keys",
     "derived/log_attribute_keys",
+    "derived/usage_1h",
     "logs/l0",
     "logs/l1",
     "logs/l2",

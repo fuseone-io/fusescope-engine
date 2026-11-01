@@ -220,6 +220,7 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         row_group_rows,
         compact_logs: false,
         text_index: fs_index::TextIndexLimits::DEFAULT,
+        usage_max_entries: 100_000,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
@@ -378,8 +379,8 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     assert_eq!(done.inputs.len(), 3);
     assert_eq!(
         done.outputs.len(),
-        3,
-        "the L1, attribute_keys and trace_summary files"
+        4,
+        "the L1, attribute_keys, trace_summary and usage_1h files"
     );
 
     let now = visible(&f).await;
@@ -521,8 +522,8 @@ async fn outputs_close_at_the_target_size() {
     let now = visible(&f).await;
     assert_eq!(
         now.len(),
-        done.outputs.len() - 2,
-        "every L1 output; the others are attribute_keys and trace_summary"
+        done.outputs.len() - 3,
+        "every L1 output; the others are attribute_keys, trace_summary and usage_1h"
     );
     assert_eq!(now.iter().map(|x| x.row_count).sum::<i64>(), 18);
     let mut all_rows = Vec::new();
@@ -639,7 +640,11 @@ async fn a_pass_publishes_trace_and_service_graph_contributions_with_the_l1() {
     registered_an_hour_ago(&f, &inputs).await;
     let c = compactor(&f, config(4));
     let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
-    assert_eq!(done.outputs.len(), 4, "L1 and all three derived files");
+    assert_eq!(
+        done.outputs.len(),
+        5,
+        "L1, the three derived files and usage"
+    );
 
     let summaries = trace_summary_files(&f).await;
     assert_eq!(summaries.len(), 1);
@@ -879,8 +884,8 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     assert_eq!(service_graph_files(&f).await.len(), 0, "and has no row");
     assert_eq!(
         c.stats().orphaned.load(Ordering::Relaxed),
-        4,
-        "the L1 object and the three derived tables"
+        5,
+        "the L1 object, the three derived tables and the usage"
     );
     assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
 
@@ -923,8 +928,8 @@ async fn a_stale_fence_publishes_nothing() {
     assert_eq!(c.stats().lease_lost.load(Ordering::Relaxed), 1);
     assert_eq!(
         c.stats().orphaned.load(Ordering::Relaxed),
-        4,
-        "the L1 object and the three derived tables"
+        5,
+        "the L1 object, the three derived tables and the usage"
     );
 
     // The real holder's fence works.
@@ -1328,16 +1333,16 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         .remove(0);
     let first = sweeper.sweep_once().await.unwrap();
     assert_eq!(
-        first.prefixes, 7,
-        "the tenant's l0, l1, sidecar, three derived and log l0 days"
+        first.prefixes, 8,
+        "the tenant's l0, l1, sidecar, three derived, usage and log l0 days"
     );
     assert_eq!(
-        first.listed, 13,
+        first.listed, 14,
         "the objects of those partitions, foreign levels and signals not walked"
     );
     assert_eq!(
-        first.seen, 7,
-        "the L1, sidecar, three derived files, the log file and the stray; nothing foreign"
+        first.seen, 8,
+        "the L1, sidecar, three derived files, the usage, the log file and the stray; nothing foreign"
     );
     assert_eq!(first.deleted, 0, "first sight: nothing deleted");
     assert!(first.wrapped);
@@ -1347,7 +1352,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     let again = sweeper.sweep_once().await.unwrap();
     assert_eq!(
         (again.seen, again.deleted),
-        (7, 0),
+        (8, 0),
         "seen twice within the TTL: still nothing"
     );
 
@@ -1371,10 +1376,10 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;
     let second = sweeper.sweep_once().await.unwrap();
-    assert_eq!(second.seen, 6, "the stray has a row now");
+    assert_eq!(second.seen, 7, "the stray has a row now");
     assert_eq!(
-        second.deleted, 6,
-        "the L1, its sidecar, the three derived files and the log file"
+        second.deleted, 7,
+        "the L1, its sidecar, the three derived files, the usage and the log file"
     );
     assert_eq!(second.forgotten, 1, "the stray");
     assert!(!present(&f, &orphan_l1).await);
@@ -1397,7 +1402,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         Vec::<String>::new()
     );
     assert_eq!(stats.sweeps.load(Ordering::Relaxed), 3);
-    assert_eq!(stats.deleted.load(Ordering::Relaxed), 6);
+    assert_eq!(stats.deleted.load(Ordering::Relaxed), 7);
     assert_eq!(stats.forgotten.load(Ordering::Relaxed), 1);
     f.db.finish().await;
 }

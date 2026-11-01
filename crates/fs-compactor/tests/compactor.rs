@@ -610,6 +610,7 @@ fn no_compaction() -> fs_compactor::CompactionConfig {
         row_group_rows: 1024,
         compact_logs: false,
         text_index: fs_index::TextIndexLimits::DEFAULT,
+        usage_max_entries: 100_000,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,

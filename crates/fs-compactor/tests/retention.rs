@@ -229,7 +229,12 @@ async fn write_request_l0(
     flush::upload_index(f.store.as_ref(), &prepared)
         .await
         .unwrap();
-    let file = f.db.catalog.register_file(&prepared.file).await.unwrap();
+    // Counted already: these tests are about expiry, which waits for usage.
+    let counted = fs_catalog::NewFile {
+        usage_accounted: true,
+        ..prepared.file.clone()
+    };
+    let file = f.db.catalog.register_file(&counted).await.unwrap();
     sqlx::query(
         "update engine_file set created_at = now() - interval '1 hour',
                                 confirmed_at = now() - interval '1 hour'
@@ -305,6 +310,7 @@ fn compactor(f: &Fixture) -> Compactor {
             row_group_rows: 4,
             compact_logs: false,
             text_index: fs_index::TextIndexLimits::DEFAULT,
+            usage_max_entries: 100_000,
             inject_swap_failures: 0,
             inject_put_failure_at: None,
             inject_put_hold: None,
@@ -1075,6 +1081,7 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
                 row_group_rows: 4,
                 compact_logs: false,
                 text_index: fs_index::TextIndexLimits::DEFAULT,
+                usage_max_entries: 100_000,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
                 inject_put_hold: None,

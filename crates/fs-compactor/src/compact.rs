@@ -56,6 +56,9 @@ pub struct CompactionConfig {
     pub service_graph_max_bytes: usize,
     /// Rows per output row group.
     pub row_group_rows: usize,
+    /// Most `(hour, service)` pairs one pass counts usage for; a pass past
+    /// it fails rather than drop a count.
+    pub usage_max_entries: usize,
     /// Budgets of the text sidecar of each log L1 file.
     pub text_index: fs_index::TextIndexLimits,
     /// Also compact the L0 files of log rows. Off, no pass takes a new
@@ -79,6 +82,10 @@ pub struct CompactionConfig {
 pub struct CompactorStats {
     /// Passes that swapped outputs in.
     pub passes: AtomicU64,
+    /// Files whose usage an accounting pass counted.
+    pub accounted: AtomicU64,
+    /// `usage_1h` contributions published, by compaction and accounting.
+    pub usage_contributions: AtomicU64,
     /// Inputs merged by completed passes.
     pub inputs: AtomicU64,
     /// Outputs published by completed passes.
@@ -129,6 +136,7 @@ struct DerivedContributions {
     keys: KeyStats,
     summaries: TraceSummaries,
     service_graph: ServiceGraphBuilder,
+    usage: Option<fs_schema::usage::UsageCounts>,
 }
 
 #[derive(Clone, Copy)]
@@ -166,17 +174,18 @@ struct PublishedDerived {
     keys: Option<NewFile>,
     summaries: Option<NewFile>,
     service_graph: Option<NewFile>,
+    usage: Vec<NewFile>,
     summary_skipped: Option<DerivedLimit>,
     service_graph_skipped: Option<DerivedLimit>,
 }
 
 /// The compaction side of the compactor.
 pub struct Compactor {
-    catalog: Catalog,
-    store: Arc<dyn ObjectStore>,
-    root: Path,
-    config: CompactionConfig,
-    stats: Arc<CompactorStats>,
+    pub(crate) catalog: Catalog,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) root: Path,
+    pub(crate) config: CompactionConfig,
+    pub(crate) stats: Arc<CompactorStats>,
     inject_swap_failures: AtomicU32,
     /// Hours of a signal already reported as exceeding the input cap.
     reported: std::sync::Mutex<
@@ -315,11 +324,11 @@ impl Compactor {
 
     /// How many of the hour's oldest files fit one pass under both caps;
     /// fewer than two when the two oldest do not fit the byte cap.
-    fn taken(&self, all: &[FileRecord]) -> usize {
+    pub(crate) fn taken(&self, all: &[FileRecord]) -> usize {
         let mut taken = 0;
         let mut bytes = 0u64;
         for file in all {
-            if taken >= self.config.max_inputs_per_pass.max(2) {
+            if taken >= self.config.max_inputs_per_pass.max(1) {
                 break;
             }
             let size = u64::try_from(file.size_bytes).unwrap_or(u64::MAX);
@@ -370,6 +379,7 @@ impl Compactor {
                 trace_summary_max_bytes: self.config.trace_summary_max_bytes,
                 service_graph_max_spans: self.config.service_graph_max_spans,
                 service_graph_max_bytes: self.config.service_graph_max_bytes,
+                usage_max_entries: self.config.usage_max_entries,
                 text_index: self.config.text_index,
             },
             table_before,
@@ -404,6 +414,7 @@ impl Compactor {
             keys: merger.take_keys(),
             summaries: merger.take_trace_summaries(),
             service_graph: merger.take_service_graph(),
+            usage: merger.take_usage(),
         };
         drop(merger);
         self.report_dropped_keys(tenant, signal, hour, &contributions.keys);
@@ -506,6 +517,7 @@ impl Compactor {
             keys,
             summaries,
             service_graph,
+            usage,
         } = contributions;
         let root = self.root.clone();
         let keys =
@@ -535,10 +547,26 @@ impl Compactor {
         })
         .await??;
         let service_graph = self.publish_prepared(service_graph, guard, puts).await?;
+        let usage = match usage {
+            Some(counts) => {
+                let root = self.root.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    crate::usage::usage_files(&root, tenant, &counts)
+                })
+                .await??;
+                let mut files = Vec::with_capacity(prepared.len());
+                for one in prepared {
+                    files.extend(self.publish_prepared(Some(one), guard, puts).await?);
+                }
+                files
+            }
+            None => Vec::new(),
+        };
         Ok(PublishedDerived {
             keys,
             summaries,
             service_graph,
+            usage,
             summary_skipped,
             service_graph_skipped,
         })
@@ -553,6 +581,9 @@ impl Compactor {
         if published.keys.is_some() {
             self.stats.derived.fetch_add(1, Ordering::Relaxed);
         }
+        self.stats
+            .usage_contributions
+            .fetch_add(published.usage.len() as u64, Ordering::Relaxed);
         if published.summaries.is_some() {
             self.stats.trace_summary.fetch_add(1, Ordering::Relaxed);
         } else if let Some(limit) = published.summary_skipped {
@@ -635,6 +666,7 @@ impl Compactor {
             .chain(derived.keys.clone())
             .chain(derived.summaries.clone())
             .chain(derived.service_graph.clone())
+            .chain(derived.usage.iter().cloned())
             .collect();
         Ok(self
             .catalog
@@ -642,7 +674,7 @@ impl Compactor {
             .await?)
     }
 
-    async fn put_once(
+    pub(crate) async fn put_once(
         &self,
         path: &str,
         bytes: Bytes,

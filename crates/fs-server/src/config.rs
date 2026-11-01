@@ -556,6 +556,10 @@ fn default_text_index_bytes_per_row_group() -> usize {
     fs_index::TextIndexLimits::DEFAULT.max_bytes_per_row_group
 }
 
+fn default_usage_max_entries() -> usize {
+    100_000
+}
+
 fn default_text_index_bytes_per_file() -> usize {
     fs_index::TextIndexLimits::DEFAULT.max_bytes_per_file
 }
@@ -740,6 +744,10 @@ pub struct CompactorConfig {
     /// Bloom bytes of one log L1 file's text sidecar; at most 512 MiB.
     #[serde(default = "default_text_index_bytes_per_file")]
     pub text_index_max_bytes_per_file: usize,
+    /// Most `(hour, service)` pairs one pass counts usage for; a pass past
+    /// it fails rather than drop a count.
+    #[serde(default = "default_usage_max_entries")]
+    pub usage_max_entries: usize,
     /// How often the bucket is swept for objects without a catalog row.
     #[serde(default = "default_orphan_interval")]
     pub orphan_interval_secs: u64,
@@ -806,6 +814,7 @@ impl Default for CompactorConfig {
             compact_logs: false,
             text_index_max_bytes_per_row_group: default_text_index_bytes_per_row_group(),
             text_index_max_bytes_per_file: default_text_index_bytes_per_file(),
+            usage_max_entries: default_usage_max_entries(),
             orphan_interval_secs: default_orphan_interval(),
             orphan_ttl_secs: default_orphan_ttl(),
             sweep_objects_per_pass: default_sweep_objects(),
@@ -858,6 +867,7 @@ impl CompactorConfig {
                 service_graph_max_bytes: self.service_graph_max_bytes,
                 row_group_rows,
                 text_index: self.text_index_limits().unwrap_or_default(),
+                usage_max_entries: self.usage_max_entries,
                 compact_logs: self.compact_logs,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
@@ -1127,6 +1137,9 @@ impl Config {
     fn validate_compactor(&self) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
         self.compactor.text_index_limits()?;
+        if self.compactor.usage_max_entries == 0 {
+            return invalid("compactor.usage_max_entries must be positive");
+        }
         let derived_bytes = self
             .compactor
             .trace_summary_max_bytes

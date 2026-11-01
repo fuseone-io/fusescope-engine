@@ -30,6 +30,7 @@ use fs_schema::parquet::{gather, log_writer_properties, writer_properties};
 use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::spans::{TRACE_ID_BYTES, col, span_schema_v1, trace_ids};
 use fs_schema::trace_summary::TraceSummaries;
+use fs_schema::usage::{UsageCounts, UsageSignal};
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
@@ -41,6 +42,15 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
 use crate::CompactError;
+
+/// The usage signal of rows of `signal`, `None` for one without usage.
+pub(crate) fn usage_signal(signal: Signal) -> Option<UsageSignal> {
+    match signal {
+        Signal::Traces => Some(UsageSignal::Spans),
+        Signal::Logs => Some(UsageSignal::Logs),
+        _ => None,
+    }
+}
 
 /// One L1 file ready to upload with its catalog row and sidecar.
 pub struct Output {
@@ -73,6 +83,9 @@ pub struct MergeConfig {
     pub text_index: fs_index::TextIndexLimits,
     /// Conservative byte budget for the service-graph builder.
     pub service_graph_max_bytes: usize,
+    /// Most `(hour, service)` pairs the pass counts usage for; past it the
+    /// pass fails rather than drop a count.
+    pub usage_max_entries: usize,
 }
 
 /// Merges L0 files of one tenant, signal and hour into L1 outputs, one at
@@ -120,7 +133,8 @@ impl L1Merger {
             Signal::Logs => log_schema_v1(),
             _ => return Err(CompactError::Merge("a signal without L1 files")),
         };
-        let merge = Merge::open(store, inputs, &schema, config.row_group_rows).await?;
+        let usage = usage_signal(signal).map(|s| (s, config.usage_max_entries));
+        let merge = Merge::open(store, inputs, &schema, config.row_group_rows, usage).await?;
         let hour_ns = hour
             .timestamp_nanos_opt()
             .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
@@ -154,6 +168,12 @@ impl L1Merger {
     /// The pass's service graph builder, including which cap skipped it.
     pub fn take_service_graph(&mut self) -> ServiceGraphBuilder {
         std::mem::take(&mut self.graph)
+    }
+
+    /// Usage of the inputs not counted before, once they are spent; `None`
+    /// when every input was counted.
+    pub fn take_usage(&mut self) -> Option<UsageCounts> {
+        self.merge.usage.take()
     }
 
     /// The next output, closed at the target size or at the end of the
@@ -237,7 +257,7 @@ pub fn service_graph_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id
     partitioned_path(root, tenant, Signal::ServiceGraph1m.path_name(), hour, id)
 }
 
-fn partitioned_path(
+pub(crate) fn partitioned_path(
     root: &Path,
     tenant: TenantId,
     kind: &str,
@@ -371,6 +391,26 @@ impl AsyncFileReader for ObjectReader {
     }
 }
 
+/// The batches of `file`, `batch_rows` rows at a time.
+///
+/// # Errors
+/// Store or Parquet failure opening the file.
+pub(crate) async fn batches(
+    store: Arc<dyn ObjectStore>,
+    file: &FileRecord,
+    batch_rows: usize,
+) -> Result<ParquetRecordBatchStream<ObjectReader>, CompactError> {
+    let reader = ObjectReader {
+        store,
+        path: Path::from(file.path.as_str()),
+        size: u64::try_from(file.size_bytes).unwrap_or(0),
+    };
+    Ok(ParquetRecordBatchStreamBuilder::new(reader)
+        .await?
+        .with_batch_size(batch_rows)
+        .build()?)
+}
+
 /// The head of one input in the heap: its sort key and where the row is.
 type Head = Reverse<(Service, i64, usize, usize, usize)>;
 
@@ -384,6 +424,10 @@ struct Merge {
     inputs: Vec<Input>,
     slots: Vec<Option<Slot>>,
     heap: BinaryHeap<Head>,
+    /// Usage of the inputs flagged in `uncounted`, with its cap.
+    usage: Option<UsageCounts>,
+    uncounted: Vec<bool>,
+    usage_cap: usize,
 }
 
 impl Merge {
@@ -392,22 +436,22 @@ impl Merge {
         files: &[FileRecord],
         schema: &SchemaRef,
         batch_rows: usize,
+        usage: Option<(UsageSignal, usize)>,
     ) -> Result<Self, CompactError> {
+        let uncounted: Vec<bool> = files.iter().map(|f| !f.usage_accounted).collect();
+        let counts = usage
+            .filter(|_| uncounted.contains(&true))
+            .map(|(signal, _)| UsageCounts::new(signal));
         let mut merge = Self {
             inputs: Vec::with_capacity(files.len()),
             slots: Vec::new(),
             heap: BinaryHeap::new(),
+            usage: counts,
+            uncounted,
+            usage_cap: usage.map_or(0, |(_, cap)| cap),
         };
         for file in files {
-            let reader = ObjectReader {
-                store: Arc::clone(&store),
-                path: Path::from(file.path.as_str()),
-                size: u64::try_from(file.size_bytes).unwrap_or(0),
-            };
-            let stream = ParquetRecordBatchStreamBuilder::new(reader)
-                .await?
-                .with_batch_size(batch_rows)
-                .build()?;
+            let stream = batches(Arc::clone(&store), file, batch_rows).await?;
             merge.inputs.push(Input { stream, slot: None });
         }
         for input in 0..merge.inputs.len() {
@@ -449,10 +493,27 @@ impl Merge {
             }
             let loaded = Slot::load(batch, schema)?;
             let slot = self.slots.len();
-            self.slots.push(Some(loaded));
             next.slot = Some(slot);
+            self.count_usage(input, &loaded.batch)?;
+            self.slots.push(Some(loaded));
             row = 0;
         }
+    }
+
+    /// Counts `batch` of `input` into the usage when the input was not
+    /// counted before.
+    fn count_usage(&mut self, input: usize, batch: &RecordBatch) -> Result<(), CompactError> {
+        let (Some(usage), Some(true)) = (self.usage.as_mut(), self.uncounted.get(input).copied())
+        else {
+            return Ok(());
+        };
+        usage.absorb(batch)?;
+        if usage.len() > self.usage_cap {
+            return Err(CompactError::Merge(
+                "usage pairs over compactor.usage_max_entries",
+            ));
+        }
+        Ok(())
     }
 
     /// The next output row group in sort order, or `None` when every
@@ -646,7 +707,7 @@ impl OutputBuilder {
             services: self.services.into_iter().collect(),
             summary: None,
             content_sha256: Some(content_sha256),
-            usage_accounted: false,
+            usage_accounted: true,
         };
         Ok(Output { file, bytes, index })
     }

@@ -398,6 +398,7 @@ impl Metrics {
             return;
         };
         render_compaction(out, &stats.compaction);
+        render_usage(out, &stats.compaction);
         render_orphans(out, &stats.orphans);
         render_retention(out, &stats.retention);
     }
@@ -569,6 +570,21 @@ impl Metrics {
             );
         }
     }
+}
+
+fn render_usage(out: &mut String, c: &fs_compactor::CompactorStats) {
+    counter(
+        out,
+        "fusescope_usage_files_accounted_total",
+        "Files whose usage an accounting pass counted in place",
+        c.accounted.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_usage_contributions_total",
+        "usage_1h contributions published by compaction and accounting passes",
+        c.usage_contributions.load(Ordering::Relaxed),
+    );
 }
 
 fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {

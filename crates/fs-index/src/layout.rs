@@ -7,7 +7,7 @@
 //! t/{tenant uuid}/traces/index/trace_id/dt=YYYY-MM-DD/hr=HH/{file uuid}.tix
 //! t/{tenant uuid}/logs/index/ngram/dt=YYYY-MM-DD/hr=HH/{file uuid}.ngb
 //! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
-//! t/{tenant uuid}/derived/{attribute_keys|log_attribute_keys}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
+//! t/{tenant uuid}/derived/{attribute_keys|log_attribute_keys|usage_1h}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
 //!
 //! A derived table is partitioned by the hour of the compaction pass that
@@ -73,7 +73,7 @@ impl EngineObject {
                 _ => return None,
             },
             "derived" => match parts.next()? {
-                "attribute_keys" | "log_attribute_keys" => (None, false, true),
+                "attribute_keys" | "log_attribute_keys" | "usage_1h" => (None, false, true),
                 _ => return None,
             },
             _ => return None,
@@ -198,7 +198,7 @@ mod tests {
         assert!(ngb.sidecar && !ngb.derived);
         assert_eq!(ngb.level, None);
         assert_eq!(ngb.partition, "dt=2026-10-24/hr=14");
-        for table in ["attribute_keys", "log_attribute_keys"] {
+        for table in ["attribute_keys", "log_attribute_keys", "usage_1h"] {
             let keys = EngineObject::parse(&format!(
                 "t/{T}/derived/{table}/dt=2026-10-24/hr=14/{F}.parquet"
             ))

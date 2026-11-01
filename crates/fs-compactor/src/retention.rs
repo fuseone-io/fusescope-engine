@@ -366,6 +366,7 @@ impl Retention {
             Signal::Logs,
             Signal::TraceSummary,
             Signal::ServiceGraph1m,
+            Signal::Usage1h,
         ] {
             result = self
                 .catalog

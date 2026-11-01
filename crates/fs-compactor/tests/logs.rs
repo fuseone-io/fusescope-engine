@@ -316,6 +316,7 @@ fn config(compact_logs: bool) -> CompactionConfig {
         row_group_rows: 4,
         compact_logs,
         text_index: fs_index::TextIndexLimits::DEFAULT,
+        usage_max_entries: 100_000,
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
@@ -664,6 +665,36 @@ async fn with_log_compaction_off_log_files_stay_as_they_are() {
     f.db.finish().await;
 }
 
+/// With log compaction off, log L0 files are counted in place by the
+/// accounting pass, once, and stay at L0; spans are counted by their pass.
+#[tokio::test]
+async fn with_log_compaction_off_log_files_are_counted_in_place() {
+    let Some(f) = fixture().await else { return };
+    let inputs = three_log_l0(&f).await;
+    let c = compactor(&f, config(false));
+    let me = fence(&f).await;
+    assert!(c.compact_once(&me).await.unwrap().is_none());
+    let mut passes = 0;
+    while c.account_once(&me).await.unwrap().is_some() {
+        passes += 1;
+    }
+    assert_eq!(passes, 1, "one cold hour of log files");
+    let now = visible(&f, Signal::Logs).await;
+    assert_eq!(now.len(), inputs.len());
+    assert!(
+        now.iter()
+            .all(|x| x.level == Level::L0 && x.usage_accounted)
+    );
+    let counted = counted(
+        &f,
+        "select cast(sum(rows) as bigint) from usage_1h where signal = 2",
+    )
+    .await;
+    assert_eq!(counted, 9);
+    assert!(c.account_once(&me).await.unwrap().is_none(), "counted once");
+    f.db.finish().await;
+}
+
 /// A log pass cut short before its swap, between its L1 file and its text
 /// sidecar or between the sidecar and the table, publishes nothing and leaves the inputs
 /// visible; what it uploaded is swept as orphans. The next engine
@@ -761,8 +792,8 @@ async fn a_log_pass_cut_short_publishes_nothing_and_the_next_one_compacts_once()
         .unwrap();
     let swept = sweeper.sweep_once().await.unwrap();
     assert_eq!(
-        swept.deleted, 9,
-        "four log L1 files, three of their text sidecars and two tables"
+        swept.deleted, 11,
+        "four log L1 files, three of their text sidecars, two tables and two usage contributions"
     );
     assert_eq!(objects_under(&f, "/logs/l1/").await.len(), 0);
     assert_eq!(sidecars().await, input_sidecars, "the inputs' stay");

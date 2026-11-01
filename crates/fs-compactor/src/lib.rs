@@ -28,11 +28,13 @@ pub mod merge;
 mod objects;
 pub mod orphans;
 pub mod retention;
+mod usage;
 
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
 pub use lease::Leadership;
 pub use orphans::{OrphanStats, SweepConfig, Sweeper};
 pub use retention::{Rebuild, Retention, RetentionConfig, RetentionStats};
+pub use usage::Accounted;
 
 /// Why a compaction pass failed.
 #[derive(Debug, thiserror::Error)]
@@ -247,6 +249,7 @@ async fn work_loop(
                         }
                     }
                 }
+                accounting_passes(&compactor, &leadership).await;
             }
             _ = expire.tick() => {
                 retention_passes(&retention, &leadership).await;
@@ -255,6 +258,24 @@ async fn work_loop(
                 if changed.is_err() || !*leader.borrow() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// Accounting passes, after the tick's compaction, until nothing is left
+/// to count or the tick's share is spent.
+async fn accounting_passes(compactor: &Compactor, leadership: &Leadership) {
+    for _ in 0..PASSES_PER_TICK {
+        let Some(fence) = leadership.fence() else {
+            return;
+        };
+        match compactor.account_once(&fence).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "usage accounting pass failed");
+                return;
             }
         }
     }
