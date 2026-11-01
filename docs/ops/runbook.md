@@ -202,6 +202,14 @@ the sidecar, so the same `ingest.max_memory_bytes` admits fewer log bytes
 than span bytes. A binary without text sidecars ignores them; the files it
 purges leave theirs behind until a newer orphan sweep removes them.
 
+L2 compaction (`compactor.compact_l2`) is off by default. Roll out
+queriers first, then compactors with it off, then turn it on. Once an L2
+file is published the binary is not rolled back: an older one does not
+recognise L2 sidecar paths, does not expire `usage_1h` and rebuilds key
+tables from L1 files alone. Retention never expires a file whose usage was
+not counted (`usage_accounted`); a tenant whose expired days stay is
+waiting for the L1 or accounting pass of those hours.
+
 ### Start
 
 | Message | Meaning |

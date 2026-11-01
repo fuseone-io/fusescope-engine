@@ -251,7 +251,11 @@ C5 landed after C6.
   `a_log_buffer_keeps_the_file_scratch_of_every_live_hour`,
   `a_text_sidecar_fits_one_copy_of_its_input_and_the_file_scratch`).
   Closed after review round 2; issue #1 closed.
-- L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
+- L1 to L2 compaction with zstd 7 and `usage_1h` (DESIGN 7.2, 7.3). In
+  progress: an hour of a single L0 file taken by L0 to L1, the
+  `usage_accounted` mark and usage logical bytes v1, `usage_1h`
+  contributions and table, the accounting pass, then the L2 pass.
+  Promotions from querier statistics need their own ADR.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two
   weeks without regression.

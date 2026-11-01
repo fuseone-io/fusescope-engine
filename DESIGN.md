@@ -583,7 +583,7 @@ lease expire at once, keeping the generation. A purge deletes the catalog
 rows of files quarantined for `compactor.quarantine_ttl_secs` on the database
 clock, each in a transaction that holds the locks of its path and sidecar
 and marks both for deletion, then each object and its `trace_id` sidecar
-under the claim protocol of the orphan sweep (section 7.2), leaving
+under the claim protocol of the orphan sweep (section 7.4), leaving
 tombstones: from the row's commit on, a writer replaying the file, before
 the delete or however long after it, is refused with `ObjectDoomed` and
 gives its rows a fresh id, so no row ever points at an object the purge
@@ -634,14 +634,17 @@ At every level the compactor:
    `visible`. Queriers holding an older copy keep reading the inputs until
    the quarantine TTL, with no error.
 3. Updates derived tables incrementally from the inputs.
-4. Decides promotions: an attribute filtered in more than N% of the last
-   week's queries, using querier statistics, becomes a native column at L2.
+4. Promotes no attribute: every level keeps the schema of its signal.
+   Promotions decided from querier statistics, an attribute filtered in
+   more than N% of the last week's queries becoming a native column at L2,
+   need their own ADR first; they change the schema per tenant and the
+   contract with the Go backend.
 
 ### 7.1 L0 to L1
 
 A pass takes the oldest cold hour, across tenants and signals, spans before
 logs within an hour, of one signal: one whose visible L0 files of that
-signal number at least two and all ended, and were confirmed, more than
+signal all ended, and were confirmed, more than
 `compactor.hour_close_delay_secs` ago, so the hot window has let go of them
 and late data is no longer arriving. The ingester confirms a registration
 in a second statement once the rows are retained in memory for it, so the
@@ -663,12 +666,14 @@ whatever the session time zone, and hour and files are read in one
 repeatable-read snapshot, so a file registered meanwhile is neither counted
 nor taken. It merges the hour's oldest files up to
 `compactor.max_inputs_per_pass` and `compactor.max_input_bytes`, a ceiling:
-an hour whose two oldest files do not fit is passed over, reported once, and
+an hour whose oldest file does not fit is passed over, reported once, and
 the next cold hour of either signal is tried, so one oversized hour never
 blocks the queue;
 the server refuses a cap under twice the ingest buffer so two L0 files
 normally fit. A large hour closes over
-several passes; an hour left with a single L0 file keeps it. A pass runs
+several passes. An hour of a single L0 file is taken too, rewritten as
+one L1 file, so its keys, summaries and usage are counted within the close
+delay like any other hour's and a day ends with no L0 left. A pass runs
 only under the lease fence; without one it does nothing. Every input is already sorted by `(service_name, timestamp)`, so the
 merge is a k-way heap over one row group per input, ties in registration
 order, producing row groups of the ingester's size through the same writer
@@ -902,7 +907,74 @@ snapshot (`rebuild_inputs`), and the budget sees each page as it arrives
 and ends the read on the first one that does not fit, so a list beyond
 the budget is never held whole and what was admitted is what was read.
 
-### 7.2 Orphan sweep
+### 7.2 L1 to L2
+
+With `compactor.compact_l2`, off by default, a pass takes a closed day of
+one tenant and signal, the oldest first: its UTC day ended more than
+`compactor.hour_close_delay_secs` ago, no visible L0 file of that signal
+starts in it, and it has at least two visible L1 files or one L1 file
+and nothing at L2 yet. Day and inputs come from one repeatable-read
+snapshot, and every input must have ended, by its real `ts_max`, and been
+confirmed more than the close delay ago, so a legacy file that crossed
+into the next day keeps that day open. It merges the day's L1 files,
+oldest first, up to `compactor.max_inputs_per_pass` and
+`compactor.max_l2_input_bytes` (16 GiB), with the k-way merge of section
+7.1, one decoded batch per input, into L2 files at
+`{traces|logs}/l2/dt=…/{id}.parquet`, zstd level 7, the writer settings
+of L1 otherwise, each with its sidecar: `traces/index/trace_id/dt=…/{id}.tix`
+or `logs/index/ngram/dt=…/{id}.ngb`. A day larger than the cap closes over
+several passes into L2 files whose ranges overlap, which pruning handles
+as any other overlap. An output is written in memory and uploaded under
+the create-once rule, so it closes at `compactor.l2_target_bytes` (1 GiB)
+or at `compactor.l2_output_bytes` (512 MiB), whichever comes first: its
+encoded bytes, its row group in progress and its sidecar counted together.
+A sidecar never grows past its cap, `compactor.max_trace_index_bytes` for
+the trace ids, the text sidecar's own budget for logs: an output whose
+trace ids pass the cap is published without a `.tix`, and one whose
+distinct services pass `compactor.max_services_per_file` lists none, both
+read as unknown, so the file is scanned rather than memory exceeded. The
+pass counts no attribute key, summary or usage: its rows were counted
+when they left L0. Inputs are quarantined and outputs published in one
+fenced swap, with the crash boundaries of section 7.1. Each tick runs up
+to `PASSES_PER_TICK` L1 passes and, whatever their backlog, at least one
+and up to `compactor.l2_passes_per_tick` L2 passes. The rebuild of
+`attribute_keys` and `log_attribute_keys` after retention reads the L1
+and L2 files that remain.
+
+Once an L2 file is published the binary is not rolled back: an older one
+does not recognise the paths of L2 sidecars, does not expire `usage_1h`
+and rebuilds key tables from L1 alone. The rollout is queriers first, then
+compactors with `compact_l2` off, then `compact_l2` on.
+
+### 7.3 Usage
+
+`usage_1h` holds, per tenant, signal (spans 1, logs 2), service and hour,
+the rows and the usage logical bytes (version 1, `fs_schema::usage`) that
+reached the engine. The logical bytes of a row are the payload of its
+fields after the ingest limits: a primitive by its width, a string or a
+binary by its bytes, a map by its keys and values, recursively; they leave
+out compression, offsets, validity, dictionaries and Parquet overhead, and
+the columns derived from others: `ts_bucket_start`, the fingerprint, enum
+strings, `has_error` and the promoted copies of attributes. Sums are
+checked: an overflow fails the pass, never saturates.
+
+Every row is counted exactly once, when its file leaves L0. A catalog row
+carries `usage_accounted` (migration 0018): L0 files register `false`, a
+pass counts only the inputs still `false`, publishes its counts in the
+same fenced swap as its outputs, one immutable contribution per hour it
+covers, `derived/usage_1h/dt=…/hr=…/{id}.parquet` (signal 13), and
+registers every output `true`. Files written before the column existed
+read `false`, so the first L1 or accounting pass over them counts them
+once. A signal whose compaction is off, logs without `compact_logs`, is
+counted by an accounting pass instead: the same cold-hour rule, its L0
+inputs read and left in place, the contribution published and the inputs
+marked `true` in one fenced transaction. Retention never expires a file
+still `false`; the contribution files expire by the rule of their hour.
+The SQL table `usage_1h` sums every contribution, one row per
+`(signal, service_name, hour)`: `signal` `UInt8`, `service_name` nullable,
+`hour` a whole UTC hour, `rows` and `bytes` `UInt64`.
+
+### 7.4 Orphan sweep
 
 A crash between an upload and its registration, a compaction that did not
 publish, or a cancelled pass leaves objects no row points at. The leader
