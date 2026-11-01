@@ -222,7 +222,7 @@ fn sidecar(
             let index_path = fs_index::text_index::sidecar_path(path).ok_or_else(no_sidecar)?;
             Some((index_path, Bytes::from(builder.finish(content_sha256)?)))
         }
-        (RowSignal::Logs, None) => None,
+        (RowSignal::Logs, None) | (RowSignal::Metrics, _) => None,
     })
 }
 
@@ -330,6 +330,7 @@ pub fn schema_of(signal: RowSignal) -> arrow::datatypes::SchemaRef {
     match signal {
         RowSignal::Traces => span_schema_v1(),
         RowSignal::Logs => log_schema_v1(),
+        RowSignal::Metrics => fs_schema::metrics::samples_schema_v1(),
     }
 }
 
@@ -338,6 +339,7 @@ pub fn catalog_signal(signal: RowSignal) -> Signal {
     match signal {
         RowSignal::Traces => Signal::Traces,
         RowSignal::Logs => Signal::Logs,
+        RowSignal::Metrics => Signal::MetricSamples,
     }
 }
 

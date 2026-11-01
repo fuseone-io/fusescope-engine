@@ -4075,6 +4075,7 @@ async fn future_layout_version_fails_closed() {
             }),
             hour: None,
             signal: RowSignal::Traces,
+            metric: None,
         };
         wal.append(&intent.to_record().encode()).unwrap();
         wal.sync().unwrap();
@@ -4143,6 +4144,7 @@ async fn an_intent_of_layout_3_is_written_with_layout_3_after_a_restart() {
             layout: Some(layout),
             hour: None,
             signal: RowSignal::Traces,
+            metric: None,
         };
         wal.append(&intent.to_record().encode()).unwrap();
         wal.sync().unwrap();

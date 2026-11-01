@@ -20,6 +20,10 @@ pub const VERSION_HOUR_INTENT: u8 = 2;
 /// or without an hour. A reader without that signal meets it and fails,
 /// rather than reading the intent as one over spans.
 pub const VERSION_SIGNAL_INTENT: u8 = 3;
+/// Record format version of an intent over metric records: one hour, and
+/// the set of two files, samples and series, its rows go to. A reader
+/// without metrics meets it and fails.
+pub const VERSION_METRIC_INTENT: u8 = 4;
 
 /// Bytes of the seed at the head of a [`RecordSignal::Logs`] payload.
 pub const LOG_SEED_BYTES: usize = 16;
@@ -50,6 +54,10 @@ pub enum RecordSignal {
     /// seed names the request for the ids of its rows, so a replay gives
     /// them the ids the live conversion did.
     Logs = 3,
+    /// An `ExportMetricsServiceRequest`. Its samples take their source
+    /// order from the record's position, so a replay converts it as the
+    /// live request was.
+    Metrics = 4,
 }
 
 impl RecordSignal {
@@ -58,6 +66,7 @@ impl RecordSignal {
             1 => Some(Self::Traces),
             2 => Some(Self::FlushIntent),
             3 => Some(Self::Logs),
+            4 => Some(Self::Metrics),
             _ => None,
         }
     }
@@ -91,6 +100,40 @@ pub struct FlushIntent {
     /// records of that signal in its range. Absent in intents of traces.
     #[serde(default, skip_serializing_if = "RowSignal::is_traces")]
     pub signal: RowSignal,
+    /// For metric rows: the set the samples file, `file` under `layout`,
+    /// and its series file belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<MetricIntent>,
+}
+
+/// The two files of a metric intent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricIntent {
+    /// The set both files register under.
+    pub set: fs_catalog::FileSetId,
+    /// Each file with its role and layout: exactly a samples and a series
+    /// file, the samples one the intent's `file` and `layout`.
+    pub files: Vec<MetricFile>,
+}
+
+/// One file of a metric intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricFile {
+    /// Samples or series.
+    pub role: fs_catalog::MetricRole,
+    /// Its id.
+    pub file: fs_catalog::FileId,
+    /// How its bytes are laid out.
+    pub layout: FileLayout,
+}
+
+impl MetricIntent {
+    /// The file of `role`.
+    pub fn file(&self, role: fs_catalog::MetricRole) -> Option<&MetricFile> {
+        self.files.iter().find(|f| f.role == role)
+    }
 }
 
 /// Signal of a set of rows: what a buffer holds and a [`FlushIntent`] names.
@@ -104,6 +147,9 @@ pub enum RowSignal {
     Traces,
     /// Log rows from [`RecordSignal::Logs`] records.
     Logs,
+    /// Metric samples, with their series, from [`RecordSignal::Metrics`]
+    /// records.
+    Metrics,
 }
 
 impl RowSignal {
@@ -112,6 +158,7 @@ impl RowSignal {
         match self {
             Self::Traces => RecordSignal::Traces,
             Self::Logs => RecordSignal::Logs,
+            Self::Metrics => RecordSignal::Metrics,
         }
     }
 
@@ -162,12 +209,12 @@ impl FileLayout {
     pub const CURRENT_VERSION: u32 = 4;
 
     /// Versions this engine writes for rows of `signal`: the current one
-    /// and those whose intents may still be in a log. Log files exist only
-    /// from version 4 on.
+    /// and those whose intents may still be in a log. Log and metric
+    /// files exist only from version 4 on.
     pub fn written_versions(signal: RowSignal) -> &'static [u32] {
         match signal {
             RowSignal::Traces => &[3, 4],
-            RowSignal::Logs => &[4],
+            RowSignal::Logs | RowSignal::Metrics => &[4],
         }
     }
 
@@ -226,6 +273,7 @@ impl FlushIntent {
     pub fn to_record(&self) -> WalRecord {
         WalRecord {
             version: match (self.signal, self.hour) {
+                (RowSignal::Metrics, _) => VERSION_METRIC_INTENT,
                 (RowSignal::Logs, _) => VERSION_SIGNAL_INTENT,
                 (RowSignal::Traces, Some(_)) => VERSION_HOUR_INTENT,
                 (RowSignal::Traces, None) => VERSION,
@@ -238,9 +286,10 @@ impl FlushIntent {
 
     /// Reads an intent from its record, refusing what the record's version
     /// does not allow: the first version names traces and no hour, the hour
-    /// version traces and an hour, the signal version another signal, with
-    /// or without an hour, and any hour is the start of a representable
-    /// one. Anything else was not written by this engine's cut.
+    /// version traces and an hour, the signal version logs, with or without
+    /// an hour, the metric version metrics, an hour and its two files, and
+    /// any hour is the start of a representable one. Anything else was not
+    /// written by this engine's cut.
     ///
     /// # Errors
     /// Not an intent record, a malformed payload, or a signal or an hour the
@@ -253,8 +302,15 @@ impl FlushIntent {
         let allowed = match (record.version, intent.signal, intent.hour) {
             (VERSION, RowSignal::Traces, None)
             | (VERSION_HOUR_INTENT, RowSignal::Traces, Some(_))
-            | (VERSION_SIGNAL_INTENT, RowSignal::Logs, _) => true,
-            (VERSION | VERSION_HOUR_INTENT | VERSION_SIGNAL_INTENT, _, _) => false,
+            | (VERSION_SIGNAL_INTENT, RowSignal::Logs, _)
+            | (VERSION_METRIC_INTENT, RowSignal::Metrics, Some(_)) => {
+                intent.metric.is_some() == (intent.signal == RowSignal::Metrics)
+            }
+            (
+                VERSION | VERSION_HOUR_INTENT | VERSION_SIGNAL_INTENT | VERSION_METRIC_INTENT,
+                _,
+                _,
+            ) => false,
             (version, _, _) => {
                 return Err(IngestError::Record(format!(
                     "unsupported version {version}"
@@ -267,6 +323,9 @@ impl FlushIntent {
                 record.version, intent.signal, intent.hour
             )));
         }
+        if let Some(metric) = &intent.metric {
+            intent.check_metric(metric)?;
+        }
         if let Some(secs) = intent.hour {
             let representable = chrono::DateTime::from_timestamp(secs, 0)
                 .and_then(|hour| hour.timestamp_nanos_opt())
@@ -278,6 +337,37 @@ impl FlushIntent {
             }
         }
         Ok(intent)
+    }
+
+    /// Exactly a samples and a series file under distinct ids, the samples
+    /// one this intent's file and layout, both layouts written for metrics.
+    fn check_metric(&self, metric: &MetricIntent) -> Result<(), IngestError> {
+        use fs_catalog::MetricRole;
+        let refuse = |why: &str| Err(IngestError::Record(format!("metric intent: {why}")));
+        let roles: Vec<MetricRole> = metric.files.iter().map(|f| f.role).collect();
+        if roles != MetricRole::BOTH {
+            return refuse("not a samples then a series file");
+        }
+        let (Some(samples), Some(series)) = (
+            metric.file(MetricRole::Samples),
+            metric.file(MetricRole::Series),
+        ) else {
+            return refuse("a role missing");
+        };
+        if samples.file != self.file || Some(samples.layout) != self.layout {
+            return refuse("the samples file is not the intent's");
+        }
+        if series.file == samples.file {
+            return refuse("one id for both files");
+        }
+        for file in &metric.files {
+            if !FileLayout::written_versions(RowSignal::Metrics).contains(&file.layout.version)
+                || file.layout.text_index.is_some()
+            {
+                return refuse("a layout this engine does not write");
+            }
+        }
+        Ok(())
     }
 
     /// The hour the file holds, when the buffer was cut by hour. Always
@@ -342,7 +432,14 @@ impl WalRecord {
             .split_at_checked(HEADER_LEN)
             .ok_or_else(|| IngestError::Record(format!("short record: {} bytes", bytes.len())))?;
         let version = header.first().copied().unwrap_or(0);
-        if ![VERSION, VERSION_HOUR_INTENT, VERSION_SIGNAL_INTENT].contains(&version) {
+        if ![
+            VERSION,
+            VERSION_HOUR_INTENT,
+            VERSION_SIGNAL_INTENT,
+            VERSION_METRIC_INTENT,
+        ]
+        .contains(&version)
+        {
             return Err(IngestError::Record(format!(
                 "unsupported version {version}"
             )));
@@ -401,6 +498,7 @@ mod tests {
             layout: Some(FileLayout::current(4096)),
             hour: None,
             signal: RowSignal::Traces,
+            metric: None,
         };
         let record = intent.to_record();
         assert_eq!(record.signal, RecordSignal::FlushIntent);
@@ -483,6 +581,7 @@ mod tests {
             layout: Some(layout),
             hour: None,
             signal: RowSignal::Logs,
+            metric: None,
         };
         let decoded =
             FlushIntent::from_record(&WalRecord::decode(&intent.to_record().encode()).unwrap())
@@ -521,6 +620,7 @@ mod tests {
             layout: Some(FileLayout::current(4096)),
             hour: None,
             signal: RowSignal::Traces,
+            metric: None,
         };
         let one_hour = FlushIntent {
             hour: Some(1_792_677_600),
@@ -639,6 +739,7 @@ mod tests {
             layout: Some(FileLayout::current(64)),
             hour,
             signal: RowSignal::Logs,
+            metric: None,
         }
     }
 
@@ -710,5 +811,149 @@ mod tests {
             WalRecord::decode(&rows).is_err(),
             "the signal version is for intents"
         );
+    }
+
+    fn metric_intent() -> FlushIntent {
+        use fs_catalog::{FileId, FileSetId, MetricRole};
+        let samples = FileId::new();
+        let layout = FileLayout::current(64);
+        FlushIntent {
+            tenant: TenantId::new(),
+            file: samples,
+            first: fs_wal::Position {
+                segment: 3,
+                offset: 16,
+            },
+            end: fs_wal::Position {
+                segment: 3,
+                offset: 800,
+            },
+            layout: Some(layout),
+            hour: Some(1_792_677_600),
+            signal: RowSignal::Metrics,
+            metric: Some(MetricIntent {
+                set: FileSetId::new(),
+                files: vec![
+                    MetricFile {
+                        role: MetricRole::Samples,
+                        file: samples,
+                        layout,
+                    },
+                    MetricFile {
+                        role: MetricRole::Series,
+                        file: FileId::new(),
+                        layout,
+                    },
+                ],
+            }),
+        }
+    }
+
+    /// A metric record and its intent have kinds of their own, which an
+    /// engine without metrics refuses as unknown; the intent names one
+    /// hour and exactly a samples and a series file.
+    #[test]
+    fn metric_records_and_intents_round_trip_under_their_own_codes() {
+        let record = WalRecord {
+            version: VERSION,
+            tenant: TenantId::new(),
+            signal: RecordSignal::Metrics,
+            payload: Bytes::from_static(b"otlp metrics"),
+        };
+        let bytes = record.encode();
+        assert_eq!(bytes.get(1), Some(&4));
+        assert_eq!(WalRecord::decode(&bytes).unwrap(), record);
+
+        let intent = metric_intent();
+        let record = intent.to_record();
+        assert_eq!(record.version, VERSION_METRIC_INTENT);
+        let decoded = WalRecord::decode(&record.encode()).unwrap();
+        assert_eq!(FlushIntent::from_record(&decoded).unwrap(), intent);
+    }
+
+    #[test]
+    fn a_metric_intent_is_refused_unless_it_names_a_samples_and_a_series_file_of_one_hour() {
+        use fs_catalog::{FileId, MetricRole};
+        let refused = |intent: &FlushIntent| FlushIntent::from_record(&intent.to_record()).is_err();
+        let good = metric_intent();
+        assert!(!refused(&good));
+        let mut no_hour = good.clone();
+        no_hour.hour = None;
+        assert!(refused(&no_hour));
+        let mut no_files = good.clone();
+        no_files.metric = None;
+        assert!(refused(&no_files));
+        let edit = |change: &dyn Fn(&mut MetricIntent)| {
+            let mut intent = good.clone();
+            change(intent.metric.as_mut().unwrap());
+            intent
+        };
+        assert!(refused(&edit(&|m| m.files.reverse())), "series first");
+        assert!(
+            refused(&edit(&|m| {
+                m.files.pop();
+            })),
+            "one file"
+        );
+        assert!(
+            refused(&edit(&|m| {
+                let extra = *m.files.get(1).unwrap();
+                m.files.push(extra);
+            })),
+            "a role twice"
+        );
+        assert!(
+            refused(&edit(
+                &|m| m.files.get_mut(1).unwrap().role = MetricRole::Samples
+            )),
+            "two samples"
+        );
+        assert!(
+            refused(&edit(&|m| m.files.get_mut(0).unwrap().file = FileId::new())),
+            "samples not the intent's file"
+        );
+        assert!(
+            refused(&edit(
+                &|m| m.files.get_mut(1).unwrap().file = m.files.first().unwrap().file
+            )),
+            "one id twice"
+        );
+        assert!(
+            refused(&edit(&|m| m.files.get_mut(1).unwrap().layout.version = 3)),
+            "an unwritten layout"
+        );
+        assert!(
+            refused(&edit(&|m| {
+                m.files.get_mut(1).unwrap().layout.text_index = Some(TextIndexLayout {
+                    version: 1,
+                    max_bytes_per_row_group: 1,
+                    max_bytes_per_file: 1,
+                });
+            })),
+            "a text sidecar"
+        );
+        // Unknown fields in the files are not tolerated.
+        let mut record = good.to_record();
+        let text = String::from_utf8(record.payload.to_vec()).unwrap();
+        let tampered = text.replacen("\"role\":\"series\"", "\"role\":\"series\",\"extra\":1", 1);
+        assert_ne!(tampered, text);
+        record.payload = Bytes::from(tampered);
+        assert!(FlushIntent::from_record(&record).is_err());
+        // Only the metric version names metrics, and it names nothing else.
+        for version in [VERSION, VERSION_HOUR_INTENT, VERSION_SIGNAL_INTENT] {
+            let record = WalRecord {
+                version,
+                ..good.to_record()
+            };
+            assert!(FlushIntent::from_record(&record).is_err(), "{version}");
+        }
+        let logs = WalRecord {
+            version: VERSION_METRIC_INTENT,
+            ..logs_intent(Some(1_792_677_600)).to_record()
+        };
+        assert!(FlushIntent::from_record(&logs).is_err());
+        let mut logs_with_files = logs_intent(Some(1_792_677_600));
+        logs_with_files.metric = good.metric.clone();
+        assert!(FlushIntent::from_record(&logs_with_files.to_record()).is_err());
     }
 }

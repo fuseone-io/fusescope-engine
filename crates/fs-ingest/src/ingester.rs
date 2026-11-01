@@ -527,6 +527,7 @@ impl Shared {
                 layout: Some(layout),
                 hour: hour.map(|h| h.timestamp()),
                 signal: stream.signal,
+                metric: None,
             };
             let file_at = |hour: Option<DateTime<Utc>>| match hour {
                 Some(hour) => {
@@ -725,6 +726,7 @@ impl Shared {
             layout: bound.layout,
             hour: bound.hour.map(|h| h.timestamp()),
             signal: stream.signal,
+            metric: None,
         };
         if let Err(e) = self.append_wal(tenant, intent.to_record().encode()).await {
             warn!(tenant = %tenant.0, file = %old.0, error = %e, "superseding intent could not be logged; keeping the id");
@@ -1339,6 +1341,12 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                         let stream = Stream::logs(record.tenant);
                         out.rows.push((stream, entry.position, builder.finish()?));
                     }
+                    RecordSignal::Metrics => {
+                        return Err(IngestError::Record(format!(
+                            "metric record at {:?} cannot be replayed by this engine yet",
+                            entry.position
+                        )));
+                    }
                     // An intent this engine cannot read was written by a newer
                     // one. Skipping it would send its rows back to live and
                     // write them as other bytes under an id already taken, so
@@ -1802,6 +1810,7 @@ mod tests {
             layout: None,
             hour: Some(i64::try_from(hour / 1_000_000_000).unwrap()),
             signal: RowSignal::Traces,
+            metric: None,
         };
         let replayed = Replayed {
             rows: vec![
@@ -1891,6 +1900,7 @@ mod tests {
             layout: None,
             hour: None,
             signal: RowSignal::Traces,
+            metric: None,
         };
         let replayed = Replayed {
             rows: vec![

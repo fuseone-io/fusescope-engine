@@ -613,7 +613,7 @@ pub const TEXT_INDEX_SCRATCH_FACTOR: usize = 1;
 /// Copies of its input the flush of rows of `signal` holds as scratch.
 pub fn scratch_factor(signal: RowSignal) -> usize {
     match signal {
-        RowSignal::Traces => FLUSH_SCRATCH_FACTOR,
+        RowSignal::Traces | RowSignal::Metrics => FLUSH_SCRATCH_FACTOR,
         RowSignal::Logs => FLUSH_SCRATCH_FACTOR + TEXT_INDEX_SCRATCH_FACTOR,
     }
 }
@@ -772,7 +772,7 @@ impl Buffers {
     /// The per-file scratch of a flush of rows of `signal`.
     fn file_scratch(&self, signal: RowSignal) -> usize {
         match signal {
-            RowSignal::Traces => 0,
+            RowSignal::Traces | RowSignal::Metrics => 0,
             RowSignal::Logs => self.text_file_scratch,
         }
     }
