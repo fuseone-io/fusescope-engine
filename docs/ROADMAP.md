@@ -269,7 +269,10 @@ C5 landed after C6.
   sidecars and service lists dropped past their caps, L2 paths of a day
   parsed and swept, key rebuilds reading L1 and L2, and a fair tick
   (`crates/fs-compactor/tests/l2.rs`). Promotions from querier statistics
-  need their own ADR.
+  need their own ADR. Closed after review round 4. Before `compact_l2` is
+  turned on by default: a soak with wide rows, RSS watched beside
+  `fusescope_compaction_l2_peak_bytes`, since the encoder's buffers are
+  measured after each write, not bounded before it.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two
   weeks without regression.

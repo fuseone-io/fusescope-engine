@@ -1221,7 +1221,7 @@ impl Config {
                 "compactor.l2_output_bytes, l2_target_bytes, max_l2_input_bytes and l1_passes_per_tick must be positive",
             );
         }
-        if self.compactor.l2_output_bytes < 16 << 20 {
+        if self.compactor.l2_output_bytes < compact::MIN_L2_OUTPUT_BYTES {
             return invalid("compactor.l2_output_bytes must be at least 16 MiB");
         }
         let c = &self.compactor;
@@ -2077,7 +2077,8 @@ mod tests {
             catalog_url: Some("postgres://x".into()),
             ..Secrets::default()
         };
-        for (value, ok) in [((16 << 20) - 1, false), (16 << 20, true)] {
+        let least = fs_compactor::compact::MIN_L2_OUTPUT_BYTES;
+        for (value, ok) in [(least - 1, false), (least, true)] {
             let config = Config::parse(&format!(
                 "{MINIMAL}[compactor]\nl2_output_bytes = {value}\nl2_target_bytes = {value}\n"
             ))

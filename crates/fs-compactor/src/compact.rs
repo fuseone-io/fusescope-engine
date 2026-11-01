@@ -51,6 +51,11 @@ pub const MAX_SERVICES_PER_FILE: usize = 1_000_000;
 /// Most bytes a pass's usage counts hold.
 pub const MAX_USAGE_BYTES: usize = 1 << 30;
 
+/// Least `l2_output_bytes` the server configures: below it no L1 file of
+/// wide rows fits. The compactor itself takes any budget, an input it
+/// cannot read within one passed over.
+pub const MIN_L2_OUTPUT_BYTES: usize = 16 << 20;
+
 /// What one pass is allowed to take on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionConfig {
