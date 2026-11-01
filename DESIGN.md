@@ -926,8 +926,15 @@ or `logs/index/ngram/dt=…/{id}.ngb`. A day larger than the cap closes over
 several passes into L2 files whose ranges overlap, which pruning handles
 as any other overlap. An output is written in memory and uploaded under
 the create-once rule, so it closes at `compactor.l2_target_bytes` (1 GiB)
-or at `compactor.l2_output_bytes` (512 MiB), whichever comes first: its
-encoded bytes, its row group in progress and its sidecar counted together.
+or at `compactor.l2_output_bytes` (512 MiB), whichever comes first. That
+budget bounds what the pass holds, not only the output: the decoded batch
+of each input, sized by reading a 1-row and a 16-row probe so its fixed
+and per-row costs are both counted, the group being gathered, itself held
+to a quarter of the budget, and the output's encoded bytes, row group in
+progress, service names and sidecar with the copies `finish` makes. An
+output closes before the next group would take the total past the budget,
+so the floor is one batch per input; the highest total a pass reached is
+`l2_peak_bytes` in the compactor stats.
 A sidecar never grows past its cap, `compactor.max_trace_index_bytes`
 (256 MiB) for the trace ids, the text sidecar's own budget for logs: an
 output whose trace ids pass the cap is published without a `.tix`
@@ -941,7 +948,11 @@ swap, with the crash boundaries of section 7.1. Each tick
 (`compaction_tick`) runs up to `compactor.l1_passes_per_tick` (64) L1
 passes, then, whatever their backlog, at least one and up to
 `compactor.l2_passes_per_tick` (1) L2 passes, then the accounting passes
-of section 7.3. The rebuild of
+of section 7.3. Every pass knob has a ceiling the compactor enforces
+whatever its caller validated, and the server refuses a value above it:
+1024 L1 and 64 L2 passes a tick, 8 GiB for `l2_target_bytes` and
+`l2_output_bytes`, 1 GiB of trace ids, 1 000 000 services, 1 GiB of usage
+counts. The rebuild of
 `attribute_keys` and `log_attribute_keys` after retention reads the L1
 and L2 files that remain.
 
@@ -960,7 +971,13 @@ binary by its bytes, a map by its keys and values, recursively; they leave
 out compression, offsets, validity, dictionaries and Parquet overhead, and
 the columns derived from others: `ts_bucket_start`, the fingerprint, enum
 strings, `has_error` and the promoted copies of attributes. Sums are
-checked: an overflow fails the pass, never saturates.
+checked: an overflow fails the pass, never saturates. A pass's counts are
+held to `compactor.usage_max_bytes` (64 MiB, at most 1 GiB), each
+`(hour, service)` entry costed at its service name plus 96 bytes before it
+is allocated: counts that a new entry would take past the budget are set
+aside as a contribution of their own, published in the same swap, and
+counting goes on, so a pass with many services yields several
+contributions for an hour and none is ever refused.
 
 Every row is counted exactly once, when its file leaves L0. A catalog row
 carries `usage_accounted` (migration 0018): L0 files register `false`, a
@@ -976,7 +993,11 @@ marked `true` in one fenced transaction. Retention never expires a file
 still `false`; the contribution files expire by the rule of their hour.
 The SQL table `usage_1h` sums every contribution, one row per
 `(signal, service_name, hour)`: `signal` `UInt8`, `service_name` nullable,
-`hour` a whole UTC hour, `rows` and `bytes` `UInt64`.
+`hour` a whole UTC hour, `rows` and `bytes` `UInt64`. A contribution is
+checked whole as it is decoded and as the table reads it
+(`usage::check_rows`): a signal other than spans or logs, an hour not
+whole, or a `(signal, service, hour)` twice in one file fails the read
+rather than reaching a sum.
 
 ### 7.4 Orphan sweep
 

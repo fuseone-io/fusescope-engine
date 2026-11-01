@@ -210,6 +210,13 @@ tables from L1 files alone. Retention never expires a file whose usage was
 not counted (`usage_accounted`); a tenant whose expired days stay is
 waiting for the L1 or accounting pass of those hours.
 
+`compactor.l2_output_bytes` bounds the memory of an L2 pass, inputs
+included; each input holds at least one decoded batch, so a day of many
+wide inputs closes outputs early rather than exceeding it. A query of
+`usage_1h` that fails naming the table met a contribution outside the
+domain (unknown signal, partial hour, duplicate key): find the file under
+`derived/usage_1h/` and escalate, do not delete it.
+
 ### Start
 
 | Message | Meaning |
