@@ -87,9 +87,9 @@ pub struct MergeConfig {
     pub text_index: fs_index::TextIndexLimits,
     /// Conservative byte budget for the service-graph builder.
     pub service_graph_max_bytes: usize,
-    /// Most `(hour, service)` pairs the pass counts usage for; past it the
-    /// pass fails rather than drop a count.
-    pub usage_max_entries: usize,
+    /// Bytes the usage counts may hold; past them a full count is set
+    /// aside, handed out as its own contribution.
+    pub usage_max_bytes: usize,
 }
 
 /// Merges files of one tenant and signal into outputs of the next level,
@@ -110,6 +110,19 @@ pub struct Merger {
     hour_ns: i64,
     summaries: TraceSummaries,
     graph: ServiceGraphBuilder,
+    /// The output being written, between steps.
+    current: Option<OutputBuilder>,
+    /// Most bytes the inputs and the output held together, counted before
+    /// each row group.
+    peak: usize,
+}
+
+/// What a merge hands back at each step.
+pub enum Step {
+    /// An output, closed.
+    Output(Box<Output>),
+    /// Usage counts set aside full, a contribution of their own.
+    Usage(UsageCounts),
 }
 
 impl Merger {
@@ -138,8 +151,11 @@ impl Merger {
             Signal::Logs => log_schema_v1(),
             _ => return Err(CompactError::Merge("a signal without L1 files")),
         };
-        let usage = usage_signal(signal).map(|s| (s, config.usage_max_entries));
-        let merge = Merge::open(store, inputs, &schema, config.read_batch_rows, usage).await?;
+        let usage = usage_signal(signal).map(|s| (s, config.usage_max_bytes));
+        // The inputs hold a quarter of the output budget between them.
+        let batch_bytes = (config.output_bytes / 4) / inputs.len().max(1);
+        let reading = (config.read_batch_rows, batch_bytes);
+        let merge = Merge::open(store, inputs, &schema, reading, usage).await?;
         let hour_ns = hour
             .timestamp_nanos_opt()
             .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
@@ -156,7 +172,15 @@ impl Merger {
             hour_ns,
             summaries: TraceSummaries::default(),
             graph: ServiceGraphBuilder::default(),
+            current: None,
+            peak: 0,
         })
+    }
+
+    /// Most bytes the inputs and the output held together before a row
+    /// group, as the merge counts them.
+    pub fn peak_bytes(&self) -> usize {
+        self.peak
     }
 
     /// The `attribute_keys` table with every row merged so far counted
@@ -181,29 +205,57 @@ impl Merger {
         self.merge.usage.take()
     }
 
-    /// The next output, closed at the target size or at the end of the
-    /// inputs; `None` once the inputs are spent. Only this output's bytes
-    /// are held.
+    /// The next step: an output, closed at its target size, before its
+    /// memory would pass the output budget, or at the end of the inputs;
+    /// or usage counts set aside full while merging. `None` once the inputs
+    /// are spent and every output handed back.
+    ///
+    /// A row group holds at most a quarter of the budget, and an output
+    /// closes before the next one when what it holds, what the inputs hold
+    /// and twice the row group, gathered and encoded, would not fit.
     ///
     /// # Errors
     /// Store, Parquet or Arrow failures, or an input whose columns are not
     /// the signal's schema.
-    pub async fn next_output(&mut self) -> Result<Option<Output>, CompactError> {
-        if self.done {
-            return Ok(None);
+    pub async fn next_step(&mut self) -> Result<Option<Step>, CompactError> {
+        if let Some(full) = self.merge.usage_full.pop() {
+            return Ok(Some(Step::Usage(full)));
         }
-        let id = FileId::new();
-        let path = match self.config.level {
-            Level::L2 => l2_path(&self.root, self.tenant, self.signal, self.hour, id),
-            _ => l1_path(&self.root, self.tenant, self.signal, self.hour, id),
-        };
-        let mut current = OutputBuilder::new(&self.schema, self.signal, id, path, &self.config)?;
+        if self.done {
+            return Ok(self
+                .current
+                .take()
+                .filter(|c| c.rows > 0)
+                .map(|c| c.finish(self.tenant))
+                .transpose()?
+                .map(|o| Step::Output(Box::new(o))));
+        }
+        let group_bytes = self.config.output_bytes / 4;
         let derived = self.config.level == Level::L1;
-        while let Some(group) = self
-            .merge
-            .next_group(&self.schema, self.config.row_group_rows)
-            .await?
-        {
+        loop {
+            if self.current.is_none() {
+                self.current = Some(self.new_output()?);
+            }
+            let held = self.merge.held_bytes();
+            let output = self.current.as_ref().map_or(0, OutputBuilder::memory);
+            self.peak = self.peak.max(held.saturating_add(output));
+            let room = held
+                .saturating_add(output)
+                .saturating_add(group_bytes.saturating_mul(2));
+            if self.current.as_ref().is_some_and(|c| c.rows > 0) && room > self.config.output_bytes
+            {
+                return self.close();
+            }
+            let Some(group) = self
+                .merge
+                .next_group(&self.schema, self.config.row_group_rows, group_bytes)
+                .await?
+            else {
+                self.done = true;
+                return Ok(self
+                    .close()?
+                    .or(self.merge.usage_full.pop().map(Step::Usage)));
+            };
             if derived {
                 self.keys
                     .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
@@ -220,18 +272,46 @@ impl Merger {
                     self.config.service_graph_max_bytes,
                 )?;
             }
+            let gathered = group.get_array_memory_size();
+            self.peak = self.peak.max(
+                self.merge
+                    .held_bytes()
+                    .saturating_add(output)
+                    .saturating_add(gathered),
+            );
+            let current = self
+                .current
+                .as_mut()
+                .ok_or(CompactError::Merge("no output being written"))?;
             current.write(&group)?;
-            if current.bytes_written() >= self.config.target_bytes
-                || current.memory() >= self.config.output_bytes
-            {
-                return Ok(Some(current.finish(self.tenant)?));
+            let full = current.bytes_written() >= self.config.target_bytes;
+            drop(group);
+            if full {
+                return self.close();
+            }
+            if let Some(counts) = self.merge.usage_full.pop() {
+                return Ok(Some(Step::Usage(counts)));
             }
         }
-        self.done = true;
-        if current.rows == 0 {
-            return Ok(None);
+    }
+
+    /// The output being written, finished; `None` when it holds no row.
+    fn close(&mut self) -> Result<Option<Step>, CompactError> {
+        match self.current.take() {
+            Some(current) if current.rows > 0 => {
+                Ok(Some(Step::Output(Box::new(current.finish(self.tenant)?))))
+            }
+            _ => Ok(None),
         }
-        Ok(Some(current.finish(self.tenant)?))
+    }
+
+    fn new_output(&self) -> Result<OutputBuilder, CompactError> {
+        let id = FileId::new();
+        let path = match self.config.level {
+            Level::L2 => l2_path(&self.root, self.tenant, self.signal, self.hour, id),
+            _ => l1_path(&self.root, self.tenant, self.signal, self.hour, id),
+        };
+        OutputBuilder::new(&self.schema, self.signal, id, path, &self.config)
     }
 }
 
@@ -321,6 +401,8 @@ struct Slot {
     batch: RecordBatch,
     services: Vec<Service>,
     timestamps: Vec<i64>,
+    /// What the slot holds: the batch and its sort keys.
+    bytes: usize,
 }
 
 impl Slot {
@@ -348,11 +430,20 @@ impl Slot {
             .as_primitive::<TimestampNanosecondType>()
             .values()
             .to_vec();
+        let bytes = batch.get_array_memory_size()
+            + services.capacity() * std::mem::size_of::<Service>()
+            + timestamps.capacity() * std::mem::size_of::<i64>();
         Ok(Self {
             batch,
             services,
             timestamps,
+            bytes,
         })
+    }
+
+    /// What one row holds, rounded up.
+    fn row_bytes(&self) -> usize {
+        self.bytes.div_ceil(self.batch.num_rows().max(1))
     }
 }
 
@@ -426,25 +517,61 @@ impl AsyncFileReader for ObjectReader {
     }
 }
 
-/// The batches of `file`, `batch_rows` rows at a time.
+/// The batches of `file`, at most `batch_rows` rows and, when
+/// `batch_bytes` bounds them, about `batch_bytes` of decoded memory at a
+/// time, one row at least. What a batch decodes to is measured on the
+/// first rows of the file, a batch of one row and one of
+/// [`PROBE_ROWS`], which tell what any batch costs apart from what each
+/// row adds; the footer's sizes are of encoded pages and say nothing of
+/// what a dictionary expands to.
 ///
 /// # Errors
-/// Store or Parquet failure opening the file.
+/// Store or Parquet failure opening or probing the file.
 pub(crate) async fn batches(
     store: Arc<dyn ObjectStore>,
     file: &FileRecord,
     batch_rows: usize,
+    batch_bytes: usize,
 ) -> Result<ParquetRecordBatchStream<ObjectReader>, CompactError> {
-    let reader = ObjectReader {
-        store,
+    let reader = || ObjectReader {
+        store: Arc::clone(&store),
         path: Path::from(file.path.as_str()),
         size: u64::try_from(file.size_bytes).unwrap_or(0),
     };
-    Ok(ParquetRecordBatchStreamBuilder::new(reader)
+    let mut rows = batch_rows.max(1);
+    if batch_bytes < usize::MAX / 8 {
+        let probe = |size: usize| {
+            let reader = reader();
+            async move {
+                let mut stream = ParquetRecordBatchStreamBuilder::new(reader)
+                    .await?
+                    .with_batch_size(size)
+                    .with_row_groups(vec![0])
+                    .build()?;
+                let first = stream.next().await.transpose()?;
+                Ok::<_, CompactError>(first.map(|b| (b.num_rows(), b.get_array_memory_size())))
+            }
+        };
+        if let (Some((1, one)), Some((n, many))) = (probe(1).await?, probe(PROBE_ROWS).await?) {
+            let per_row = many
+                .saturating_sub(one)
+                .div_ceil(n.saturating_sub(1).max(1))
+                .max(1);
+            let fixed = one.saturating_sub(per_row);
+            let room = batch_bytes.saturating_sub(fixed);
+            // A quarter more than measured: later rows may be wider.
+            rows = (room * 4 / (per_row * 5)).clamp(1, rows);
+        }
+    }
+    Ok(ParquetRecordBatchStreamBuilder::new(reader())
         .await?
-        .with_batch_size(batch_rows)
+        .with_batch_size(rows)
         .build()?)
 }
+
+/// Rows of the larger batch read to measure what a row of a file
+/// decodes to.
+const PROBE_ROWS: usize = 16;
 
 /// The head of one input in the heap: its sort key and where the row is.
 type Head = Reverse<(Service, i64, usize, usize, usize)>;
@@ -459,10 +586,12 @@ struct Merge {
     inputs: Vec<Input>,
     slots: Vec<Option<Slot>>,
     heap: BinaryHeap<Head>,
-    /// Usage of the inputs flagged in `uncounted`, with its cap.
+    /// Usage of the inputs flagged in `uncounted`, within its budget.
     usage: Option<UsageCounts>,
     uncounted: Vec<bool>,
-    usage_cap: usize,
+    usage_budget: usize,
+    /// Counts set aside full, waiting to be published.
+    usage_full: Vec<UsageCounts>,
 }
 
 impl Merge {
@@ -470,7 +599,7 @@ impl Merge {
         store: Arc<dyn ObjectStore>,
         files: &[FileRecord],
         schema: &SchemaRef,
-        batch_rows: usize,
+        (batch_rows, batch_bytes): (usize, usize),
         usage: Option<(UsageSignal, usize)>,
     ) -> Result<Self, CompactError> {
         let uncounted: Vec<bool> = files.iter().map(|f| !f.usage_accounted).collect();
@@ -483,10 +612,11 @@ impl Merge {
             heap: BinaryHeap::new(),
             usage: counts,
             uncounted,
-            usage_cap: usage.map_or(0, |(_, cap)| cap),
+            usage_budget: usage.map_or(0, |(_, budget)| budget),
+            usage_full: Vec::new(),
         };
         for file in files {
-            let stream = batches(Arc::clone(&store), file, batch_rows).await?;
+            let stream = batches(Arc::clone(&store), file, batch_rows, batch_bytes).await?;
             merge.inputs.push(Input { stream, slot: None });
         }
         for input in 0..merge.inputs.len() {
@@ -535,6 +665,11 @@ impl Merge {
         }
     }
 
+    /// What the loaded slots hold.
+    fn held_bytes(&self) -> usize {
+        self.slots.iter().flatten().map(|s| s.bytes).sum()
+    }
+
     /// Counts `batch` of `input` into the usage when the input was not
     /// counted before.
     fn count_usage(&mut self, input: usize, batch: &RecordBatch) -> Result<(), CompactError> {
@@ -542,27 +677,31 @@ impl Merge {
         else {
             return Ok(());
         };
-        usage.absorb(batch)?;
-        if usage.len() > self.usage_cap {
-            return Err(CompactError::Merge(
-                "usage pairs over compactor.usage_max_entries",
-            ));
-        }
+        usage.absorb_within(batch, self.usage_budget, &mut self.usage_full)?;
         Ok(())
     }
 
-    /// The next output row group in sort order, or `None` when every
-    /// input is spent.
+    /// The next output row group in sort order, at most `rows` rows and,
+    /// by the bytes per row of the slots it takes from, about `max_bytes`,
+    /// one row at least; `None` when every input is spent.
     async fn next_group(
         &mut self,
         schema: &SchemaRef,
         rows: usize,
+        max_bytes: usize,
     ) -> Result<Option<RecordBatch>, CompactError> {
-        let mut picked: Vec<(usize, usize)> = Vec::with_capacity(rows);
-        while picked.len() < rows {
+        let mut picked: Vec<(usize, usize)> = Vec::new();
+        let mut bytes = 0usize;
+        while picked.len() < rows && (picked.is_empty() || bytes < max_bytes) {
             let Some(Reverse((_, _, input, row, slot))) = self.heap.pop() else {
                 break;
             };
+            bytes = bytes.saturating_add(
+                self.slots
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map_or(0, Slot::row_bytes),
+            );
             picked.push((slot, row));
             self.advance(input, row + 1, schema).await?;
         }

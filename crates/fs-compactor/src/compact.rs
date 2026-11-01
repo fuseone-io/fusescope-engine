@@ -27,11 +27,29 @@ use tracing::{info, warn};
 
 use crate::CompactError;
 use crate::derived::{key_table, read_table, table_file};
-use crate::merge::{MergeConfig, Merger};
+use crate::merge::{MergeConfig, Merger, Step};
 use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
 
 /// Hard ceiling for the two C6 builders retained by one pass together.
 pub const MAX_DERIVED_BUILDER_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Most L1 passes a tick runs.
+pub const MAX_L1_PASSES_PER_TICK: usize = 1024;
+
+/// Most L2 passes a tick runs.
+pub const MAX_L2_PASSES_PER_TICK: usize = 64;
+
+/// Most bytes an L2 file reaches or holds in memory as it is written.
+pub const MAX_L2_OUTPUT_BYTES: usize = 8 << 30;
+
+/// Most bytes of trace ids an output collects for its sidecar.
+pub const MAX_TRACE_INDEX_BYTES: usize = 1 << 30;
+
+/// Most distinct services an output lists.
+pub const MAX_SERVICES_PER_FILE: usize = 1_000_000;
+
+/// Most bytes a pass's usage counts hold.
+pub const MAX_USAGE_BYTES: usize = 1 << 30;
 
 /// What one pass is allowed to take on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,9 +94,9 @@ pub struct CompactionConfig {
     /// Most distinct services an output lists; past it the output lists
     /// none, which pruning reads as unknown.
     pub max_services_per_file: usize,
-    /// Most `(hour, service)` pairs one pass counts usage for; a pass past
-    /// it fails rather than drop a count.
-    pub usage_max_entries: usize,
+    /// Bytes a pass's usage counts may hold; past them a full count is set
+    /// aside as its own contribution, published in the same swap.
+    pub usage_max_bytes: usize,
     /// Budgets of the text sidecar of each log L1 file.
     pub text_index: fs_index::TextIndexLimits,
     /// Also compact the L0 files of log rows. Off, no pass takes a new
@@ -106,6 +124,9 @@ pub struct CompactorStats {
     pub accounted: AtomicU64,
     /// L2 passes that swapped outputs in.
     pub l2_passes: AtomicU64,
+    /// Most bytes one L2 merge held, inputs and output together, as the
+    /// merge counts them before each row group.
+    pub l2_peak_bytes: AtomicU64,
     /// Span outputs published without a `trace_id` sidecar, their trace
     /// ids past `max_trace_index_bytes`.
     pub sidecars_over_cap: AtomicU64,
@@ -242,6 +263,7 @@ impl Compactor {
             config.trace_summary_max_bytes,
             config.service_graph_max_bytes,
         );
+        bound_passes(&mut config);
         let inject = config.inject_swap_failures;
         Self {
             catalog,
@@ -414,7 +436,7 @@ impl Compactor {
                 trace_summary_max_bytes: self.config.trace_summary_max_bytes,
                 service_graph_max_spans: self.config.service_graph_max_spans,
                 service_graph_max_bytes: self.config.service_graph_max_bytes,
-                usage_max_entries: self.config.usage_max_entries,
+                usage_max_bytes: self.config.usage_max_bytes,
                 text_index: self.config.text_index,
             },
             table_before,
@@ -433,17 +455,17 @@ impl Compactor {
             armed: true,
         };
         let mut puts = 0usize;
-        while let Some(output) = merger.next_output().await? {
-            self.put_once(&output.file.path, output.bytes.clone(), &mut puts)
-                .await?;
-            guard.created += 1;
-            if let Some((path, index)) = &output.index {
-                self.put_once(path, index.clone(), &mut puts).await?;
+        let mut usage_set_aside: Vec<NewFile> = Vec::new();
+        while let Some(step) = merger.next_step().await? {
+            match step {
+                Step::Output(output) => {
+                    outputs.push(self.publish_output(*output, &mut guard, &mut puts).await?);
+                }
+                Step::Usage(counts) => usage_set_aside.extend(
+                    self.publish_usage(tenant, counts, &mut guard, &mut puts)
+                        .await?,
+                ),
             }
-            outputs.push(Published {
-                bytes: output.bytes.len() as u64,
-                file: output.file,
-            });
         }
         let contributions = DerivedContributions {
             keys: merger.take_keys(),
@@ -453,9 +475,10 @@ impl Compactor {
         };
         drop(merger);
         self.report_dropped_keys(tenant, signal, hour, &contributions.keys);
-        let derived = self
+        let mut derived = self
             .publish_derived(tenant, hour, contributions, &mut guard, &mut puts)
             .await?;
+        derived.usage.extend(usage_set_aside);
         let compaction = self
             .swap(tenant, signal, &owned, &replaced, &outputs, &derived, fence)
             .await?;
@@ -764,6 +787,17 @@ fn bounded_derived_bytes(summary: usize, graph: usize) -> (usize, usize) {
     (summary, graph)
 }
 
+/// Clamps the pass knobs to their ceilings, whatever the caller validated.
+fn bound_passes(config: &mut CompactionConfig) {
+    config.l1_passes_per_tick = config.l1_passes_per_tick.min(MAX_L1_PASSES_PER_TICK);
+    config.l2_passes_per_tick = config.l2_passes_per_tick.clamp(1, MAX_L2_PASSES_PER_TICK);
+    config.l2_target_bytes = config.l2_target_bytes.min(MAX_L2_OUTPUT_BYTES);
+    config.l2_output_bytes = config.l2_output_bytes.min(MAX_L2_OUTPUT_BYTES);
+    config.max_trace_index_bytes = config.max_trace_index_bytes.min(MAX_TRACE_INDEX_BYTES);
+    config.max_services_per_file = config.max_services_per_file.min(MAX_SERVICES_PER_FILE);
+    config.usage_max_bytes = config.usage_max_bytes.min(MAX_USAGE_BYTES);
+}
+
 /// An output already in the bucket, waiting for the swap.
 pub(crate) struct Published {
     pub(crate) file: NewFile,
@@ -773,6 +807,47 @@ pub(crate) struct Published {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pass_knobs_are_bounded_inside_the_compactor() {
+        let mut config = CompactionConfig {
+            hour_close_delay: Duration::from_secs(60),
+            l1_target_bytes: 1 << 20,
+            max_inputs_per_pass: 16,
+            max_input_bytes: 1 << 30,
+            trace_summary_max_traces: 1,
+            trace_summary_max_bytes: 1 << 20,
+            service_graph_max_spans: 1,
+            service_graph_max_bytes: 1 << 20,
+            row_group_rows: 4,
+            usage_max_bytes: usize::MAX,
+            compact_l2: true,
+            l2_target_bytes: usize::MAX,
+            l2_output_bytes: usize::MAX,
+            max_l2_input_bytes: u64::MAX,
+            l2_passes_per_tick: usize::MAX,
+            l1_passes_per_tick: usize::MAX,
+            max_trace_index_bytes: usize::MAX,
+            max_services_per_file: usize::MAX,
+            text_index: fs_index::TextIndexLimits::DEFAULT,
+            compact_logs: true,
+            inject_swap_failures: 0,
+            inject_put_failure_at: None,
+            inject_put_hold: None,
+        };
+        bound_passes(&mut config);
+        assert_eq!(config.l1_passes_per_tick, MAX_L1_PASSES_PER_TICK);
+        assert_eq!(config.l2_passes_per_tick, MAX_L2_PASSES_PER_TICK);
+        assert_eq!(config.l2_target_bytes, MAX_L2_OUTPUT_BYTES);
+        assert_eq!(config.l2_output_bytes, MAX_L2_OUTPUT_BYTES);
+        assert_eq!(config.max_trace_index_bytes, MAX_TRACE_INDEX_BYTES);
+        assert_eq!(config.max_services_per_file, MAX_SERVICES_PER_FILE);
+        assert_eq!(config.usage_max_bytes, MAX_USAGE_BYTES);
+
+        config.l2_passes_per_tick = 0;
+        bound_passes(&mut config);
+        assert_eq!(config.l2_passes_per_tick, 1);
+    }
 
     #[test]
     fn derived_byte_limits_are_bounded_inside_the_compactor() {

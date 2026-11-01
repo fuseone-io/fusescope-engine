@@ -8,6 +8,7 @@
     clippy::panic
 )]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -220,7 +221,7 @@ fn config() -> CompactionConfig {
         service_graph_max_spans: 4_000_000,
         service_graph_max_bytes: 256 << 20,
         row_group_rows: 4,
-        usage_max_entries: 100_000,
+        usage_max_bytes: 64 << 20,
         compact_l2: true,
         l2_target_bytes: 1 << 30,
         l2_output_bytes: 512 << 20,
@@ -537,7 +538,7 @@ async fn l2_outputs_stay_within_their_memory_and_sidecar_caps() {
         &f,
         CompactionConfig {
             l2_output_bytes: 1,
-            max_trace_index_bytes: 16,
+            max_trace_index_bytes: 0,
             max_services_per_file: 0,
             ..config()
         },
@@ -563,10 +564,7 @@ async fn l2_outputs_stay_within_their_memory_and_sidecar_caps() {
                 .exists()
         })
         .count();
-    assert!(
-        with_sidecar < l2.len(),
-        "an output past its trace cap has none"
-    );
+    assert_eq!(with_sidecar, 0, "an output past its trace cap has none");
     assert!(c.stats().sidecars_over_cap.load(Ordering::Relaxed) >= 1);
     let trace = format!(
         "select count(*) from spans where trace_id = X'{}'",
@@ -745,5 +743,95 @@ async fn a_day_larger_than_one_pass_closes_over_several() {
     assert_eq!(now.len(), 2);
     assert!(now.iter().all(|x| x.level == Level::L2));
     assert_eq!(count(&f, "select count(*) from spans").await, 9);
+    f.db.finish().await;
+}
+
+/// Writes one cold L0 file of `spans` spans of `service` from `start`,
+/// each carrying an attribute of `value_bytes` bytes.
+async fn write_wide_l0(f: &Fixture, start: u64, spans: u8, value_bytes: usize) {
+    let mut request = request("web", 7, start, spans, "k");
+    for (i, span) in request.resource_spans[0].scope_spans[0]
+        .spans
+        .iter_mut()
+        .enumerate()
+    {
+        // Hex of a running mix: a payload compression cannot shrink.
+        let mut state = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut value = String::with_capacity(value_bytes);
+        while value.len() < value_bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            write!(value, "{state:016x}").unwrap();
+        }
+        span.attributes = vec![kv("payload", &value)];
+    }
+    let mut builder = SpanBatchBuilder::new(Limits::default());
+    builder.append_request(&request).unwrap();
+    let prepared = flush::prepare(
+        f.tenant,
+        &Path::from(""),
+        fs_catalog::FileId::new(),
+        &[builder.finish().unwrap()],
+        FileLayout::current(1024),
+    )
+    .unwrap();
+    flush::upload(f.store.as_ref(), &prepared).await.unwrap();
+    flush::upload_index(f.store.as_ref(), &prepared)
+        .await
+        .unwrap();
+    f.db.catalog.register_file(&prepared.file).await.unwrap();
+    backdate(f).await;
+}
+
+/// With row groups of up to 1024 rows and a budget far below a whole day,
+/// the merge splits its row groups and closes outputs early enough that
+/// the inputs and the output never hold more than the budget.
+#[tokio::test]
+async fn an_l2_merge_holds_no_more_than_its_output_budget() {
+    let Some(f) = fixture(15).await else { return };
+    for hour in [3, 4, 5] {
+        write_wide_l0(&f, closed_day() + hour * HOUR, 200, 2048).await;
+    }
+    let budget = 3 << 19;
+    let wide = CompactionConfig {
+        row_group_rows: 1024,
+        l2_output_bytes: budget,
+        ..config()
+    };
+    let me = fence(&f).await;
+    let c = compactor(&f, wide.clone());
+    while c.compact_once(&me).await.unwrap().is_some() {}
+    backdate(&f).await;
+    c.compact_l2_once(&me).await.unwrap().unwrap();
+
+    let peak = usize::try_from(c.stats().l2_peak_bytes.load(Ordering::Relaxed)).unwrap();
+    assert!(
+        peak > 0 && peak <= budget,
+        "peak {peak} over the budget {budget}"
+    );
+    let l2 = spans(&f).await;
+    assert!(l2.iter().all(|x| x.level == Level::L2));
+    assert!(l2.len() >= 2, "{} outputs", l2.len());
+    assert_eq!(l2.iter().map(|x| x.row_count).sum::<i64>(), 600);
+    let largest_group = l2
+        .iter()
+        .flat_map(|x| {
+            let file = std::fs::File::open(f.dir.path().join(&x.path)).unwrap();
+            ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                .collect::<Vec<_>>()
+        })
+        .max()
+        .unwrap();
+    assert!(
+        largest_group < 600,
+        "row groups split by bytes: {largest_group}"
+    );
+    assert_eq!(count(&f, "select count(*) from spans").await, 600);
     f.db.finish().await;
 }

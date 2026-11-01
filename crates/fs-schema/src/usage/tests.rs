@@ -232,3 +232,45 @@ fn a_contribution_with_rows_outside_the_domain_is_refused() {
         assert!(decode(contribution(&rows, 1)).is_err(), "{why}");
     }
 }
+
+#[test]
+fn a_full_count_is_set_aside_before_a_new_key_would_pass_the_budget() {
+    let services: Vec<String> = (0..50).map(|i| format!("service-{i:04}")).collect();
+    let mut builder = crate::logs::LogBatchBuilder::new(Limits::default());
+    for service in &services {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(resource(service)),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        time_unix_nano: T0,
+                        body: Some(AnyValue {
+                            value: Some(Value::StringValue("x".into())),
+                        }),
+                        ..LogRecord::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        builder.append_request(&request, &[7; 16]).unwrap();
+    }
+    let batch = builder.finish().unwrap();
+    let budget = 10 * UsageCounts::entry_bytes("service-0000");
+    let mut counts = UsageCounts::new(UsageSignal::Logs);
+    let mut full = Vec::new();
+    counts.absorb_within(&batch, budget, &mut full).unwrap();
+    assert!(full.len() >= 4, "{} counts set aside", full.len());
+    assert!(full.iter().all(|c| c.estimated_bytes() <= budget));
+    assert!(counts.estimated_bytes() <= budget);
+    let mut all = UsageCounts::new(UsageSignal::Logs);
+    for part in full {
+        all.merge(part).unwrap();
+    }
+    all.merge(counts).unwrap();
+    let mut whole = UsageCounts::new(UsageSignal::Logs);
+    whole.absorb(&batch).unwrap();
+    assert_eq!(all, whole, "nothing lost, nothing counted twice");
+}

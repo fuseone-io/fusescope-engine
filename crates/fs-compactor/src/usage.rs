@@ -80,6 +80,55 @@ pub struct Accounted {
 }
 
 impl Compactor {
+    /// Uploads `counts` as their contributions, one per hour, counted in
+    /// `guard` until the swap publishes them.
+    ///
+    /// # Errors
+    /// Encoding or store failure.
+    pub(crate) async fn publish_usage(
+        &self,
+        tenant: TenantId,
+        counts: UsageCounts,
+        guard: &mut OrphanGuard<crate::CompactorStats>,
+        puts: &mut usize,
+    ) -> Result<Vec<NewFile>, CompactError> {
+        let root = self.root.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || usage_files(&root, tenant, &counts)).await??;
+        let mut files = Vec::with_capacity(prepared.len());
+        for (file, bytes) in prepared {
+            self.put_once(&file.path, bytes, puts).await?;
+            guard.created += 1;
+            files.push(file);
+        }
+        Ok(files)
+    }
+
+    /// Uploads one output and its sidecar, counted in `guard` until the
+    /// swap publishes them; a span output without a sidecar is counted.
+    ///
+    /// # Errors
+    /// Store failure.
+    pub(crate) async fn publish_output(
+        &self,
+        output: crate::output::Output,
+        guard: &mut OrphanGuard<crate::CompactorStats>,
+        puts: &mut usize,
+    ) -> Result<crate::compact::Published, CompactError> {
+        self.put_once(&output.file.path, output.bytes.clone(), puts)
+            .await?;
+        guard.created += 1;
+        if let Some((path, index)) = &output.index {
+            self.put_once(path, index.clone(), puts).await?;
+        } else if output.file.signal == Signal::Traces {
+            self.stats.sidecars_over_cap.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(crate::compact::Published {
+            bytes: output.bytes.len() as u64,
+            file: output.file,
+        })
+    }
+
     /// Counts the oldest cold hour of span or log files whose usage is not
     /// counted and that no compaction pass takes: L1 and L2 files written
     /// before usage was counted, and L0 files of a signal whose compaction
@@ -115,7 +164,6 @@ impl Compactor {
         };
         let files = candidate.files.get(..taken).unwrap_or(&[]);
         let tenant = candidate.tenant_id;
-        let counts = self.count_files(candidate.signal, files).await?;
         let mut guard = OrphanGuard {
             stats: Arc::clone(&self.stats),
             tenant,
@@ -123,16 +171,10 @@ impl Compactor {
             created: 0,
             armed: true,
         };
-        let root = self.root.clone();
-        let prepared =
-            tokio::task::spawn_blocking(move || usage_files(&root, tenant, &counts)).await??;
         let mut puts = 0usize;
-        let mut outputs = Vec::with_capacity(prepared.len());
-        for (file, bytes) in prepared {
-            self.put_once(&file.path, bytes, &mut puts).await?;
-            guard.created += 1;
-            outputs.push(file);
-        }
+        let outputs = self
+            .count_files(tenant, candidate.signal, files, &mut guard, &mut puts)
+            .await?;
         let ids: Vec<FileId> = files.iter().map(|f| f.id).collect();
         self.catalog
             .account_files_fenced(tenant, candidate.signal, &ids, &outputs, fence)
@@ -162,26 +204,38 @@ impl Compactor {
         }))
     }
 
-    /// The usage of every row of `files`, read one batch at a time.
+    /// Counts every row of `files`, read one batch at a time, publishing
+    /// each count set aside full as it comes; returns every contribution
+    /// uploaded.
     async fn count_files(
         &self,
+        tenant: TenantId,
         signal: Signal,
         files: &[FileRecord],
-    ) -> Result<UsageCounts, CompactError> {
+        guard: &mut OrphanGuard<crate::CompactorStats>,
+        puts: &mut usize,
+    ) -> Result<Vec<NewFile>, CompactError> {
         let usage = usage_signal(signal).ok_or(CompactError::Merge("a signal without usage"))?;
         let mut counts = UsageCounts::new(usage);
+        let mut published = Vec::new();
+        let batch_bytes = self.config.l2_output_bytes / 4;
         for file in files {
-            let mut stream =
-                batches(Arc::clone(&self.store), file, self.config.row_group_rows).await?;
+            let mut stream = batches(
+                Arc::clone(&self.store),
+                file,
+                self.config.row_group_rows,
+                batch_bytes,
+            )
+            .await?;
             while let Some(batch) = stream.next().await.transpose()? {
-                counts.absorb(&batch)?;
-                if counts.len() > self.config.usage_max_entries {
-                    return Err(CompactError::Merge(
-                        "usage pairs over compactor.usage_max_entries",
-                    ));
+                let mut full = Vec::new();
+                counts.absorb_within(&batch, self.config.usage_max_bytes, &mut full)?;
+                for part in full {
+                    published.extend(self.publish_usage(tenant, part, guard, puts).await?);
                 }
             }
         }
-        Ok(counts)
+        published.extend(self.publish_usage(tenant, counts, guard, puts).await?);
+        Ok(published)
     }
 }

@@ -316,7 +316,7 @@ fn config(compact_logs: bool) -> CompactionConfig {
         row_group_rows: 4,
         compact_logs,
         text_index: fs_index::TextIndexLimits::DEFAULT,
-        usage_max_entries: 100_000,
+        usage_max_bytes: 64 << 20,
         compact_l2: false,
         l2_target_bytes: 1 << 30,
         l2_output_bytes: 512 << 20,

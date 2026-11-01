@@ -211,7 +211,13 @@ fn per_row<O: arrow::array::OffsetSizeTrait>(
 pub struct UsageCounts {
     signal: UsageSignal,
     entries: BTreeMap<(i64, Option<String>), (u64, u64)>,
+    /// What the entries hold, by [`UsageCounts::entry_bytes`].
+    bytes: usize,
 }
+
+/// Bytes an entry holds besides its service name: its tree node, key and
+/// counts.
+const ENTRY_OVERHEAD: usize = 96;
 
 impl UsageCounts {
     /// No row counted yet.
@@ -219,7 +225,18 @@ impl UsageCounts {
         Self {
             signal,
             entries: BTreeMap::new(),
+            bytes: 0,
         }
+    }
+
+    /// What one entry for `service` holds.
+    pub fn entry_bytes(service: &str) -> usize {
+        ENTRY_OVERHEAD + service.len()
+    }
+
+    /// What the counts hold, by [`Self::entry_bytes`].
+    pub fn estimated_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// The signal counted.
@@ -244,6 +261,23 @@ impl UsageCounts {
     /// A batch without those columns, a type the version does not size, or
     /// an overflow.
     pub fn absorb(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
+        let mut never = Vec::new();
+        self.absorb_within(batch, usize::MAX, &mut never)
+    }
+
+    /// [`Self::absorb`] within `budget` bytes: before a new pair would take
+    /// the counts past it, the counts so far are moved to `full` and
+    /// counting goes on from none, so every row is counted once across
+    /// `full` and `self`, each within the budget, or holding one pair.
+    ///
+    /// # Errors
+    /// As [`Self::absorb`].
+    pub fn absorb_within(
+        &mut self,
+        batch: &RecordBatch,
+        budget: usize,
+        full: &mut Vec<UsageCounts>,
+    ) -> Result<(), SchemaError> {
         let bytes = row_bytes(batch, self.signal)?;
         let ts = batch
             .column_by_name("timestamp")
@@ -259,10 +293,16 @@ impl UsageCounts {
         let services = services.as_string::<i32>();
         for (row, size) in bytes.into_iter().enumerate() {
             let hour = ts.value(row).div_euclid(HOUR_NANOS) * HOUR_NANOS;
-            let service = services
-                .is_valid(row)
-                .then(|| services.value(row).to_owned());
-            let entry = self.entries.entry((hour, service)).or_insert((0, 0));
+            let name = services.is_valid(row).then(|| services.value(row));
+            let key = (hour, name.map(str::to_owned));
+            if !self.entries.contains_key(&key) {
+                let cost = Self::entry_bytes(name.unwrap_or_default());
+                if !self.entries.is_empty() && self.bytes.saturating_add(cost) > budget {
+                    full.push(std::mem::replace(self, Self::new(self.signal)));
+                }
+                self.bytes = self.bytes.saturating_add(cost);
+            }
+            let entry = self.entries.entry(key).or_insert((0, 0));
             entry.0 = entry.0.checked_add(1).ok_or(OVERFLOW)?;
             entry.1 = entry.1.checked_add(size).ok_or(OVERFLOW)?;
         }
@@ -278,6 +318,11 @@ impl UsageCounts {
             return Err(SchemaError::Layout("usage counts of another signal"));
         }
         for (key, (rows, bytes)) in other.entries {
+            if !self.entries.contains_key(&key) {
+                self.bytes = self
+                    .bytes
+                    .saturating_add(Self::entry_bytes(key.1.as_deref().unwrap_or_default()));
+            }
             let entry = self.entries.entry(key).or_insert((0, 0));
             entry.0 = entry.0.checked_add(rows).ok_or(OVERFLOW)?;
             entry.1 = entry.1.checked_add(bytes).ok_or(OVERFLOW)?;

@@ -31,6 +31,16 @@ pub struct Output {
     pub index: Option<(String, Bytes)>,
 }
 
+/// Bytes a service name holds in the set besides its characters.
+const SERVICE_OVERHEAD: usize = 48;
+
+/// Bytes of one `(trace, file)` entry of a `trace_id` sidecar.
+const TRACE_ENTRY_BYTES: usize = TRACE_ID_BYTES + 4;
+
+/// Copies of the entries `finish` holds at once: the sorted entries, the
+/// encoded body and the framed sidecar.
+const TRACE_FINISH_COPIES: usize = 3;
+
 /// One output file being written.
 pub(crate) struct OutputBuilder {
     signal: Signal,
@@ -161,16 +171,24 @@ impl OutputBuilder {
         self.writer.bytes_written()
     }
 
-    /// Bytes the output holds: what is encoded, the row group in progress,
-    /// the trace ids and the text sidecar.
+    /// Bytes the output holds, and what finishing it allocates: what is
+    /// encoded, the row group in progress, the service names, the trace ids
+    /// with the sorted entries and two encoded copies `finish` makes of
+    /// them, and the text sidecar, which may double once as it closes.
     pub(crate) fn memory(&self) -> usize {
-        self.writer.bytes_written()
-            + self.writer.memory_size()
-            + self.traces.capacity() * TRACE_ID_BYTES
-            + self
-                .text
-                .as_ref()
-                .map_or(0, fs_index::TextIndexBuilder::allocated)
+        let services: usize = self
+            .services
+            .iter()
+            .map(|s| s.len() + SERVICE_OVERHEAD)
+            .sum();
+        let traces = self.traces.capacity() * TRACE_ID_BYTES
+            + self.traces.len() * TRACE_ENTRY_BYTES * TRACE_FINISH_COPIES;
+        let text = self
+            .text
+            .as_ref()
+            .map_or(0, fs_index::TextIndexBuilder::allocated)
+            * 2;
+        self.writer.bytes_written() + self.writer.memory_size() + services + traces + text
     }
 
     pub(crate) fn finish(mut self, tenant: TenantId) -> Result<Output, CompactError> {

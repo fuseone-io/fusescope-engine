@@ -556,8 +556,8 @@ fn default_text_index_bytes_per_row_group() -> usize {
     fs_index::TextIndexLimits::DEFAULT.max_bytes_per_row_group
 }
 
-fn default_usage_max_entries() -> usize {
-    100_000
+fn default_usage_max_bytes() -> usize {
+    64 << 20
 }
 
 fn default_l2_target_bytes() -> usize {
@@ -772,10 +772,10 @@ pub struct CompactorConfig {
     /// Bloom bytes of one log L1 file's text sidecar; at most 512 MiB.
     #[serde(default = "default_text_index_bytes_per_file")]
     pub text_index_max_bytes_per_file: usize,
-    /// Most `(hour, service)` pairs one pass counts usage for; a pass past
-    /// it fails rather than drop a count.
-    #[serde(default = "default_usage_max_entries")]
-    pub usage_max_entries: usize,
+    /// Bytes a pass's usage counts may hold before a full count is set
+    /// aside as its own contribution; between 1 MiB and 1 GiB.
+    #[serde(default = "default_usage_max_bytes")]
+    pub usage_max_bytes: usize,
     /// Also merge closed days of L1 files into L2. Off by default; once an
     /// L2 file is published the binary is not rolled back past this
     /// version.
@@ -868,7 +868,7 @@ impl Default for CompactorConfig {
             compact_logs: false,
             text_index_max_bytes_per_row_group: default_text_index_bytes_per_row_group(),
             text_index_max_bytes_per_file: default_text_index_bytes_per_file(),
-            usage_max_entries: default_usage_max_entries(),
+            usage_max_bytes: default_usage_max_bytes(),
             compact_l2: false,
             l2_target_bytes: default_l2_target_bytes(),
             l2_output_bytes: default_l2_output_bytes(),
@@ -929,7 +929,7 @@ impl CompactorConfig {
                 service_graph_max_bytes: self.service_graph_max_bytes,
                 row_group_rows,
                 text_index: self.text_index_limits().unwrap_or_default(),
-                usage_max_entries: self.usage_max_entries,
+                usage_max_bytes: self.usage_max_bytes,
                 compact_l2: self.compact_l2,
                 l2_target_bytes: self.l2_target_bytes,
                 l2_output_bytes: self.l2_output_bytes,
@@ -1206,10 +1206,11 @@ impl Config {
 
     /// The bounds of the text sidecars, the usage counts and the L2 passes.
     fn validate_compactor_passes(&self) -> Result<(), ServerError> {
+        use fs_compactor::compact;
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
         self.compactor.text_index_limits()?;
-        if self.compactor.usage_max_entries == 0 {
-            return invalid("compactor.usage_max_entries must be positive");
+        if !(1 << 20..=compact::MAX_USAGE_BYTES).contains(&self.compactor.usage_max_bytes) {
+            return invalid("compactor.usage_max_bytes must be between 1 MiB and 1 GiB");
         }
         if self.compactor.l2_output_bytes == 0
             || self.compactor.l2_target_bytes == 0
@@ -1219,6 +1220,42 @@ impl Config {
             return invalid(
                 "compactor.l2_output_bytes, l2_target_bytes, max_l2_input_bytes and l1_passes_per_tick must be positive",
             );
+        }
+        let c = &self.compactor;
+        let ceilings = [
+            (
+                "l1_passes_per_tick",
+                c.l1_passes_per_tick,
+                compact::MAX_L1_PASSES_PER_TICK,
+            ),
+            (
+                "l2_passes_per_tick",
+                c.l2_passes_per_tick,
+                compact::MAX_L2_PASSES_PER_TICK,
+            ),
+            (
+                "l2_target_bytes",
+                c.l2_target_bytes,
+                compact::MAX_L2_OUTPUT_BYTES,
+            ),
+            (
+                "l2_output_bytes",
+                c.l2_output_bytes,
+                compact::MAX_L2_OUTPUT_BYTES,
+            ),
+            (
+                "max_trace_index_bytes",
+                c.max_trace_index_bytes,
+                compact::MAX_TRACE_INDEX_BYTES,
+            ),
+            (
+                "max_services_per_file",
+                c.max_services_per_file,
+                compact::MAX_SERVICES_PER_FILE,
+            ),
+        ];
+        if let Some((key, _, max)) = ceilings.iter().find(|(_, value, max)| value > max) {
+            return invalid(&format!("compactor.{key} must be at most {max}"));
         }
         Ok(())
     }
@@ -2029,6 +2066,30 @@ mod tests {
                 .to_string()
                 .contains("compactor.rebuilds_per_tick must be at most 256")
         );
+    }
+
+    #[test]
+    fn compactor_pass_knobs_have_ceilings() {
+        use fs_compactor::compact;
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        for (key, max) in [
+            ("l1_passes_per_tick", compact::MAX_L1_PASSES_PER_TICK),
+            ("l2_passes_per_tick", compact::MAX_L2_PASSES_PER_TICK),
+            ("l2_target_bytes", compact::MAX_L2_OUTPUT_BYTES),
+            ("l2_output_bytes", compact::MAX_L2_OUTPUT_BYTES),
+            ("max_trace_index_bytes", compact::MAX_TRACE_INDEX_BYTES),
+            ("max_services_per_file", compact::MAX_SERVICES_PER_FILE),
+            ("usage_max_bytes", compact::MAX_USAGE_BYTES),
+        ] {
+            for (value, ok) in [(max, true), (max + 1, false)] {
+                let config =
+                    Config::parse(&format!("{MINIMAL}[compactor]\n{key} = {value}\n")).unwrap();
+                assert_eq!(config.validate(&secrets).is_ok(), ok, "{key} = {value}");
+            }
+        }
     }
 
     #[test]

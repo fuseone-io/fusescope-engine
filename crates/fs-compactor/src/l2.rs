@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::CompactError;
 use crate::compact::{Compactor, Published};
 use crate::derived::key_table;
-use crate::merge::{MergeConfig, Merger};
+use crate::merge::{MergeConfig, Merger, Step};
 use crate::objects::OrphanGuard;
 
 /// Rows read from an L1 input at a time: a day merges many inputs, each
@@ -135,34 +135,28 @@ impl Compactor {
         };
         let mut puts = 0usize;
         let mut outputs: Vec<Published> = Vec::new();
-        while let Some(output) = merger.next_output().await? {
-            self.put_once(&output.file.path, output.bytes.clone(), &mut puts)
-                .await?;
-            guard.created += 1;
-            if let Some((path, index)) = &output.index {
-                self.put_once(path, index.clone(), &mut puts).await?;
-            } else if signal == Signal::Traces {
-                self.stats.sidecars_over_cap.fetch_add(1, Ordering::Relaxed);
-            }
-            outputs.push(Published {
-                bytes: output.bytes.len() as u64,
-                file: output.file,
-            });
-        }
-        let usage = merger.take_usage();
-        drop(merger);
         let mut counted: Vec<NewFile> = Vec::new();
-        if let Some(counts) = usage {
-            let root = self.root.clone();
-            let prepared = tokio::task::spawn_blocking(move || {
-                crate::usage::usage_files(&root, tenant, &counts)
-            })
-            .await??;
-            for (file, bytes) in prepared {
-                self.put_once(&file.path, bytes, &mut puts).await?;
-                guard.created += 1;
-                counted.push(file);
+        while let Some(step) = merger.next_step().await? {
+            match step {
+                Step::Output(output) => {
+                    outputs.push(self.publish_output(*output, &mut guard, &mut puts).await?);
+                }
+                Step::Usage(counts) => counted.extend(
+                    self.publish_usage(tenant, counts, &mut guard, &mut puts)
+                        .await?,
+                ),
             }
+        }
+        let rest = merger.take_usage();
+        self.stats
+            .l2_peak_bytes
+            .fetch_max(merger.peak_bytes() as u64, Ordering::Relaxed);
+        drop(merger);
+        if let Some(counts) = rest {
+            counted.extend(
+                self.publish_usage(tenant, counts, &mut guard, &mut puts)
+                    .await?,
+            );
         }
         if crate::objects::take_injected(&self.inject_swap_failures) {
             return Err(CompactError::Injected("swap"));
@@ -210,7 +204,7 @@ impl Compactor {
             trace_summary_max_bytes: 0,
             service_graph_max_spans: 0,
             service_graph_max_bytes: 0,
-            usage_max_entries: self.config.usage_max_entries,
+            usage_max_bytes: self.config.usage_max_bytes,
             text_index: self.config.text_index,
         }
     }

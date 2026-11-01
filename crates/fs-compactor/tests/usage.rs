@@ -206,7 +206,7 @@ fn config() -> CompactionConfig {
         service_graph_max_spans: 4_000_000,
         service_graph_max_bytes: 256 << 20,
         row_group_rows: 4,
-        usage_max_entries: 100_000,
+        usage_max_bytes: 64 << 20,
         compact_l2: false,
         l2_target_bytes: 1 << 30,
         l2_output_bytes: 512 << 20,
@@ -632,5 +632,71 @@ async fn a_contribution_with_rows_outside_the_domain_fails_the_query() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("usage_1h"), "{err}");
+    f.db.finish().await;
+}
+
+/// Usage past its byte budget is set aside as contributions of its own,
+/// published in the same swap: one hour of many services gives several
+/// contributions of that hour, the table sums them to one row per service,
+/// and the accounting pass makes progress the same way instead of failing.
+#[tokio::test]
+async fn counts_past_their_budget_become_several_contributions_and_the_pass_goes_on() {
+    let Some(f) = fixture(15).await else { return };
+    let h = closed_hour();
+    let mut inputs = Vec::new();
+    for i in 0..40u64 {
+        inputs.push(write_l0(&f, &format!("service-{i:03}"), h + i * 1_000_000_000, 1).await);
+    }
+    let want = expected(&f, &inputs);
+    let budget = 4 * fs_schema::usage::UsageCounts::entry_bytes("service-000");
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            usage_max_bytes: budget,
+            ..config()
+        },
+    );
+    let me = fence(&f).await;
+    while c.compact_once(&me).await.unwrap().is_some() {}
+    let contributions =
+        f.db.catalog
+            .all_visible_files(f.tenant, Signal::Usage1h)
+            .await
+            .unwrap();
+    assert!(
+        contributions.len() >= 10,
+        "{} contributions",
+        contributions.len()
+    );
+    assert!(
+        contributions
+            .iter()
+            .all(|x| x.range.start == contributions[0].range.start)
+    );
+    assert_eq!(
+        totals(&usage(&f).await),
+        want,
+        "one row per service, counted once"
+    );
+
+    // The same files counted again in place, as legacy files.
+    sqlx::query(
+        "update engine_file set usage_accounted = false, confirmed_at = now() - interval '1 hour'
+         where signal = 1",
+    )
+    .execute(f.db.catalog.pool())
+    .await
+    .unwrap();
+    sqlx::query("delete from engine_file where signal = $1")
+        .bind(Signal::Usage1h.code())
+        .execute(f.db.catalog.pool())
+        .await
+        .unwrap();
+    let mut counted = 0;
+    while let Some(done) = c.account_once(&me).await.unwrap() {
+        counted += done.contributions;
+    }
+    assert!(counted >= 10, "{counted} contributions");
+    assert_eq!(totals(&usage(&f).await), want);
     f.db.finish().await;
 }
