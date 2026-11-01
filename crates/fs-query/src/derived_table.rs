@@ -42,15 +42,19 @@ use crate::prune::Pruning;
 /// Refuses a file schema the table's reader does not know.
 pub type SchemaCheck = fn(&arrow::datatypes::Schema) -> Result<(), SchemaError>;
 
-/// Refuses rows the table's reader would misread: `check` sees the whole
-/// file at once, its batches projected to `columns`, so it can refuse a
-/// key a file lists twice.
+/// Checks the rows of one file, batch by batch, in file order.
+pub type RowChecker =
+    Box<dyn FnMut(&arrow::record_batch::RecordBatch) -> Result<(), SchemaError> + Send>;
+
+/// Refuses rows the table's reader would misread: a new `check` sees each
+/// file streamed, its batches projected to `columns`, and may hold what
+/// it needs across them, never the file.
 #[derive(Clone, Copy)]
 pub struct RowCheck {
     /// The columns `check` reads.
     pub columns: &'static [&'static str],
-    /// Refuses a batch.
-    pub check: fn(&[arrow::record_batch::RecordBatch]) -> Result<(), SchemaError>,
+    /// A checker for one file.
+    pub check: fn() -> RowChecker,
 }
 
 /// Per path, whether its footer and rows passed the checks, shared by every
@@ -186,14 +190,15 @@ async fn check_rows(
         .with_projection(mask)
         .build()
         .map_err(datafusion::error::DataFusionError::from)?;
-    let mut batches = Vec::new();
+    let mut check = (rows.check)();
     while let Some(batch) = stream.next().await {
-        batches.push(batch.map_err(datafusion::error::DataFusionError::from)?);
+        let batch = batch.map_err(datafusion::error::DataFusionError::from)?;
+        check(&batch).map_err(|source| QueryError::DerivedTable {
+            path: file.path.clone(),
+            source,
+        })?;
     }
-    (rows.check)(&batches).map_err(|source| QueryError::DerivedTable {
-        path: file.path.clone(),
-        source,
-    })
+    Ok(())
 }
 
 /// Fetches byte ranges of one object of `size` bytes for the Parquet

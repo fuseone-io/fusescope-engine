@@ -418,19 +418,27 @@ pub fn check_schema(found: &Schema) -> Result<(), SchemaError> {
 /// rows and bytes.
 pub type UsageRow = (u8, Option<String>, i64, u64, u64);
 
-/// The columns [`check_rows`] reads.
+/// The columns [`RowOrder`] reads.
 pub const ROW_KEY_COLUMNS: &[&str] = &[columns::SIGNAL, columns::SERVICE_NAME, columns::HOUR];
 
 /// Refuses rows a sum would misread: a signal other than spans or logs,
-/// an hour not on the hour, or a `(signal, service, hour)` the file lists
-/// twice, which would count it twice. `batches` are the whole file, with
-/// at least [`ROW_KEY_COLUMNS`].
-///
-/// # Errors
-/// A row as above, or a batch without those columns.
-pub fn check_rows(batches: &[RecordBatch]) -> Result<(), SchemaError> {
-    let mut seen = std::collections::HashSet::new();
-    for batch in batches {
+/// an hour not on the hour, or keys out of the order [`encode_hour`]
+/// writes them, strictly ascending by `(signal, hour, service)` with no
+/// service first, which is how a `(signal, service, hour)` listed twice
+/// shows. Batch by batch, holding one key, so a file is checked in the
+/// memory of its largest batch.
+#[derive(Debug, Default)]
+pub struct RowOrder {
+    last: Option<(u8, i64, Option<String>)>,
+}
+
+impl RowOrder {
+    /// Checks the next `batch` of the file, with at least
+    /// [`ROW_KEY_COLUMNS`].
+    ///
+    /// # Errors
+    /// A row as above, or a batch without those columns.
+    pub fn check(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
         let column = |name: &str| {
             batch.column_by_name(name).ok_or(SchemaError::Layout(
                 "usage_1h rows without their key columns",
@@ -446,27 +454,51 @@ pub fn check_rows(batches: &[RecordBatch]) -> Result<(), SchemaError> {
             .as_primitive_opt::<TimestampNanosecondType>()
             .ok_or(SchemaError::Layout("usage_1h hour"))?;
         for i in 0..batch.num_rows() {
-            if !matches!(signal.value(i), 1 | 2) {
+            let key = (
+                signal.value(i),
+                hour.value(i),
+                service.is_valid(i).then(|| service.value(i)),
+            );
+            if !matches!(key.0, 1 | 2) {
                 return Err(SchemaError::Layout(
                     "usage_1h row of a signal other than spans or logs",
                 ));
             }
-            if hour.value(i).rem_euclid(HOUR_NANOS) != 0 {
+            if key.1.rem_euclid(HOUR_NANOS) != 0 {
                 return Err(SchemaError::Layout(
                     "usage_1h row of an hour not on the hour",
                 ));
             }
-            let key = (
-                signal.value(i),
-                service.is_valid(i).then(|| service.value(i).to_owned()),
-                hour.value(i),
-            );
-            if !seen.insert(key) {
-                return Err(SchemaError::Layout("usage_1h key listed twice in one file"));
+            match &mut self.last {
+                Some((s, h, name)) if (*s, *h, name.as_deref()) >= key => {
+                    return Err(SchemaError::Layout(
+                        "usage_1h keys out of order or listed twice in one file",
+                    ));
+                }
+                Some((s, h, name)) => {
+                    (*s, *h) = (key.0, key.1);
+                    match (name.as_mut(), key.2) {
+                        (Some(buffer), Some(value)) => {
+                            buffer.clear();
+                            buffer.push_str(value);
+                        }
+                        (_, value) => *name = value.map(str::to_owned),
+                    }
+                }
+                None => self.last = Some((key.0, key.1, key.2.map(str::to_owned))),
             }
         }
+        Ok(())
     }
-    Ok(())
+}
+
+/// [`RowOrder`] over the whole file.
+///
+/// # Errors
+/// As [`RowOrder::check`].
+pub fn check_rows(batches: &[RecordBatch]) -> Result<(), SchemaError> {
+    let mut order = RowOrder::default();
+    batches.iter().try_for_each(|batch| order.check(batch))
 }
 
 /// Encodes the contribution of `hour`.

@@ -208,13 +208,14 @@ fn a_contribution_with_rows_outside_the_domain_is_refused() {
     let hour = 1_792_677_600_000_000_000i64;
     let good = contribution(
         &[
-            (1, Some("api"), hour),
             (1, None, hour),
+            (1, Some("api"), hour),
+            (1, Some("web"), hour),
             (2, Some("api"), hour),
         ],
         1,
     );
-    assert_eq!(decode(good).unwrap().len(), 3);
+    assert_eq!(decode(good).unwrap().len(), 4);
     for (rows, why) in [
         (vec![(3u8, Some("api"), hour)], "signal 3"),
         (vec![(0, Some("api"), hour)], "signal 0"),
@@ -226,6 +227,22 @@ fn a_contribution_with_rows_outside_the_domain_is_refused() {
         (
             vec![(1, None, hour), (1, None, hour)],
             "no service, counted twice",
+        ),
+        (
+            vec![(1, Some("web"), hour), (1, Some("api"), hour)],
+            "services out of order",
+        ),
+        (
+            vec![(1, Some("api"), hour), (1, None, hour)],
+            "no service after a service",
+        ),
+        (
+            vec![
+                (1, Some("api"), hour),
+                (1, Some("web"), hour),
+                (1, Some("api"), hour),
+            ],
+            "a key counted twice, apart",
         ),
     ] {
         // One row per batch: the check sees the whole file.
