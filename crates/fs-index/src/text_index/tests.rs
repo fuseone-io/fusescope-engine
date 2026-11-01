@@ -296,3 +296,58 @@ fn sidecar_paths_belong_to_log_files_of_any_level() {
         Vec::<String>::new()
     );
 }
+
+#[test]
+fn the_builder_allocates_within_its_memory_bound() {
+    let long = "Abc".repeat(5000);
+    let (hundred, more) = ("a".repeat(100), "b".repeat(150));
+    let groups: [&[&str]; 4] = [
+        &[hundred.as_str(), more.as_str()],
+        &["GET /api 200", long.as_str()],
+        &["x"],
+        &["Payment DECLINED", ""],
+    ];
+    let bodies: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
+    let body_bytes = bodies.iter().map(|b| b.len()).sum();
+    let longest = bodies.iter().map(|b| b.len()).max().unwrap();
+    for limits in [
+        TextIndexLimits::DEFAULT,
+        TextIndexLimits::new(256, 512).unwrap(),
+    ] {
+        let bound = TextIndexBuilder::memory_bound(PATH, body_bytes, groups.len(), longest, limits);
+        let mut builder = TextIndexBuilder::new(PATH, limits, body_bytes, groups.len()).unwrap();
+        for group in groups {
+            builder
+                .add_row_group(group.iter().map(|b| b.as_bytes()))
+                .unwrap();
+            assert!(
+                builder.allocated() <= bound,
+                "{} over {bound}",
+                builder.allocated()
+            );
+        }
+        let allocated = builder.allocated();
+        let bytes = builder.finish([0; 32]).unwrap();
+        assert!(
+            allocated <= bound && bytes.capacity() <= bound,
+            "{allocated} {} over {bound}",
+            bytes.capacity()
+        );
+    }
+}
+
+#[test]
+fn a_growing_body_does_not_double_the_folded_copy() {
+    let (hundred, more) = ("A".repeat(100), "B".repeat(150));
+    let limits = TextIndexLimits::DEFAULT;
+    let bound = TextIndexBuilder::memory_bound(PATH, 250, 1, 150, limits);
+    let mut builder = TextIndexBuilder::new(PATH, limits, 250, 1).unwrap();
+    builder
+        .add_row_group([hundred.as_bytes(), more.as_bytes()])
+        .unwrap();
+    assert!(
+        builder.allocated() <= bound,
+        "{} over {bound}",
+        builder.allocated()
+    );
+}

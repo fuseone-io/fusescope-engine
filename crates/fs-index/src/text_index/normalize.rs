@@ -39,9 +39,10 @@ pub fn has_token(body: &[u8], needle: &[u8]) -> bool {
 }
 
 /// `bytes` with ASCII letters lowercased into `into`, which is cleared
-/// first.
+/// first and grows to exactly the longest input, never by doubling.
 pub(crate) fn fold_into(bytes: &[u8], into: &mut Vec<u8>) {
     into.clear();
+    into.reserve_exact(bytes.len());
     into.extend(bytes.iter().map(u8::to_ascii_lowercase));
 }
 

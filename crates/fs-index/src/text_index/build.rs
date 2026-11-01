@@ -96,6 +96,27 @@ impl TextIndexBuilder {
             .saturating_add(4)
     }
 
+    /// Most bytes a builder for `path` over `row_groups` row groups,
+    /// `body_bytes` bytes of bodies and none longer than `longest_body`
+    /// holds at once: the reserved buffer, the row groups' descriptors
+    /// staged apart until [`Self::finish`], and the folded copy of one body.
+    pub fn memory_bound(
+        path: &str,
+        body_bytes: usize,
+        row_groups: usize,
+        longest_body: usize,
+        limits: TextIndexLimits,
+    ) -> usize {
+        Self::encoded_bound(path, body_bytes, row_groups, limits)
+            .saturating_add(row_groups.saturating_mul(GROUP_LEN))
+            .saturating_add(longest_body)
+    }
+
+    /// Bytes the builder holds now.
+    pub fn allocated(&self) -> usize {
+        self.out.capacity() + self.groups.capacity() + self.fold.capacity()
+    }
+
     /// A sidecar for the file at `path`, its buffer reserved for
     /// `body_bytes` and `row_groups` as [`Self::encoded_bound`] gives.
     ///

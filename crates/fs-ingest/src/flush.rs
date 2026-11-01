@@ -258,21 +258,78 @@ fn text_builder(
             "a text sidecar is only written for log files".into(),
         ));
     }
-    let mut body_bytes = 0usize;
-    let mut row_count = 0usize;
-    for batch in inputs {
-        let bodies = batch
-            .column(batch.schema().index_of(fs_schema::logs::col::BODY)?)
-            .as_string::<i32>();
-        let offsets = bodies.value_offsets();
-        let span = offsets.last().copied().unwrap_or(0) - offsets.first().copied().unwrap_or(0);
-        body_bytes += usize::try_from(span).unwrap_or(0);
-        row_count += batch.num_rows();
-    }
-    let row_groups = row_count.div_ceil(layout.row_group_rows.max(1));
+    let bodies = Bodies::of(inputs)?;
+    let row_groups = bodies.rows.div_ceil(layout.row_group_rows.max(1));
     Ok(Some(fs_index::TextIndexBuilder::new(
-        path, limits, body_bytes, row_groups,
+        path,
+        limits,
+        bodies.bytes,
+        row_groups,
     )?))
+}
+
+/// Most bytes building the text sidecar of `batches` under `layout` holds,
+/// zero when the layout writes none: what the flush must hold as scratch
+/// for it, the folded copy of the longest body included.
+///
+/// # Errors
+/// Rows without a timestamp or a body column, or a layout whose text
+/// sizing this engine does not write.
+pub fn text_index_memory(
+    stream: Stream,
+    root: &Path,
+    id: FileId,
+    batches: &[RecordBatch],
+    layout: &FileLayout,
+) -> Result<usize, IngestError> {
+    let Some(limits) = layout.text_limits()? else {
+        return Ok(0);
+    };
+    let schema = schema_of(stream.signal);
+    let start = earliest(batches, schema.index_of(col::TIMESTAMP)?).unwrap_or(0);
+    let path = l0_path_of(root, stream, Utc.timestamp_nanos(start), id);
+    let bodies = Bodies::of(batches)?;
+    let row_groups = bodies.rows.div_ceil(layout.row_group_rows.max(1));
+    Ok(fs_index::TextIndexBuilder::memory_bound(
+        path.as_ref(),
+        bodies.bytes,
+        row_groups,
+        bodies.longest,
+        limits,
+    ))
+}
+
+/// Sizes of the bodies of log batches.
+struct Bodies {
+    bytes: usize,
+    longest: usize,
+    rows: usize,
+}
+
+impl Bodies {
+    fn of(batches: &[RecordBatch]) -> Result<Self, IngestError> {
+        let mut out = Self {
+            bytes: 0,
+            longest: 0,
+            rows: 0,
+        };
+        for batch in batches {
+            let bodies = batch
+                .column(batch.schema().index_of(fs_schema::logs::col::BODY)?)
+                .as_string::<i32>();
+            let offsets = bodies.value_offsets();
+            let span = offsets.last().copied().unwrap_or(0) - offsets.first().copied().unwrap_or(0);
+            out.bytes += usize::try_from(span).unwrap_or(0);
+            let longest = offsets
+                .windows(2)
+                .map(|w| w.last().copied().unwrap_or(0) - w.first().copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            out.longest = out.longest.max(usize::try_from(longest).unwrap_or(0));
+            out.rows += batch.num_rows();
+        }
+        Ok(out)
+    }
 }
 
 /// The sidecar of one file: every trace of every row group, file index 0.
@@ -540,13 +597,34 @@ pub async fn upload_index(
         let existing = store
             .get(&Path::from(index_path.as_str()))
             .await?
-            .bytes()
-            .await?;
-        if existing != *index {
+            .into_stream();
+        if !same_bytes(existing, index).await? {
             return Err(mismatch());
         }
     }
     Ok(Some(outcome))
+}
+
+/// True when `stream` yields exactly `expected`, compared chunk by chunk
+/// as it arrives, so the object is never held whole beside it.
+///
+/// # Errors
+/// Store failure while reading.
+pub async fn same_bytes(
+    mut stream: impl futures_util::Stream<Item = object_store::Result<Bytes>> + Unpin,
+    expected: &[u8],
+) -> Result<bool, IngestError> {
+    use futures_util::StreamExt;
+    let mut at = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let end = at.saturating_add(chunk.len());
+        if expected.get(at..end) != Some(chunk.as_ref()) {
+            return Ok(false);
+        }
+        at = end;
+    }
+    Ok(at == expected.len())
 }
 
 async fn put_once(
@@ -979,6 +1057,72 @@ mod tests {
             upload(&store, &foreign).await.unwrap(),
             Upload::Existing { size: 18 }
         );
+    }
+
+    #[test]
+    fn the_text_sidecar_memory_covers_its_builder() {
+        let stream = Stream::logs(TenantId(uuid::Uuid::from_u128(0x7e5a)));
+        let id = FileId(uuid::Uuid::from_u128(0xf11e));
+        let limits = fs_index::TextIndexLimits::DEFAULT;
+        let layout = FileLayout::for_signal(RowSignal::Logs, 3, limits);
+        let memory =
+            text_index_memory(stream, &Path::from(""), id, &[log_batch()], &layout).unwrap();
+        let prepared = prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout).unwrap();
+        let (_, sidecar) = prepared.index.unwrap();
+        // Five bodies, "web 0" to "api 2", five bytes each; two row groups.
+        assert_eq!(
+            memory,
+            fs_index::TextIndexBuilder::memory_bound(&prepared.file.path, 25, 2, 5, limits)
+        );
+        assert!(sidecar.len() <= memory);
+        assert_eq!(
+            text_index_memory(
+                stream,
+                &Path::from(""),
+                id,
+                &[log_batch()],
+                &FileLayout::current(3)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_object_is_compared_chunk_by_chunk() {
+        let chunks = |parts: &[&'static [u8]]| {
+            futures_util::stream::iter(
+                parts
+                    .iter()
+                    .map(|p| Ok(Bytes::from_static(p)))
+                    .collect::<Vec<object_store::Result<Bytes>>>(),
+            )
+        };
+        let expected = b"abcdefgh";
+        assert!(
+            same_bytes(chunks(&[b"abc", b"def", b"gh"]), expected)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !same_bytes(chunks(&[b"abc", b"deX", b"gh"]), expected)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !same_bytes(chunks(&[b"abc", b"defgh", b"i"]), expected)
+                .await
+                .unwrap()
+        );
+        assert!(!same_bytes(chunks(&[b"abc"]), expected).await.unwrap());
+        let failing = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"abc")),
+            Err(object_store::Error::Generic {
+                store: "test",
+                source: "cut".into(),
+            }),
+        ]);
+        assert!(same_bytes(failing, expected).await.is_err());
     }
 
     /// Five log rows of two services, the same on every call.

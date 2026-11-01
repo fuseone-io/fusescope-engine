@@ -762,6 +762,17 @@ impl Shared {
         let legacy = layout.is_none();
         let layout = layout.unwrap_or_else(|| FileLayout::current(self.config.row_group_rows));
         flush::check_layout(&layout, stream.signal)?;
+        // The lease keeps one more copy of the input for a log file's text
+        // sidecar; whatever the sidecar's builder may hold beyond it is
+        // counted here until the attempt ends.
+        let sidecar_bound =
+            flush::text_index_memory(stream, &self.root, file_id, &batches, &layout)?;
+        let input: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        let _sidecar_scratch = self
+            .buffers
+            .lock()
+            .await
+            .hold_scratch(sidecar_bound.saturating_sub(input));
         let root = self.root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             flush::prepare_stream(stream, &root, file_id, &batches, layout)
