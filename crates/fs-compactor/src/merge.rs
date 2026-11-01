@@ -274,11 +274,16 @@ impl Merger {
                 let gathered = picks
                     .bytes
                     .saturating_add(GROUP_COLUMN_BYTES.saturating_mul(columns));
+                let overhead = self
+                    .current
+                    .as_ref()
+                    .map_or(0, |c| c.row_group_overhead(picks.rows(), picks.bytes / 2));
                 let room = self
                     .merge
                     .reserved()
                     .saturating_add(output)
-                    .saturating_add(gathered.saturating_mul(3));
+                    .saturating_add(gathered.saturating_mul(3))
+                    .saturating_add(overhead);
                 if room > self.config.output_bytes {
                     if self.current.as_ref().is_some_and(|c| c.rows > 0) {
                         self.picks = Some(picks);

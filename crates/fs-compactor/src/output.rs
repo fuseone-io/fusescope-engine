@@ -42,21 +42,45 @@ const TRACE_ENTRY_BYTES: usize = TRACE_ID_BYTES + 4;
 /// encoded body and the framed sidecar.
 const TRACE_FINISH_COPIES: usize = 3;
 
-/// Bytes of each buffer an output is written into.
-const CHUNK_BYTES: usize = 4 << 20;
+/// Bytes of each buffer an output is written into: a sixty-fourth of
+/// its memory budget, within these.
+const MIN_CHUNK_BYTES: usize = 64 << 10;
+const MAX_CHUNK_BYTES: usize = 4 << 20;
 
-/// An output's bytes in buffers of [`CHUNK_BYTES`], so growing never
-/// copies what is written, as a doubling buffer would.
-#[derive(Default)]
+/// Bytes one data page holds in the page indexes until the footer: its
+/// location and unencoded size, its minimum and maximum truncated to 64
+/// bytes, its null count and flag, and its level histograms, a counter
+/// per level.
+fn page_index_bytes(max_def: i16, max_rep: i16) -> usize {
+    let levels = usize::try_from(max_def).unwrap_or(0) + usize::try_from(max_rep).unwrap_or(0) + 2;
+    32 + 2 * 64 + 9 + 8 * levels
+}
+
+/// Bytes one column chunk holds in the footer besides its pages: its
+/// path, encodings, offsets and statistics truncated to 64 bytes.
+const CHUNK_META_BYTES: usize = 1024;
+
+/// Bytes of the footer whatever its row groups: the schema and the
+/// key-value metadata, the Arrow schema among them.
+const FOOTER_FIXED_BYTES: usize = 64 << 10;
+
+/// Copies of the indexes and footer at once as an output finishes: the
+/// indexes held, the footer encoded, and the metadata built from them.
+const FOOTER_COPIES: usize = 3;
+
+/// An output's bytes in buffers of one size, so growing never copies
+/// what is written, as a doubling buffer would.
 pub(crate) struct Chunks {
     done: Vec<Bytes>,
     current: Vec<u8>,
+    size: usize,
+    len: usize,
 }
 
 impl std::io::Write for Chunks {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.current.len() == self.current.capacity() {
-            let full = std::mem::replace(&mut self.current, Vec::with_capacity(CHUNK_BYTES));
+            let full = std::mem::replace(&mut self.current, Vec::with_capacity(self.size));
             if !full.is_empty() {
                 self.done.push(Bytes::from(full));
             }
@@ -64,6 +88,7 @@ impl std::io::Write for Chunks {
         let n = buf.len().min(self.current.capacity() - self.current.len());
         self.current
             .extend_from_slice(buf.get(..n).unwrap_or_default());
+        self.len += n;
         Ok(n)
     }
 
@@ -73,9 +98,19 @@ impl std::io::Write for Chunks {
 }
 
 impl Chunks {
-    /// Bytes the buffers hold, written or not.
-    pub(crate) fn capacity(&self) -> usize {
-        self.done.iter().map(Bytes::len).sum::<usize>() + self.current.capacity()
+    fn new(size: usize) -> Self {
+        Self {
+            done: Vec::new(),
+            current: Vec::new(),
+            size,
+            len: 0,
+        }
+    }
+
+    /// The most the buffers hold: what is written and a whole buffer
+    /// besides, the one being filled or the next.
+    pub(crate) fn held(&self) -> usize {
+        self.len + self.size
     }
 
     /// The bytes, their length and their SHA-256.
@@ -89,8 +124,107 @@ impl Chunks {
         for chunk in &self.done {
             hash.update(chunk);
         }
-        let len = self.done.iter().map(Bytes::len).sum();
-        (self.done.into_iter().collect(), len, hash.finalize().into())
+        (
+            self.done.into_iter().collect(),
+            self.len,
+            hash.finalize().into(),
+        )
+    }
+}
+
+/// What the page indexes and footer of `groups` hold, by their page
+/// counts.
+fn index_bytes(groups: &[parquet::file::metadata::RowGroupMetaData]) -> usize {
+    use parquet::basic::PageType;
+    groups
+        .iter()
+        .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
+        .map(|c| {
+            let pages = c.page_encoding_stats().map_or(
+                usize::try_from(c.num_values()).unwrap_or(usize::MAX),
+                |stats| {
+                    stats
+                        .iter()
+                        .filter(|s| {
+                            matches!(s.page_type, PageType::DATA_PAGE | PageType::DATA_PAGE_V2)
+                        })
+                        .map(|s| usize::try_from(s.count).unwrap_or(usize::MAX))
+                        .sum()
+                },
+            );
+            let descr = c.column_descr();
+            pages
+                .saturating_mul(page_index_bytes(
+                    descr.max_def_level(),
+                    descr.max_rep_level(),
+                ))
+                .saturating_add(CHUNK_META_BYTES)
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// What writing a row group adds besides its rows, for one writer.
+struct RowGroupCost {
+    /// The bloom filters of a row group, sized as the Parquet split-block
+    /// filter sizes them for each column's distinct values and
+    /// false-positive rate, before folding.
+    blooms: usize,
+    /// Leaf columns.
+    leaves: usize,
+    /// The largest index entry of a page of any leaf.
+    page_entry: usize,
+    page_bytes: usize,
+    page_rows: usize,
+}
+
+impl RowGroupCost {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn new(
+        schema: &SchemaRef,
+        properties: &parquet::file::properties::WriterProperties,
+    ) -> Result<Self, CompactError> {
+        let descr = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
+        let blooms = descr
+            .columns()
+            .iter()
+            .filter_map(|c| properties.bloom_filter_properties(c.path()))
+            .map(|b| {
+                let bits = -8.0 * b.ndv() as f64 / (1.0 - b.fpp().powf(1.0 / 8.0)).ln();
+                ((bits / 8.0) as usize)
+                    .clamp(32, 128 << 20)
+                    .next_power_of_two()
+                    + 64
+            })
+            .sum();
+        let page_entry = descr
+            .columns()
+            .iter()
+            .map(|c| page_index_bytes(c.max_def_level(), c.max_rep_level()))
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            blooms,
+            leaves: descr.num_columns(),
+            page_entry,
+            page_bytes: properties.data_page_size_limit().max(1),
+            page_rows: properties.data_page_row_count_limit().max(1),
+        })
+    }
+
+    /// For a row group of `rows` rows whose values take `payload` bytes:
+    /// its bloom filters, built and written, and its page indexes. A page
+    /// closes past the page size or row limit, so a column has at most
+    /// those pages, one at a dictionary fallback and its last; a value
+    /// encodes to no more than its payload and a four-byte index.
+    fn of(&self, rows: usize, payload: usize) -> usize {
+        let encoded = payload.saturating_add(rows.saturating_mul(4 * self.leaves));
+        let pages = (encoded / self.page_bytes)
+            .saturating_add(self.leaves.saturating_mul(rows / self.page_rows + 2));
+        (2 * self.blooms).saturating_add(FOOTER_COPIES * pages.saturating_mul(self.page_entry))
     }
 }
 
@@ -114,6 +248,10 @@ pub(crate) struct OutputBuilder {
     traces_over: bool,
     max_trace_bytes: usize,
     max_services: usize,
+    /// The row groups whose indexes `index_bytes` counts.
+    indexed: usize,
+    index_bytes: usize,
+    cost: RowGroupCost,
 }
 
 impl OutputBuilder {
@@ -132,7 +270,10 @@ impl OutputBuilder {
             (_, true) => log_writer_properties(row_group_rows)?,
             (_, false) => writer_properties(row_group_rows)?,
         };
-        let writer = ArrowWriter::try_new(Chunks::default(), Arc::clone(schema), Some(properties))?;
+        let cost = RowGroupCost::new(schema, &properties)?;
+        let chunk = (config.output_bytes / 64).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES);
+        let writer =
+            ArrowWriter::try_new(Chunks::new(chunk), Arc::clone(schema), Some(properties))?;
         // Grows with the row groups; a pass's outputs are not sized ahead.
         let text = logs
             .then(|| fs_index::TextIndexBuilder::new(path.as_ref(), config.text_index, 0, 0))
@@ -153,6 +294,9 @@ impl OutputBuilder {
             traces_over: false,
             max_trace_bytes: config.max_trace_index_bytes,
             max_services: config.max_services_per_file,
+            indexed: 0,
+            index_bytes: 0,
+            cost,
         })
     }
 
@@ -183,6 +327,11 @@ impl OutputBuilder {
             text.add_row_group((0..bodies.len()).map(|i| bodies.value(i).as_bytes()))?;
         }
         self.rows += group.num_rows();
+        let groups = self.writer.flushed_row_groups();
+        self.index_bytes = self
+            .index_bytes
+            .saturating_add(index_bytes(groups.get(self.indexed..).unwrap_or_default()));
+        self.indexed = groups.len();
         Ok(())
     }
 
@@ -225,9 +374,11 @@ impl OutputBuilder {
     }
 
     /// Bytes the output holds, and what finishing it allocates: its
-    /// buffers, the row group in progress, the service names, the trace
-    /// ids with the sorted entries and two encoded copies `finish` makes
-    /// of them, and the text sidecar, which may double once as it closes.
+    /// buffers, the row group in progress, the page indexes and the
+    /// footer with the copies of them closing makes, the service names,
+    /// the trace ids with the sorted entries and two encoded copies
+    /// `finish` makes of them, and the text sidecar, which may double once
+    /// as it closes.
     pub(crate) fn memory(&self) -> usize {
         let services: usize = self
             .services
@@ -241,7 +392,15 @@ impl OutputBuilder {
             .as_ref()
             .map_or(0, fs_index::TextIndexBuilder::allocated)
             * 2;
-        self.writer.inner().capacity() + self.writer.memory_size() + services + traces + text
+        let footer = FOOTER_COPIES * (self.index_bytes + FOOTER_FIXED_BYTES);
+        self.writer.inner().held() + self.writer.memory_size() + footer + services + traces + text
+    }
+
+    /// What writing one more row group of `rows` rows whose values take
+    /// `payload` bytes holds besides them and their encoding, as
+    /// [`RowGroupCost::of`].
+    pub(crate) fn row_group_overhead(&self, rows: usize, payload: usize) -> usize {
+        self.cost.of(rows, payload)
     }
 
     pub(crate) fn finish(mut self, tenant: TenantId) -> Result<Output, CompactError> {
@@ -285,3 +444,6 @@ impl OutputBuilder {
         Ok(Output { file, bytes, index })
     }
 }
+
+#[cfg(test)]
+mod tests;

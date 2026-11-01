@@ -77,6 +77,13 @@ pub(crate) struct Merge {
     decode_peak: usize,
 }
 
+impl Picks {
+    /// Rows picked.
+    pub(crate) fn rows(&self) -> usize {
+        self.picked.len()
+    }
+}
+
 impl Merge {
     /// Opens `files` read as `reading`, taking all of them, or for a
     /// bounded read those that fit in order, one at least.
