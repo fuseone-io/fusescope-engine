@@ -912,8 +912,8 @@ the budget is never held whole and what was admitted is what was read.
 With `compactor.compact_l2`, off by default, a pass takes a closed day of
 one tenant and signal, the oldest first: its UTC day ended more than
 `compactor.hour_close_delay_secs` ago, no visible L0 file of that signal
-starts in it, and it has at least two visible L1 files or one L1 file
-and nothing at L2 yet. Day and inputs come from one repeatable-read
+starts in it, and it has a visible L1 file, beside L2 files or not, so a
+day larger than one pass closes over several. Day and inputs come from one repeatable-read
 snapshot, and every input must have ended, by its real `ts_max`, and been
 confirmed more than the close delay ago, so a legacy file that crossed
 into the next day keeps that day open. It merges the day's L1 files,

@@ -717,3 +717,33 @@ async fn a_tick_runs_an_l2_pass_behind_an_l1_backlog() {
     );
     f.db.finish().await;
 }
+
+/// A day larger than one pass closes over several: the L1 file the first
+/// pass left beside its L2 file is taken by the next.
+#[tokio::test]
+async fn a_day_larger_than_one_pass_closes_over_several() {
+    let Some(f) = fixture(15).await else { return };
+    let l1 = day_of_l1(&f, closed_day()).await;
+    let me = fence(&f).await;
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            max_inputs_per_pass: 2,
+            ..config()
+        },
+    );
+    assert_eq!(
+        c.compact_l2_once(&me).await.unwrap().unwrap().inputs.len(),
+        2
+    );
+    backdate(&f).await;
+    let rest = c.compact_l2_once(&me).await.unwrap().unwrap();
+    assert_eq!(rest.inputs.len(), 1);
+    assert!(l1.iter().any(|x| x.id == rest.inputs[0]));
+    assert!(c.compact_l2_once(&me).await.unwrap().is_none());
+    let now = spans(&f).await;
+    assert_eq!(now.len(), 2);
+    assert!(now.iter().all(|x| x.level == Level::L2));
+    assert_eq!(count(&f, "select count(*) from spans").await, 9);
+    f.db.finish().await;
+}

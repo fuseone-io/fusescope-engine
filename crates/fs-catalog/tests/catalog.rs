@@ -2623,9 +2623,9 @@ async fn usage_is_counted_once_and_holds_retention_until_then() {
     db.finish().await;
 }
 
-/// A day is ready for L2 once it closed, holds no L0 file and two L1
-/// files, or one and no L2 yet, all cold; a legacy L1 file that runs into
-/// the day after keeps its day open until it is cold too.
+/// A day is ready for L2 once it closed and holds no L0 file and at least
+/// one L1 file, all cold, whatever L2 files it has; a legacy L1 file that
+/// runs into the day after keeps its day open until it is cold too.
 #[tokio::test]
 async fn a_closed_day_without_l0_files_is_ready_for_l2() {
     let Some(db) = TestDb::new().await else {
@@ -2684,7 +2684,12 @@ async fn a_closed_day_without_l0_files_is_ready_for_l2() {
         .await
         .unwrap();
     backdate(&db).await;
-    assert!(ready(&db).await.is_none(), "one L1 beside an L2 waits");
+    let beside = ready(&db).await.unwrap();
+    assert_eq!(
+        beside.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [l1.id],
+        "an L1 left beside an L2 is taken, so a large day closes"
+    );
     let late = c
         .register_file(&file_spanning(
             t,

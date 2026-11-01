@@ -108,8 +108,9 @@ impl Catalog {
     /// The `skip`-th oldest closed day, across tenants and `signals`, ready
     /// for L2, with its L1 files, oldest registration first: the UTC day
     /// ended more than `closed_for` ago, no visible L0 file of its signal
-    /// starts in it, it holds at least two visible L1 files, or one and no
-    /// L2 file yet, and every L1 file of it ended, by its own `ts_max`, and
+    /// starts in it, it holds a visible L1 file, beside L2 files or not, so
+    /// a day larger than one pass closes over several, and every L1 file of
+    /// it ended, by its own `ts_max`, and
     /// was confirmed more than `closed_for` ago. Day and files are read in
     /// one repeatable-read snapshot. `hour` of the answer is the day's
     /// start.
@@ -134,16 +135,14 @@ impl Catalog {
              group by tenant_id, signal, day
              having {DAY_BIN} + interval '1 day' < now() - make_interval(secs => $3)
                 and count(*) filter (where level = $4) = 0
-                and (count(*) filter (where level = $5) >= 2
-                     or (count(*) filter (where level = $5) = 1
-                         and count(*) filter (where level = $6) = 0))
+                and count(*) filter (where level = $5) >= 1
                 and max(ts_max) filter (where level = $5) < now() - make_interval(secs => $3)
                 and count(confirmed_at) filter (where level = $5)
                     = count(*) filter (where level = $5)
                 and max(confirmed_at) filter (where level = $5)
                     < now() - make_interval(secs => $3)
              order by day, signal, tenant_id
-             offset $7
+             offset $6
              limit 1"
         ))
         .bind(&codes)
@@ -151,7 +150,6 @@ impl Catalog {
         .bind(closed_for.as_secs_f64())
         .bind(Level::L0.code())
         .bind(Level::L1.code())
-        .bind(Level::L2.code())
         .bind(skip)
         .fetch_optional(&mut *tx)
         .await?;
