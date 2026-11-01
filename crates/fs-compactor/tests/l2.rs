@@ -526,9 +526,8 @@ async fn an_l2_pass_cut_short_publishes_nothing_and_the_next_merges_once() {
     f.db.finish().await;
 }
 
-/// An output closes at its memory budget; one whose trace ids pass their
-/// cap has no sidecar, one whose services pass theirs lists none, and
-/// both are still read by queries.
+/// An output whose trace ids pass their cap has no sidecar, one whose
+/// services pass theirs lists none, and both are still read by queries.
 #[tokio::test]
 async fn l2_outputs_stay_within_their_memory_and_sidecar_caps() {
     let Some(f) = fixture(15).await else { return };
@@ -537,7 +536,6 @@ async fn l2_outputs_stay_within_their_memory_and_sidecar_caps() {
     let c = compactor(
         &f,
         CompactionConfig {
-            l2_output_bytes: 1,
             max_trace_index_bytes: 0,
             max_services_per_file: 0,
             ..config()
@@ -545,11 +543,6 @@ async fn l2_outputs_stay_within_their_memory_and_sidecar_caps() {
     );
     c.compact_l2_once(&me).await.unwrap().unwrap();
     let l2 = spans(&f).await;
-    assert!(
-        l2.len() >= 2,
-        "each row group closes an output: {}",
-        l2.len()
-    );
     assert!(
         l2.iter().all(|x| x.services.is_empty()),
         "services over the cap: unknown"
@@ -746,34 +739,72 @@ async fn a_day_larger_than_one_pass_closes_over_several() {
     f.db.finish().await;
 }
 
-/// Writes one cold L0 file of `spans` spans of `service` from `start`,
-/// each carrying an attribute of `value_bytes` bytes.
-async fn write_wide_l0(f: &Fixture, start: u64, spans: u8, value_bytes: usize) {
-    let mut request = request("web", 7, start, spans, "k");
-    for (i, span) in request.resource_spans[0].scope_spans[0]
-        .spans
-        .iter_mut()
-        .enumerate()
-    {
-        // Hex of a running mix: a payload compression cannot shrink.
-        let mut state = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut value = String::with_capacity(value_bytes);
-        while value.len() < value_bytes {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            write!(value, "{state:016x}").unwrap();
-        }
-        span.attributes = vec![kv("payload", &value)];
+fn noise(seed: usize, len: usize) -> String {
+    // Hex of a running mix: a payload compression cannot shrink.
+    let mut state = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut value = String::with_capacity(len + 16);
+    while value.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        write!(value, "{state:016x}").unwrap();
     }
-    let mut builder = SpanBatchBuilder::new(Limits::default());
-    builder.append_request(&request).unwrap();
+    value.truncate(len);
+    value
+}
+
+/// One cold span L0 file of `narrow` spans of a few bytes, sorting first,
+/// then `wide` spans at the default ingest limits: sixteen attributes of
+/// the largest value. Every span has its own service and trace.
+async fn write_mixed_l0(f: &Fixture, start: u64, narrow: usize, wide: usize) {
+    let limits = Limits::default();
+    let resource_spans = (0..narrow + wide)
+        .map(|i| {
+            let big = i >= narrow;
+            let service = if big {
+                format!("wide-{i:05}")
+            } else {
+                format!("narrow-{i:05}")
+            };
+            let attributes = (0..if big { 16 } else { 1 })
+                .map(|a| {
+                    let len = if big { limits.max_value_bytes } else { 4 };
+                    kv(&format!("k{a}"), &noise(i * 16 + a, len))
+                })
+                .collect();
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", &service)],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: (i as u128 + 1).to_be_bytes().to_vec(),
+                        span_id: vec![1; 8],
+                        name: "op".into(),
+                        kind: 2,
+                        start_time_unix_nano: start + i as u64,
+                        end_time_unix_nano: start + i as u64 + 1_000,
+                        attributes,
+                        ..Span::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }
+        })
+        .collect();
+    let mut builder = SpanBatchBuilder::new(limits);
+    builder
+        .append_request(&ExportTraceServiceRequest { resource_spans })
+        .unwrap();
     let prepared = flush::prepare(
         f.tenant,
         &Path::from(""),
         fs_catalog::FileId::new(),
         &[builder.finish().unwrap()],
-        FileLayout::current(1024),
+        FileLayout::current(8192),
     )
     .unwrap();
     flush::upload(f.store.as_ref(), &prepared).await.unwrap();
@@ -784,23 +815,23 @@ async fn write_wide_l0(f: &Fixture, start: u64, spans: u8, value_bytes: usize) {
     backdate(f).await;
 }
 
-/// With row groups of up to 1024 rows and a budget far below a whole day,
-/// the merge splits its row groups and closes outputs early enough that
-/// the inputs and the output never hold more than the budget.
+/// The first rows of a day narrow, the rest at the ingest limits, each
+/// its own service and trace: the merge reads its input by the pages it
+/// touches, not by the width of its first rows, sizes row groups by
+/// their rows and closes outputs early enough that what it holds never
+/// passes the budget.
 #[tokio::test]
-async fn an_l2_merge_holds_no_more_than_its_output_budget() {
+async fn a_day_whose_first_rows_are_narrow_merges_within_its_budget() {
     let Some(f) = fixture(15).await else { return };
-    for hour in [3, 4, 5] {
-        write_wide_l0(&f, closed_day() + hour * HOUR, 200, 2048).await;
-    }
-    let budget = 3 << 19;
+    write_mixed_l0(&f, closed_day() + 3 * HOUR, 16, 600).await;
+    let budget = 64 << 20;
     let wide = CompactionConfig {
-        row_group_rows: 1024,
+        row_group_rows: 8192,
         l2_output_bytes: budget,
         ..config()
     };
     let me = fence(&f).await;
-    let c = compactor(&f, wide.clone());
+    let c = compactor(&f, wide);
     while c.compact_once(&me).await.unwrap().is_some() {}
     backdate(&f).await;
     c.compact_l2_once(&me).await.unwrap().unwrap();
@@ -813,7 +844,7 @@ async fn an_l2_merge_holds_no_more_than_its_output_budget() {
     let l2 = spans(&f).await;
     assert!(l2.iter().all(|x| x.level == Level::L2));
     assert!(l2.len() >= 2, "{} outputs", l2.len());
-    assert_eq!(l2.iter().map(|x| x.row_count).sum::<i64>(), 600);
+    assert_eq!(l2.iter().map(|x| x.row_count).sum::<i64>(), 616);
     let largest_group = l2
         .iter()
         .flat_map(|x| {
@@ -829,9 +860,9 @@ async fn an_l2_merge_holds_no_more_than_its_output_budget() {
         .max()
         .unwrap();
     assert!(
-        largest_group < 600,
+        largest_group < 616,
         "row groups split by bytes: {largest_group}"
     );
-    assert_eq!(count(&f, "select count(*) from spans").await, 600);
+    assert_eq!(count(&f, "select count(*) from spans").await, 616);
     f.db.finish().await;
 }

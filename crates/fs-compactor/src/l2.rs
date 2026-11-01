@@ -21,10 +21,11 @@ const L2_READ_BATCH_ROWS: usize = 8192;
 
 impl Compactor {
     /// Merges the oldest closed day ready for L2, of one tenant and
-    /// signal, its L1 files up to the input caps, and swaps the outputs in
-    /// under `fence`. A day whose oldest file exceeds the cap is passed
-    /// over and the next is tried. `None` when `compact_l2` is off or
-    /// nothing qualifies.
+    /// signal, its L1 files up to the input caps and as many as the merge
+    /// budget reads, and swaps the outputs in under `fence`. A day whose
+    /// oldest file exceeds the cap, or cannot be read within the budget,
+    /// is passed over and the next is tried. `None` when `compact_l2` is
+    /// off or nothing qualifies.
     ///
     /// # Errors
     /// A refused swap (conflict or lost lease), or a store, Parquet or
@@ -37,7 +38,7 @@ impl Compactor {
             return Ok(None);
         }
         let mut skip = 0;
-        let (candidate, taken) = loop {
+        loop {
             let Some(candidate) = self
                 .catalog
                 .l2_inputs(
@@ -50,41 +51,55 @@ impl Compactor {
                 return Ok(None);
             };
             let taken = self.taken_l2(&candidate.files);
-            if taken >= 1 {
-                break (candidate, taken);
+            if taken == 0 {
+                warn!(
+                    role = "compactor",
+                    tenant = %candidate.tenant_id.0,
+                    signal = ?candidate.signal,
+                    day = %candidate.hour,
+                    "closed day passed over: its oldest L1 file exceeds compactor.max_l2_input_bytes"
+                );
+                skip += 1;
+                continue;
             }
-            warn!(
-                role = "compactor",
-                tenant = %candidate.tenant_id.0,
-                signal = ?candidate.signal,
-                day = %candidate.hour,
-                "closed day passed over: its oldest L1 file exceeds compactor.max_l2_input_bytes"
-            );
-            skip += 1;
-        };
-        let inputs = candidate.files.get(..taken).unwrap_or(&[]);
-        let result = self
-            .merge_day(
-                candidate.tenant_id,
-                candidate.signal,
-                candidate.hour,
-                inputs,
-                fence,
-            )
-            .await;
-        match &result {
-            Ok(_) => {}
-            Err(CompactError::Catalog(CatalogError::LeaseLost { .. })) => {
-                self.stats.lease_lost.fetch_add(1, Ordering::Relaxed);
+            let inputs = candidate.files.get(..taken).unwrap_or(&[]);
+            let result = self
+                .merge_day(
+                    candidate.tenant_id,
+                    candidate.signal,
+                    candidate.hour,
+                    inputs,
+                    fence,
+                )
+                .await;
+            match &result {
+                Ok(_) => {}
+                Err(CompactError::OverBudget { path, floor }) => {
+                    warn!(
+                        role = "compactor",
+                        tenant = %candidate.tenant_id.0,
+                        signal = ?candidate.signal,
+                        day = %candidate.hour,
+                        path = %path,
+                        floor,
+                        "closed day passed over: its oldest L1 file cannot be read within compactor.l2_output_bytes"
+                    );
+                    self.stats.l2_over_budget.fetch_add(1, Ordering::Relaxed);
+                    skip += 1;
+                    continue;
+                }
+                Err(CompactError::Catalog(CatalogError::LeaseLost { .. })) => {
+                    self.stats.lease_lost.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(CompactError::Catalog(CatalogError::CompactionConflict { .. })) => {
+                    self.stats.conflicts.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.stats.failures.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(CompactError::Catalog(CatalogError::CompactionConflict { .. })) => {
-                self.stats.conflicts.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(_) => {
-                self.stats.failures.fetch_add(1, Ordering::Relaxed);
-            }
+            return result.map(Some);
         }
-        result.map(Some)
     }
 
     /// The oldest files of a day that fit the L2 caps.
@@ -126,6 +141,7 @@ impl Compactor {
             KeyStats::new(table),
         )
         .await?;
+        let inputs = inputs.get(..merger.taken()).unwrap_or(&[]);
         let mut guard = OrphanGuard {
             stats: Arc::clone(&self.stats),
             tenant,

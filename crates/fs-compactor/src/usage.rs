@@ -8,14 +8,14 @@ use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, FileRecord, LeaseFence, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_schema::usage::UsageCounts;
-use futures_util::StreamExt;
 use object_store::path::Path;
 use tracing::info;
 
 use crate::CompactError;
 use crate::compact::Compactor;
-use crate::merge::{batches, partitioned_path, usage_signal};
+use crate::merge::{partitioned_path, usage_signal};
 use crate::objects::OrphanGuard;
+use crate::read;
 
 const HOUR_NANOS: i64 = 3_600_000_000_000;
 
@@ -97,7 +97,7 @@ impl Compactor {
             tokio::task::spawn_blocking(move || usage_files(&root, tenant, &counts)).await??;
         let mut files = Vec::with_capacity(prepared.len());
         for (file, bytes) in prepared {
-            self.put_once(&file.path, bytes, puts).await?;
+            self.put_once(&file.path, bytes.into(), puts).await?;
             guard.created += 1;
             files.push(file);
         }
@@ -119,12 +119,12 @@ impl Compactor {
             .await?;
         guard.created += 1;
         if let Some((path, index)) = &output.index {
-            self.put_once(path, index.clone(), puts).await?;
+            self.put_once(path, index.clone().into(), puts).await?;
         } else if output.file.signal == Signal::Traces {
             self.stats.sidecars_over_cap.fetch_add(1, Ordering::Relaxed);
         }
         Ok(crate::compact::Published {
-            bytes: output.bytes.len() as u64,
+            bytes: output.bytes.content_length() as u64,
             file: output.file,
         })
     }
@@ -218,16 +218,23 @@ impl Compactor {
         let usage = usage_signal(signal).ok_or(CompactError::Merge("a signal without usage"))?;
         let mut counts = UsageCounts::new(usage);
         let mut published = Vec::new();
-        let batch_bytes = self.config.l2_output_bytes / 4;
+        let schema = match signal {
+            Signal::Logs => fs_schema::logs::log_schema_v1(),
+            _ => fs_schema::spans::span_schema_v1(),
+        };
         for file in files {
-            let mut stream = batches(
+            let (input, layout) = read::Input::bounded(
                 Arc::clone(&self.store),
-                file,
-                self.config.row_group_rows,
-                batch_bytes,
+                (&file.path, file.size_bytes),
+                &schema,
+                &[],
             )
             .await?;
-            while let Some(batch) = stream.next().await.transpose()? {
+            // One file at a time, within a quarter of the L2 budget or
+            // its costliest row.
+            let chunks = layout.plan(self.config.l2_output_bytes / 4, self.config.row_group_rows);
+            let mut input = input.with_chunks(chunks);
+            while let Some((batch, _)) = input.next().await? {
                 let mut from = 0;
                 while let Some((part, next)) =
                     counts.absorb_from(&batch, from, self.config.usage_max_bytes, None)?

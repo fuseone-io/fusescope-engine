@@ -13,6 +13,7 @@ use fs_catalog::{FileId, Level, NewFile, Signal, TenantId, TimeRange};
 use fs_index::TraceIndex;
 use fs_schema::parquet::{l2_writer_properties, log_writer_properties, writer_properties};
 use fs_schema::spans::{TRACE_ID_BYTES, col, trace_ids};
+use object_store::PutPayload;
 use object_store::path::Path;
 use parquet::arrow::ArrowWriter;
 
@@ -24,7 +25,7 @@ pub struct Output {
     /// Catalog row.
     pub file: NewFile,
     /// Parquet bytes.
-    pub bytes: Bytes,
+    pub bytes: PutPayload,
     /// Where the sidecar goes and its bytes: the `trace_id` sidecar of a
     /// span file, the text sidecar of a log file; `None` when its cap was
     /// passed, so the file is scanned.
@@ -41,13 +42,65 @@ const TRACE_ENTRY_BYTES: usize = TRACE_ID_BYTES + 4;
 /// encoded body and the framed sidecar.
 const TRACE_FINISH_COPIES: usize = 3;
 
+/// Bytes of each buffer an output is written into.
+const CHUNK_BYTES: usize = 4 << 20;
+
+/// An output's bytes in buffers of [`CHUNK_BYTES`], so growing never
+/// copies what is written, as a doubling buffer would.
+#[derive(Default)]
+pub(crate) struct Chunks {
+    done: Vec<Bytes>,
+    current: Vec<u8>,
+}
+
+impl std::io::Write for Chunks {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.current.len() == self.current.capacity() {
+            let full = std::mem::replace(&mut self.current, Vec::with_capacity(CHUNK_BYTES));
+            if !full.is_empty() {
+                self.done.push(Bytes::from(full));
+            }
+        }
+        let n = buf.len().min(self.current.capacity() - self.current.len());
+        self.current
+            .extend_from_slice(buf.get(..n).unwrap_or_default());
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Chunks {
+    /// Bytes the buffers hold, written or not.
+    pub(crate) fn capacity(&self) -> usize {
+        self.done.iter().map(Bytes::len).sum::<usize>() + self.current.capacity()
+    }
+
+    /// The bytes, their length and their SHA-256.
+    fn finish(mut self) -> (PutPayload, usize, [u8; 32]) {
+        use sha2::Digest;
+        if !self.current.is_empty() {
+            self.done
+                .push(Bytes::from(std::mem::take(&mut self.current)));
+        }
+        let mut hash = sha2::Sha256::new();
+        for chunk in &self.done {
+            hash.update(chunk);
+        }
+        let len = self.done.iter().map(Bytes::len).sum();
+        (self.done.into_iter().collect(), len, hash.finalize().into())
+    }
+}
+
 /// One output file being written.
 pub(crate) struct OutputBuilder {
     signal: Signal,
     level: Level,
     id: FileId,
     path: Path,
-    writer: ArrowWriter<Vec<u8>>,
+    writer: ArrowWriter<Chunks>,
     text: Option<fs_index::TextIndexBuilder>,
     pub(crate) rows: usize,
     ts_min: i64,
@@ -79,7 +132,7 @@ impl OutputBuilder {
             (_, true) => log_writer_properties(row_group_rows)?,
             (_, false) => writer_properties(row_group_rows)?,
         };
-        let writer = ArrowWriter::try_new(Vec::new(), Arc::clone(schema), Some(properties))?;
+        let writer = ArrowWriter::try_new(Chunks::default(), Arc::clone(schema), Some(properties))?;
         // Grows with the row groups; a pass's outputs are not sized ahead.
         let text = logs
             .then(|| fs_index::TextIndexBuilder::new(path.as_ref(), config.text_index, 0, 0))
@@ -171,10 +224,10 @@ impl OutputBuilder {
         self.writer.bytes_written()
     }
 
-    /// Bytes the output holds, and what finishing it allocates: what is
-    /// encoded, the row group in progress, the service names, the trace ids
-    /// with the sorted entries and two encoded copies `finish` makes of
-    /// them, and the text sidecar, which may double once as it closes.
+    /// Bytes the output holds, and what finishing it allocates: its
+    /// buffers, the row group in progress, the service names, the trace
+    /// ids with the sorted entries and two encoded copies `finish` makes
+    /// of them, and the text sidecar, which may double once as it closes.
     pub(crate) fn memory(&self) -> usize {
         let services: usize = self
             .services
@@ -188,13 +241,12 @@ impl OutputBuilder {
             .as_ref()
             .map_or(0, fs_index::TextIndexBuilder::allocated)
             * 2;
-        self.writer.bytes_written() + self.writer.memory_size() + services + traces + text
+        self.writer.inner().capacity() + self.writer.memory_size() + services + traces + text
     }
 
     pub(crate) fn finish(mut self, tenant: TenantId) -> Result<Output, CompactError> {
-        let bytes = Bytes::from(self.writer.into_inner()?);
+        let (bytes, size, content_sha256) = self.writer.into_inner()?.finish();
         let (id, path) = (self.id, self.path);
-        let content_sha256 = crate::objects::sha256(&bytes);
         let no_sidecar = || CompactError::Merge("output path has no sidecar");
         let index = if let Some(text) = self.text {
             let index_path =
@@ -219,7 +271,7 @@ impl OutputBuilder {
             signal: self.signal,
             level: self.level,
             path: path.to_string(),
-            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            size_bytes: i64::try_from(size).unwrap_or(i64::MAX),
             row_count: i64::try_from(self.rows).unwrap_or(i64::MAX),
             range: TimeRange {
                 start: Utc.timestamp_nanos(self.ts_min),

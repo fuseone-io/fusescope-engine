@@ -23,13 +23,16 @@ use tracing::{info, warn};
 
 pub mod compact;
 mod derived;
+mod kway;
 mod l2;
 pub mod lease;
 pub mod merge;
 mod objects;
 pub mod orphans;
 pub mod output;
+mod read;
 pub mod retention;
+mod sizes;
 mod usage;
 
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
@@ -71,6 +74,15 @@ pub enum CompactError {
     /// A failure injected by test configuration.
     #[error("injected failure: {0}")]
     Injected(&'static str),
+    /// The oldest input of a bounded merge cannot be read within its
+    /// budget: a single row of it costs `floor` bytes to read.
+    #[error("input {path} needs {floor} bytes a row, past the merge budget")]
+    OverBudget {
+        /// The input.
+        path: String,
+        /// What reading its costliest row holds.
+        floor: usize,
+    },
     /// The tenant of the hour being compacted is no longer in the catalog.
     #[error("tenant {} is gone", .0.0)]
     TenantGone(fs_catalog::TenantId),

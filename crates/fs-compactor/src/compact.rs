@@ -21,8 +21,8 @@ use fs_catalog::{
 use fs_schema::attribute_keys::{KeyStats, KeyTable};
 use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::trace_summary::TraceSummaries;
-use object_store::ObjectStore;
 use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload};
 use tracing::{info, warn};
 
 use crate::CompactError;
@@ -130,6 +130,9 @@ pub struct CompactorStats {
     /// Most bytes of usage counts one pass held at once, by
     /// `UsageCounts::entry_bytes`.
     pub usage_peak_bytes: AtomicU64,
+    /// Closed days passed over because their oldest L1 file cannot be
+    /// read within `l2_output_bytes`.
+    pub l2_over_budget: AtomicU64,
     /// Span outputs published without a `trace_id` sidecar, their trace
     /// ids past `max_trace_index_bytes`.
     pub sidecars_over_cap: AtomicU64,
@@ -704,7 +707,7 @@ impl Compactor {
         let Some((file, bytes)) = prepared else {
             return Ok(None);
         };
-        self.put_once(&file.path, bytes, puts).await?;
+        self.put_once(&file.path, bytes.into(), puts).await?;
         guard.created += 1;
         Ok(Some(file))
     }
@@ -741,7 +744,7 @@ impl Compactor {
     pub(crate) async fn put_once(
         &self,
         path: &str,
-        bytes: Bytes,
+        bytes: PutPayload,
         puts: &mut usize,
     ) -> Result<(), CompactError> {
         let this = *puts;

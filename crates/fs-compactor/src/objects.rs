@@ -4,7 +4,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use bytes::Bytes;
 use fs_catalog::TenantId;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
@@ -20,16 +19,13 @@ use crate::CompactError;
 pub(crate) async fn create(
     store: &dyn ObjectStore,
     path: &str,
-    bytes: Bytes,
+    bytes: PutPayload,
 ) -> Result<(), CompactError> {
     let create = PutOptions {
         mode: PutMode::Create,
         ..PutOptions::default()
     };
-    match store
-        .put_opts(&Path::from(path), PutPayload::from_bytes(bytes), create)
-        .await
-    {
+    match store.put_opts(&Path::from(path), bytes, create).await {
         Ok(_) => Ok(()),
         Err(object_store::Error::AlreadyExists { .. }) => {
             Err(CompactError::ObjectExists(path.to_owned()))

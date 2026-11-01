@@ -45,8 +45,8 @@ use tracing::{info, warn};
 
 use crate::CompactError;
 use crate::derived::{key_table, read_table, table_file};
-use crate::merge::ObjectReader;
 use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
+use crate::read::ObjectReader;
 
 /// Rows a rebuild decodes from an L1 file at a time: under the default
 /// limits one row of attribute maps may reach several megabytes, so a
@@ -614,7 +614,7 @@ impl Retention {
         };
         let mut outputs = Vec::new();
         if let Some((file, bytes)) = table_file(&self.root, tenant, this_hour(), &keys)? {
-            create(self.store.as_ref(), &file.path, bytes).await?;
+            create(self.store.as_ref(), &file.path, bytes.into()).await?;
             guard.created += 1;
             outputs.push(file);
         }
@@ -683,6 +683,7 @@ impl Retention {
             store: Arc::clone(&self.store),
             path: Path::from(file.path.as_str()),
             size: u64::try_from(file.size_bytes).unwrap_or(0),
+            exact: false,
         };
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
         let columns = builder.parquet_schema();
