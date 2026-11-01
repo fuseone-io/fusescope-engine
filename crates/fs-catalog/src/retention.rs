@@ -186,7 +186,7 @@ impl Catalog {
         }))
     }
 
-    /// Visible files of one tenant, signal and level whose rows end at or
+    /// Visible files of one tenant, signal and any of `levels` whose rows end at or
     /// after `since`, oldest first: what remains once retention has cut
     /// there. Read `page` rows at a time in one repeatable-read snapshot;
     /// `admit` sees each page as it arrives and ends the read with `None`
@@ -199,7 +199,7 @@ impl Catalog {
         &self,
         tenant: TenantId,
         signal: Signal,
-        level: Level,
+        levels: &[Level],
         since: DateTime<Utc>,
         page: i64,
         mut admit: impl FnMut(&[RebuildInput]) -> bool,
@@ -213,14 +213,14 @@ impl Catalog {
         loop {
             let rows: Vec<(crate::FileId, DateTime<Utc>, String, i64)> = sqlx::query_as(
                 "select id, ts_min, path, size_bytes from engine_file
-                 where tenant_id = $1 and signal = $2 and level = $3 and state = $4 and ts_max >= $5
+                 where tenant_id = $1 and signal = $2 and level = any($3) and state = $4 and ts_max >= $5
                    and ($6::timestamptz is null or (ts_min, id) > ($6, $7))
                  order by ts_min, id
                  limit $8",
             )
             .bind(tenant)
             .bind(signal.code())
-            .bind(level.code())
+            .bind(levels.iter().map(|l| l.code()).collect::<Vec<i16>>())
             .bind(FileState::Visible.code())
             .bind(since)
             .bind(after.map(|(ts, _)| ts))

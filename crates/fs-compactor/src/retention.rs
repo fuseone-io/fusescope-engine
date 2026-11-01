@@ -466,7 +466,7 @@ impl Retention {
             .rebuild_inputs(
                 stale.tenant_id,
                 data,
-                Level::L1,
+                &[Level::L1, Level::L2],
                 stale.cutoff,
                 INPUT_PAGE,
                 |page| budget.admit(page),

@@ -2463,7 +2463,7 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
     );
     let mut pages = 0;
     let remaining = c
-        .rebuild_inputs(t, Signal::Traces, Level::L1, cut, 1, |page| {
+        .rebuild_inputs(t, Signal::Traces, &[Level::L1], cut, 1, |page| {
             pages += 1;
             assert_eq!(page.len(), 1, "a page of one, never an empty one");
             true
@@ -2488,7 +2488,7 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
     assert_eq!(pages, 2);
     let mut seen = 0;
     let refused = c
-        .rebuild_inputs(t, Signal::Traces, Level::L1, cut, 1, |page| {
+        .rebuild_inputs(t, Signal::Traces, &[Level::L1], cut, 1, |page| {
             seen += page.len();
             seen < 2
         })
@@ -2619,6 +2619,105 @@ async fn usage_is_counted_once_and_holds_retention_until_then() {
     assert_eq!(
         expired.files.iter().map(|f| f.id).collect::<Vec<_>>(),
         [old.id]
+    );
+    db.finish().await;
+}
+
+/// A day is ready for L2 once it closed, holds no L0 file and two L1
+/// files, or one and no L2 yet, all cold; a legacy L1 file that runs into
+/// the day after keeps its day open until it is cold too.
+#[tokio::test]
+async fn a_closed_day_without_l0_files_is_ready_for_l2() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let c = &db.catalog;
+    let t = c
+        .create_tenant(&NewTenant::with_defaults("days"))
+        .await
+        .unwrap()
+        .id;
+    let day = yesterday(c).await - Duration::days(1);
+    let at = |hour: i64, minutes: i64| TimeRange {
+        start: day + Duration::hours(hour),
+        end: day + Duration::hours(hour) + Duration::minutes(minutes),
+    };
+    let ready = |db: &TestDb| {
+        let c = db.catalog.clone();
+        async move {
+            c.l2_inputs(&[Signal::Traces], StdDuration::from_secs(60), 0)
+                .await
+                .unwrap()
+        }
+    };
+    let backdate = |db: &TestDb| {
+        let c = db.catalog.clone();
+        async move {
+            sqlx::query("update engine_file set confirmed_at = now() - interval '1 hour'")
+                .execute(c.pool())
+                .await
+                .unwrap();
+        }
+    };
+    let l1 = c
+        .register_file(&file_spanning(t, Signal::Traces, Level::L1, at(1, 10)))
+        .await
+        .unwrap();
+    let l0 = c
+        .register_file(&file_spanning(t, Signal::Traces, Level::L0, at(2, 10)))
+        .await
+        .unwrap();
+    backdate(&db).await;
+    assert!(ready(&db).await.is_none(), "an L0 file keeps the day open");
+    c.swap_files(t, Signal::Traces, &[l0.id], &[])
+        .await
+        .unwrap();
+    let one = ready(&db).await.unwrap();
+    assert_eq!((one.tenant_id, one.hour), (t, day));
+    assert_eq!(
+        one.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [l1.id],
+        "one L1, no L2 yet"
+    );
+
+    c.register_file(&file_spanning(t, Signal::Traces, Level::L2, at(0, 30)))
+        .await
+        .unwrap();
+    backdate(&db).await;
+    assert!(ready(&db).await.is_none(), "one L1 beside an L2 waits");
+    let late = c
+        .register_file(&file_spanning(
+            t,
+            Signal::Traces,
+            Level::L1,
+            TimeRange {
+                start: day + Duration::hours(23),
+                end: Utc::now(),
+            },
+        ))
+        .await
+        .unwrap();
+    backdate(&db).await;
+    assert!(
+        ready(&db).await.is_none(),
+        "a file still running keeps the day open"
+    );
+    sqlx::query("update engine_file set ts_max = ts_min + interval '1 hour' where id = $1")
+        .bind(late.id)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    let two = ready(&db).await.unwrap();
+    assert_eq!(
+        two.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [l1.id, late.id],
+        "the L1 files only, oldest first"
+    );
+    assert!(
+        c.l2_inputs(&[Signal::Logs], StdDuration::from_secs(60), 0)
+            .await
+            .unwrap()
+            .is_none()
     );
     db.finish().await;
 }

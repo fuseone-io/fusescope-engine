@@ -22,6 +22,9 @@ pub struct CompactionInputs {
 /// Hours are UTC, whatever the session's time zone.
 const HOUR_BIN: &str = "date_bin('1 hour', ts_min, timestamptz '1970-01-01 00:00:00+00')";
 
+/// Days are UTC, whatever the session's time zone.
+const DAY_BIN: &str = "date_bin('1 day', ts_min, timestamptz '1970-01-01 00:00:00+00')";
+
 impl Catalog {
     /// The `skip`-th oldest hour, across tenants and `signals`, spans
     /// before logs within an hour, whose visible L0 files of one signal
@@ -98,6 +101,89 @@ impl Catalog {
             tenant_id,
             signal,
             hour,
+            files,
+        }))
+    }
+
+    /// The `skip`-th oldest closed day, across tenants and `signals`, ready
+    /// for L2, with its L1 files, oldest registration first: the UTC day
+    /// ended more than `closed_for` ago, no visible L0 file of its signal
+    /// starts in it, it holds at least two visible L1 files, or one and no
+    /// L2 file yet, and every L1 file of it ended, by its own `ts_max`, and
+    /// was confirmed more than `closed_for` ago. Day and files are read in
+    /// one repeatable-read snapshot. `hour` of the answer is the day's
+    /// start.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn l2_inputs(
+        &self,
+        signals: &[Signal],
+        closed_for: std::time::Duration,
+        skip: i64,
+    ) -> Result<Option<CompactionInputs>, CatalogError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await?;
+        let codes: Vec<i16> = signals.iter().map(|s| s.code()).collect();
+        let day: Option<(TenantId, i16, DateTime<Utc>)> = sqlx::query_as(&format!(
+            "select tenant_id, signal, {DAY_BIN} as day
+             from engine_file
+             where signal = any($1) and state = $2
+             group by tenant_id, signal, day
+             having {DAY_BIN} + interval '1 day' < now() - make_interval(secs => $3)
+                and count(*) filter (where level = $4) = 0
+                and (count(*) filter (where level = $5) >= 2
+                     or (count(*) filter (where level = $5) = 1
+                         and count(*) filter (where level = $6) = 0))
+                and max(ts_max) filter (where level = $5) < now() - make_interval(secs => $3)
+                and count(confirmed_at) filter (where level = $5)
+                    = count(*) filter (where level = $5)
+                and max(confirmed_at) filter (where level = $5)
+                    < now() - make_interval(secs => $3)
+             order by day, signal, tenant_id
+             offset $7
+             limit 1"
+        ))
+        .bind(&codes)
+        .bind(FileState::Visible.code())
+        .bind(closed_for.as_secs_f64())
+        .bind(Level::L0.code())
+        .bind(Level::L1.code())
+        .bind(Level::L2.code())
+        .bind(skip)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((tenant_id, code, day)) = day else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let signal = Signal::from_code(code)?;
+        let rows = sqlx::query_as::<_, FileRow>(&format!(
+            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
+             from engine_file
+             where tenant_id = $1 and signal = $2 and level = $3 and state = $4
+               and {DAY_BIN} = $5
+             order by created_at, id"
+        ))
+        .bind(tenant_id)
+        .bind(signal.code())
+        .bind(Level::L1.code())
+        .bind(FileState::Visible.code())
+        .bind(day)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let files = rows
+            .into_iter()
+            .map(FileRecord::try_from)
+            .collect::<Result<_, _>>()?;
+        Ok(Some(CompactionInputs {
+            tenant_id,
+            signal,
+            hour: day,
             files,
         }))
     }
