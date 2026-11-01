@@ -597,6 +597,24 @@ fn render_usage(out: &mut String, c: &fs_compactor::CompactorStats) {
         "Span outputs published without a trace_id sidecar, their trace ids past the cap",
         c.sidecars_over_cap.load(Ordering::Relaxed),
     );
+    counter(
+        out,
+        "fusescope_compaction_l2_over_budget_total",
+        "Closed days passed over because their oldest L1 file cannot be read within l2_output_bytes",
+        c.l2_over_budget.load(Ordering::Relaxed),
+    );
+    gauge(
+        out,
+        "fusescope_compaction_l2_peak_bytes",
+        "Most bytes one L2 pass held since start, inputs, row group and output together",
+        c.l2_peak_bytes.load(Ordering::Relaxed),
+    );
+    gauge(
+        out,
+        "fusescope_usage_peak_bytes",
+        "Most bytes of usage counts one pass held at once since start",
+        c.usage_peak_bytes.load(Ordering::Relaxed),
+    );
 }
 
 fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
@@ -609,12 +627,12 @@ fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
         ),
         (
             "fusescope_compaction_inputs_total",
-            "L0 files merged by completed passes",
+            "L0 files merged into L1 and L1 files merged into L2 by completed passes",
             load(&c.inputs),
         ),
         (
             "fusescope_compaction_outputs_total",
-            "L1 files published by completed passes",
+            "L1 and L2 files published by completed passes",
             load(&c.outputs),
         ),
         (
@@ -1161,6 +1179,39 @@ mod tests {
                 || l.split_once(' ')
                     .is_some_and(|(_, v)| v.parse::<u64>().is_ok())
         }));
+    }
+
+    #[test]
+    fn renders_l2_and_usage_peaks() {
+        let metrics = Metrics::default();
+        let compactor = Arc::new(fs_compactor::Stats::default());
+        compactor
+            .compaction
+            .l2_peak_bytes
+            .fetch_max(1 << 20, Ordering::Relaxed);
+        compactor
+            .compaction
+            .usage_peak_bytes
+            .fetch_max(4096, Ordering::Relaxed);
+        compactor
+            .compaction
+            .l2_over_budget
+            .fetch_add(2, Ordering::Relaxed);
+        metrics.register_compactor(compactor);
+        let page = metrics.render();
+        assert!(
+            page.contains("# TYPE fusescope_compaction_l2_peak_bytes gauge\nfusescope_compaction_l2_peak_bytes 1048576\n"),
+            "{page}"
+        );
+        assert!(page.contains("fusescope_usage_peak_bytes 4096\n"), "{page}");
+        assert!(
+            page.contains("fusescope_compaction_l2_over_budget_total 2\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("# HELP fusescope_compaction_inputs_total L0 files merged into L1 and L1 files merged into L2"),
+            "{page}"
+        );
     }
 
     #[test]
