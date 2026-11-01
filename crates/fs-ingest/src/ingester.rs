@@ -304,7 +304,7 @@ impl Shared {
         }
         // Admitted rows must always be writable: besides the batch itself,
         // room for the scratch its flush will reserve stays free.
-        if Buffers::admission_cost(bytes, rows, stream.signal)
+        if buffers.admission_cost(bytes, rows, stream.signal, hours.len())
             > buffers.headroom(self.config.max_memory_bytes)
         {
             self.stats.over_capacity.fetch_add(1, Ordering::Relaxed);
@@ -762,17 +762,6 @@ impl Shared {
         let legacy = layout.is_none();
         let layout = layout.unwrap_or_else(|| FileLayout::current(self.config.row_group_rows));
         flush::check_layout(&layout, stream.signal)?;
-        // The lease keeps one more copy of the input for a log file's text
-        // sidecar; whatever the sidecar's builder may hold beyond it is
-        // counted here until the attempt ends.
-        let sidecar_bound =
-            flush::text_index_memory(stream, &self.root, file_id, &batches, &layout)?;
-        let input: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-        let _sidecar_scratch = self
-            .buffers
-            .lock()
-            .await
-            .hold_scratch(sidecar_bound.saturating_sub(input));
         let root = self.root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             flush::prepare_stream(stream, &root, file_id, &batches, layout)
@@ -1506,7 +1495,8 @@ impl Ingester {
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
         let flush_stats = Arc::new(FlushStats::default());
-        let buffers = rebuild(replayed, Arc::clone(&flush_stats.scratch_bytes))?;
+        let buffers = rebuild(replayed, Arc::clone(&flush_stats.scratch_bytes))?
+            .with_text_file_scratch(flush::text_index_file_scratch(&root));
         info!(
             records,
             damaged,
@@ -1585,6 +1575,13 @@ impl Ingester {
     /// Group-commit counters of the WAL writer.
     pub fn writer_stats(&self) -> Arc<crate::walwriter::WriterStats> {
         self.shared.writer.stats()
+    }
+
+    /// Memory counted against `max_memory_bytes`: rows held in every
+    /// state, bytes admitted and not pushed yet, and scratch leases.
+    pub async fn memory_held(&self) -> usize {
+        let buffers = self.shared.buffers.lock().await;
+        buffers.total_bytes() + buffers.reserved_total() + buffers.scratch_total()
     }
 
     /// Bytes the WAL held on disk after the last group commit.

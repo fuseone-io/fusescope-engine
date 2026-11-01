@@ -38,7 +38,10 @@ mod probe;
 
 pub use bloom::{BITS_PER_TERM, HASHES};
 pub use build::{MIN_GROUP_BYTES, TextIndexBuilder, TextIndexLimits};
-pub use normalize::{NGRAM, has_token, is_token, tokens, trigram_count, trigrams};
+pub use normalize::{
+    FOLD_STACK, NGRAM, STREAMING_HASH_BYTES, folded_hash, has_token, is_token, tokens,
+    trigram_count, trigrams,
+};
 pub use probe::Probe;
 
 use crate::IndexError;
@@ -48,7 +51,8 @@ const MAGIC: [u8; 6] = *b"FSNGB\0";
 const VERSION: u8 = 1;
 /// Normalization 1: ASCII letters folded, tokens `[A-Za-z0-9]+`.
 pub const NORMALIZATION: u8 = 1;
-const GROUP_LEN: usize = 8 + 1 + 2 * (4 + 1 + 4);
+/// Bytes of one row group's descriptor.
+pub const GROUP_LEN: usize = 8 + 1 + 2 * (4 + 1 + 4);
 const INDEXED: u8 = 1;
 const ALL_ASCII: u8 = 2;
 

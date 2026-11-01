@@ -14,6 +14,8 @@ use crate::frame::{self, HEADER_LEN};
 /// Bloom bytes a row group may spend whatever its body bytes, so a group
 /// of a few short bodies is still indexed.
 pub const MIN_GROUP_BYTES: u64 = 64;
+#[allow(clippy::cast_possible_truncation)]
+const MIN_GROUP_USIZE: usize = MIN_GROUP_BYTES as usize;
 
 /// Bloom bytes a sidecar may spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +73,6 @@ pub struct TextIndexBuilder {
     count: u32,
     limits: TextIndexLimits,
     spent: u64,
-    fold: Vec<u8>,
 }
 
 impl TextIndexBuilder {
@@ -86,35 +87,32 @@ impl TextIndexBuilder {
         prefix_len(path)
             .saturating_add(
                 body_bytes
-                    .saturating_add(
-                        row_groups
-                            .saturating_mul(usize::try_from(MIN_GROUP_BYTES).unwrap_or(usize::MAX)),
-                    )
+                    .saturating_add(row_groups.saturating_mul(MIN_GROUP_USIZE))
                     .min(limits.max_bytes_per_file),
             )
             .saturating_add(row_groups.saturating_mul(GROUP_LEN))
             .saturating_add(4)
     }
 
-    /// Most bytes a builder for `path` over `row_groups` row groups,
-    /// `body_bytes` bytes of bodies and none longer than `longest_body`
-    /// holds at once: the reserved buffer, the row groups' descriptors
-    /// staged apart until [`Self::finish`], and the folded copy of one body.
+    /// Most bytes a builder for `path` over `row_groups` row groups and
+    /// `body_bytes` bytes of bodies holds at once: the reserved buffer and
+    /// the row groups' descriptors staged apart until [`Self::finish`].
+    /// Folding needs no buffer but for a token longer than
+    /// [`super::FOLD_STACK`] with an upper-case letter, whose streaming
+    /// hash holds [`super::STREAMING_HASH_BYTES`] at most.
     pub fn memory_bound(
         path: &str,
         body_bytes: usize,
         row_groups: usize,
-        longest_body: usize,
         limits: TextIndexLimits,
     ) -> usize {
         Self::encoded_bound(path, body_bytes, row_groups, limits)
             .saturating_add(row_groups.saturating_mul(GROUP_LEN))
-            .saturating_add(longest_body)
     }
 
-    /// Bytes the builder holds now.
+    /// Bytes the builder's buffers hold now.
     pub fn allocated(&self) -> usize {
-        self.out.capacity() + self.groups.capacity() + self.fold.capacity()
+        self.out.capacity() + self.groups.capacity()
     }
 
     /// A sidecar for the file at `path`, its buffer reserved for
@@ -144,7 +142,6 @@ impl TextIndexBuilder {
             count: 0,
             limits,
             spent: 0,
-            fold: Vec::new(),
         })
     }
 
@@ -233,12 +230,16 @@ impl TextIndexBuilder {
             .unwrap_or_default()
             .split_at_mut(gram_bytes);
         for body in bodies {
-            normalize::fold_into(body, &mut self.fold);
-            for gram in self.fold.windows(NGRAM) {
-                bloom::insert(gram_bloom, gram_bits, HASHES, gram);
+            for gram in normalize::trigrams(body) {
+                bloom::insert(gram_bloom, gram_bits, HASHES, &gram);
             }
-            for token in normalize::tokens(&self.fold) {
-                bloom::insert(token_bloom, token_bits, HASHES, token);
+            for token in normalize::tokens(body) {
+                bloom::insert_hash(
+                    token_bloom,
+                    token_bits,
+                    HASHES,
+                    normalize::folded_hash(token),
+                );
             }
         }
     }

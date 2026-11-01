@@ -182,16 +182,15 @@ fn row_groups_past_the_file_budget_carry_no_bloom_and_are_always_read() {
 #[test]
 fn a_group_without_terms_is_indexed_and_holds_none() {
     let bytes = build(
-        &[&["", "ab", "."], &["hello world"]],
+        &[&["", "--", "."], &["hello world"]],
         TextIndexLimits::DEFAULT,
     );
     let index = TextIndex::decode(bytes).unwrap();
     assert!(index.indexed(0));
     let g = index.groups[0];
-    assert_eq!(g.ngram.bits, 0);
+    assert_eq!((g.ngram.bits, g.token.bits), (0, 0));
     assert_eq!(index.select(&fragment("hello")), vec![1]);
-    // "ab" is a token of group 0: the token bloom is not empty.
-    assert_eq!(index.select(&token("ab")), vec![0]);
+    assert_eq!(index.select(&token("hello")), vec![1]);
 }
 
 #[test]
@@ -309,12 +308,11 @@ fn the_builder_allocates_within_its_memory_bound() {
     ];
     let bodies: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
     let body_bytes = bodies.iter().map(|b| b.len()).sum();
-    let longest = bodies.iter().map(|b| b.len()).max().unwrap();
     for limits in [
         TextIndexLimits::DEFAULT,
         TextIndexLimits::new(256, 512).unwrap(),
     ] {
-        let bound = TextIndexBuilder::memory_bound(PATH, body_bytes, groups.len(), longest, limits);
+        let bound = TextIndexBuilder::memory_bound(PATH, body_bytes, groups.len(), limits);
         let mut builder = TextIndexBuilder::new(PATH, limits, body_bytes, groups.len()).unwrap();
         for group in groups {
             builder
@@ -333,6 +331,14 @@ fn the_builder_allocates_within_its_memory_bound() {
             "{allocated} {} over {bound}",
             bytes.capacity()
         );
+        let floor = usize::try_from(MIN_GROUP_BYTES).unwrap();
+        assert!(
+            bound
+                <= body_bytes
+                    + groups.len() * (floor + 2 * GROUP_LEN)
+                    + (HEADER_LEN + 2 + PATH.len() + 32 + 2 + 4),
+            "the bodies, a floor and two descriptors per group, and the prefix"
+        );
     }
 }
 
@@ -340,7 +346,7 @@ fn the_builder_allocates_within_its_memory_bound() {
 fn a_growing_body_does_not_double_the_folded_copy() {
     let (hundred, more) = ("A".repeat(100), "B".repeat(150));
     let limits = TextIndexLimits::DEFAULT;
-    let bound = TextIndexBuilder::memory_bound(PATH, 250, 1, 150, limits);
+    let bound = TextIndexBuilder::memory_bound(PATH, 250, 1, limits);
     let mut builder = TextIndexBuilder::new(PATH, limits, 250, 1).unwrap();
     builder
         .add_row_group([hundred.as_bytes(), more.as_bytes()])

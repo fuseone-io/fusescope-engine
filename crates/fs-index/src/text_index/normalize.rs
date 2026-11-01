@@ -39,11 +39,42 @@ pub fn has_token(body: &[u8], needle: &[u8]) -> bool {
 }
 
 /// `bytes` with ASCII letters lowercased into `into`, which is cleared
-/// first and grows to exactly the longest input, never by doubling.
+/// first.
 pub(crate) fn fold_into(bytes: &[u8], into: &mut Vec<u8>) {
     into.clear();
-    into.reserve_exact(bytes.len());
     into.extend(bytes.iter().map(u8::to_ascii_lowercase));
+}
+
+/// Longest token folded on the stack before hashing.
+pub const FOLD_STACK: usize = 256;
+
+/// Most bytes the streaming hash of a longer token allocates: its state and
+/// its copy of the default secret.
+pub const STREAMING_HASH_BYTES: usize = 1024;
+
+/// The bloom hash of `token` folded, without a heap buffer: the token
+/// itself when it has no upper-case letter, a stack copy up to
+/// [`FOLD_STACK`] bytes, and a streaming hash of folded pieces beyond.
+pub fn folded_hash(token: &[u8]) -> u64 {
+    if !token.iter().any(u8::is_ascii_uppercase) {
+        return super::bloom::hash(token);
+    }
+    let mut stack = [0u8; FOLD_STACK];
+    if let Some(folded) = stack.get_mut(..token.len()) {
+        for (to, from) in folded.iter_mut().zip(token) {
+            *to = from.to_ascii_lowercase();
+        }
+        return super::bloom::hash(folded);
+    }
+    let mut hasher = twox_hash::XxHash3_64::with_seed(0);
+    for piece in token.chunks(FOLD_STACK) {
+        let folded = &mut stack[..piece.len()];
+        for (to, from) in folded.iter_mut().zip(piece) {
+            *to = from.to_ascii_lowercase();
+        }
+        std::hash::Hasher::write(&mut hasher, folded);
+    }
+    std::hash::Hasher::finish(&hasher)
 }
 
 #[cfg(test)]
@@ -67,6 +98,27 @@ mod tests {
         let got: Vec<&[u8]> = tokens("GET /api/v1?id=42 naïve-x".as_bytes()).collect();
         let want: Vec<&[u8]> = vec![b"GET", b"api", b"v1", b"id", b"42", b"na", b"ve", b"x"];
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_folded_hash_is_the_hash_of_the_folded_token_at_any_length() {
+        for len in [0, 1, 255, 256, 257, 600, 5000] {
+            let token: Vec<u8> = (0..len)
+                .map(|i| if i % 3 == 0 { b'Q' } else { b'q' })
+                .collect();
+            let mut folded = Vec::new();
+            fold_into(&token, &mut folded);
+            assert_eq!(
+                folded_hash(&token),
+                super::super::bloom::hash(&folded),
+                "{len}"
+            );
+            assert_eq!(
+                folded_hash(&folded),
+                super::super::bloom::hash(&folded),
+                "{len}"
+            );
+        }
     }
 
     #[test]

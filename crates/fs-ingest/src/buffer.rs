@@ -754,9 +754,36 @@ pub struct Buffers {
     reserved_total: Arc<AtomicUsize>,
     scratch_total: Arc<AtomicU64>,
     next_coalesce: u64,
+    /// Scratch the text sidecar of one log file needs beyond its copy of
+    /// the input; see [`crate::flush::text_index_file_scratch`].
+    text_file_scratch: usize,
 }
 
 impl Buffers {
+    /// Keeps `bytes` per log file for its text sidecar beyond its copy of
+    /// the input: per live hour of a log stream, since a cut writes one file
+    /// per hour, per waiting log flush, and in every log flush's lease.
+    #[must_use]
+    pub fn with_text_file_scratch(mut self, bytes: usize) -> Self {
+        self.text_file_scratch = bytes;
+        self
+    }
+
+    /// The per-file scratch of a flush of rows of `signal`.
+    fn file_scratch(&self, signal: RowSignal) -> usize {
+        match signal {
+            RowSignal::Traces => 0,
+            RowSignal::Logs => self.text_file_scratch,
+        }
+    }
+
+    /// The scratch lease of one flush of `bytes` of rows of `signal`.
+    fn lease_bytes(&self, signal: RowSignal, bytes: usize) -> usize {
+        bytes
+            .saturating_mul(scratch_factor(signal))
+            .saturating_add(self.file_scratch(signal))
+    }
+
     /// Empty buffers whose scratch bytes are published through `counter`, so
     /// a metrics page reads the same value every lease updates.
     pub fn with_scratch_counter(counter: Arc<AtomicU64>) -> Self {
@@ -827,14 +854,22 @@ impl Buffers {
         let live: usize = self
             .tenants
             .iter()
-            .map(|(s, b)| b.bytes.saturating_mul(scratch_factor(s.signal)))
+            .filter(|(_, b)| !b.is_empty())
+            .map(|(s, b)| {
+                let files = self
+                    .file_scratch(s.signal)
+                    .saturating_mul(b.hours().len().max(1));
+                b.bytes
+                    .saturating_mul(scratch_factor(s.signal))
+                    .saturating_add(files)
+            })
             .sum();
         let waiting: usize = self
             .flushing
             .iter()
             .flat_map(|(s, list)| list.iter().map(move |f| (s.signal, f)))
             .filter(|(_, f)| !f.in_progress)
-            .map(|(signal, f)| f.buffer.bytes.saturating_mul(scratch_factor(signal)))
+            .map(|(signal, f)| self.lease_bytes(signal, f.buffer.bytes))
             .sum();
         live.saturating_add(waiting)
     }
@@ -847,19 +882,38 @@ impl Buffers {
 
     /// Room an admission needs under the global cap: the batch's cost and
     /// the margin its flush keeps.
-    pub fn admission_cost(bytes: usize, rows: usize, signal: RowSignal) -> usize {
-        Self::batch_cost(bytes, rows).saturating_mul(1 + scratch_factor(signal))
+    pub fn admission_cost(
+        &self,
+        bytes: usize,
+        rows: usize,
+        signal: RowSignal,
+        hours: usize,
+    ) -> usize {
+        Self::batch_cost(bytes, rows)
+            .saturating_mul(1 + scratch_factor(signal))
+            .saturating_add(self.file_scratch(signal).saturating_mul(hours))
     }
 
     /// Bytes still admissible under `cap` with the flush margin kept, for
     /// the rows held and for the ones admitted but not pushed yet.
     pub fn headroom(&self, cap: usize) -> usize {
+        let reserved_hours: HashMap<Stream, usize> = self
+            .reserved_hours
+            .lock()
+            .map(|r| {
+                r.iter()
+                    .map(|(s, hours)| (*s, hours.values().sum()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let reserved: usize = self
             .reserved
             .iter()
             .map(|(s, r)| {
+                let hours = reserved_hours.get(s).copied().unwrap_or(0);
                 r.load(Ordering::Relaxed)
                     .saturating_mul(1 + scratch_factor(s.signal))
+                    .saturating_add(self.file_scratch(s.signal).saturating_mul(hours))
             })
             .sum();
         cap.saturating_sub(
@@ -1046,7 +1100,7 @@ impl Buffers {
     ) -> Option<(Vec<RecordBatch>, Scratch)> {
         let buffer = self.tenants.remove(&tenant).filter(|b| !b.is_empty())?;
         let batches = buffer.batches();
-        let lease = self.hold_scratch(buffer.bytes.saturating_mul(scratch_factor(tenant.signal)));
+        let lease = self.hold_scratch(self.lease_bytes(tenant.signal, buffer.bytes));
         self.flushing.entry(tenant).or_default().push(Flushing {
             file,
             buffer,
@@ -1100,7 +1154,7 @@ impl Buffers {
                 continue;
             }
             let batches = part.batches();
-            let held = self.hold_scratch(part.bytes.saturating_mul(scratch_factor(tenant.signal)));
+            let held = self.hold_scratch(self.lease_bytes(tenant.signal, part.bytes));
             self.flushing.entry(tenant).or_default().push(Flushing {
                 file,
                 buffer: part,
@@ -1242,16 +1296,9 @@ impl Buffers {
                 .iter_mut()
                 .find(|f| f.file == file && !f.in_progress)?;
             entry.in_progress = true;
-            (
-                entry
-                    .buffer
-                    .bytes
-                    .saturating_mul(scratch_factor(tenant.signal)),
-                entry.layout,
-                entry.origin,
-            )
+            (entry.buffer.bytes, entry.layout, entry.origin)
         };
-        let lease = self.hold_scratch(lease_bytes);
+        let lease = self.hold_scratch(self.lease_bytes(tenant.signal, lease_bytes));
         let batches = self
             .flushing
             .get(&tenant)?
@@ -1499,6 +1546,11 @@ mod tests {
     /// 2026-10-22T14:00:00Z.
     const H14: u64 = 1_792_677_600_000_000_000;
     const HOUR: u64 = 3_600_000_000_000;
+
+    fn hour(h: u64) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.timestamp_nanos(i64::try_from(H14 + (h - 14) * HOUR).unwrap())
+    }
 
     fn span_batch(timestamps: &[u64]) -> RecordBatch {
         use fs_schema::limits::Limits;
@@ -1862,26 +1914,31 @@ mod tests {
     fn a_log_flush_keeps_one_more_copy_for_its_text_sidecar() {
         let logs = Stream::logs(TenantId(uuid::Uuid::from_u128(7)));
         let factor = FLUSH_SCRATCH_FACTOR + TEXT_INDEX_SCRATCH_FACTOR;
-        let mut buffers = Buffers::default();
+        let file_scratch = 100;
+        let mut buffers = Buffers::default().with_text_file_scratch(file_scratch);
         buffers
             .get_mut(logs)
             .push(tagged(4, 1), at(10), Instant::now());
         let live = buffers.total_bytes();
-        assert_eq!(buffers.flush_margin(), live * factor);
-        assert_eq!(buffers.headroom(live * (1 + factor) + 1), 1);
+        // A cut writes one file per hour; rows without one are one file.
+        let margin = live * factor + file_scratch;
+        assert_eq!(buffers.flush_margin(), margin);
+        assert_eq!(buffers.headroom(live + margin + 1), 1);
         assert_eq!(
-            Buffers::admission_cost(10, 0, RowSignal::Logs),
-            Buffers::batch_cost(10, 0) * (1 + factor)
+            buffers.admission_cost(10, 0, RowSignal::Logs, 2),
+            Buffers::batch_cost(10, 0) * (1 + factor) + 2 * file_scratch
         );
         assert_eq!(
-            Buffers::admission_cost(10, 0, RowSignal::Traces),
-            Buffers::batch_cost(10, 0) * (1 + FLUSH_SCRATCH_FACTOR)
+            buffers.admission_cost(10, 0, RowSignal::Traces, 2),
+            Buffers::batch_cost(10, 0) * (1 + FLUSH_SCRATCH_FACTOR),
+            "span files have no text sidecar"
         );
-        let reservation = buffers.reserve(logs, 2, &[]);
+        let hours = [hour(14), hour(15)];
+        let reservation = buffers.reserve(logs, 2, &hours);
         assert_eq!(
-            buffers.headroom(live * (1 + factor) + 2 * (1 + factor)),
+            buffers.headroom(live + margin + 2 * (1 + factor) + 2 * file_scratch),
             0,
-            "a log reservation keeps the log margin"
+            "a log reservation keeps the log margin, a file per hour included"
         );
         drop(reservation);
         let file = FileId(uuid::Uuid::from_u128(1));
@@ -1896,15 +1953,28 @@ mod tests {
             .unwrap();
         assert_eq!(
             buffers.scratch_total(),
-            live * factor,
+            margin,
             "the lease covers the sidecar"
         );
+        assert_eq!(buffers.flush_margin(), 0);
         drop(lease);
         buffers.flush_failed(logs, file, Instant::now());
-        assert_eq!(buffers.flush_margin(), live * factor);
+        assert_eq!(buffers.flush_margin(), margin);
         let (_, lease, _, _) = buffers.take_flushing(logs, file).unwrap();
-        assert_eq!(buffers.scratch_total(), live * factor, "a retry too");
+        assert_eq!(buffers.scratch_total(), margin, "a retry too");
         drop(lease);
+    }
+
+    #[test]
+    fn a_log_buffer_keeps_the_file_scratch_of_every_live_hour() {
+        let logs = Stream::logs(TenantId(uuid::Uuid::from_u128(8)));
+        let mut buffers = Buffers::default().with_text_file_scratch(100);
+        // The batch's own schema does not matter to the buffer: its hours do.
+        let batch = span_batch(&[H14, H14 + HOUR, H14 + 2 * HOUR]);
+        buffers.get_mut(logs).push(batch, at(10), Instant::now());
+        let live = buffers.total_bytes();
+        let factor = FLUSH_SCRATCH_FACTOR + TEXT_INDEX_SCRATCH_FACTOR;
+        assert_eq!(buffers.flush_margin(), live * factor + 3 * 100);
     }
 
     fn values(batches: &[RecordBatch]) -> Vec<i64> {

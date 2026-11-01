@@ -497,12 +497,19 @@ carries no bloom and is always read.
 The flush builds the sidecar of a log L0 file from the row groups it
 encodes, in its output buffer, after the Parquet object and before the
 catalog row. Log flushes hold one more copy of their input in the lease
-for it (`TEXT_INDEX_SCRATCH_FACTOR`), and admission keeps that room for log
-rows; whatever the builder may hold beyond that copy, its row-group
-descriptors and the folded copy of the longest body included
-(`TextIndexBuilder::memory_bound`), is held as scratch for the attempt. A
-sidecar already in place is compared with the prepared one chunk by chunk
-as it is read, never held whole beside it. The intent records the sizing (`FileLayout.text_index`), so a replay
+for it (`TEXT_INDEX_SCRATCH_FACTOR`): the sidecar's blooms never exceed
+the bodies' bytes or a group's floor, and with its row-group descriptors it
+fits that copy, since a log row holds more than the floor and two
+descriptors over three rows besides its body. Folding needs no buffer: a
+token is folded on the stack, and one longer than 256 bytes is hashed in
+streaming. What remains per file, the sidecar's prefix, one short row
+group, an 8 KiB range read and the streaming hash
+(`flush::text_index_file_scratch`), is kept by admission per live hour of a
+log stream, since a cut writes one file per hour, per waiting log flush,
+and in every log flush's lease, so a flush never holds memory admission
+did not set aside. A sidecar already in place is read back in ranges of
+`COMPARE_CHUNK` and compared, never held whole beside the prepared one,
+whatever the store would return for a whole read. The intent records the sizing (`FileLayout.text_index`), so a replay
 writes the same bytes; an intent logged without it writes no sidecar. A
 sidecar already there with other bytes gives the rows a fresh id, like a
 Parquet object with other bytes. The compactor builds one for each log L1

@@ -244,7 +244,12 @@ C5 landed after C6.
   `an_existing_object_is_compared_chunk_by_chunk`); the search time starts
   before the index lookup (`the_time_of_a_search_includes_its_index_lookup`);
   a search that cannot be measured publishes nothing; precision 1 has a
-  finite bucket.
+  finite bucket. Review round 2: the sidecar in place is read back in
+  ranges, the fold buffer is gone, and the per-file scratch is kept from
+  admission per live hour of a log stream instead of held during the
+  attempt (`a_retry_meets_its_sidecar_within_the_memory_cap`,
+  `a_log_buffer_keeps_the_file_scratch_of_every_live_hour`,
+  `a_text_sidecar_fits_one_copy_of_its_input_and_the_file_scratch`).
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two

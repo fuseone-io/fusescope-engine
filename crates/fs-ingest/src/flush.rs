@@ -268,51 +268,15 @@ fn text_builder(
     )?))
 }
 
-/// Most bytes building the text sidecar of `batches` under `layout` holds,
-/// zero when the layout writes none: what the flush must hold as scratch
-/// for it, the folded copy of the longest body included.
-///
-/// # Errors
-/// Rows without a timestamp or a body column, or a layout whose text
-/// sizing this engine does not write.
-pub fn text_index_memory(
-    stream: Stream,
-    root: &Path,
-    id: FileId,
-    batches: &[RecordBatch],
-    layout: &FileLayout,
-) -> Result<usize, IngestError> {
-    let Some(limits) = layout.text_limits()? else {
-        return Ok(0);
-    };
-    let schema = schema_of(stream.signal);
-    let start = earliest(batches, schema.index_of(col::TIMESTAMP)?).unwrap_or(0);
-    let path = l0_path_of(root, stream, Utc.timestamp_nanos(start), id);
-    let bodies = Bodies::of(batches)?;
-    let row_groups = bodies.rows.div_ceil(layout.row_group_rows.max(1));
-    Ok(fs_index::TextIndexBuilder::memory_bound(
-        path.as_ref(),
-        bodies.bytes,
-        row_groups,
-        bodies.longest,
-        limits,
-    ))
-}
-
 /// Sizes of the bodies of log batches.
 struct Bodies {
     bytes: usize,
-    longest: usize,
     rows: usize,
 }
 
 impl Bodies {
     fn of(batches: &[RecordBatch]) -> Result<Self, IngestError> {
-        let mut out = Self {
-            bytes: 0,
-            longest: 0,
-            rows: 0,
-        };
+        let mut out = Self { bytes: 0, rows: 0 };
         for batch in batches {
             let bodies = batch
                 .column(batch.schema().index_of(fs_schema::logs::col::BODY)?)
@@ -320,12 +284,6 @@ impl Bodies {
             let offsets = bodies.value_offsets();
             let span = offsets.last().copied().unwrap_or(0) - offsets.first().copied().unwrap_or(0);
             out.bytes += usize::try_from(span).unwrap_or(0);
-            let longest = offsets
-                .windows(2)
-                .map(|w| w.last().copied().unwrap_or(0) - w.first().copied().unwrap_or(0))
-                .max()
-                .unwrap_or(0);
-            out.longest = out.longest.max(usize::try_from(longest).unwrap_or(0));
             out.rows += batch.num_rows();
         }
         Ok(out)
@@ -594,38 +552,61 @@ pub async fn upload_index(
         if size != u64::try_from(index.len()).unwrap_or(u64::MAX) {
             return Err(mismatch());
         }
-        let existing = store
-            .get(&Path::from(index_path.as_str()))
-            .await?
-            .into_stream();
-        if !same_bytes(existing, index).await? {
+        if !same_bytes(store, &Path::from(index_path.as_str()), index).await? {
             return Err(mismatch());
         }
     }
     Ok(Some(outcome))
 }
 
-/// True when `stream` yields exactly `expected`, compared chunk by chunk
-/// as it arrives, so the object is never held whole beside it.
+/// Bytes of an existing object read at once to compare it, whatever the
+/// store would hand back for a whole read.
+pub const COMPARE_CHUNK: usize = 8 * 1024;
+
+/// True when the object at `path`, already known to be `expected.len()`
+/// long, holds exactly `expected`: read in ranges of [`COMPARE_CHUNK`], so
+/// at most one range is held beside the prepared bytes.
 ///
 /// # Errors
 /// Store failure while reading.
 pub async fn same_bytes(
-    mut stream: impl futures_util::Stream<Item = object_store::Result<Bytes>> + Unpin,
+    store: &dyn ObjectStore,
+    path: &Path,
     expected: &[u8],
 ) -> Result<bool, IngestError> {
-    use futures_util::StreamExt;
-    let mut at = 0usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let end = at.saturating_add(chunk.len());
-        if expected.get(at..end) != Some(chunk.as_ref()) {
+    for (i, part) in expected.chunks(COMPARE_CHUNK).enumerate() {
+        let start = (i * COMPARE_CHUNK) as u64;
+        let range = start..start + part.len() as u64;
+        if store.get_range(path, range).await?.as_ref() != part {
             return Ok(false);
         }
-        at = end;
     }
-    Ok(at == expected.len())
+    Ok(true)
 }
+
+/// Scratch the text sidecar of one log L0 file under `root` holds beyond
+/// its copy of the input, which bounds its bodies, its blooms of at most
+/// the bodies' bytes, and a floor and two descriptors per row group, since
+/// every log row holds more than that besides its body once a row group
+/// has three rows: the sidecar's prefix, one row group short of that, the
+/// range read to compare a sidecar already in place, and the streaming hash
+/// of a long token.
+pub fn text_index_file_scratch(root: &Path) -> usize {
+    let path = root.as_ref().len() + L0_LOG_PATH_LEN + 1;
+    let floor = usize::try_from(fs_index::text_index::MIN_GROUP_BYTES).unwrap_or(usize::MAX);
+    fs_index::TextIndexBuilder::encoded_bound(
+        &"x".repeat(path),
+        0,
+        1,
+        fs_index::TextIndexLimits::DEFAULT,
+    )
+    .saturating_add(floor + fs_index::text_index::GROUP_LEN)
+    .saturating_add(COMPARE_CHUNK)
+    .saturating_add(fs_index::text_index::STREAMING_HASH_BYTES)
+}
+
+/// Length of `t/{tenant}/logs/l0/dt=YYYY-MM-DD/hr=HH/{id}.parquet`.
+const L0_LOG_PATH_LEN: usize = 2 + 36 + 9 + 14 + 6 + 36 + 8;
 
 async fn put_once(
     store: &dyn ObjectStore,
@@ -705,6 +686,7 @@ mod tests {
     use fs_schema::limits::Limits;
     use fs_schema::spans::SpanBatchBuilder;
     use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -1059,70 +1041,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_text_sidecar_memory_covers_its_builder() {
-        let stream = Stream::logs(TenantId(uuid::Uuid::from_u128(0x7e5a)));
-        let id = FileId(uuid::Uuid::from_u128(0xf11e));
-        let limits = fs_index::TextIndexLimits::DEFAULT;
-        let layout = FileLayout::for_signal(RowSignal::Logs, 3, limits);
-        let memory =
-            text_index_memory(stream, &Path::from(""), id, &[log_batch()], &layout).unwrap();
-        let prepared = prepare_stream(stream, &Path::from(""), id, &[log_batch()], layout).unwrap();
-        let (_, sidecar) = prepared.index.unwrap();
-        // Five bodies, "web 0" to "api 2", five bytes each; two row groups.
-        assert_eq!(
-            memory,
-            fs_index::TextIndexBuilder::memory_bound(&prepared.file.path, 25, 2, 5, limits)
-        );
-        assert!(sidecar.len() <= memory);
-        assert_eq!(
-            text_index_memory(
-                stream,
-                &Path::from(""),
-                id,
-                &[log_batch()],
-                &FileLayout::current(3)
-            )
-            .unwrap(),
-            0
+    #[tokio::test]
+    async fn an_existing_object_is_compared_in_ranges() {
+        let store = InMemory::new();
+        let path = Path::from("x.ngb");
+        let expected: Vec<u8> = (0..3 * COMPARE_CHUNK + 5)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        store
+            .put(&path, PutPayload::from(expected.clone()))
+            .await
+            .unwrap();
+        assert!(same_bytes(&store, &path, &expected).await.unwrap());
+        let mut other = expected.clone();
+        *other.last_mut().unwrap() ^= 1;
+        assert!(!same_bytes(&store, &path, &other).await.unwrap());
+        assert!(
+            same_bytes(&store, &Path::from("missing"), &expected)
+                .await
+                .is_err()
         );
     }
 
-    #[tokio::test]
-    async fn an_existing_object_is_compared_chunk_by_chunk() {
-        let chunks = |parts: &[&'static [u8]]| {
-            futures_util::stream::iter(
-                parts
-                    .iter()
-                    .map(|p| Ok(Bytes::from_static(p)))
-                    .collect::<Vec<object_store::Result<Bytes>>>(),
-            )
-        };
-        let expected = b"abcdefgh";
+    /// Log rows hold more than a row group's floor and two descriptors
+    /// over three rows besides their bodies: the sidecar of rows with the
+    /// shortest bodies, in row groups of three, stays within one copy of the
+    /// input and the per-file scratch.
+    #[test]
+    fn a_text_sidecar_fits_one_copy_of_its_input_and_the_file_scratch() {
+        let stream = Stream::logs(TenantId(uuid::Uuid::from_u128(0x7e5a)));
+        let id = FileId(uuid::Uuid::from_u128(0xf11e));
+        let batch = log_batch();
+        let layout = FileLayout::for_signal(RowSignal::Logs, 3, fs_index::TextIndexLimits::DEFAULT);
+        let prepared = prepare_stream(
+            stream,
+            &Path::from(""),
+            id,
+            std::slice::from_ref(&batch),
+            layout,
+        )
+        .unwrap();
+        let rows = batch.num_rows();
+        let bound = fs_index::TextIndexBuilder::memory_bound(
+            &prepared.file.path,
+            25,
+            rows.div_ceil(3),
+            fs_index::TextIndexLimits::DEFAULT,
+        );
+        assert!(prepared.index.unwrap().1.len() <= bound);
         assert!(
-            same_bytes(chunks(&[b"abc", b"def", b"gh"]), expected)
-                .await
-                .unwrap()
+            bound <= batch.get_array_memory_size() + text_index_file_scratch(&Path::from("")),
+            "{bound} over {} + {}",
+            batch.get_array_memory_size(),
+            text_index_file_scratch(&Path::from(""))
         );
         assert!(
-            !same_bytes(chunks(&[b"abc", b"deX", b"gh"]), expected)
-                .await
-                .unwrap()
+            text_index_file_scratch(&Path::from("a/b")) > text_index_file_scratch(&Path::from(""))
         );
-        assert!(
-            !same_bytes(chunks(&[b"abc", b"defgh", b"i"]), expected)
-                .await
-                .unwrap()
-        );
-        assert!(!same_bytes(chunks(&[b"abc"]), expected).await.unwrap());
-        let failing = futures_util::stream::iter(vec![
-            Ok(Bytes::from_static(b"abc")),
-            Err(object_store::Error::Generic {
-                store: "test",
-                source: "cut".into(),
-            }),
-        ]);
-        assert!(same_bytes(failing, expected).await.is_err());
     }
 
     /// Five log rows of two services, the same on every call.

@@ -11,6 +11,7 @@
     clippy::panic
 )]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use fs_index::TextIndex;
 use fs_index::text_index::Probe;
 use fs_ingest::{IngestConfig, Ingester};
 use fs_wal::{Wal, WalConfig};
+use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -114,6 +116,15 @@ struct Harness {
 async fn start(catalog: &Catalog, dir: tempfile::TempDir, config: IngestConfig) -> Harness {
     std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    start_on(catalog, dir, config, store).await
+}
+
+async fn start_on(
+    catalog: &Catalog,
+    dir: tempfile::TempDir,
+    config: IngestConfig,
+    store: Arc<dyn ObjectStore>,
+) -> Harness {
     let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
     let ingester =
         Arc::new(Ingester::new(config, catalog.clone(), store, Path::from(""), wal).unwrap());
@@ -872,6 +883,189 @@ async fn a_text_sidecar_with_other_bytes_gives_the_rows_a_fresh_id() {
         2,
         "the damaged one is left to the sweep"
     );
+    h.stop().await;
+    db.finish().await;
+}
+
+/// A local bucket that refuses to read a text sidecar whole and notes the
+/// largest range read of one, as a store that would hand a whole object
+/// back in one piece would expose a second copy.
+#[derive(Debug)]
+struct RangesOnly {
+    inner: LocalFileSystem,
+    largest_range: std::sync::atomic::AtomicU64,
+    whole_reads: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Display for RangesOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RangesOnly({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for RangesOnly {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let sidecar = std::path::Path::new(location.as_ref())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ngb"));
+        if sidecar && !options.head {
+            let Some(object_store::GetRange::Bounded(range)) = &options.range else {
+                self.whole_reads.fetch_add(1, Ordering::Relaxed);
+                return Err(object_store::Error::Generic {
+                    store: "RangesOnly",
+                    source: "a text sidecar is never read whole".into(),
+                });
+            };
+            self.largest_range
+                .fetch_max(range.end - range.start, Ordering::Relaxed);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// `count` records of `name` with bodies of `body_bytes` of distinct words.
+fn big_logs(name: &str, count: u64, body_bytes: usize) -> ExportLogsServiceRequest {
+    let mut request = logs(name, count, 0, 0);
+    for (i, record) in request.resource_logs[0].scope_logs[0]
+        .log_records
+        .iter_mut()
+        .enumerate()
+    {
+        let mut body = String::with_capacity(body_bytes);
+        let mut n = i * 1_000_000;
+        while body.len() + 12 < body_bytes {
+            let _ = write!(body, "w{n:x} ");
+            n += 1;
+        }
+        record.body = Some(AnyValue {
+            value: Some(Value::StringValue(body)),
+        });
+    }
+    request
+}
+
+/// Under a tight memory cap, bodies of 64 KiB and a sidecar already in
+/// place at the retry: the retry reads the sidecar back in ranges only,
+/// the memory counted never passes the cap at any moment, and the flush
+/// completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_meets_its_sidecar_within_the_memory_cap() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    // Just above what admitting four rows of 64 KiB bodies needs: the
+    // rows, four copies for their flush and the file's sidecar scratch.
+    let cap = 1536 * 1024;
+    let config = IngestConfig {
+        inject_register_failures: 1,
+        checkpoint_after_flush: false,
+        max_memory_bytes: cap,
+        max_tenant_bytes: cap,
+        max_buffer_bytes: cap,
+        ..test_config()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(RangesOnly {
+        inner: LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap(),
+        largest_range: std::sync::atomic::AtomicU64::new(0),
+        whole_reads: std::sync::atomic::AtomicU64::new(0),
+    });
+    let h = start_on(&db.catalog, dir, config, store.clone()).await;
+    assert_eq!(
+        h.export_logs(big_logs("api", 4, 64 * 1024), &token).await,
+        0
+    );
+    h.ingester.flush_all().await;
+    let sidecars = files_under(&h.bucket(), "", "ngb");
+    assert_eq!(sidecars.len(), 1, "written before the registration failed");
+    let sidecar_len = std::fs::metadata(&sidecars[0]).unwrap().len();
+    let chunk = fs_ingest::flush::COMPARE_CHUNK as u64;
+    assert!(sidecar_len > 3 * chunk, "{sidecar_len}");
+    assert_eq!(db.files(tenant, Signal::Logs).await.len(), 0);
+
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = tokio::spawn({
+        let ingester = Arc::clone(&h.ingester);
+        let running = Arc::clone(&running);
+        async move {
+            let mut peak = 0usize;
+            while running.load(Ordering::Relaxed) {
+                peak = peak.max(ingester.memory_held().await);
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+            peak
+        }
+    });
+    h.ingester.flush_all().await;
+    running.store(false, Ordering::Relaxed);
+    let peak = sampler.await.unwrap();
+
+    assert_eq!(
+        db.files(tenant, Signal::Logs).await.len(),
+        1,
+        "the retry completed"
+    );
+    assert!(peak <= cap, "{peak} counted over the cap of {cap}");
+    assert!(peak > 0, "the sampler saw the attempt");
+    assert_eq!(store.whole_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(store.largest_range.load(Ordering::Relaxed), chunk);
+    let flush = h.ingester.flush_stats();
+    assert_eq!(flush.replay_mismatch.load(Ordering::Relaxed), 0);
     h.stop().await;
     db.finish().await;
 }

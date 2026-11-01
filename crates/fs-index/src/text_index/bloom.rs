@@ -22,9 +22,19 @@ pub fn wanted_bits(terms: u64) -> u64 {
         .saturating_mul(64)
 }
 
+/// The hash a term's bits come from.
+pub fn hash(term: &[u8]) -> u64 {
+    twox_hash::XxHash3_64::oneshot(term)
+}
+
 /// Sets the bits of `term` in `bloom`, `bits` long.
 pub fn insert(bloom: &mut [u8], bits: u64, hashes: u8, term: &[u8]) {
-    for bit in positions(term, bits, hashes) {
+    insert_hash(bloom, bits, hashes, hash(term));
+}
+
+/// Sets the bits of the term whose [`hash`] is `h`.
+pub fn insert_hash(bloom: &mut [u8], bits: u64, hashes: u8, h: u64) {
+    for bit in positions(h, bits, hashes) {
         if let Some(byte) = usize::try_from(bit / 8).ok().and_then(|i| bloom.get_mut(i)) {
             *byte |= 1 << (bit % 8);
         }
@@ -35,7 +45,7 @@ pub fn insert(bloom: &mut [u8], bits: u64, hashes: u8, term: &[u8]) {
 /// An empty bloom holds nothing.
 pub fn may_contain(bloom: &[u8], bits: u64, hashes: u8, term: &[u8]) -> bool {
     bits > 0
-        && positions(term, bits, hashes).all(|bit| {
+        && positions(hash(term), bits, hashes).all(|bit| {
             usize::try_from(bit / 8)
                 .ok()
                 .and_then(|i| bloom.get(i))
@@ -43,8 +53,7 @@ pub fn may_contain(bloom: &[u8], bits: u64, hashes: u8, term: &[u8]) -> bool {
         })
 }
 
-fn positions(term: &[u8], bits: u64, hashes: u8) -> impl Iterator<Item = u64> {
-    let h = twox_hash::XxHash3_64::oneshot(term);
+fn positions(h: u64, bits: u64, hashes: u8) -> impl Iterator<Item = u64> {
     (1..=u64::from(hashes)).map(move |j| mix(h.wrapping_add(j.wrapping_mul(GOLDEN))) % bits.max(1))
 }
 
