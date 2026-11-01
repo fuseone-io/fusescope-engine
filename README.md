@@ -1,4 +1,19 @@
-# fusescope-engine
+<p align="center">
+  <img alt="FuseScope" src=".github/brand/fusescope-logo-universal.svg" width="440">
+</p>
+
+<h1 align="center">FuseScope Engine</h1>
+
+<p align="center">
+  <b>Storage and query engine for OpenTelemetry traces, logs and metrics on object storage.</b>
+</p>
+
+<p align="center">
+  <a href="DESIGN.md">Design</a> ·
+  <a href="docs/ROADMAP.md">Roadmap</a> ·
+  <a href="https://datafusion.apache.org"><img alt="Rust" src="https://img.shields.io/badge/Rust-DataFusion-0f5fb8"></a>
+  <a href="https://github.com/fuseone-io/fusescope-engine/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/fuseone-io/fusescope-engine?color=950fb8"></a>
+</p>
 
 Storage and query engine for OpenTelemetry traces, logs and metrics on object
 storage. Built in Rust on Apache Arrow, Parquet and DataFusion. It is the
