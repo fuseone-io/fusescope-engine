@@ -919,7 +919,7 @@ confirmed more than the close delay ago, so a legacy file that crossed
 into the next day keeps that day open. It merges the day's L1 files,
 oldest first, up to `compactor.max_inputs_per_pass` and
 `compactor.max_l2_input_bytes` (16 GiB), with the k-way merge of section
-7.1, one decoded batch per input, into L2 files at
+7.1, reading 8192 rows of each input at a time, into L2 files at
 `{traces|logs}/l2/dt=…/{id}.parquet`, zstd level 7, the writer settings
 of L1 otherwise, each with its sidecar: `traces/index/trace_id/dt=…/{id}.tix`
 or `logs/index/ngram/dt=…/{id}.ngb`. A day larger than the cap closes over
@@ -928,16 +928,20 @@ as any other overlap. An output is written in memory and uploaded under
 the create-once rule, so it closes at `compactor.l2_target_bytes` (1 GiB)
 or at `compactor.l2_output_bytes` (512 MiB), whichever comes first: its
 encoded bytes, its row group in progress and its sidecar counted together.
-A sidecar never grows past its cap, `compactor.max_trace_index_bytes` for
-the trace ids, the text sidecar's own budget for logs: an output whose
-trace ids pass the cap is published without a `.tix`, and one whose
-distinct services pass `compactor.max_services_per_file` lists none, both
-read as unknown, so the file is scanned rather than memory exceeded. The
-pass counts no attribute key, summary or usage: its rows were counted
-when they left L0. Inputs are quarantined and outputs published in one
-fenced swap, with the crash boundaries of section 7.1. Each tick runs up
-to `PASSES_PER_TICK` L1 passes and, whatever their backlog, at least one
-and up to `compactor.l2_passes_per_tick` L2 passes. The rebuild of
+A sidecar never grows past its cap, `compactor.max_trace_index_bytes`
+(256 MiB) for the trace ids, the text sidecar's own budget for logs: an
+output whose trace ids pass the cap is published without a `.tix`
+(`fusescope_compaction_sidecars_over_cap_total`), and one whose distinct
+services pass `compactor.max_services_per_file` (10 000) lists none, both
+read as unknown, so the file is scanned rather than memory exceeded; the
+same caps bound L1 outputs. The pass counts no attribute key, summary or
+service graph, and usage only for an input written before usage was
+counted. Inputs are quarantined and outputs published in one fenced
+swap, with the crash boundaries of section 7.1. Each tick
+(`compaction_tick`) runs up to `compactor.l1_passes_per_tick` (64) L1
+passes, then, whatever their backlog, at least one and up to
+`compactor.l2_passes_per_tick` (1) L2 passes, then the accounting passes
+of section 7.3. The rebuild of
 `attribute_keys` and `log_attribute_keys` after retention reads the L1
 and L2 files that remain.
 

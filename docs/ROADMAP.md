@@ -251,11 +251,19 @@ C5 landed after C6.
   `a_log_buffer_keeps_the_file_scratch_of_every_live_hour`,
   `a_text_sidecar_fits_one_copy_of_its_input_and_the_file_scratch`).
   Closed after review round 2; issue #1 closed.
-- L1 to L2 compaction with zstd 7 and `usage_1h` (DESIGN 7.2, 7.3). In
-  progress: an hour of a single L0 file taken by L0 to L1, the
-  `usage_accounted` mark and usage logical bytes v1, `usage_1h`
-  contributions and table, the accounting pass, then the L2 pass.
-  Promotions from querier statistics need their own ADR.
+- L1 to L2 compaction with zstd 7 and `usage_1h` (DESIGN 7.2, 7.3). Done:
+  an hour of a single L0 file taken by L0 to L1; `usage_accounted`
+  (migration 0018) and usage logical bytes v1 (`fs_schema::usage`, pinned
+  per signal); `usage_1h` contributions in the swap of the pass that takes
+  a file off L0 and the SQL table summing them; the accounting pass for
+  legacy files and log L0 files with `compact_logs` off; retention held
+  for uncounted files (`crates/fs-compactor/tests/usage.rs`,
+  `usage_is_counted_once_and_holds_retention_until_then`); the L2 pass by
+  closed day (`l2_inputs`), zstd 7, outputs closed at their memory budget,
+  sidecars and service lists dropped past their caps, L2 paths of a day
+  parsed and swept, key rebuilds reading L1 and L2, and a fair tick
+  (`crates/fs-compactor/tests/l2.rs`). Promotions from querier statistics
+  need their own ADR.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two
   weeks without regression.

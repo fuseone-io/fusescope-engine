@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fs_catalog::{
-    Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, NewFile, Signal,
+    Catalog, CatalogError, Compaction, FileId, FileRecord, LeaseFence, Level, NewFile, Signal,
 };
 use fs_schema::attribute_keys::{KeyStats, KeyTable};
 use fs_schema::service_graph::ServiceGraphBuilder;
@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use crate::CompactError;
 use crate::derived::{key_table, read_table, table_file};
-use crate::merge::{L1Merger, MergeConfig};
+use crate::merge::{MergeConfig, Merger};
 use crate::objects::{CountsOrphans, OrphanGuard, create, take_injected};
 
 /// Hard ceiling for the two C6 builders retained by one pass together.
@@ -56,6 +56,26 @@ pub struct CompactionConfig {
     pub service_graph_max_bytes: usize,
     /// Rows per output row group.
     pub row_group_rows: usize,
+    /// Also merge closed days of L1 files into L2. Off, no L2 pass runs;
+    /// L2 files already written are read, expired and swept regardless.
+    pub compact_l2: bool,
+    /// An L2 file closes once it reaches this many bytes.
+    pub l2_target_bytes: usize,
+    /// An L2 file closes once what it holds in memory reaches this, its
+    /// encoded bytes, row group in progress and sidecar together.
+    pub l2_output_bytes: usize,
+    /// Most input bytes one L2 pass merges, a ceiling.
+    pub max_l2_input_bytes: u64,
+    /// L2 passes each tick runs, at least one, whatever the L1 backlog.
+    pub l2_passes_per_tick: usize,
+    /// L1 passes each tick runs at most.
+    pub l1_passes_per_tick: usize,
+    /// Most bytes of trace ids an output collects for its `trace_id`
+    /// sidecar; past it the output has none and is scanned.
+    pub max_trace_index_bytes: usize,
+    /// Most distinct services an output lists; past it the output lists
+    /// none, which pruning reads as unknown.
+    pub max_services_per_file: usize,
     /// Most `(hour, service)` pairs one pass counts usage for; a pass past
     /// it fails rather than drop a count.
     pub usage_max_entries: usize,
@@ -84,6 +104,11 @@ pub struct CompactorStats {
     pub passes: AtomicU64,
     /// Files whose usage an accounting pass counted.
     pub accounted: AtomicU64,
+    /// L2 passes that swapped outputs in.
+    pub l2_passes: AtomicU64,
+    /// Span outputs published without a `trace_id` sidecar, their trace
+    /// ids past `max_trace_index_bytes`.
+    pub sidecars_over_cap: AtomicU64,
     /// `usage_1h` contributions published, by compaction and accounting.
     pub usage_contributions: AtomicU64,
     /// Inputs merged by completed passes.
@@ -186,7 +211,7 @@ pub struct Compactor {
     pub(crate) root: Path,
     pub(crate) config: CompactionConfig,
     pub(crate) stats: Arc<CompactorStats>,
-    inject_swap_failures: AtomicU32,
+    pub(crate) inject_swap_failures: AtomicU32,
     /// Hours of a signal already reported as exceeding the input cap.
     reported: std::sync::Mutex<
         std::collections::HashSet<(fs_catalog::TenantId, Signal, chrono::DateTime<chrono::Utc>)>,
@@ -228,6 +253,11 @@ impl Compactor {
             reported: std::sync::Mutex::new(std::collections::HashSet::new()),
             derived_reported: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// The settings the passes run under.
+    pub fn config(&self) -> &CompactionConfig {
+        &self.config
     }
 
     /// The counters.
@@ -364,7 +394,7 @@ impl Compactor {
             .timestamp_nanos_opt()
             .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
         let max_new_keys = max_keys_hour.saturating_sub(table_before.admitted_in(hour_ns));
-        let mut merger = L1Merger::open(
+        let mut merger = Merger::open(
             Arc::clone(&self.store),
             &self.root,
             tenant,
@@ -372,8 +402,13 @@ impl Compactor {
             hour,
             &owned,
             MergeConfig {
+                level: Level::L1,
                 row_group_rows: self.config.row_group_rows,
+                read_batch_rows: self.config.row_group_rows,
                 target_bytes: self.config.l1_target_bytes,
+                output_bytes: usize::MAX,
+                max_trace_index_bytes: self.config.max_trace_index_bytes,
+                max_services_per_file: self.config.max_services_per_file,
                 max_new_keys,
                 trace_summary_max_traces: self.config.trace_summary_max_traces,
                 trace_summary_max_bytes: self.config.trace_summary_max_bytes,
@@ -693,7 +728,7 @@ impl Compactor {
         create(self.store.as_ref(), path, bytes).await
     }
 
-    fn count(&self, inputs: &[FileRecord], outputs: &[Published]) {
+    pub(crate) fn count(&self, inputs: &[FileRecord], outputs: &[Published]) {
         let s = &self.stats;
         s.passes.fetch_add(1, Ordering::Relaxed);
         s.inputs.fetch_add(inputs.len() as u64, Ordering::Relaxed);
@@ -730,9 +765,9 @@ fn bounded_derived_bytes(summary: usize, graph: usize) -> (usize, usize) {
 }
 
 /// An output already in the bucket, waiting for the swap.
-struct Published {
-    file: NewFile,
-    bytes: u64,
+pub(crate) struct Published {
+    pub(crate) file: NewFile,
+    pub(crate) bytes: u64,
 }
 
 #[cfg(test)]

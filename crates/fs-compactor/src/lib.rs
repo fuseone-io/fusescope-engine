@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs_catalog::Catalog;
+use fs_catalog::{Catalog, LeaseFence};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::watch;
@@ -23,10 +23,12 @@ use tracing::{info, warn};
 
 pub mod compact;
 mod derived;
+mod l2;
 pub mod lease;
 pub mod merge;
 mod objects;
 pub mod orphans;
+pub mod output;
 pub mod retention;
 mod usage;
 
@@ -236,20 +238,7 @@ async fn work_loop(
                 .await;
             }
             _ = compact.tick() => {
-                for _ in 0..PASSES_PER_TICK {
-                    let Some(fence) = leadership.fence() else {
-                        break;
-                    };
-                    match compactor.compact_once(&fence).await {
-                        Ok(Some(_)) => {}
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!(role = "compactor", error = %e, "compaction pass failed");
-                            break;
-                        }
-                    }
-                }
-                accounting_passes(&compactor, &leadership).await;
+                compaction_tick(&compactor, || leadership.fence()).await;
             }
             _ = expire.tick() => {
                 retention_passes(&retention, &leadership).await;
@@ -263,22 +252,62 @@ async fn work_loop(
     }
 }
 
-/// Accounting passes, after the tick's compaction, until nothing is left
-/// to count or the tick's share is spent.
-async fn accounting_passes(compactor: &Compactor, leadership: &Leadership) {
-    for _ in 0..PASSES_PER_TICK {
-        let Some(fence) = leadership.fence() else {
-            return;
-        };
-        match compactor.account_once(&fence).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
+/// Passes one compaction tick ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TickPasses {
+    /// L0 to L1 passes.
+    pub l1: usize,
+    /// L1 to L2 passes.
+    pub l2: usize,
+    /// Accounting passes.
+    pub accounted: usize,
+}
+
+/// One compaction tick: up to `l1_passes_per_tick` L0 to L1 passes, then,
+/// however long the L1 backlog, up to `l2_passes_per_tick` L1 to L2 passes,
+/// at least one, then up to [`PASSES_PER_TICK`] accounting passes. Each
+/// kind stops at its first `None` or failure; `fence` gives the lease's
+/// fence before every pass, and none ends the tick.
+pub async fn compaction_tick(
+    compactor: &Compactor,
+    fence: impl Fn() -> Option<LeaseFence>,
+) -> TickPasses {
+    let mut ran = TickPasses::default();
+    let config = compactor.config();
+    for _ in 0..config.l1_passes_per_tick {
+        let Some(f) = fence() else { return ran };
+        match compactor.compact_once(&f).await {
+            Ok(Some(_)) => ran.l1 += 1,
+            Ok(None) => break,
             Err(e) => {
-                warn!(role = "compactor", error = %e, "usage accounting pass failed");
-                return;
+                warn!(role = "compactor", error = %e, "compaction pass failed");
+                break;
             }
         }
     }
+    for _ in 0..config.l2_passes_per_tick.max(1) {
+        let Some(f) = fence() else { return ran };
+        match compactor.compact_l2_once(&f).await {
+            Ok(Some(_)) => ran.l2 += 1,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "L2 pass failed");
+                break;
+            }
+        }
+    }
+    for _ in 0..PASSES_PER_TICK {
+        let Some(f) = fence() else { return ran };
+        match compactor.account_once(&f).await {
+            Ok(Some(_)) => ran.accounted += 1,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "usage accounting pass failed");
+                break;
+            }
+        }
+    }
+    ran
 }
 
 /// Expiry passes until nothing is beyond its cut, then stale tables

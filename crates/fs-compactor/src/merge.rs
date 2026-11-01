@@ -21,27 +21,27 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, SchemaRef, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use chrono::{DateTime, TimeZone, Utc};
-use fs_catalog::{FileId, FileRecord, Level, NewFile, Signal, TenantId, TimeRange};
-use fs_index::TraceIndex;
+use chrono::{DateTime, Utc};
+use fs_catalog::{FileId, FileRecord, Level, Signal, TenantId};
 use fs_schema::attribute_keys::KeyStats;
 use fs_schema::logs::log_schema_v1;
-use fs_schema::parquet::{gather, log_writer_properties, writer_properties};
+use fs_schema::parquet::gather;
 use fs_schema::service_graph::ServiceGraphBuilder;
-use fs_schema::spans::{TRACE_ID_BYTES, col, span_schema_v1, trace_ids};
+use fs_schema::spans::{col, span_schema_v1};
 use fs_schema::trace_summary::TraceSummaries;
 use fs_schema::usage::{UsageCounts, UsageSignal};
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStream};
-use parquet::arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
 use crate::CompactError;
+use crate::output::{Output, OutputBuilder};
 
 /// The usage signal of rows of `signal`, `None` for one without usage.
 pub(crate) fn usage_signal(signal: Signal) -> Option<UsageSignal> {
@@ -52,24 +52,28 @@ pub(crate) fn usage_signal(signal: Signal) -> Option<UsageSignal> {
     }
 }
 
-/// One L1 file ready to upload with its catalog row and sidecar.
-pub struct Output {
-    /// Catalog row.
-    pub file: NewFile,
-    /// Parquet bytes.
-    pub bytes: Bytes,
-    /// Where the sidecar goes and its bytes: the `trace_id` sidecar of a
-    /// span file, the text sidecar of a log file.
-    pub index: Option<(String, Bytes)>,
-}
-
 /// Bounds of one merge.
 #[derive(Debug, Clone, Copy)]
 pub struct MergeConfig {
+    /// The level of the outputs: L1 from the L0 files of an hour, L2 from
+    /// the L1 files of a day. Keys, summaries and the service graph are
+    /// built at L1 only.
+    pub level: Level,
     /// Rows per output row group.
     pub row_group_rows: usize,
+    /// Rows read from an input at a time.
+    pub read_batch_rows: usize,
     /// An output closes once its bytes reach this.
     pub target_bytes: usize,
+    /// An output closes once what it holds in memory reaches this: its
+    /// encoded bytes, its row group in progress and its sidecar.
+    pub output_bytes: usize,
+    /// Most bytes of trace ids an output collects for its `trace_id`
+    /// sidecar; past it the output has none.
+    pub max_trace_index_bytes: usize,
+    /// Most distinct services an output lists; past it the output lists
+    /// none, read as unknown.
+    pub max_services_per_file: usize,
     /// Most keys new to the `attribute_keys` table this merge admits: what
     /// is left of the tenant's `max_keys_hour` for the hour being merged.
     pub max_new_keys: usize,
@@ -88,9 +92,10 @@ pub struct MergeConfig {
     pub usage_max_entries: usize,
 }
 
-/// Merges L0 files of one tenant, signal and hour into L1 outputs, one at
-/// a time.
-pub struct L1Merger {
+/// Merges files of one tenant and signal into outputs of the next level,
+/// one at a time: the L0 files of an hour into L1, the L1 files of a day
+/// into L2.
+pub struct Merger {
     signal: Signal,
     schema: SchemaRef,
     merge: Merge,
@@ -107,9 +112,9 @@ pub struct L1Merger {
     graph: ServiceGraphBuilder,
 }
 
-impl L1Merger {
-    /// Opens `inputs`, all L0 files of `signal` of `tenant` in the hour
-    /// starting at `hour`; outputs go under `root`. `keys` is the tenant's
+impl Merger {
+    /// Opens `inputs`, the files of `signal` of `tenant` in the hour, or
+    /// for L2 the day, starting at `hour`; outputs go under `root`. `keys` is the tenant's
     /// table of attribute keys of that signal before, which the merge
     /// counts into. Trace summaries and the service graph are built from
     /// spans only.
@@ -134,7 +139,7 @@ impl L1Merger {
             _ => return Err(CompactError::Merge("a signal without L1 files")),
         };
         let usage = usage_signal(signal).map(|s| (s, config.usage_max_entries));
-        let merge = Merge::open(store, inputs, &schema, config.row_group_rows, usage).await?;
+        let merge = Merge::open(store, inputs, &schema, config.read_batch_rows, usage).await?;
         let hour_ns = hour
             .timestamp_nanos_opt()
             .ok_or(CompactError::Merge("hour outside the nanosecond range"))?;
@@ -188,16 +193,22 @@ impl L1Merger {
             return Ok(None);
         }
         let id = FileId::new();
-        let path = l1_path(&self.root, self.tenant, self.signal, self.hour, id);
+        let path = match self.config.level {
+            Level::L2 => l2_path(&self.root, self.tenant, self.signal, self.hour, id),
+            _ => l1_path(&self.root, self.tenant, self.signal, self.hour, id),
+        };
         let mut current = OutputBuilder::new(&self.schema, self.signal, id, path, &self.config)?;
+        let derived = self.config.level == Level::L1;
         while let Some(group) = self
             .merge
             .next_group(&self.schema, self.config.row_group_rows)
             .await?
         {
-            self.keys
-                .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
-            if self.signal == Signal::Traces {
+            if derived {
+                self.keys
+                    .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
+            }
+            if derived && self.signal == Signal::Traces {
                 self.summaries.absorb(
                     &group,
                     self.config.trace_summary_max_traces,
@@ -210,7 +221,9 @@ impl L1Merger {
                 )?;
             }
             current.write(&group)?;
-            if current.bytes_written() >= self.config.target_bytes {
+            if current.bytes_written() >= self.config.target_bytes
+                || current.memory() >= self.config.output_bytes
+            {
                 return Ok(Some(current.finish(self.tenant)?));
             }
         }
@@ -232,6 +245,28 @@ pub fn l1_path(
 ) -> Path {
     let kind = format!("{}/l1", signal.path_name());
     partitioned_path(root, tenant, &kind, hour, id)
+}
+
+/// `{root}/t/{tenant}/{traces|logs}/l2/dt=YYYY-MM-DD/{id}.parquet`
+pub fn l2_path(
+    root: &Path,
+    tenant: TenantId,
+    signal: Signal,
+    day: DateTime<Utc>,
+    id: FileId,
+) -> Path {
+    let relative = format!(
+        "t/{}/{}/l2/dt={}/{}.parquet",
+        tenant.0,
+        signal.path_name(),
+        day.format("%Y-%m-%d"),
+        id.0
+    );
+    if root.as_ref().is_empty() {
+        Path::from(relative)
+    } else {
+        Path::from(format!("{root}/{relative}"))
+    }
 }
 
 /// `{root}/t/{tenant}/derived/{attribute_keys|log_attribute_keys}/dt=YYYY-MM-DD/hr=HH/{id}.parquet`,
@@ -578,137 +613,5 @@ impl Merge {
                 *slot = None;
             }
         }
-    }
-}
-
-/// One L1 file being written.
-struct OutputBuilder {
-    signal: Signal,
-    id: FileId,
-    path: Path,
-    writer: ArrowWriter<Vec<u8>>,
-    text: Option<fs_index::TextIndexBuilder>,
-    rows: usize,
-    ts_min: i64,
-    ts_max: i64,
-    services: BTreeSet<String>,
-    traces: Vec<[u8; TRACE_ID_BYTES]>,
-}
-
-impl OutputBuilder {
-    /// The output `id` at its L1 `path`.
-    fn new(
-        schema: &SchemaRef,
-        signal: Signal,
-        id: FileId,
-        path: Path,
-        config: &MergeConfig,
-    ) -> Result<Self, CompactError> {
-        let row_group_rows = config.row_group_rows;
-        let properties = if signal == Signal::Logs {
-            log_writer_properties(row_group_rows)?
-        } else {
-            writer_properties(row_group_rows)?
-        };
-        let writer = ArrowWriter::try_new(Vec::new(), Arc::clone(schema), Some(properties))?;
-        // Grows with the row groups; a pass's outputs are not sized ahead.
-        let text = (signal == Signal::Logs)
-            .then(|| fs_index::TextIndexBuilder::new(path.as_ref(), config.text_index, 0, 0))
-            .transpose()?;
-        Ok(Self {
-            signal,
-            id,
-            path,
-            writer,
-            text,
-            rows: 0,
-            ts_min: i64::MAX,
-            ts_max: i64::MIN,
-            services: BTreeSet::new(),
-            traces: Vec::new(),
-        })
-    }
-
-    fn write(&mut self, group: &RecordBatch) -> Result<(), CompactError> {
-        let schema = group.schema();
-        let ts = group
-            .column(schema.index_of(col::TIMESTAMP)?)
-            .as_primitive::<TimestampNanosecondType>();
-        self.ts_min = self
-            .ts_min
-            .min(arrow::compute::min(ts).unwrap_or(self.ts_min));
-        self.ts_max = self
-            .ts_max
-            .max(arrow::compute::max(ts).unwrap_or(self.ts_max));
-        let service = arrow::compute::cast(
-            group.column(schema.index_of(col::SERVICE_NAME)?),
-            &DataType::Utf8,
-        )?;
-        for value in service.as_string::<i32>().iter().flatten() {
-            if !self.services.contains(value) {
-                self.services.insert(value.to_owned());
-            }
-        }
-        if self.signal == Signal::Traces {
-            if let Some(ids) = trace_ids(group) {
-                self.traces.extend(ids);
-            }
-        }
-        self.writer.write(group)?;
-        self.writer.flush()?;
-        if let Some(text) = self.text.as_mut() {
-            let bodies = group
-                .column(schema.index_of(fs_schema::logs::col::BODY)?)
-                .as_string::<i32>();
-            text.add_row_group((0..bodies.len()).map(|i| bodies.value(i).as_bytes()))?;
-        }
-        self.rows += group.num_rows();
-        Ok(())
-    }
-
-    fn bytes_written(&self) -> usize {
-        self.writer.bytes_written()
-    }
-
-    fn finish(mut self, tenant: TenantId) -> Result<Output, CompactError> {
-        let bytes = Bytes::from(self.writer.into_inner()?);
-        let (id, path) = (self.id, self.path);
-        let content_sha256 = crate::objects::sha256(&bytes);
-        let no_sidecar = || CompactError::Merge("output path has no sidecar");
-        let index = if let Some(text) = self.text {
-            let index_path =
-                fs_index::text_index::sidecar_path(path.as_ref()).ok_or_else(no_sidecar)?;
-            Some((index_path, Bytes::from(text.finish(content_sha256)?)))
-        } else if self.signal == Signal::Traces {
-            let index_path = fs_index::sidecar_path(path.as_ref()).ok_or_else(no_sidecar)?;
-            self.traces.sort_unstable();
-            self.traces.dedup();
-            let index = TraceIndex::new(
-                vec![path.to_string()],
-                self.traces.iter().map(|t| (*t, 0u32)),
-            )?;
-            Some((index_path, Bytes::from(index.encode())))
-        } else {
-            None
-        };
-        let file = NewFile {
-            id,
-            origin: id,
-            tenant_id: tenant,
-            signal: self.signal,
-            level: Level::L1,
-            path: path.to_string(),
-            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-            row_count: i64::try_from(self.rows).unwrap_or(i64::MAX),
-            range: TimeRange {
-                start: Utc.timestamp_nanos(self.ts_min),
-                end: Utc.timestamp_nanos(self.ts_max),
-            },
-            services: self.services.into_iter().collect(),
-            summary: None,
-            content_sha256: Some(content_sha256),
-            usage_accounted: true,
-        };
-        Ok(Output { file, bytes, index })
     }
 }

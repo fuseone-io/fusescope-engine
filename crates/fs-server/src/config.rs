@@ -560,6 +560,34 @@ fn default_usage_max_entries() -> usize {
     100_000
 }
 
+fn default_l2_target_bytes() -> usize {
+    1 << 30
+}
+
+fn default_l2_output_bytes() -> usize {
+    512 << 20
+}
+
+fn default_max_l2_input_bytes() -> u64 {
+    16 << 30
+}
+
+fn default_l2_passes_per_tick() -> usize {
+    1
+}
+
+fn default_l1_passes_per_tick() -> usize {
+    64
+}
+
+fn default_max_trace_index_bytes() -> usize {
+    256 << 20
+}
+
+fn default_max_services_per_file() -> usize {
+    10_000
+}
+
 fn default_text_index_bytes_per_file() -> usize {
     fs_index::TextIndexLimits::DEFAULT.max_bytes_per_file
 }
@@ -748,6 +776,32 @@ pub struct CompactorConfig {
     /// it fails rather than drop a count.
     #[serde(default = "default_usage_max_entries")]
     pub usage_max_entries: usize,
+    /// Also merge closed days of L1 files into L2. Off by default; once an
+    /// L2 file is published the binary is not rolled back past this
+    /// version.
+    #[serde(default)]
+    pub compact_l2: bool,
+    /// An L2 file closes once it reaches this many bytes.
+    #[serde(default = "default_l2_target_bytes")]
+    pub l2_target_bytes: usize,
+    /// An L2 file closes once what it holds in memory reaches this.
+    #[serde(default = "default_l2_output_bytes")]
+    pub l2_output_bytes: usize,
+    /// Most input bytes one L2 pass merges.
+    #[serde(default = "default_max_l2_input_bytes")]
+    pub max_l2_input_bytes: u64,
+    /// L2 passes each tick runs, at least one, whatever the L1 backlog.
+    #[serde(default = "default_l2_passes_per_tick")]
+    pub l2_passes_per_tick: usize,
+    /// L1 passes each tick runs at most.
+    #[serde(default = "default_l1_passes_per_tick")]
+    pub l1_passes_per_tick: usize,
+    /// Most bytes of trace ids an output collects for its sidecar.
+    #[serde(default = "default_max_trace_index_bytes")]
+    pub max_trace_index_bytes: usize,
+    /// Most distinct services an output lists.
+    #[serde(default = "default_max_services_per_file")]
+    pub max_services_per_file: usize,
     /// How often the bucket is swept for objects without a catalog row.
     #[serde(default = "default_orphan_interval")]
     pub orphan_interval_secs: u64,
@@ -815,6 +869,14 @@ impl Default for CompactorConfig {
             text_index_max_bytes_per_row_group: default_text_index_bytes_per_row_group(),
             text_index_max_bytes_per_file: default_text_index_bytes_per_file(),
             usage_max_entries: default_usage_max_entries(),
+            compact_l2: false,
+            l2_target_bytes: default_l2_target_bytes(),
+            l2_output_bytes: default_l2_output_bytes(),
+            max_l2_input_bytes: default_max_l2_input_bytes(),
+            l2_passes_per_tick: default_l2_passes_per_tick(),
+            l1_passes_per_tick: default_l1_passes_per_tick(),
+            max_trace_index_bytes: default_max_trace_index_bytes(),
+            max_services_per_file: default_max_services_per_file(),
             orphan_interval_secs: default_orphan_interval(),
             orphan_ttl_secs: default_orphan_ttl(),
             sweep_objects_per_pass: default_sweep_objects(),
@@ -868,6 +930,14 @@ impl CompactorConfig {
                 row_group_rows,
                 text_index: self.text_index_limits().unwrap_or_default(),
                 usage_max_entries: self.usage_max_entries,
+                compact_l2: self.compact_l2,
+                l2_target_bytes: self.l2_target_bytes,
+                l2_output_bytes: self.l2_output_bytes,
+                max_l2_input_bytes: self.max_l2_input_bytes,
+                l2_passes_per_tick: self.l2_passes_per_tick,
+                l1_passes_per_tick: self.l1_passes_per_tick,
+                max_trace_index_bytes: self.max_trace_index_bytes,
+                max_services_per_file: self.max_services_per_file,
                 compact_logs: self.compact_logs,
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
@@ -1134,12 +1204,28 @@ impl Config {
         Ok(())
     }
 
-    fn validate_compactor(&self) -> Result<(), ServerError> {
+    /// The bounds of the text sidecars, the usage counts and the L2 passes.
+    fn validate_compactor_passes(&self) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
         self.compactor.text_index_limits()?;
         if self.compactor.usage_max_entries == 0 {
             return invalid("compactor.usage_max_entries must be positive");
         }
+        if self.compactor.l2_output_bytes == 0
+            || self.compactor.l2_target_bytes == 0
+            || self.compactor.max_l2_input_bytes == 0
+            || self.compactor.l1_passes_per_tick == 0
+        {
+            return invalid(
+                "compactor.l2_output_bytes, l2_target_bytes, max_l2_input_bytes and l1_passes_per_tick must be positive",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_compactor(&self) -> Result<(), ServerError> {
+        let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
+        self.validate_compactor_passes()?;
         let derived_bytes = self
             .compactor
             .trace_summary_max_bytes

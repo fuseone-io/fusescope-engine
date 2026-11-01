@@ -585,6 +585,18 @@ fn render_usage(out: &mut String, c: &fs_compactor::CompactorStats) {
         "usage_1h contributions published by compaction and accounting passes",
         c.usage_contributions.load(Ordering::Relaxed),
     );
+    counter(
+        out,
+        "fusescope_compaction_l2_passes_total",
+        "L1 to L2 passes that swapped outputs in",
+        c.l2_passes.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_compaction_sidecars_over_cap_total",
+        "Span outputs published without a trace_id sidecar, their trace ids past the cap",
+        c.sidecars_over_cap.load(Ordering::Relaxed),
+    );
 }
 
 fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
