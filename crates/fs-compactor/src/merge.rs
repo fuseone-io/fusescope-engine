@@ -115,6 +115,9 @@ pub struct Merger {
     /// Most bytes the inputs and the output held together, counted before
     /// each row group.
     peak: usize,
+    /// A row group whose usage counting stopped at a full count, with the
+    /// rows to count and the row to resume at.
+    pending: Option<(RecordBatch, Vec<bool>, usize)>,
 }
 
 /// What a merge hands back at each step.
@@ -174,6 +177,7 @@ impl Merger {
             graph: ServiceGraphBuilder::default(),
             current: None,
             peak: 0,
+            pending: None,
         })
     }
 
@@ -181,6 +185,12 @@ impl Merger {
     /// group, as the merge counts them.
     pub fn peak_bytes(&self) -> usize {
         self.peak
+    }
+
+    /// Most bytes of usage counts the merge held at once, a full count
+    /// being handed out included.
+    pub fn usage_peak_bytes(&self) -> usize {
+        self.merge.usage_peak
     }
 
     /// The `attribute_keys` table with every row merged so far counted
@@ -218,9 +228,6 @@ impl Merger {
     /// Store, Parquet or Arrow failures, or an input whose columns are not
     /// the signal's schema.
     pub async fn next_step(&mut self) -> Result<Option<Step>, CompactError> {
-        if let Some(full) = self.merge.usage_full.pop() {
-            return Ok(Some(Step::Usage(full)));
-        }
         if self.done {
             return Ok(self
                 .current
@@ -231,46 +238,38 @@ impl Merger {
                 .map(|o| Step::Output(Box::new(o))));
         }
         let group_bytes = self.config.output_bytes / 4;
-        let derived = self.config.level == Level::L1;
         loop {
             if self.current.is_none() {
                 self.current = Some(self.new_output()?);
             }
-            let held = self.merge.held_bytes();
             let output = self.current.as_ref().map_or(0, OutputBuilder::memory);
-            self.peak = self.peak.max(held.saturating_add(output));
-            let room = held
-                .saturating_add(output)
-                .saturating_add(group_bytes.saturating_mul(2));
-            if self.current.as_ref().is_some_and(|c| c.rows > 0) && room > self.config.output_bytes
-            {
-                return self.close();
-            }
-            let Some(group) = self
-                .merge
-                .next_group(&self.schema, self.config.row_group_rows, group_bytes)
-                .await?
-            else {
-                self.done = true;
-                return Ok(self
-                    .close()?
-                    .or(self.merge.usage_full.pop().map(Step::Usage)));
+            let (group, take, from) = if let Some(pending) = self.pending.take() {
+                pending
+            } else {
+                let held = self.merge.held_bytes();
+                self.peak = self.peak.max(held.saturating_add(output));
+                let room = held
+                    .saturating_add(output)
+                    .saturating_add(group_bytes.saturating_mul(2));
+                if self.current.as_ref().is_some_and(|c| c.rows > 0)
+                    && room > self.config.output_bytes
+                {
+                    return self.close();
+                }
+                let Some((group, take)) = self
+                    .merge
+                    .next_group(&self.schema, self.config.row_group_rows, group_bytes)
+                    .await?
+                else {
+                    self.done = true;
+                    return self.close();
+                };
+                self.absorb_derived(&group)?;
+                (group, take, 0)
             };
-            if derived {
-                self.keys
-                    .absorb(&group, self.hour_ns, self.config.max_new_keys)?;
-            }
-            if derived && self.signal == Signal::Traces {
-                self.summaries.absorb(
-                    &group,
-                    self.config.trace_summary_max_traces,
-                    self.config.trace_summary_max_bytes,
-                )?;
-                self.graph.absorb(
-                    &group,
-                    self.config.service_graph_max_spans,
-                    self.config.service_graph_max_bytes,
-                )?;
+            if let Some((full, next)) = self.merge.count_usage(&group, from, &take)? {
+                self.pending = Some((group, take, next));
+                return Ok(Some(Step::Usage(full)));
             }
             let gathered = group.get_array_memory_size();
             self.peak = self.peak.max(
@@ -289,10 +288,30 @@ impl Merger {
             if full {
                 return self.close();
             }
-            if let Some(counts) = self.merge.usage_full.pop() {
-                return Ok(Some(Step::Usage(counts)));
-            }
         }
+    }
+
+    /// Counts `group` into the keys, and for spans the summaries and the
+    /// service graph, at L1.
+    fn absorb_derived(&mut self, group: &RecordBatch) -> Result<(), CompactError> {
+        if self.config.level != Level::L1 {
+            return Ok(());
+        }
+        self.keys
+            .absorb(group, self.hour_ns, self.config.max_new_keys)?;
+        if self.signal == Signal::Traces {
+            self.summaries.absorb(
+                group,
+                self.config.trace_summary_max_traces,
+                self.config.trace_summary_max_bytes,
+            )?;
+            self.graph.absorb(
+                group,
+                self.config.service_graph_max_spans,
+                self.config.service_graph_max_bytes,
+            )?;
+        }
+        Ok(())
     }
 
     /// The output being written, finished; `None` when it holds no row.
@@ -398,6 +417,7 @@ type Service = Option<Arc<str>>;
 
 /// A loaded row group of one input with its sort keys.
 struct Slot {
+    input: usize,
     batch: RecordBatch,
     services: Vec<Service>,
     timestamps: Vec<i64>,
@@ -406,7 +426,7 @@ struct Slot {
 }
 
 impl Slot {
-    fn load(batch: RecordBatch, schema: &SchemaRef) -> Result<Self, CompactError> {
+    fn load(input: usize, batch: RecordBatch, schema: &SchemaRef) -> Result<Self, CompactError> {
         let batch = coerce(batch, schema)?;
         let service = arrow::compute::cast(
             batch.column(schema.index_of(col::SERVICE_NAME)?),
@@ -434,6 +454,7 @@ impl Slot {
             + services.capacity() * std::mem::size_of::<Service>()
             + timestamps.capacity() * std::mem::size_of::<i64>();
         Ok(Self {
+            input,
             batch,
             services,
             timestamps,
@@ -590,8 +611,7 @@ struct Merge {
     usage: Option<UsageCounts>,
     uncounted: Vec<bool>,
     usage_budget: usize,
-    /// Counts set aside full, waiting to be published.
-    usage_full: Vec<UsageCounts>,
+    usage_peak: usize,
 }
 
 impl Merge {
@@ -613,7 +633,7 @@ impl Merge {
             usage: counts,
             uncounted,
             usage_budget: usage.map_or(0, |(_, budget)| budget),
-            usage_full: Vec::new(),
+            usage_peak: 0,
         };
         for file in files {
             let stream = batches(Arc::clone(&store), file, batch_rows, batch_bytes).await?;
@@ -656,10 +676,9 @@ impl Merge {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let loaded = Slot::load(batch, schema)?;
+            let loaded = Slot::load(input, batch, schema)?;
             let slot = self.slots.len();
             next.slot = Some(slot);
-            self.count_usage(input, &loaded.batch)?;
             self.slots.push(Some(loaded));
             row = 0;
         }
@@ -670,26 +689,35 @@ impl Merge {
         self.slots.iter().flatten().map(|s| s.bytes).sum()
     }
 
-    /// Counts `batch` of `input` into the usage when the input was not
-    /// counted before.
-    fn count_usage(&mut self, input: usize, batch: &RecordBatch) -> Result<(), CompactError> {
-        let (Some(usage), Some(true)) = (self.usage.as_mut(), self.uncounted.get(input).copied())
-        else {
-            return Ok(());
+    /// Counts the rows `take` flags of `group`, from `from`, into the
+    /// usage; the counts set aside full and the row to resume at when the
+    /// budget stops it.
+    fn count_usage(
+        &mut self,
+        group: &RecordBatch,
+        from: usize,
+        take: &[bool],
+    ) -> Result<Option<(UsageCounts, usize)>, CompactError> {
+        let Some(usage) = self.usage.as_mut().filter(|_| take.contains(&true)) else {
+            return Ok(None);
         };
-        usage.absorb_within(batch, self.usage_budget, &mut self.usage_full)?;
-        Ok(())
+        let full = usage.absorb_from(group, from, self.usage_budget, Some(take))?;
+        let held =
+            usage.estimated_bytes() + full.as_ref().map_or(0, |(full, _)| full.estimated_bytes());
+        self.usage_peak = self.usage_peak.max(held);
+        Ok(full)
     }
 
     /// The next output row group in sort order, at most `rows` rows and,
     /// by the bytes per row of the slots it takes from, about `max_bytes`,
-    /// one row at least; `None` when every input is spent.
+    /// one row at least, with which of its rows come from inputs whose
+    /// usage was not counted; `None` when every input is spent.
     async fn next_group(
         &mut self,
         schema: &SchemaRef,
         rows: usize,
         max_bytes: usize,
-    ) -> Result<Option<RecordBatch>, CompactError> {
+    ) -> Result<Option<(RecordBatch, Vec<bool>)>, CompactError> {
         let mut picked: Vec<(usize, usize)> = Vec::new();
         let mut bytes = 0usize;
         while picked.len() < rows && (picked.is_empty() || bytes < max_bytes) {
@@ -708,9 +736,20 @@ impl Merge {
         if picked.is_empty() {
             return Ok(None);
         }
+        let take = picked
+            .iter()
+            .map(|(slot, _)| {
+                self.slots
+                    .get(*slot)
+                    .and_then(Option::as_ref)
+                    .and_then(|s| self.uncounted.get(s.input))
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .collect();
         let group = self.gather(schema, &picked)?;
         self.drop_spent();
-        Ok(Some(group))
+        Ok(Some((group, take)))
     }
 
     /// Gathers `(slot, row)` picks into one batch, remapping slots to the

@@ -151,6 +151,9 @@ impl Compactor {
         self.stats
             .l2_peak_bytes
             .fetch_max(merger.peak_bytes() as u64, Ordering::Relaxed);
+        self.stats
+            .usage_peak_bytes
+            .fetch_max(merger.usage_peak_bytes() as u64, Ordering::Relaxed);
         drop(merger);
         if let Some(counts) = rest {
             counted.extend(

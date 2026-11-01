@@ -210,9 +210,37 @@ fn per_row<O: arrow::array::OffsetSizeTrait>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageCounts {
     signal: UsageSignal,
-    entries: BTreeMap<(i64, Option<String>), (u64, u64)>,
+    hours: BTreeMap<i64, HourCounts>,
     /// What the entries hold, by [`UsageCounts::entry_bytes`].
     bytes: usize,
+}
+
+/// `(rows, bytes)` of one hour: of rows without a service, then by
+/// service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HourCounts {
+    unnamed: Option<(u64, u64)>,
+    named: BTreeMap<String, (u64, u64)>,
+}
+
+impl HourCounts {
+    fn get_mut(&mut self, service: Option<&str>) -> Option<&mut (u64, u64)> {
+        match service {
+            None => self.unnamed.as_mut(),
+            Some(name) => self.named.get_mut(name),
+        }
+    }
+
+    fn insert(&mut self, service: Option<&str>) -> &mut (u64, u64) {
+        match service {
+            None => self.unnamed.insert((0, 0)),
+            Some(name) => self.named.entry(name.to_owned()).or_insert((0, 0)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.named.len() + usize::from(self.unnamed.is_some())
+    }
 }
 
 /// Bytes an entry holds besides its service name: its tree node, key and
@@ -224,7 +252,7 @@ impl UsageCounts {
     pub fn new(signal: UsageSignal) -> Self {
         Self {
             signal,
-            entries: BTreeMap::new(),
+            hours: BTreeMap::new(),
             bytes: 0,
         }
     }
@@ -246,12 +274,12 @@ impl UsageCounts {
 
     /// Distinct `(hour, service)` pairs counted.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.hours.values().map(HourCounts::len).sum()
     }
 
     /// True when nothing was counted.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.hours.is_empty()
     }
 
     /// Counts every row of `batch`, by the hour of its `timestamp` and its
@@ -261,23 +289,29 @@ impl UsageCounts {
     /// A batch without those columns, a type the version does not size, or
     /// an overflow.
     pub fn absorb(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
-        let mut never = Vec::new();
-        self.absorb_within(batch, usize::MAX, &mut never)
+        match self.absorb_from(batch, 0, usize::MAX, None)? {
+            None => Ok(()),
+            Some(_) => Err(SchemaError::Layout("usage counts past an unbounded budget")),
+        }
     }
 
-    /// [`Self::absorb`] within `budget` bytes: before a new pair would take
-    /// the counts past it, the counts so far are moved to `full` and
-    /// counting goes on from none, so every row is counted once across
-    /// `full` and `self`, each within the budget, or holding one pair.
+    /// Counts the rows of `batch` from `from` on, those `take` flags when
+    /// given, within `budget` bytes. Before a new pair would take the
+    /// counts past it, counting stops: the counts so far are handed back
+    /// with the row to resume at, not counted yet, and `self` starts from
+    /// none, so a caller holds one full count at a time and every row is
+    /// counted once. A count holds one pair at least. `None` once the rows
+    /// are counted.
     ///
     /// # Errors
     /// As [`Self::absorb`].
-    pub fn absorb_within(
+    pub fn absorb_from(
         &mut self,
         batch: &RecordBatch,
+        from: usize,
         budget: usize,
-        full: &mut Vec<UsageCounts>,
-    ) -> Result<(), SchemaError> {
+        take: Option<&[bool]>,
+    ) -> Result<Option<(UsageCounts, usize)>, SchemaError> {
         let bytes = row_bytes(batch, self.signal)?;
         let ts = batch
             .column_by_name("timestamp")
@@ -291,21 +325,48 @@ impl UsageCounts {
             &DataType::Utf8,
         )?;
         let services = services.as_string::<i32>();
-        for (row, size) in bytes.into_iter().enumerate() {
+        for (row, size) in bytes.into_iter().enumerate().skip(from) {
+            if take.is_some_and(|take| !take.get(row).copied().unwrap_or(false)) {
+                continue;
+            }
             let hour = ts.value(row).div_euclid(HOUR_NANOS) * HOUR_NANOS;
             let name = services.is_valid(row).then(|| services.value(row));
-            let key = (hour, name.map(str::to_owned));
-            if !self.entries.contains_key(&key) {
+            let known = self
+                .hours
+                .get_mut(&hour)
+                .and_then(|h| h.get_mut(name))
+                .is_some();
+            if !known {
                 let cost = Self::entry_bytes(name.unwrap_or_default());
-                if !self.entries.is_empty() && self.bytes.saturating_add(cost) > budget {
-                    full.push(std::mem::replace(self, Self::new(self.signal)));
+                if !self.is_empty() && self.bytes.saturating_add(cost) > budget {
+                    let full = std::mem::replace(self, Self::new(self.signal));
+                    return Ok(Some((full, row)));
                 }
-                self.bytes = self.bytes.saturating_add(cost);
             }
-            let entry = self.entries.entry(key).or_insert((0, 0));
-            entry.0 = entry.0.checked_add(1).ok_or(OVERFLOW)?;
-            entry.1 = entry.1.checked_add(size).ok_or(OVERFLOW)?;
+            self.add(hour, name, 1, size)?;
         }
+        Ok(None)
+    }
+
+    /// Adds `rows` and `bytes` to `(hour, service)`.
+    fn add(
+        &mut self,
+        hour: i64,
+        service: Option<&str>,
+        rows: u64,
+        bytes: u64,
+    ) -> Result<(), SchemaError> {
+        let counts = self.hours.entry(hour).or_default();
+        let entry = if let Some(entry) = counts.get_mut(service) {
+            entry
+        } else {
+            self.bytes = self
+                .bytes
+                .saturating_add(Self::entry_bytes(service.unwrap_or_default()));
+            counts.insert(service)
+        };
+        entry.0 = entry.0.checked_add(rows).ok_or(OVERFLOW)?;
+        entry.1 = entry.1.checked_add(bytes).ok_or(OVERFLOW)?;
         Ok(())
     }
 
@@ -317,31 +378,34 @@ impl UsageCounts {
         if other.signal != self.signal {
             return Err(SchemaError::Layout("usage counts of another signal"));
         }
-        for (key, (rows, bytes)) in other.entries {
-            if !self.entries.contains_key(&key) {
-                self.bytes = self
-                    .bytes
-                    .saturating_add(Self::entry_bytes(key.1.as_deref().unwrap_or_default()));
+        for (hour, counts) in other.hours {
+            if let Some((rows, bytes)) = counts.unnamed {
+                self.add(hour, None, rows, bytes)?;
             }
-            let entry = self.entries.entry(key).or_insert((0, 0));
-            entry.0 = entry.0.checked_add(rows).ok_or(OVERFLOW)?;
-            entry.1 = entry.1.checked_add(bytes).ok_or(OVERFLOW)?;
+            for (service, (rows, bytes)) in counts.named {
+                self.add(hour, Some(&service), rows, bytes)?;
+            }
         }
         Ok(())
     }
 
     /// The hours counted, as nanoseconds since the epoch, in order.
     pub fn hours(&self) -> Vec<i64> {
-        let mut hours: Vec<i64> = self.entries.keys().map(|(hour, _)| *hour).collect();
-        hours.dedup();
-        hours
+        self.hours.keys().copied().collect()
     }
 
-    /// `(service, rows, bytes)` of `hour`, services in order.
+    /// `(service, rows, bytes)` of `hour`, services in order, no service
+    /// first.
     pub fn of_hour(&self, hour: i64) -> impl Iterator<Item = (Option<&str>, u64, u64)> {
-        self.entries
-            .range((hour, None)..(hour.saturating_add(1), None))
-            .map(|((_, service), (rows, bytes))| (service.as_deref(), *rows, *bytes))
+        let counts = self.hours.get(&hour);
+        let unnamed = counts
+            .and_then(|c| c.unnamed)
+            .map(|(rows, bytes)| (None, rows, bytes));
+        let named = counts
+            .into_iter()
+            .flat_map(|c| c.named.iter())
+            .map(|(service, (rows, bytes))| (Some(service.as_str()), *rows, *bytes));
+        unnamed.into_iter().chain(named)
     }
 
     /// The contribution of `hour` as a batch of format v1.

@@ -127,6 +127,9 @@ pub struct CompactorStats {
     /// Most bytes one L2 merge held, inputs and output together, as the
     /// merge counts them before each row group.
     pub l2_peak_bytes: AtomicU64,
+    /// Most bytes of usage counts one pass held at once, by
+    /// `UsageCounts::entry_bytes`.
+    pub usage_peak_bytes: AtomicU64,
     /// Span outputs published without a `trace_id` sidecar, their trace
     /// ids past `max_trace_index_bytes`.
     pub sidecars_over_cap: AtomicU64,
@@ -467,6 +470,9 @@ impl Compactor {
                 ),
             }
         }
+        self.stats
+            .usage_peak_bytes
+            .fetch_max(merger.usage_peak_bytes() as u64, Ordering::Relaxed);
         let contributions = DerivedContributions {
             keys: merger.take_keys(),
             summaries: merger.take_trace_summaries(),

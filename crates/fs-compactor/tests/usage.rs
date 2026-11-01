@@ -10,6 +10,7 @@
 )]
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arrow::array::{Array, AsArray};
@@ -649,15 +650,24 @@ async fn counts_past_their_budget_become_several_contributions_and_the_pass_goes
     }
     let want = expected(&f, &inputs);
     let budget = 4 * fs_schema::usage::UsageCounts::entry_bytes("service-000");
-    let c = compactor(
-        &f,
+    let stats = Arc::new(CompactorStats::default());
+    let c = Compactor::new(
+        f.db.catalog.clone(),
+        f.store.clone(),
+        Path::from(""),
         CompactionConfig {
             usage_max_bytes: budget,
             ..config()
         },
+        Arc::clone(&stats),
     );
     let me = fence(&f).await;
     while c.compact_once(&me).await.unwrap().is_some() {}
+    let held = stats.usage_peak_bytes.load(Ordering::Relaxed);
+    assert!(
+        held > 0 && held <= budget as u64,
+        "{held} bytes of counts held, budget {budget}: every input opened, one count at a time"
+    );
     let contributions =
         f.db.catalog
             .all_visible_files(f.tenant, Signal::Usage1h)
@@ -697,6 +707,7 @@ async fn counts_past_their_budget_become_several_contributions_and_the_pass_goes
         counted += done.contributions;
     }
     assert!(counted >= 10, "{counted} contributions");
+    assert!(stats.usage_peak_bytes.load(Ordering::Relaxed) <= budget as u64);
     assert_eq!(totals(&usage(&f).await), want);
     f.db.finish().await;
 }

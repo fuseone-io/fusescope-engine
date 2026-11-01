@@ -228,11 +228,19 @@ impl Compactor {
             )
             .await?;
             while let Some(batch) = stream.next().await.transpose()? {
-                let mut full = Vec::new();
-                counts.absorb_within(&batch, self.config.usage_max_bytes, &mut full)?;
-                for part in full {
+                let mut from = 0;
+                while let Some((part, next)) =
+                    counts.absorb_from(&batch, from, self.config.usage_max_bytes, None)?
+                {
+                    self.stats
+                        .usage_peak_bytes
+                        .fetch_max(part.estimated_bytes() as u64, Ordering::Relaxed);
                     published.extend(self.publish_usage(tenant, part, guard, puts).await?);
+                    from = next;
                 }
+                self.stats
+                    .usage_peak_bytes
+                    .fetch_max(counts.estimated_bytes() as u64, Ordering::Relaxed);
             }
         }
         published.extend(self.publish_usage(tenant, counts, guard, puts).await?);
