@@ -250,6 +250,7 @@ C5 landed after C6.
   attempt (`a_retry_meets_its_sidecar_within_the_memory_cap`,
   `a_log_buffer_keeps_the_file_scratch_of_every_live_hour`,
   `a_text_sidecar_fits_one_copy_of_its_input_and_the_file_scratch`).
+  Closed after review round 2; issue #1 closed.
 - L1 to L2 compaction with zstd 7 and promoted columns; `usage_1h`.
 - Go: logs views on the Flight provider; logs diff against ClickHouse.
 - Exit: logs view and service map served by the engine in staging for two

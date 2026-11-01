@@ -509,7 +509,10 @@ log stream, since a cut writes one file per hour, per waiting log flush,
 and in every log flush's lease, so a flush never holds memory admission
 did not set aside. A sidecar already in place is read back in ranges of
 `COMPARE_CHUNK` and compared, never held whole beside the prepared one,
-whatever the store would return for a whole read. The intent records the sizing (`FileLayout.text_index`), so a replay
+whatever the store would return for a whole read. Admission charges the
+per-file scratch for every hour of a request, also hours the buffer or
+another reservation already holds: safe, but it can refuse or flush early
+near the cap; charging only new hours is left for later. The intent records the sizing (`FileLayout.text_index`), so a replay
 writes the same bytes; an intent logged without it writes no sidecar. A
 sidecar already there with other bytes gives the rows a fresh id, like a
 Parquet object with other bytes. The compactor builds one for each log L1
