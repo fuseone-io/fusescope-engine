@@ -228,8 +228,9 @@ impl Compactor {
 
     /// Compacts the oldest cold hour with at least two L0 files of one
     /// signal, spans before logs within an hour, up to the configured
-    /// inputs, and swaps the outputs in under `fence`. An hour whose two
-    /// oldest files exceed the input cap is passed over, reported once,
+    /// inputs, and swaps the outputs in under `fence`; an hour of a single
+    /// file is rewritten too. An hour whose oldest file exceeds the input
+    /// cap is passed over, reported once,
     /// and the next hour of either signal is tried. `None` when nothing
     /// qualifies.
     ///
@@ -249,13 +250,13 @@ impl Compactor {
         let (candidate, inputs) = loop {
             let Some(candidate) = self
                 .catalog
-                .compaction_inputs(signals, self.config.hour_close_delay, 2, skip)
+                .compaction_inputs(signals, self.config.hour_close_delay, 1, skip)
                 .await?
             else {
                 return Ok(None);
             };
             let taken = self.taken(&candidate.files);
-            if taken >= 2 {
+            if taken >= 1 {
                 break (candidate, taken);
             }
             self.report_over_cap(candidate.tenant_id, candidate.signal, candidate.hour);
@@ -286,8 +287,8 @@ impl Compactor {
         result.map(Some)
     }
 
-    /// Counts and warns once per hour of a signal whose two oldest files
-    /// exceed the cap.
+    /// Counts and warns once per hour of a signal whose oldest file
+    /// exceeds the cap.
     fn report_over_cap(
         &self,
         tenant: fs_catalog::TenantId,

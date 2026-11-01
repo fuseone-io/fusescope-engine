@@ -471,6 +471,36 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     f.db.finish().await;
 }
 
+/// An hour of a single cold L0 file is rewritten as one L1 file, so the
+/// hour's keys are counted within the close delay and no L0 stays behind.
+#[tokio::test]
+async fn an_hour_of_a_single_l0_file_becomes_one_l1_file() {
+    let Some(f) = fixture().await else { return };
+    let h = nanos(closed_hour());
+    let lone = write_l0(
+        &f.db.catalog,
+        &f.store,
+        f.tenant,
+        &[request("api", 9, h, 4)],
+        4,
+    )
+    .await;
+    registered_an_hour_ago(&f, std::slice::from_ref(&lone)).await;
+    let c = compactor(&f, config(4));
+    let me = fence(&f).await;
+    let done = c.compact_once(&me).await.unwrap().unwrap();
+    assert_eq!(done.inputs, [lone.id]);
+    let now = visible(&f).await;
+    assert_eq!(now.len(), 1);
+    assert_eq!(now[0].level, Level::L1);
+    assert_eq!(now[0].row_count, lone.row_count);
+    assert!(
+        c.compact_once(&me).await.unwrap().is_none(),
+        "an L1 file is not taken again"
+    );
+    f.db.finish().await;
+}
+
 #[tokio::test]
 async fn outputs_close_at_the_target_size() {
     let Some(f) = fixture().await else { return };
@@ -786,10 +816,10 @@ async fn a_pass_takes_the_oldest_inputs_up_to_its_limit() {
         now.iter().any(|x| x.id == inputs[2].id),
         "the newest stays as L0"
     );
-    assert!(
-        c.compact_once(&fence(&f).await).await.unwrap().is_none(),
-        "one L0 left: not enough to compact"
-    );
+    let rest = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    // Its inputs also name the attribute_keys table the pass replaces.
+    assert_eq!(rest.inputs[0], inputs[2].id, "the one left is taken alone");
+    assert!(c.compact_once(&fence(&f).await).await.unwrap().is_none());
     f.db.finish().await;
 }
 
@@ -1022,12 +1052,13 @@ async fn a_null_service_sorts_before_an_empty_one_across_inputs() {
     f.db.finish().await;
 }
 
-/// The input byte cap is a ceiling: an hour whose two oldest files do not
-/// fit is skipped and counted, not compacted over the cap.
+/// The input byte cap is a ceiling: an hour whose oldest file does not fit
+/// is skipped and counted, not compacted over the cap.
 #[tokio::test]
 async fn the_input_cap_is_a_ceiling() {
     let Some(f) = fixture().await else { return };
     let inputs = three_closed_l0(&f, 4).await;
+    let oldest = u64::try_from(inputs[0].size_bytes).unwrap();
     let smallest_pair: u64 = inputs
         .iter()
         .take(2)
@@ -1036,7 +1067,7 @@ async fn the_input_cap_is_a_ceiling() {
     let c = compactor(
         &f,
         CompactionConfig {
-            max_input_bytes: smallest_pair - 1,
+            max_input_bytes: oldest - 1,
             ..config(4)
         },
     );
@@ -1079,27 +1110,22 @@ async fn an_hour_over_the_cap_does_not_block_later_hours() {
         );
     }
     registered_an_hour_ago(&f, &later).await;
-    let pair: u64 = stuck
-        .iter()
-        .take(2)
-        .map(|x| u64::try_from(x.size_bytes).unwrap())
-        .sum();
+    let oldest = u64::try_from(stuck[0].size_bytes).unwrap();
     let c = compactor(
         &f,
         CompactionConfig {
-            max_input_bytes: pair - 1,
+            max_input_bytes: oldest - 1,
             ..config(4)
         },
     );
     let me = fence(&f).await;
-    let done = c.compact_once(&me).await.unwrap().unwrap();
-    assert_eq!(
-        done.inputs,
-        later.iter().map(|x| x.id).collect::<Vec<_>>(),
-        "the later hour"
-    );
-    assert_eq!(c.stats().skipped.load(Ordering::Relaxed), 1);
-    assert!(c.compact_once(&me).await.unwrap().is_none());
+    let mut taken = Vec::new();
+    while let Some(done) = c.compact_once(&me).await.unwrap() {
+        taken.extend(done.inputs);
+    }
+    let later_ids: Vec<_> = later.iter().map(|x| x.id).collect();
+    taken.retain(|id| later_ids.contains(id) || stuck.iter().any(|x| x.id == *id));
+    assert_eq!(taken, later_ids, "the later hour, oldest first");
     assert_eq!(
         c.stats().skipped.load(Ordering::Relaxed),
         1,
