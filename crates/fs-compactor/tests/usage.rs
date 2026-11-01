@@ -568,3 +568,69 @@ async fn the_table_sums_every_contribution_of_a_key() {
     assert!(fields[1].2, "service_name is nullable");
     f.db.finish().await;
 }
+
+/// A contribution whose footer is valid but whose rows are not, a signal
+/// other than spans or logs, fails the query instead of being summed.
+#[tokio::test]
+async fn a_contribution_with_rows_outside_the_domain_fails_the_query() {
+    use arrow::array::{StringArray, TimestampNanosecondArray, UInt8Array, UInt64Array};
+    let Some(f) = fixture(15).await else { return };
+    let hour = i64::try_from(closed_hour()).unwrap();
+    let batch = RecordBatch::try_new(
+        fs_schema::usage::schema(),
+        vec![
+            Arc::new(UInt8Array::from(vec![3u8])),
+            Arc::new(StringArray::from(vec![Some("api")])),
+            Arc::new(TimestampNanosecondArray::from(vec![hour]).with_timezone("UTC")),
+            Arc::new(UInt64Array::from(vec![1u64])),
+            Arc::new(UInt64Array::from(vec![1u64])),
+        ],
+    )
+    .unwrap();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = writer.into_inner().unwrap();
+    let id = fs_catalog::FileId::new();
+    let path = format!(
+        "t/{}/derived/usage_1h/dt=2026-10-24/hr=14/{}.parquet",
+        f.tenant.0, id.0
+    );
+    std::fs::create_dir_all(f.dir.path().join(&path).parent().unwrap()).unwrap();
+    std::fs::write(f.dir.path().join(&path), &bytes).unwrap();
+    let start = Utc.timestamp_nanos(hour);
+    f.db.catalog
+        .register_file(&fs_catalog::NewFile {
+            id,
+            origin: id,
+            tenant_id: f.tenant,
+            signal: Signal::Usage1h,
+            level: Level::L1,
+            path,
+            size_bytes: i64::try_from(bytes.len()).unwrap(),
+            row_count: 1,
+            range: fs_catalog::TimeRange {
+                start,
+                end: start + chrono::Duration::minutes(59),
+            },
+            services: vec!["api".into()],
+            summary: None,
+            content_sha256: None,
+            usage_accounted: true,
+        })
+        .await
+        .unwrap();
+    let querier = Querier::new(
+        f.db.catalog.clone(),
+        f.store.clone(),
+        None,
+        QueryLimits::default(),
+    )
+    .unwrap();
+    let err = querier
+        .collect(f.tenant, "select * from usage_1h")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("usage_1h"), "{err}");
+    f.db.finish().await;
+}

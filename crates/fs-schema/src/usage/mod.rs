@@ -373,6 +373,57 @@ pub fn check_schema(found: &Schema) -> Result<(), SchemaError> {
 /// rows and bytes.
 pub type UsageRow = (u8, Option<String>, i64, u64, u64);
 
+/// The columns [`check_rows`] reads.
+pub const ROW_KEY_COLUMNS: &[&str] = &[columns::SIGNAL, columns::SERVICE_NAME, columns::HOUR];
+
+/// Refuses rows a sum would misread: a signal other than spans or logs,
+/// an hour not on the hour, or a `(signal, service, hour)` the file lists
+/// twice, which would count it twice. `batches` are the whole file, with
+/// at least [`ROW_KEY_COLUMNS`].
+///
+/// # Errors
+/// A row as above, or a batch without those columns.
+pub fn check_rows(batches: &[RecordBatch]) -> Result<(), SchemaError> {
+    let mut seen = std::collections::HashSet::new();
+    for batch in batches {
+        let column = |name: &str| {
+            batch.column_by_name(name).ok_or(SchemaError::Layout(
+                "usage_1h rows without their key columns",
+            ))
+        };
+        let signal = column(columns::SIGNAL)?
+            .as_primitive_opt::<arrow::datatypes::UInt8Type>()
+            .ok_or(SchemaError::Layout("usage_1h signal"))?;
+        let service = column(columns::SERVICE_NAME)?
+            .as_string_opt::<i32>()
+            .ok_or(SchemaError::Layout("usage_1h service_name"))?;
+        let hour = column(columns::HOUR)?
+            .as_primitive_opt::<TimestampNanosecondType>()
+            .ok_or(SchemaError::Layout("usage_1h hour"))?;
+        for i in 0..batch.num_rows() {
+            if !matches!(signal.value(i), 1 | 2) {
+                return Err(SchemaError::Layout(
+                    "usage_1h row of a signal other than spans or logs",
+                ));
+            }
+            if hour.value(i).rem_euclid(HOUR_NANOS) != 0 {
+                return Err(SchemaError::Layout(
+                    "usage_1h row of an hour not on the hour",
+                ));
+            }
+            let key = (
+                signal.value(i),
+                service.is_valid(i).then(|| service.value(i).to_owned()),
+                hour.value(i),
+            );
+            if !seen.insert(key) {
+                return Err(SchemaError::Layout("usage_1h key listed twice in one file"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Encodes the contribution of `hour`.
 ///
 /// # Errors
@@ -392,13 +443,14 @@ pub fn encode_hour(counts: &UsageCounts, hour: i64) -> Result<Vec<u8>, SchemaErr
 /// Decodes and validates a contribution into `(signal, service, hour, rows, bytes)` rows.
 ///
 /// # Errors
-/// It is not a `usage_1h` format-v1 file.
+/// It is not a `usage_1h` format-v1 file, or [`check_rows`] refuses it.
 pub fn decode(bytes: bytes::Bytes) -> Result<Vec<UsageRow>, SchemaError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
     check_schema(builder.schema())?;
+    let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
+    check_rows(&batches)?;
     let mut out = Vec::new();
-    for batch in builder.build()? {
-        let batch = batch?;
+    for batch in batches {
         let signal = batch
             .column(0)
             .as_primitive::<arrow::datatypes::UInt8Type>();

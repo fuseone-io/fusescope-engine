@@ -42,14 +42,15 @@ use crate::prune::Pruning;
 /// Refuses a file schema the table's reader does not know.
 pub type SchemaCheck = fn(&arrow::datatypes::Schema) -> Result<(), SchemaError>;
 
-/// Refuses rows the table's reader would misread: `check` sees every
-/// batch of a file projected to `columns`.
+/// Refuses rows the table's reader would misread: `check` sees the whole
+/// file at once, its batches projected to `columns`, so it can refuse a
+/// key a file lists twice.
 #[derive(Clone, Copy)]
 pub struct RowCheck {
     /// The columns `check` reads.
     pub columns: &'static [&'static str],
     /// Refuses a batch.
-    pub check: fn(&arrow::record_batch::RecordBatch) -> Result<(), SchemaError>,
+    pub check: fn(&[arrow::record_batch::RecordBatch]) -> Result<(), SchemaError>,
 }
 
 /// Per path, whether its footer and rows passed the checks, shared by every
@@ -185,14 +186,14 @@ async fn check_rows(
         .with_projection(mask)
         .build()
         .map_err(datafusion::error::DataFusionError::from)?;
+    let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
-        let batch = batch.map_err(datafusion::error::DataFusionError::from)?;
-        (rows.check)(&batch).map_err(|source| QueryError::DerivedTable {
-            path: file.path.clone(),
-            source,
-        })?;
+        batches.push(batch.map_err(datafusion::error::DataFusionError::from)?);
     }
-    Ok(())
+    (rows.check)(&batches).map_err(|source| QueryError::DerivedTable {
+        path: file.path.clone(),
+        source,
+    })
 }
 
 /// Fetches byte ranges of one object of `size` bytes for the Parquet

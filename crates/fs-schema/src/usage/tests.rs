@@ -8,6 +8,7 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use super::*;
 use crate::limits::Limits;
+use parquet::arrow::ArrowWriter;
 
 /// 2026-10-24T14:17:03Z.
 const T0: u64 = 1_792_678_623_000_000_000;
@@ -172,4 +173,62 @@ fn another_schema_or_bytes_version_is_refused() {
     let other = Schema::new_with_metadata(schema().fields().clone(), metadata);
     assert!(check_schema(&other).is_err());
     assert!(check_schema(&schema()).is_ok());
+}
+
+/// A contribution of format v1 with `rows`, written in batches of `split`.
+fn contribution(rows: &[(u8, Option<&str>, i64)], split: usize) -> bytes::Bytes {
+    let mut writer = ArrowWriter::try_new(Vec::new(), schema(), None).unwrap();
+    for part in rows.chunks(split) {
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(UInt8Array::from(
+                    part.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    part.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(
+                    TimestampNanosecondArray::from(part.iter().map(|r| r.2).collect::<Vec<_>>())
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(UInt64Array::from(vec![1u64; part.len()])),
+                Arc::new(UInt64Array::from(vec![1u64; part.len()])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    bytes::Bytes::from(writer.into_inner().unwrap())
+}
+
+#[test]
+fn a_contribution_with_rows_outside_the_domain_is_refused() {
+    let hour = 1_792_677_600_000_000_000i64;
+    let good = contribution(
+        &[
+            (1, Some("api"), hour),
+            (1, None, hour),
+            (2, Some("api"), hour),
+        ],
+        1,
+    );
+    assert_eq!(decode(good).unwrap().len(), 3);
+    for (rows, why) in [
+        (vec![(3u8, Some("api"), hour)], "signal 3"),
+        (vec![(0, Some("api"), hour)], "signal 0"),
+        (vec![(1, Some("api"), hour + 1)], "an hour not on the hour"),
+        (
+            vec![(1, Some("api"), hour), (1, Some("api"), hour)],
+            "a key counted twice",
+        ),
+        (
+            vec![(1, None, hour), (1, None, hour)],
+            "no service, counted twice",
+        ),
+    ] {
+        // One row per batch: the check sees the whole file.
+        assert!(decode(contribution(&rows, 1)).is_err(), "{why}");
+    }
 }

@@ -174,7 +174,11 @@ fn usage_table(
         usage::check_schema,
         verified,
     )
-    .with_time_columns(&[columns::HOUR]);
+    .with_time_columns(&[columns::HOUR])
+    .with_row_check(RowCheck {
+        columns: usage::ROW_KEY_COLUMNS,
+        check: usage::check_rows,
+    });
     let total = |column: &'static str| {
         cast(sum(col(column)), arrow::datatypes::DataType::UInt64).alias(column)
     };
@@ -210,7 +214,11 @@ fn keys_table(
             |schema| attribute_keys::check_schema(schema, KeyTable::Spans).map(|_| ()),
             RowCheck {
                 columns: KEY_ROW_COLUMNS,
-                check: |batch| attribute_keys::check_rows(batch, KeyTable::Spans),
+                check: |batches| {
+                    batches
+                        .iter()
+                        .try_for_each(|b| attribute_keys::check_rows(b, KeyTable::Spans))
+                },
             },
         ),
         KeyTable::Logs => (
@@ -218,7 +226,11 @@ fn keys_table(
             |schema| attribute_keys::check_schema(schema, KeyTable::Logs).map(|_| ()),
             RowCheck {
                 columns: KEY_ROW_COLUMNS,
-                check: |batch| attribute_keys::check_rows(batch, KeyTable::Logs),
+                check: |batches| {
+                    batches
+                        .iter()
+                        .try_for_each(|b| attribute_keys::check_rows(b, KeyTable::Logs))
+                },
             },
         ),
     };
