@@ -260,11 +260,12 @@ C5 landed after C6.
   for uncounted files (`crates/fs-compactor/tests/usage.rs`,
   `usage_is_counted_once_and_holds_retention_until_then`); the L2 pass by
   closed day (`l2_inputs`), a day of one L1 beside L2 files taken again,
-  zstd 7, the whole pass held to `l2_output_bytes` (probe-sized input
-  batches, byte-bounded groups, `l2_peak_bytes`), usage counts held to
-  `usage_max_bytes` and set aside as extra contributions, contributions
-  checked row by row in decode and SQL, pass knobs capped inside the
-  compactor,
+  zstd 7, the whole pass held to `l2_output_bytes` (input chunks planned
+  from the page index, groups sized by their rows, outputs in fixed
+  buffers, `a_day_whose_first_rows_are_narrow_merges_within_its_budget`),
+  usage counted on merged groups with one full count held at a time,
+  contributions checked streamed by key order in decode and SQL, pass
+  knobs capped inside the compactor,
   sidecars and service lists dropped past their caps, L2 paths of a day
   parsed and swept, key rebuilds reading L1 and L2, and a fair tick
   (`crates/fs-compactor/tests/l2.rs`). Promotions from querier statistics

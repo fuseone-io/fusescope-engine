@@ -919,7 +919,7 @@ confirmed more than the close delay ago, so a legacy file that crossed
 into the next day keeps that day open. It merges the day's L1 files,
 oldest first, up to `compactor.max_inputs_per_pass` and
 `compactor.max_l2_input_bytes` (16 GiB), with the k-way merge of section
-7.1, reading 8192 rows of each input at a time, into L2 files at
+7.1, into L2 files at
 `{traces|logs}/l2/dt=…/{id}.parquet`, zstd level 7, the writer settings
 of L1 otherwise, each with its sidecar: `traces/index/trace_id/dt=…/{id}.tix`
 or `logs/index/ngram/dt=…/{id}.ngb`. A day larger than the cap closes over
@@ -927,14 +927,34 @@ several passes into L2 files whose ranges overlap, which pruning handles
 as any other overlap. An output is written in memory and uploaded under
 the create-once rule, so it closes at `compactor.l2_target_bytes` (1 GiB)
 or at `compactor.l2_output_bytes` (512 MiB), whichever comes first. That
-budget bounds what the pass holds, not only the output: the decoded batch
-of each input, sized by reading a 1-row and a 16-row probe so its fixed
-and per-row costs are both counted, the group being gathered, itself held
-to a quarter of the budget, and the output's encoded bytes, row group in
-progress, service names and sidecar with the copies `finish` makes. An
-output closes before the next group would take the total past the budget,
-so the floor is one batch per input; the highest total a pass reached is
-`l2_peak_bytes` in the compactor stats.
+budget bounds what the pass holds, not only the output, without trusting
+any row read so far:
+
+- Each input is read in chunks of rows planned from its page index before
+  anything is fetched. A chunk costs, for every column, the pages it
+  touches: compressed as fetched, decompressed, and decoded by the
+  unencoded size the index records for each page, twice for buffer
+  growth; plus each column's dictionary, sized from its page header; plus
+  the row's sort keys. Pages are fetched exactly, never the gap between
+  two. A file without unencoded page sizes is refused.
+- Inputs are taken oldest first while their metadata and two chunks each
+  fit half the budget, the costliest single row of each setting its
+  least chunk; what is left widens their chunks. An input holds at most
+  two batches: a row group that would load a third ends early. A day
+  whose oldest file alone does not fit is passed over
+  (`fusescope_compaction_l2_over_budget_total`), as is one with a single
+  row too large to merge.
+- A row group takes at most a sixteenth of the budget by the exact size
+  of its rows, twice for buffer growth. The output closes before a row
+  group when what the inputs may hold, what the output holds and three
+  times the row group, gathered, encoded and appended, would pass the
+  budget. The output is written into 4 MiB buffers, so growing it never
+  copies.
+
+The highest total a pass reached, by what is loaded and encoded and by
+the bound of the chunk being read, is `fusescope_compaction_l2_peak_bytes`.
+The encoder's buffers for one row group are assumed within the row group
+itself; that is measured after each write, not bounded before it.
 A sidecar never grows past its cap, `compactor.max_trace_index_bytes`
 (256 MiB) for the trace ids, the text sidecar's own budget for logs: an
 output whose trace ids pass the cap is published without a `.tix`
@@ -973,11 +993,13 @@ the columns derived from others: `ts_bucket_start`, the fingerprint, enum
 strings, `has_error` and the promoted copies of attributes. Sums are
 checked: an overflow fails the pass, never saturates. A pass's counts are
 held to `compactor.usage_max_bytes` (64 MiB, at most 1 GiB), each
-`(hour, service)` entry costed at its service name plus 96 bytes before it
-is allocated: counts that a new entry would take past the budget are set
-aside as a contribution of their own, published in the same swap, and
-counting goes on, so a pass with many services yields several
-contributions for an hour and none is ever refused.
+`(hour, service)` entry costed at its service name plus 96 bytes before
+its name is allocated. Counting runs on each merged row group and stops
+where a new entry would pass the budget: the counts so far become a
+contribution of their own, published before counting resumes at that
+row and swapped in with the pass, so a pass holds one full count at most
+(`fusescope_usage_peak_bytes`), yields several contributions for an hour
+when it has many services, and none is ever refused.
 
 Every row is counted exactly once, when its file leaves L0. A catalog row
 carries `usage_accounted` (migration 0018): L0 files register `false`, a
@@ -994,10 +1016,12 @@ still `false`; the contribution files expire by the rule of their hour.
 The SQL table `usage_1h` sums every contribution, one row per
 `(signal, service_name, hour)`: `signal` `UInt8`, `service_name` nullable,
 `hour` a whole UTC hour, `rows` and `bytes` `UInt64`. A contribution is
-checked whole as it is decoded and as the table reads it
-(`usage::check_rows`): a signal other than spans or logs, an hour not
-whole, or a `(signal, service, hour)` twice in one file fails the read
-rather than reaching a sum.
+checked as it is decoded and as the table reads it, streamed one batch at
+a time with only the last key held (`usage::RowOrder`): a signal other
+than spans or logs, an hour not whole, or keys not strictly ascending by
+`(signal, hour, service)`, no service first, as every contribution is
+written, fails the read rather than reaching a sum; a key listed twice is
+one out of order.
 
 ### 7.4 Orphan sweep
 

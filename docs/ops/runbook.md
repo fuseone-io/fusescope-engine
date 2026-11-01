@@ -211,8 +211,13 @@ not counted (`usage_accounted`); a tenant whose expired days stay is
 waiting for the L1 or accounting pass of those hours.
 
 `compactor.l2_output_bytes` bounds the memory of an L2 pass, inputs
-included; each input holds at least one decoded batch, so a day of many
-wide inputs closes outputs early rather than exceeding it. A query of
+included: a day of many wide inputs takes fewer of them a pass and closes
+outputs early rather than exceeding it, and
+`fusescope_compaction_l2_peak_bytes` shows how close passes came. Each
+input needs room for its costliest pages, about 20 MiB for log files of
+64 KiB bodies; a day whose oldest L1 file does not fit half the budget is
+passed over and counted in `fusescope_compaction_l2_over_budget_total`,
+staying at L1 and queryable until the budget is raised. A query of
 `usage_1h` that fails naming the table met a contribution outside the
 domain (unknown signal, partial hour, duplicate key): find the file under
 `derived/usage_1h/` and escalate, do not delete it.
