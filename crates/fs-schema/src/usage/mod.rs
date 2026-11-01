@@ -206,6 +206,67 @@ fn per_row<O: arrow::array::OffsetSizeTrait>(
     Ok(out)
 }
 
+/// The rows of one batch as usage counts them: the logical bytes, hour
+/// and service of each, computed once, so counting stops and resumes at
+/// any row without measuring the batch again.
+#[derive(Debug)]
+pub struct UsageRows {
+    signal: UsageSignal,
+    sizes: Vec<u64>,
+    hours: Vec<i64>,
+    services: ArrayRef,
+}
+
+impl UsageRows {
+    /// The rows of `batch`, rows of `signal`.
+    ///
+    /// # Errors
+    /// A batch without `timestamp` or `service_name`, a type the version
+    /// does not size, or an overflow.
+    pub fn new(batch: &RecordBatch, signal: UsageSignal) -> Result<Self, SchemaError> {
+        #[cfg(test)]
+        tests::SIZED.with(|n| n.set(n.get() + 1));
+        let sizes = row_bytes(batch, signal)?;
+        let hours = batch
+            .column_by_name("timestamp")
+            .ok_or(SchemaError::Layout("usage: no timestamp column"))?
+            .as_primitive_opt::<TimestampNanosecondType>()
+            .ok_or(SchemaError::Layout("usage: timestamp is not nanoseconds"))?
+            .values()
+            .iter()
+            .map(|ts| ts.div_euclid(HOUR_NANOS) * HOUR_NANOS)
+            .collect();
+        let services = arrow::compute::cast(
+            batch
+                .column_by_name("service_name")
+                .ok_or(SchemaError::Layout("usage: no service_name column"))?,
+            &DataType::Utf8,
+        )?;
+        Ok(Self {
+            signal,
+            sizes,
+            hours,
+            services,
+        })
+    }
+
+    /// Rows held.
+    pub fn len(&self) -> usize {
+        self.sizes.len()
+    }
+
+    /// True when there is no row.
+    pub fn is_empty(&self) -> bool {
+        self.sizes.is_empty()
+    }
+
+    /// What it holds, the service names counted whole even when shared
+    /// with the batch.
+    pub fn memory_size(&self) -> usize {
+        (self.sizes.capacity() + self.hours.capacity()) * 8 + self.services.get_array_memory_size()
+    }
+}
+
 /// Rows and logical bytes of one signal, per hour and service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageCounts {
@@ -289,14 +350,15 @@ impl UsageCounts {
     /// A batch without those columns, a type the version does not size, or
     /// an overflow.
     pub fn absorb(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
-        match self.absorb_from(batch, 0, usize::MAX, None)? {
+        let rows = UsageRows::new(batch, self.signal)?;
+        match self.absorb_from(&rows, 0, usize::MAX, None)? {
             None => Ok(()),
             Some(_) => Err(SchemaError::Layout("usage counts past an unbounded budget")),
         }
     }
 
-    /// Counts the rows of `batch` from `from` on, those `take` flags when
-    /// given, within `budget` bytes. Before a new pair would take the
+    /// Counts `rows` from `from` on, those `take` flags when given, within
+    /// `budget` bytes. Before a new pair would take the
     /// counts past it, counting stops: the counts so far are handed back
     /// with the row to resume at, not counted yet, and `self` starts from
     /// none, so a caller holds one full count at a time and every row is
@@ -304,32 +366,23 @@ impl UsageCounts {
     /// are counted.
     ///
     /// # Errors
-    /// As [`Self::absorb`].
+    /// Rows of another signal, or an overflow.
     pub fn absorb_from(
         &mut self,
-        batch: &RecordBatch,
+        rows: &UsageRows,
         from: usize,
         budget: usize,
         take: Option<&[bool]>,
     ) -> Result<Option<(UsageCounts, usize)>, SchemaError> {
-        let bytes = row_bytes(batch, self.signal)?;
-        let ts = batch
-            .column_by_name("timestamp")
-            .ok_or(SchemaError::Layout("usage: no timestamp column"))?
-            .as_primitive_opt::<TimestampNanosecondType>()
-            .ok_or(SchemaError::Layout("usage: timestamp is not nanoseconds"))?;
-        let services = arrow::compute::cast(
-            batch
-                .column_by_name("service_name")
-                .ok_or(SchemaError::Layout("usage: no service_name column"))?,
-            &DataType::Utf8,
-        )?;
-        let services = services.as_string::<i32>();
-        for (row, size) in bytes.into_iter().enumerate().skip(from) {
+        if rows.signal != self.signal {
+            return Err(SchemaError::Layout("usage rows of another signal"));
+        }
+        let services = rows.services.as_string::<i32>();
+        for (row, (size, hour)) in rows.sizes.iter().zip(&rows.hours).enumerate().skip(from) {
             if take.is_some_and(|take| !take.get(row).copied().unwrap_or(false)) {
                 continue;
             }
-            let hour = ts.value(row).div_euclid(HOUR_NANOS) * HOUR_NANOS;
+            let (size, hour) = (*size, *hour);
             let name = services.is_valid(row).then(|| services.value(row));
             let known = self
                 .hours

@@ -15,7 +15,7 @@ use arrow::record_batch::RecordBatch;
 use fs_catalog::FileRecord;
 use fs_schema::parquet::gather;
 use fs_schema::spans::col;
-use fs_schema::usage::{UsageCounts, UsageSignal};
+use fs_schema::usage::{UsageCounts, UsageRows, UsageSignal};
 use object_store::ObjectStore;
 
 use crate::CompactError;
@@ -202,19 +202,35 @@ impl Merge {
         }
     }
 
-    /// Counts the rows `take` flags of `group`, from `from`, into the
+    /// `group` as usage counts it, when it has rows of inputs whose usage
+    /// was not counted.
+    ///
+    /// # Errors
+    /// As [`UsageRows::new`].
+    pub(crate) fn usage_rows(
+        &self,
+        group: &RecordBatch,
+        take: &[bool],
+    ) -> Result<Option<UsageRows>, CompactError> {
+        match &self.usage {
+            Some(usage) if take.contains(&true) => Ok(Some(UsageRows::new(group, usage.signal())?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Counts the rows `take` flags of `rows`, from `from`, into the
     /// usage; the counts set aside full and the row to resume at when the
     /// budget stops it.
     pub(crate) fn count_usage(
         &mut self,
-        group: &RecordBatch,
+        rows: &UsageRows,
         from: usize,
         take: &[bool],
     ) -> Result<Option<(UsageCounts, usize)>, CompactError> {
-        let Some(usage) = self.usage.as_mut().filter(|_| take.contains(&true)) else {
+        let Some(usage) = self.usage.as_mut() else {
             return Ok(None);
         };
-        let full = usage.absorb_from(group, from, self.usage_budget, Some(take))?;
+        let full = usage.absorb_from(rows, from, self.usage_budget, Some(take))?;
         let held =
             usage.estimated_bytes() + full.as_ref().map_or(0, |(full, _)| full.estimated_bytes());
         self.usage_peak = self.usage_peak.max(held);

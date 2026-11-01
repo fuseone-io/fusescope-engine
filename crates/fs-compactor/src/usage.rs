@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{FileId, FileRecord, LeaseFence, Level, NewFile, Signal, TenantId, TimeRange};
-use fs_schema::usage::UsageCounts;
+use fs_schema::usage::{UsageCounts, UsageRows};
 use object_store::path::Path;
 use tracing::info;
 
@@ -235,9 +235,11 @@ impl Compactor {
             let chunks = layout.plan(self.config.l2_output_bytes / 4, self.config.row_group_rows);
             let mut input = input.with_chunks(chunks);
             while let Some((batch, _)) = input.next().await? {
+                let rows = UsageRows::new(&batch, usage)?;
+                drop(batch);
                 let mut from = 0;
                 while let Some((part, next)) =
-                    counts.absorb_from(&batch, from, self.config.usage_max_bytes, None)?
+                    counts.absorb_from(&rows, from, self.config.usage_max_bytes, None)?
                 {
                     self.stats
                         .usage_peak_bytes

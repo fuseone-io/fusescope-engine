@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -9,6 +11,11 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use super::*;
 use crate::limits::Limits;
 use parquet::arrow::ArrowWriter;
+
+thread_local! {
+    /// Batches [`UsageRows::new`] measured on this thread.
+    pub(super) static SIZED: Cell<usize> = const { Cell::new(0) };
+}
 
 /// 2026-10-24T14:17:03Z.
 const T0: u64 = 1_792_678_623_000_000_000;
@@ -279,7 +286,9 @@ fn a_full_count_is_set_aside_before_a_new_key_would_pass_the_budget() {
     let mut counts = UsageCounts::new(UsageSignal::Logs);
     let mut full = Vec::new();
     let mut from = 0;
-    while let Some((part, next)) = counts.absorb_from(&batch, from, budget, None).unwrap() {
+    let before = SIZED.with(Cell::get);
+    let rows = UsageRows::new(&batch, UsageSignal::Logs).unwrap();
+    while let Some((part, next)) = counts.absorb_from(&rows, from, budget, None).unwrap() {
         // Counting pauses at each full count: nothing else is held.
         assert_eq!(counts.len(), 0);
         assert!(part.estimated_bytes() <= budget);
@@ -288,6 +297,11 @@ fn a_full_count_is_set_aside_before_a_new_key_would_pass_the_budget() {
         from = next;
     }
     assert!(full.len() >= 4, "{} counts set aside", full.len());
+    assert_eq!(
+        SIZED.with(Cell::get) - before,
+        1,
+        "the batch is measured once, however often counting resumes"
+    );
     assert!(counts.estimated_bytes() <= budget);
     let mut all = UsageCounts::new(UsageSignal::Logs);
     for part in full {
@@ -301,7 +315,7 @@ fn a_full_count_is_set_aside_before_a_new_key_would_pass_the_budget() {
     let odd: Vec<bool> = (0..batch.num_rows()).map(|i| i % 2 == 1).collect();
     let mut some = UsageCounts::new(UsageSignal::Logs);
     assert!(
-        some.absorb_from(&batch, 0, usize::MAX, Some(&odd))
+        some.absorb_from(&rows, 0, usize::MAX, Some(&odd))
             .unwrap()
             .is_none()
     );

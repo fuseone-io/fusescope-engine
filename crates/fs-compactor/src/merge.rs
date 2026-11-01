@@ -25,7 +25,7 @@ use fs_schema::logs::log_schema_v1;
 use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::spans::span_schema_v1;
 use fs_schema::trace_summary::TraceSummaries;
-use fs_schema::usage::{UsageCounts, UsageSignal};
+use fs_schema::usage::{UsageCounts, UsageRows, UsageSignal};
 use object_store::ObjectStore;
 use object_store::path::Path;
 
@@ -109,9 +109,10 @@ pub struct Merger {
     peak: usize,
     /// Rows picked for a row group the output closed before gathering.
     picks: Option<Picks>,
-    /// A row group whose usage counting stopped at a full count, with the
-    /// rows to count and the row to resume at.
-    pending: Option<(RecordBatch, Vec<bool>, usize)>,
+    /// A row group whose usage counting stopped at a full count, with its
+    /// rows as usage counts them, the rows to count and the row to resume
+    /// at.
+    pending: Option<(RecordBatch, Option<UsageRows>, Vec<bool>, usize)>,
 }
 
 /// What a merge hands back at each step.
@@ -252,7 +253,7 @@ impl Merger {
                 self.current = Some(self.new_output()?);
             }
             let output = self.current.as_ref().map_or(0, OutputBuilder::memory);
-            let (group, take, from) = if let Some(pending) = self.pending.take() {
+            let (group, rows, take, from) = if let Some(pending) = self.pending.take() {
                 pending
             } else {
                 let picks = if let Some(picks) = self.picks.take() {
@@ -291,18 +292,23 @@ impl Merger {
                 let (group, take) = self.merge.gather(&self.schema, &picks)?;
                 drop(picks);
                 self.absorb_derived(&group)?;
-                (group, take, 0)
+                let rows = self.merge.usage_rows(&group, &take)?;
+                (group, rows, take, 0)
             };
             self.note(
                 self.merge
                     .held_bytes()
                     .saturating_add(output)
-                    .saturating_add(group.get_array_memory_size()),
+                    .saturating_add(group.get_array_memory_size())
+                    .saturating_add(rows.as_ref().map_or(0, UsageRows::memory_size)),
             );
-            if let Some((full, next)) = self.merge.count_usage(&group, from, &take)? {
-                self.pending = Some((group, take, next));
-                return Ok(Some(Step::Usage(full)));
+            if let Some(usage) = &rows {
+                if let Some((full, next)) = self.merge.count_usage(usage, from, &take)? {
+                    self.pending = Some((group, rows, take, next));
+                    return Ok(Some(Step::Usage(full)));
+                }
             }
+            drop(rows);
             let current = self
                 .current
                 .as_mut()
