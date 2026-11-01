@@ -1366,6 +1366,7 @@ async fn orphans_are_deleted_only_after_a_ttl_without_a_row() {
         services: vec![],
         summary: None,
         content_sha256: None,
+        usage_accounted: true,
     };
     f.db.catalog.register_file(&row).await.unwrap();
     orphans_seen_two_hours_ago(&f).await;

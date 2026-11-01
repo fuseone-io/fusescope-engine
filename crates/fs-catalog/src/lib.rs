@@ -15,6 +15,7 @@ mod orphans;
 mod retention;
 mod token;
 mod types;
+mod usage;
 mod watch;
 
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};

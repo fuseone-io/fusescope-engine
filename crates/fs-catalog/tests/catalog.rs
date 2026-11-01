@@ -100,6 +100,7 @@ fn file(
         services: services.iter().map(|s| (*s).to_owned()).collect(),
         summary: Some(vec![1, 2, 3]),
         content_sha256: Some([7; 32]),
+        usage_accounted: true,
     }
 }
 
@@ -2227,6 +2228,7 @@ fn file_spanning(tenant: TenantId, signal: Signal, level: Level, range: TimeRang
         services: Vec::new(),
         summary: None,
         content_sha256: None,
+        usage_accounted: true,
     }
 }
 
@@ -2512,6 +2514,111 @@ async fn retention_expires_whole_utc_days_under_the_fence_and_finds_the_stale_ta
             .await
             .unwrap()
             .is_none()
+    );
+    db.finish().await;
+}
+
+/// Usage is counted once: a file registers uncounted and retention keeps
+/// it past the cut; a fenced count marks it and publishes its contribution
+/// in one transaction, a second count of it is a conflict, and retention
+/// then expires it. L0 files of a signal compacted at L0 are left to the
+/// compaction pass.
+#[tokio::test]
+async fn usage_is_counted_once_and_holds_retention_until_then() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let c = &db.catalog;
+    let t = c
+        .create_tenant(&NewTenant {
+            retention_days: 1,
+            ..NewTenant::with_defaults("counted")
+        })
+        .await
+        .unwrap()
+        .id;
+    let cut = yesterday(c).await;
+    let hour = Duration::hours(1);
+    let range = TimeRange {
+        start: cut - hour * 3,
+        end: cut - hour * 2,
+    };
+    let old = c
+        .register_file(&NewFile {
+            usage_accounted: false,
+            ..file_spanning(t, Signal::Traces, Level::L0, range)
+        })
+        .await
+        .unwrap();
+    assert!(!old.usage_accounted);
+    c.confirm_file(old.id).await.unwrap();
+    let generation = c
+        .acquire_lease("compactor", "a", StdDuration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = LeaseFence {
+        name: "compactor".into(),
+        holder: "a".into(),
+        generation,
+    };
+    assert!(
+        c.expire_files_fenced(Signal::Traces, 10, &fence)
+            .await
+            .unwrap()
+            .is_none(),
+        "an uncounted file stays past the cut"
+    );
+    assert!(
+        c.accounting_inputs(&[Signal::Traces], StdDuration::ZERO, 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "L0 files of a signal compacted at L0 are the compaction's to count"
+    );
+    let inputs = c
+        .accounting_inputs(&[], StdDuration::ZERO, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((inputs.tenant_id, inputs.signal), (t, Signal::Traces));
+    assert_eq!(
+        inputs.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [old.id]
+    );
+
+    let contribution = file_spanning(t, Signal::Usage1h, Level::L1, range);
+    c.account_files_fenced(t, Signal::Traces, &[old.id], &[contribution], &fence)
+        .await
+        .unwrap();
+    let again = file_spanning(t, Signal::Usage1h, Level::L1, range);
+    let err = c
+        .account_files_fenced(t, Signal::Traces, &[old.id], &[again], &fence)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::CompactionConflict { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        c.all_visible_files(t, Signal::Usage1h).await.unwrap().len(),
+        1,
+        "a refused count publishes nothing"
+    );
+    assert!(
+        c.accounting_inputs(&[], StdDuration::ZERO, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let expired = c
+        .expire_files_fenced(Signal::Traces, 10, &fence)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expired.files.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [old.id]
     );
     db.finish().await;
 }

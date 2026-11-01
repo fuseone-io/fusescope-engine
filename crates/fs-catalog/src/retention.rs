@@ -59,9 +59,13 @@ pub struct RebuildInput {
 const CUTOFF: &str = "date_bin('1 day', now(), timestamptz '1970-01-01 00:00:00+00') \
                       - make_interval(days => t.retention_days)";
 
+/// A file retention may expire: spans and logs only once their usage was
+/// counted (`usage_accounted`).
+const COUNTED: &str = "(f.usage_accounted or f.signal not in (1, 2))";
+
 impl Catalog {
     /// Quarantines, under `fence`, up to `limit` visible files of `signal`
-    /// beyond their tenant's cut, oldest first, all of the tenant whose
+    /// beyond their tenant's cut whose usage was counted, oldest first, all of the tenant whose
     /// expired file is the oldest; `None` when no file is beyond its cut.
     /// Calling again continues with what is left, so a caller that
     /// stopped anywhere resumes by calling again. The objects stay for
@@ -88,7 +92,7 @@ impl Catalog {
         let oldest: Option<(TenantId, DateTime<Utc>)> = sqlx::query_as(&format!(
             "select f.tenant_id, {CUTOFF} as cutoff
              from engine_file f join engine_tenant t on t.id = f.tenant_id
-             where f.signal = $1 and f.state = $2 and f.ts_max < {CUTOFF}
+             where f.signal = $1 and f.state = $2 and f.ts_max < {CUTOFF} and {COUNTED}
              order by f.ts_max, f.id
              limit 1"
         ))
@@ -105,11 +109,12 @@ impl Catalog {
              where id in (
                  select id from engine_file
                  where tenant_id = $2 and signal = $3 and state = $4 and ts_max < $5
+                   and (usage_accounted or signal not in (1, 2))
                  order by ts_max, id
                  limit $6
              )
              returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                       services, summary, content_sha256, state, created_at, quarantined_at",
+                       services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted",
         )
         .bind(FileState::Quarantined.code())
         .bind(tenant_id)
@@ -150,7 +155,7 @@ impl Catalog {
         let row: Option<(DateTime<Utc>, FileRow)> = sqlx::query_as::<_, StaleRow>(&format!(
             "select {CUTOFF} as cutoff,
                     f.id, f.origin, f.tenant_id, f.signal, f.level, f.path, f.size_bytes, f.row_count,
-                    f.ts_min, f.ts_max, f.services, f.summary, f.content_sha256, f.state, f.created_at, f.quarantined_at
+                    f.ts_min, f.ts_max, f.services, f.summary, f.content_sha256, f.state, f.created_at, f.quarantined_at, f.usage_accounted
              from engine_file f join engine_tenant t on t.id = f.tenant_id
              where f.signal = $1 and f.state = $2 and f.ts_min < {CUTOFF}
                and not exists (

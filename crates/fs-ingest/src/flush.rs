@@ -188,6 +188,7 @@ pub fn prepare_stream(
         services: keys.services,
         summary: None,
         content_sha256: Some(content_sha256),
+        usage_accounted: false,
     };
     Ok(Prepared {
         file,

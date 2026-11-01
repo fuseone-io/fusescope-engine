@@ -418,6 +418,7 @@ async fn retention_expires_span_log_and_per_pass_derived_files_with_the_same_day
                 services: Vec::new(),
                 summary: None,
                 content_sha256: None,
+                usage_accounted: true,
             })
             .await
             .unwrap();

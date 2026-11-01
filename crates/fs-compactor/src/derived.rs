@@ -77,6 +77,7 @@ pub(crate) fn table_file(
         services: Vec::new(),
         summary: None,
         content_sha256: Some(crate::objects::sha256(&bytes)),
+        usage_accounted: true,
     };
     Ok(Some((file, bytes)))
 }
@@ -121,6 +122,7 @@ pub(crate) fn trace_summary_file(
             services,
             summary: None,
             content_sha256: Some(crate::objects::sha256(&bytes)),
+            usage_accounted: true,
         },
         bytes,
     )))
@@ -170,6 +172,7 @@ pub(crate) fn service_graph_file(
             services,
             summary: None,
             content_sha256: Some(crate::objects::sha256(&bytes)),
+            usage_accounted: true,
         },
         bytes,
     )))

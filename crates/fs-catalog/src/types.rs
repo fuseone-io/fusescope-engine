@@ -369,6 +369,9 @@ pub struct NewFile {
     /// sha256 of the object as uploaded; `None` only for rows written
     /// before the digest was recorded.
     pub content_sha256: Option<[u8; 32]>,
+    /// The rows were counted into `usage_1h`: false for an L0 file, true
+    /// for the outputs of a pass that counted its inputs.
+    pub usage_accounted: bool,
 }
 
 /// A file row.
@@ -404,6 +407,8 @@ pub struct FileRecord {
     pub created_at: DateTime<Utc>,
     /// Quarantine time, when quarantined.
     pub quarantined_at: Option<DateTime<Utc>>,
+    /// The rows were counted into `usage_1h`.
+    pub usage_accounted: bool,
 }
 
 /// Raw row shape; converted into [`FileRecord`] with validation.
@@ -425,6 +430,7 @@ pub(crate) struct FileRow {
     pub(crate) state: i16,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) quarantined_at: Option<DateTime<Utc>>,
+    pub(crate) usage_accounted: bool,
 }
 
 impl TryFrom<FileRow> for FileRecord {
@@ -459,6 +465,7 @@ impl TryFrom<FileRow> for FileRecord {
             state: FileState::from_code(row.state)?,
             created_at: row.created_at,
             quarantined_at: row.quarantined_at,
+            usage_accounted: row.usage_accounted,
         })
     }
 }

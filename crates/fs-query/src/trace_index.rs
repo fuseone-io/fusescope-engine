@@ -257,6 +257,7 @@ mod tests {
             state: FileState::Visible,
             created_at: now,
             content_sha256: None,
+            usage_accounted: false,
             quarantined_at: None,
         }
     }

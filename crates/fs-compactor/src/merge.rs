@@ -646,6 +646,7 @@ impl OutputBuilder {
             services: self.services.into_iter().collect(),
             summary: None,
             content_sha256: Some(content_sha256),
+            usage_accounted: false,
         };
         Ok(Output { file, bytes, index })
     }

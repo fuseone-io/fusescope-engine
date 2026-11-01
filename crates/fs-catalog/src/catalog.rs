@@ -154,7 +154,7 @@ impl Catalog {
     ) -> Result<Vec<FileRecord>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3 and ts_min <= $5 and ts_max >= $4
              order by ts_min, id",
@@ -181,7 +181,7 @@ impl Catalog {
     ) -> Result<Vec<FileRecord>, CatalogError> {
         let rows = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3
              order by ts_min, id",
@@ -527,6 +527,17 @@ async fn quarantine(
     Ok(quarantined.len())
 }
 
+/// Inserts `file` as a pass's output, confirmed on insert, in `tx`.
+///
+/// # Errors
+/// A doomed path, a different row under the same id, or database failure.
+pub(crate) async fn insert_counted(
+    tx: &mut Transaction<'_, Postgres>,
+    file: &NewFile,
+) -> Result<FileRecord, CatalogError> {
+    insert_file(tx, file, Confirm::OnInsert).await
+}
+
 async fn insert_file(
     tx: &mut Transaction<'_, Postgres>,
     file: &NewFile,
@@ -536,12 +547,12 @@ async fn insert_file(
     let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
              (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state, origin,
-              confirmed_at, content_sha256)
+              confirmed_at, content_sha256, usage_accounted)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 case when $14 then clock_timestamp() end, $15)
+                 case when $14 then clock_timestamp() end, $15, $16)
          on conflict (id) do nothing
          returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                   services, summary, content_sha256, state, created_at, quarantined_at",
+                   services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted",
     )
     .bind(file.id)
     .bind(file.tenant_id)
@@ -558,6 +569,7 @@ async fn insert_file(
     .bind(file.origin)
     .bind(matches!(confirm, Confirm::OnInsert))
     .bind(file.content_sha256.map(|digest| digest.to_vec()))
+    .bind(file.usage_accounted)
     .fetch_optional(&mut **tx)
     .await?;
     let row = if let Some(row) = inserted {
@@ -565,7 +577,7 @@ async fn insert_file(
     } else {
         let existing = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
              from engine_file where id = $1",
         )
         .bind(file.id)

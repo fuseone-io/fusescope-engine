@@ -1811,6 +1811,7 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
             services: vec![],
             summary: None,
             content_sha256: None,
+            usage_accounted: true,
         })
         .await
         .unwrap();
@@ -1935,6 +1936,7 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
                     services: vec![],
                     summary: None,
                     content_sha256: None,
+                    usage_accounted: true,
                 })
                 .await
                 .unwrap();
@@ -2069,6 +2071,7 @@ async fn register_log_keys(f: &Fixture, tenant: TenantId, bytes: &[u8], rows: i6
             services: vec![],
             summary: None,
             content_sha256: None,
+            usage_accounted: true,
         })
         .await
         .unwrap();
@@ -2234,6 +2237,7 @@ async fn a_key_row_of_the_other_tables_source_fails_the_query() {
             services: vec![],
             summary: None,
             content_sha256: None,
+            usage_accounted: true,
         })
         .await
         .unwrap();
@@ -2376,6 +2380,7 @@ async fn derived_contributions_are_pruned_by_time_and_unknown_versions_fail_clos
                 services: vec!["api".into()],
                 summary: None,
                 content_sha256: None,
+                usage_accounted: true,
             })
             .await
             .unwrap();

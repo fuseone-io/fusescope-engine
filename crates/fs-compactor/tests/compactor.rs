@@ -94,6 +94,7 @@ fn file(tenant: TenantId) -> NewFile {
         services: vec![],
         summary: None,
         content_sha256: None,
+        usage_accounted: true,
     }
 }
 
