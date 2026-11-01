@@ -140,3 +140,100 @@ Logs follow the attribute, resource, scope, fingerprint and limit rules above;
 Not stored in v1: `event_name`, `dropped_attributes_count`, and the
 structured body columns (`body_v2`, `body_promoted`) the Go backend reads only
 behind its experimental `use_json_body` flag.
+
+## Metrics
+
+Sources: the OTLP metrics definitions (`metrics/v1/metrics.proto`,
+`common/v1/common.proto`), the OpenTelemetry metrics data model, the
+columns the Go backend reads (`time_series_v4`, `samples_v4`), and
+**[obs]**: the clean-room write contract observed from a known corpus,
+`fusescope-collector-server/docs/spec/clickhouse-metrics.md` and its
+`observed/0.145.0` rows (Apache-2.0).
+
+A data point becomes one or more series, each with one sample.
+
+| OTLP | Series | type | temporality | is_monotonic | unit | Source |
+|---|---|---|---|---|---|---|
+| Gauge | `<name>` | `Gauge` | `Unspecified` | false | the metric's | [obs] |
+| Sum | `<name>` | `Sum` | the sum's | the sum's | the metric's | [obs]; temporality text from the OTLP enum without its prefix |
+| Histogram | `<name>.bucket` per bound and `le="+Inf"`, value cumulative over `le` | `Histogram` | the histogram's | true | the metric's | [obs]; cumulative as Prometheus buckets are |
+| | `<name>.count` | `Sum` | the histogram's | true | the metric's, else `1` | [obs] |
+| | `<name>.sum`, when the point has a sum | `Sum` | the histogram's | true | the metric's | [obs] |
+| | `<name>.min`, `<name>.max`, when present | `Gauge` | `Unspecified` | false | the metric's | [obs] |
+| Summary | `<name>.quantile` per quantile, label `quantile` | `Summary` | `Unspecified` | false | the metric's | [obs] |
+| | `<name>.count` | `Sum` | `Cumulative` | true | `1` | [obs] |
+| | `<name>.sum` | `Sum` | `Cumulative` | true | the metric's | [obs] |
+| Exponential histogram | none: each point refused, `exponential_histogram` | | | | | engine; deferred to M3 step 4 |
+
+Every series' description is the metric's. A histogram with no bounds and
+no counts, the proto's one exception, has one `+Inf` bucket holding its
+count [obs `probe.histogram_no_minmax`].
+
+**Values.** Int becomes Float64, values above 2^53 losing precision. A
+NaN value, sum, min or max writes no sample and no series [obs
+`probe.nan`]. A Gauge or Sum point flagged `NO_RECORDED_VALUE` writes value
+0 and its flags, its value ignored [obs `probe.no_value`]; the Go backend
+reads flag bit 0 as a stale marker.
+
+**Refused points.** Refused whole before any row, reported in the
+partial success and counted by reason (OTLP invariants unless noted):
+
+- `bucket_counts` not one longer than `explicit_bounds`, a bound not
+  finite or not strictly increasing, buckets not summing to `count`, a
+  cumulative count past u64: `malformed_histogram`;
+- a quantile outside `[0, 1]` or not strictly increasing, or a quantile
+  value NaN or negative: `malformed_summary`;
+- a histogram or summary flagged `NO_RECORDED_VALUE`: `stale_histogram`
+  (engine: no observed rule says which series go stale);
+- more bounds than `ingest.max_histogram_buckets`, quantiles than
+  `ingest.max_summary_quantiles`, or labels than `ingest.max_series_labels`
+  (engine limits);
+- no `time_unix_nano`, a number point with no value, a metric with no
+  name.
+
+A request with more points than `ingest.max_metric_points_per_request` or
+more samples than `ingest.max_metric_samples_per_request` is refused whole.
+
+**Labels.** A `Map(Utf8, Utf8)` in key byte order: the resource's and the
+scope's attributes; `__scope.name__`, `__scope.version__`,
+`__scope.schema_url__` (the scope's schema URL), empty when absent; the
+point's attributes; `le` or `quantile`; `__temporality__`; `__name__`, the
+series name. Of one key the generated label wins, then the resource's,
+the scope's, the point's [obs `probe.collide_*`]. Within a level a key
+received twice keeps its last value. Keys and values follow the attribute
+limits above (an empty or long key dropped, values cut at
+`max_value_bytes`); a level of more attributes than
+`ingest.max_series_labels` refuses its points.
+
+**Canonical values** (engine): a string as received; an int in decimal; a
+double as the shortest decimal that reads back to it, never in exponent
+form, `-0` kept, `NaN`, `+Inf`, `-Inf`; a bool `true`/`false`; bytes
+standard base64; an array or key-value list as JSON, arrays in order,
+lists with a repeated key keeping its last value, a key with no value
+ignored, keys in byte order at every level, doubles as above and
+non-finite ones and bytes as JSON strings, an empty value `null`, strings
+escaped as RFC 8259 requires and no further. `le` and `quantile` use the
+double form [obs `probe.extreme_bounds`, `probe.extreme_quantiles`].
+
+**Fingerprint, version 1** (engine; the observed one is not identifiable
+[obs §4]): xxh3-64 over the domain `fs.metric.v1`; the hashes of the
+resource level (its schema URL and attributes), the scope level (name,
+version, schema URL, attributes) and the point level (attributes), each
+over its kind, its extra strings, its attribute count and the pairs in key
+byte order; then the series' name, type, unit, temporality,
+monotonicity and generated `le` or `quantile`. Strings are length
+prefixed, counts and lengths little-endian u64. Hashing each level apart
+keeps series apart whose labels match only because a level shadows
+another [obs `probe.collide_resource`]. Two declarations of one identity
+that differ in type, unit, temporality or monotonicity become two series,
+so the same labels may show under two fingerprints; `metrics.select`
+refuses such a set rather than merge it.
+
+**Rows.** A sample: name, temporality, fingerprint, `time_unix_nano` in
+milliseconds, value, flags, and `_source_order`, 36 bytes: the WAL
+instance, segment and offset of its record, big-endian, and its ordinal
+among the request's samples, the larger winning a duplicate fingerprint
+and millisecond. A series row: one per fingerprint and hour, the hour of
+its samples; of differing descriptions the longest in bytes, then the
+least in byte order. Not stored: `env`, `attrs`, `scope_attrs`,
+`resource_attrs` and `__normalized`, which the Go backend does not read.

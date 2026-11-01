@@ -424,16 +424,41 @@ on `trace_id` and `service_name`. The rules are in `crates/fs-schema/MAPPING.md`
 
 ### Metrics
 
-`series`: fingerprint (UInt64), metric_name (Dictionary), temporality
-(Dictionary), type (gauge, sum, histogram, exp_histogram, summary), unit,
-description, is_monotonic, labels (Map(Utf8, Utf8), not a JSON string),
-first_seen, last_seen.
+A data point becomes one or more series, each with one sample; the rules
+are in `crates/fs-schema/MAPPING.md` ("Metrics"), from the OTLP
+definitions and the write contract observed from a known corpus.
 
-`samples`: fingerprint, metric_name (Dictionary, kept for file pruning),
-unix_milli (Int64), value (Float64). The `env` column of `samples_v4` is not
-carried over; it is a label. Histograms are exploded into one series per
-bucket at ingest, as Prometheus does. Exponential histograms keep a dedicated
-Struct column.
+`time_series` (series, version 1): `metric_name`, `temporality`
+(`Delta`, `Cumulative`, `Unspecified`), `type` (`Gauge`, `Sum`,
+`Histogram`, `Summary`), `is_monotonic`, `fingerprint` (UInt64),
+`unix_milli` (the hour, Int64), `labels` (Map(Utf8, Utf8), not a JSON
+string), `description`, `unit`; one row a fingerprint and hour, sorted by
+name, fingerprint and hour. Labels fuse the resource, scope and point
+attributes with the generated `__name__`, `__temporality__`,
+`__scope.name__`, `__scope.version__`, `__scope.schema_url__`, `le` and
+`quantile`, which no attribute overrides; `attrs`, `scope_attrs` and
+`resource_attrs` are not kept, the Go backend reads `labels` only.
+
+`samples` (version 1): `metric_name`, `temporality`, `fingerprint`,
+`unix_milli` (Int64), `value` (Float64), `flags` (UInt32, bit 0 no recorded
+value) and `_source_order`, 36 bytes no table shows: the WAL instance,
+segment and offset of the sample's record and its ordinal in the request,
+so a duplicate fingerprint and millisecond keeps the larger in any
+sequence of compactions, whichever ingesters wrote them. Sorted by name,
+fingerprint, time and source order; a bloom filter on `metric_name`. The
+`env` column of `samples_v4` is not carried over; it is a label.
+
+The fingerprint (version 1) hashes the resource, scope and point levels
+apart, then the series' name, type, unit, temporality, monotonicity and
+`le` or `quantile`: series whose labels match only because one level
+shadows another stay apart, and two declarations of one identity that
+differ in type, unit, temporality or monotonicity become two series under
+the same labels, which `metrics.select` refuses rather than merge.
+Exponential histograms are refused point by point until M3 step 4.
+
+A request converts in two passes over one traversal: a preflight validates
+every point and counts samples, series and bytes without keeping any, and
+the conversion builds exactly that inside a reservation of the bound.
 
 ## 5. Indexes
 

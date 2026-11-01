@@ -105,6 +105,23 @@ pub fn log_writer_properties(row_group_rows: usize) -> Result<WriterProperties, 
     .build())
 }
 
+/// Columns of a metric samples or series file that carry a bloom filter.
+pub const METRIC_BLOOM_COLUMNS: [&str; 1] = [crate::metrics::col::METRIC_NAME];
+
+/// [`writer_properties`] for metric samples and series: only
+/// [`METRIC_BLOOM_COLUMNS`] carry a bloom filter.
+///
+/// # Errors
+/// A zstd level the library refuses.
+pub fn metric_writer_properties(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
+    Ok(with_blooms(
+        base_properties(row_group_rows)?,
+        &METRIC_BLOOM_COLUMNS,
+        row_group_rows,
+    )
+    .build())
+}
+
 /// [`writer_properties`] or [`log_writer_properties`] at
 /// [`L2_ZSTD_LEVEL`], for `logs` or span rows.
 ///
