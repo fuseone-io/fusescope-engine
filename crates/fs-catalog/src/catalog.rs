@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::CatalogError;
 use crate::token::{TenantToken, TokenScope, generate_token, hash_token};
 use crate::types::{
-    Compaction, FileId, FileRecord, FileRow, FileState, Ingester, NewFile, NewTenant, PurgedFile,
-    Signal, Tenant, TenantId, TimeRange,
+    Compaction, FileId, FileRecord, FileRow, FileSetId, FileState, Ingester, NewFile, NewTenant,
+    PurgedFile, Signal, Tenant, TenantId, TimeRange,
 };
 use crate::watch::Watcher;
 
@@ -119,7 +119,7 @@ impl Catalog {
     /// Duplicate path under a different id, unknown tenant, or database failure.
     pub async fn register_file(&self, file: &NewFile) -> Result<FileRecord, CatalogError> {
         let mut tx = self.pool.begin().await?;
-        let record = insert_file(&mut tx, file, Confirm::ByWriter).await?;
+        let record = insert_file(&mut tx, file, Confirm::ByWriter, None).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -152,13 +152,14 @@ impl Catalog {
         signal: Signal,
         range: TimeRange,
     ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, FileRow>(
+        let rows = sqlx::query_as::<_, FileRow>(&format!(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                     services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3 and ts_min <= $5 and ts_max >= $4
-             order by ts_min, id",
-        )
+               and {PAIRED}
+             order by ts_min, id"
+        ))
         .bind(tenant)
         .bind(signal.code())
         .bind(FileState::Visible.code())
@@ -179,13 +180,14 @@ impl Catalog {
         tenant: TenantId,
         signal: Signal,
     ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, FileRow>(
+        let rows = sqlx::query_as::<_, FileRow>(&format!(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                     services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3
-             order by ts_min, id",
-        )
+               and {PAIRED}
+             order by ts_min, id"
+        ))
         .bind(tenant)
         .bind(signal.code())
         .bind(FileState::Visible.code())
@@ -283,7 +285,11 @@ impl Catalog {
             .collect();
         let mut output_ids = Vec::with_capacity(outputs.len());
         for file in outputs {
-            output_ids.push(insert_file(&mut tx, file, Confirm::OnInsert).await?.id);
+            output_ids.push(
+                insert_file(&mut tx, file, Confirm::OnInsert, None)
+                    .await?
+                    .id,
+            );
         }
         let id = Uuid::now_v7();
         sqlx::query(
@@ -496,9 +502,16 @@ impl Catalog {
     }
 }
 
+/// A metric file is served only beside the other file of its set, visible
+/// too; `$3` is the visible state.
+const PAIRED: &str = "(file_set is null or exists (
+    select 1 from engine_file p
+    where p.tenant_id = engine_file.tenant_id and p.file_set = engine_file.file_set
+      and p.id <> engine_file.id and p.state = $3))";
+
 /// When a registration becomes eligible for compaction.
 #[derive(Clone, Copy)]
-enum Confirm {
+pub(crate) enum Confirm {
     /// With the row: nothing serves the file before it is visible.
     OnInsert,
     /// After the commit, by the writer, once its hot retention has begun.
@@ -535,21 +548,22 @@ pub(crate) async fn insert_counted(
     tx: &mut Transaction<'_, Postgres>,
     file: &NewFile,
 ) -> Result<FileRecord, CatalogError> {
-    insert_file(tx, file, Confirm::OnInsert).await
+    insert_file(tx, file, Confirm::OnInsert, None).await
 }
 
-async fn insert_file(
+pub(crate) async fn insert_file(
     tx: &mut Transaction<'_, Postgres>,
     file: &NewFile,
     confirm: Confirm,
+    file_set: Option<FileSetId>,
 ) -> Result<FileRecord, CatalogError> {
     crate::orphans::refuse_doomed(tx, &file.path).await?;
     let inserted = sqlx::query_as::<_, FileRow>(
         "insert into engine_file
              (id, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max, services, summary, state, origin,
-              confirmed_at, content_sha256, usage_accounted)
+              confirmed_at, content_sha256, usage_accounted, file_set)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 case when $14 then clock_timestamp() end, $15, $16)
+                 case when $14 then clock_timestamp() end, $15, $16, $17)
          on conflict (id) do nothing
          returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted",
@@ -570,6 +584,7 @@ async fn insert_file(
     .bind(matches!(confirm, Confirm::OnInsert))
     .bind(file.content_sha256.map(|digest| digest.to_vec()))
     .bind(file.usage_accounted)
+    .bind(file_set)
     .fetch_optional(&mut **tx)
     .await?;
     let row = if let Some(row) = inserted {

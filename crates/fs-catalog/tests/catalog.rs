@@ -1849,7 +1849,7 @@ async fn watcher_sees_file_changes() {
     let mut watcher = db.catalog.watch().await.unwrap();
     let registered = db
         .catalog
-        .register_file(&file(t, Signal::MetricSamples, 0, 1, &[]))
+        .register_file(&file(t, Signal::Logs, 0, 1, &[]))
         .await
         .unwrap();
 
@@ -1862,7 +1862,7 @@ async fn watcher_sees_file_changes() {
                 .expect("notification")
                 .unwrap();
             if change.tenant_id == t {
-                assert_eq!(change.signal, Signal::MetricSamples);
+                assert_eq!(change.signal, Signal::Logs);
                 break;
             }
         }
@@ -1882,7 +1882,7 @@ async fn watcher_sees_file_changes() {
 
     // Quarantining it is.
     db.catalog
-        .swap_files(t, Signal::MetricSamples, &[registered.id], &[])
+        .swap_files(t, Signal::Logs, &[registered.id], &[])
         .await
         .unwrap();
     wait_for_ours(&mut watcher).await;

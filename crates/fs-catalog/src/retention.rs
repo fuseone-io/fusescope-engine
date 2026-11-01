@@ -66,7 +66,8 @@ const COUNTED: &str = "(f.usage_accounted or f.signal not in (1, 2))";
 impl Catalog {
     /// Quarantines, under `fence`, up to `limit` visible files of `signal`
     /// beyond their tenant's cut whose usage was counted, oldest first, all of the tenant whose
-    /// expired file is the oldest; `None` when no file is beyond its cut.
+    /// expired file is the oldest, each with the other file of its metric
+    /// set; `None` when no file is beyond its cut.
     /// Calling again continues with what is left, so a caller that
     /// stopped anywhere resumes by calling again. The objects stay for
     /// the purge, as after a swap.
@@ -104,14 +105,21 @@ impl Catalog {
             tx.rollback().await?;
             return Ok(None);
         };
+        // The other file of a metric set goes with each, whatever its
+        // signal, so no file of a set outlives the other.
         let rows = sqlx::query_as::<_, FileRow>(
-            "update engine_file set state = $1, quarantined_at = now()
-             where id in (
-                 select id from engine_file
+            "with picked as (
+                 select id, file_set from engine_file
                  where tenant_id = $2 and signal = $3 and state = $4 and ts_max < $5
                    and (usage_accounted or signal not in (1, 2))
                  order by ts_max, id
                  limit $6
+             )
+             update engine_file set state = $1, quarantined_at = now()
+             where state = $4 and (
+                 id in (select id from picked)
+                 or (tenant_id = $2
+                     and file_set in (select file_set from picked where file_set is not null))
              )
              returning id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
                        services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted",

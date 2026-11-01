@@ -10,6 +10,7 @@
 
 mod catalog;
 mod compaction;
+mod file_set;
 mod lease;
 mod orphans;
 mod retention;
@@ -28,8 +29,8 @@ pub use token::{
     looks_like_token,
 };
 pub use types::{
-    Compaction, FileId, FileRecord, FileState, Ingester, Level, NewFile, NewTenant, PurgedFile,
-    Signal, Tenant, TenantId, TimeRange,
+    Compaction, FileId, FileRecord, FileSetId, FileState, Ingester, Level, MetricRole, NewFile,
+    NewTenant, PurgedFile, Signal, Tenant, TenantId, TimeRange,
 };
 pub use watch::{FileChange, Watcher};
 
@@ -103,6 +104,22 @@ pub enum CatalogError {
         column: &'static str,
         /// Offending value.
         value: i64,
+    },
+    /// A file set to register is not one samples and one series file of
+    /// one tenant and hour: a programming error, nothing is written.
+    #[error("file set {set}: {reason}")]
+    InvalidFileSet {
+        /// The set.
+        set: uuid::Uuid,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// Only one file of a set is registered. No crash of this version
+    /// leaves that, so nothing is healed: the writer stops.
+    #[error("file set {set} is registered in part")]
+    PartialFileSet {
+        /// The set.
+        set: uuid::Uuid,
     },
 }
 

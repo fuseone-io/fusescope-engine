@@ -95,6 +95,131 @@ impl FileId {
     }
 }
 
+/// One of the two files a metric flush writes, samples and their series.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricRole {
+    /// The samples file, [`Signal::MetricSamples`].
+    Samples,
+    /// The series file, [`Signal::MetricSeries`].
+    Series,
+}
+
+impl MetricRole {
+    /// Both roles, samples first.
+    pub const BOTH: [Self; 2] = [Self::Samples, Self::Series];
+
+    /// The signal of its file.
+    pub fn signal(self) -> Signal {
+        match self {
+            Self::Samples => Signal::MetricSamples,
+            Self::Series => Signal::MetricSeries,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Samples => "samples",
+            Self::Series => "series",
+        }
+    }
+}
+
+/// The set a metric flush's two files belong to: registered, confirmed,
+/// expired and quarantined together.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    sqlx::Type,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[sqlx(transparent)]
+#[serde(transparent)]
+pub struct FileSetId(pub Uuid);
+
+impl FileSetId {
+    /// A fresh time-ordered id, for a set that supersedes another.
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// The set of the first intent over a metric buffer's rows of `hour`,
+    /// first at `segment` and `offset` of WAL `instance`.
+    pub fn derived(
+        instance: Uuid,
+        tenant: TenantId,
+        segment: u64,
+        offset: u64,
+        hour: DateTime<Utc>,
+    ) -> Self {
+        Self(metric_name_id(
+            b"fs.metric.set.v1",
+            instance,
+            tenant,
+            (segment, offset, hour),
+            None,
+        ))
+    }
+}
+
+impl Default for FileSetId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileId {
+    /// The `role` file of the set [`FileSetId::derived`] names for the same
+    /// arguments.
+    pub fn derived_metric(
+        instance: Uuid,
+        tenant: TenantId,
+        (segment, offset, hour): (u64, u64, DateTime<Utc>),
+        role: MetricRole,
+    ) -> Self {
+        Self(metric_name_id(
+            b"fs.metric.file.v1",
+            instance,
+            tenant,
+            (segment, offset, hour),
+            Some(role),
+        ))
+    }
+}
+
+/// A v5 id over `domain`, the WAL instance, the tenant, the first record's
+/// segment and offset, the hour's seconds, all little-endian, and the
+/// role's name.
+fn metric_name_id(
+    domain: &[u8],
+    instance: Uuid,
+    tenant: TenantId,
+    (segment, offset, hour): (u64, u64, DateTime<Utc>),
+    role: Option<MetricRole>,
+) -> Uuid {
+    let mut name = Vec::with_capacity(96);
+    name.extend_from_slice(&(domain.len() as u64).to_le_bytes());
+    name.extend_from_slice(domain);
+    name.extend_from_slice(instance.as_bytes());
+    name.extend_from_slice(tenant.0.as_bytes());
+    name.extend_from_slice(&segment.to_le_bytes());
+    name.extend_from_slice(&offset.to_le_bytes());
+    name.extend_from_slice(&hour.timestamp().to_le_bytes());
+    if let Some(role) = role {
+        name.extend_from_slice(role.name().as_bytes());
+    }
+    Uuid::new_v5(&FILE_NAMESPACE, &name)
+}
+
 /// Namespace for derived file ids. Fixed forever; changing it changes every id.
 const FILE_NAMESPACE: Uuid = Uuid::from_bytes([
     0x5f, 0x73, 0x65, 0x6e, 0x67, 0x69, 0x6e, 0x65, 0x66, 0x69, 0x6c, 0x65, 0x69, 0x64, 0x30, 0x31,
