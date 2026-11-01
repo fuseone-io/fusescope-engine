@@ -15,6 +15,7 @@ pub mod parquet;
 pub mod service_graph;
 pub mod spans;
 pub mod trace_summary;
+pub mod usage;
 
 use thiserror::Error;
 
