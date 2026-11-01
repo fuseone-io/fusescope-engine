@@ -947,9 +947,14 @@ any row read so far:
 - A row group takes at most a sixteenth of the budget by the exact size
   of its rows, twice for buffer growth. The output closes before a row
   group when what the inputs may hold, what the output holds and three
-  times the row group, gathered, encoded and appended, would pass the
-  budget. The output is written into 4 MiB buffers, so growing it never
-  copies.
+  times the row group, gathered, encoded and appended, and its bloom
+  filters and page indexes would pass the budget. The output is written
+  into buffers of a sixty-fourth of the budget, 64 KiB to 4 MiB, so
+  growing it never copies, and one buffer is always charged whole before
+  it is allocated. The page indexes and the footer, bounded by the page
+  counts of the row groups written, are charged three times over, held,
+  encoded and built into metadata, so closing stays within what was
+  charged. `compactor.l2_output_bytes` is at least 16 MiB.
 
 The highest total a pass reached, by what is loaded and encoded and by
 the bound of the chunk being read, is `fusescope_compaction_l2_peak_bytes`.
@@ -994,7 +999,9 @@ strings, `has_error` and the promoted copies of attributes. Sums are
 checked: an overflow fails the pass, never saturates. A pass's counts are
 held to `compactor.usage_max_bytes` (64 MiB, at most 1 GiB), each
 `(hour, service)` entry costed at its service name plus 96 bytes before
-its name is allocated. Counting runs on each merged row group and stops
+its name is allocated. Each merged row group is measured once, its
+logical bytes, hours and services kept beside it as a cursor counted
+against the pass's memory, and counting runs over the cursor and stops
 where a new entry would pass the budget: the counts so far become a
 contribution of their own, published before counting resumes at that
 row and swapped in with the pass, so a pass holds one full count at most

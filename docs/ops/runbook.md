@@ -217,7 +217,8 @@ outputs early rather than exceeding it, and
 input needs room for its costliest pages, about 20 MiB for log files of
 64 KiB bodies; a day whose oldest L1 file does not fit half the budget is
 passed over and counted in `fusescope_compaction_l2_over_budget_total`,
-staying at L1 and queryable until the budget is raised. A query of
+staying at L1 and queryable until the budget is raised. The budget is
+at least 16 MiB. A query of
 `usage_1h` that fails naming the table met a contribution outside the
 domain (unknown signal, partial hour, duplicate key): find the file under
 `derived/usage_1h/` and escalate, do not delete it.
