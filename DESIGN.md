@@ -165,6 +165,28 @@ arriving meanwhile:
   it is written under WAL record version 3, the signal version, which an
   ingester of the previous version fails on. Span intents keep versions 1
   and 2, so a rollback is safe while no log record is in the log.
+- Metrics share the WAL, the gate and the checkpoint too. A metric record
+  has record code 4 and carries the request as received. Its preflight
+  validates and counts every point before anything is built; the rows that
+  stay are admitted with their flush margin, and what converting holds only
+  while it runs, the merge of the request's series into the buffer's
+  included, is held as scratch under the global cap. The conversion runs
+  before the append, so each sample's source order takes the record's
+  position under the gate, before the push; a replay converts with the
+  position directly, into the same bytes. A metric buffer keeps its samples
+  as other buffers keep rows and its series in two sorted runs merged as
+  requests arrive, one row a fingerprint and hour. A metric cut writes,
+  per hour, a set of two files, samples and series, under an intent of
+  record version 4 naming the set and both files, whose ids derive from
+  the rows' first position, the hour and the role. The samples file is
+  encoded, sorted by a permutation and deduplicated by source order, and
+  uploaded, its bytes dropped; then the series file; both register in one
+  transaction (`register_file_set`), retention starts for both, and the
+  set is confirmed as one. An object of the set doomed or found with other
+  bytes gives the pair two fresh ids and a fresh set under a new intent,
+  the origins kept; if that intent cannot be logged the old ids stay. The
+  hot window announces and excludes both ids. An ingester without metrics
+  refuses records of code 4 and intents of version 4.
 - Uploads never overwrite (conditional create), and registering an existing
   id verifies the immutable fields; a mismatch is an error, never a silent
   accept.

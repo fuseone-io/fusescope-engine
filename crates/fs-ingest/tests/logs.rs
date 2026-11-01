@@ -589,6 +589,7 @@ async fn the_hot_window_serves_log_rows_by_their_schema() {
         span_ids: None,
         distinct: None,
         signal: RowSignal::Traces,
+        table: None,
     };
     let got = scan(&addr, &spans_only, wait).await.unwrap();
     assert_eq!(rows(&got.batches), 3);

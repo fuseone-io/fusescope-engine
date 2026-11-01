@@ -104,6 +104,18 @@ impl Level {
     }
 }
 
+impl Level {
+    /// Bytes it holds: its pairs as allocated and their texts.
+    pub(crate) fn held(&self) -> usize {
+        self.pairs.capacity() * std::mem::size_of::<(String, String)>()
+            + self
+                .pairs
+                .iter()
+                .map(|(k, v)| k.capacity() + v.capacity())
+                .sum::<usize>()
+    }
+}
+
 /// What makes one series of a point: everything its fingerprint hashes
 /// besides the levels.
 pub(crate) struct SeriesKey<'a> {

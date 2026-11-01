@@ -610,11 +610,38 @@ fn series_batches_have_the_series_schema() {
         vec![],
         vec![gauge("g", vec![number(1.0, vec![kv("a", "b")])])],
     ));
-    let batch = series_batch(&rows.series).unwrap();
+    let batch = series_batch(&rows.series, rows.series.len()).unwrap();
     assert_eq!(batch.schema(), series_schema_v1());
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(
         batch.column(4).as_primitive::<UInt64Type>().value(0),
         rows.series.first().unwrap().fingerprint
     );
+}
+
+#[test]
+fn a_request_converted_before_its_position_was_known_takes_it_after() {
+    let req = request(
+        vec![],
+        vec![],
+        vec![
+            gauge(
+                "b",
+                vec![number(1.0, vec![]), number(2.0, vec![kv("k", "v")])],
+            ),
+            histogram("h", bounded(vec![1.0], vec![1, 1])),
+        ],
+    );
+    let limits = Limits::default();
+    let metrics = MetricLimits::default();
+    let checked = preflight(&req, &limits, &metrics).unwrap();
+    let unknown = Source {
+        instance: [0; 16],
+        segment: 0,
+        offset: 0,
+    };
+    let early = convert(&req, &limits, &metrics, &checked, unknown).unwrap();
+    let known = convert(&req, &limits, &metrics, &checked, SOURCE).unwrap();
+    assert_eq!(with_source(&early.samples, SOURCE).unwrap(), known.samples);
+    assert_eq!(checked.hours, vec![T0_MS]);
 }

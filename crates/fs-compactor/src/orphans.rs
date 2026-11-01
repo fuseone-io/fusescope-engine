@@ -49,7 +49,7 @@ use crate::CompactError;
 const CHUNK: usize = 1000;
 
 /// The kinds of partition under a tenant, in walk order.
-const KINDS: [&str; 13] = [
+const KINDS: [&str; 15] = [
     "traces/l0",
     "traces/l1",
     "traces/l2",
@@ -63,6 +63,8 @@ const KINDS: [&str; 13] = [
     "logs/l1",
     "logs/l2",
     "logs/index/ngram",
+    "metrics/samples/l0",
+    "metrics/series/l0",
 ];
 
 /// Bounds of the sweep.

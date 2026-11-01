@@ -1,10 +1,12 @@
-//! Calendar hours of span rows: an L0 file never holds rows of two.
+//! Calendar hours of rows: an L0 file never holds rows of two. Span and
+//! log rows are timed by `timestamp`, in nanoseconds; metric samples by
+//! `unix_milli`, in milliseconds.
 
 use std::collections::{BTreeSet, HashMap};
 
-use arrow::array::{AsArray, PrimitiveArray, UInt32Array};
+use arrow::array::{Array, AsArray, Int64Array, PrimitiveArray, UInt32Array};
 use arrow::compute::take_record_batch;
-use arrow::datatypes::TimestampNanosecondType;
+use arrow::datatypes::{Int64Type, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_schema::spans::col;
@@ -25,14 +27,18 @@ pub fn hour_of(nanos: i64) -> DateTime<Utc> {
 pub fn hours_in(batches: &[RecordBatch]) -> Result<BTreeSet<DateTime<Utc>>, IngestError> {
     let mut starts = BTreeSet::new();
     for batch in batches {
-        let ts = timestamps(batch)?;
-        let (Some(min), Some(max)) = (arrow::compute::min(ts), arrow::compute::max(ts)) else {
+        let ts = times(batch)?;
+        let (Some(min), Some(max)) = (ts.min(), ts.max()) else {
             continue;
         };
         if hour_floor(min) == hour_floor(max) {
             starts.insert(hour_floor(min));
         } else {
-            starts.extend(ts.values().iter().map(|t| hour_floor(*t)));
+            starts.extend(
+                (0..ts.len())
+                    .filter_map(|row| ts.nanos(row))
+                    .map(hour_floor),
+            );
         }
     }
     Ok(starts.into_iter().map(|s| Utc.timestamp_nanos(s)).collect())
@@ -60,13 +66,13 @@ pub fn partition(batch: &RecordBatch, hours: &[DateTime<Utc>]) -> Result<Partiti
         .enumerate()
         .map(|(i, hour)| hour_nanos(*hour).map(|start| (start, i)))
         .collect::<Result<_, _>>()?;
-    let ts = timestamps(batch)?;
+    let ts = times(batch)?;
     let mut by_hour: Vec<Vec<u32>> = hours.iter().map(|_| Vec::new()).collect();
     let mut rest = Vec::new();
-    for (row, t) in ts.iter().enumerate() {
-        let row = u32::try_from(row)
+    for at in 0..ts.len() {
+        let row = u32::try_from(at)
             .map_err(|_| IngestError::Encode("too many rows in one batch to partition".into()))?;
-        match t.and_then(|t| wanted.get(&hour_floor(t))) {
+        match ts.nanos(at).and_then(|t| wanted.get(&hour_floor(t))) {
             Some(i) => {
                 if let Some(rows) = by_hour.get_mut(*i) {
                     rows.push(row);
@@ -91,14 +97,62 @@ fn hour_nanos(hour: DateTime<Utc>) -> Result<i64, IngestError> {
         .ok_or_else(|| IngestError::Encode(format!("hour {hour} is outside the nanosecond range")))
 }
 
-fn timestamps(
-    batch: &RecordBatch,
-) -> Result<&PrimitiveArray<TimestampNanosecondType>, IngestError> {
-    let index = batch.schema().index_of(col::TIMESTAMP)?;
+/// The times of a batch's rows.
+enum Times<'a> {
+    /// `timestamp`, nanoseconds.
+    Nanos(&'a PrimitiveArray<TimestampNanosecondType>),
+    /// `unix_milli`, milliseconds.
+    Millis(&'a Int64Array),
+}
+
+impl Times<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Nanos(a) => a.len(),
+            Self::Millis(a) => a.len(),
+        }
+    }
+
+    /// The time of `row` in nanoseconds, saturating past the range.
+    fn nanos(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Nanos(a) => a.is_valid(row).then(|| a.value(row)),
+            Self::Millis(a) => a
+                .is_valid(row)
+                .then(|| a.value(row).saturating_mul(1_000_000)),
+        }
+    }
+
+    fn min(&self) -> Option<i64> {
+        match self {
+            Self::Nanos(a) => arrow::compute::min(*a),
+            Self::Millis(a) => arrow::compute::min(*a).map(|m| m.saturating_mul(1_000_000)),
+        }
+    }
+
+    fn max(&self) -> Option<i64> {
+        match self {
+            Self::Nanos(a) => arrow::compute::max(*a),
+            Self::Millis(a) => arrow::compute::max(*a).map(|m| m.saturating_mul(1_000_000)),
+        }
+    }
+}
+
+fn times(batch: &RecordBatch) -> Result<Times<'_>, IngestError> {
+    let schema = batch.schema();
+    if let Ok(index) = schema.index_of(col::TIMESTAMP) {
+        return batch
+            .column(index)
+            .as_primitive_opt::<TimestampNanosecondType>()
+            .map(Times::Nanos)
+            .ok_or_else(|| IngestError::Encode("timestamps are not nanoseconds".into()));
+    }
+    let index = schema.index_of(fs_schema::metrics::col::UNIX_MILLI)?;
     batch
         .column(index)
-        .as_primitive_opt::<TimestampNanosecondType>()
-        .ok_or_else(|| IngestError::Encode("span timestamps are not nanoseconds".into()))
+        .as_primitive_opt::<Int64Type>()
+        .map(Times::Millis)
+        .ok_or_else(|| IngestError::Encode("sample times are not milliseconds".into()))
 }
 
 #[cfg(test)]

@@ -141,6 +141,7 @@ impl HotWindow {
             span_ids: pruning.span_ids.clone(),
             distinct,
             signal,
+            table: None,
         };
         let calls = ingesters.iter().map(|ingester| {
             let request = request.clone();

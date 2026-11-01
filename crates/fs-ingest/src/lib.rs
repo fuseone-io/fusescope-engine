@@ -21,8 +21,11 @@ pub mod histogram;
 pub mod hot;
 pub mod hours;
 pub mod ingester;
+pub mod metric_flush;
+mod metric_ingest;
 pub mod ratelimit;
 pub mod record;
+pub mod series;
 pub mod server;
 mod sha256;
 pub mod walwriter;
@@ -99,6 +102,17 @@ pub enum IngestError {
     TooManyHours {
         /// Hours the spans fall in.
         hours: usize,
+        /// The configured limit.
+        limit: usize,
+    },
+    /// A metrics request over a request-wide bound; the caller answers
+    /// INVALID_ARGUMENT.
+    #[error("metrics request with {count} {what}, more than the {limit} allowed")]
+    TooLarge {
+        /// Points or samples.
+        what: &'static str,
+        /// How many the request carries, or expands into.
+        count: usize,
         /// The configured limit.
         limit: usize,
     },

@@ -65,6 +65,9 @@ pub struct IngestConfig {
     pub anonymous_tenant: Option<TenantId>,
     /// Attribute limits applied during conversion.
     pub limits: Limits,
+    /// Bounds of a metrics request's conversion: points, expanded samples,
+    /// buckets, quantiles and labels a series.
+    pub metrics: fs_schema::metrics::MetricLimits,
     /// How long a resolved token stays cached before the catalog is asked again.
     pub token_cache_ttl: Duration,
     /// Internal Arrow Flight address serving the hot window to queriers.
@@ -155,6 +158,7 @@ impl Default for IngestConfig {
             tenant_bytes_per_sec: None,
             anonymous_tenant: None,
             limits: Limits::default(),
+            metrics: fs_schema::metrics::MetricLimits::default(),
             token_cache_ttl: Duration::from_secs(60),
             hot_listen: None,
             persisted_retain: Duration::from_secs(8),

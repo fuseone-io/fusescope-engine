@@ -19,11 +19,13 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use fs_catalog::{FileId, TenantId};
+use fs_catalog::{FileId, FileSetId, TenantId};
+use fs_schema::metrics::SeriesRow;
 use fs_wal::Position;
 
 use crate::IngestError;
 use crate::record::{FileLayout, RowSignal};
+use crate::series::SeriesSet;
 
 /// The rows of one signal of one tenant: what a buffer, a flush and a hot
 /// scan are kept by. A tenant's streams share its memory cap.
@@ -52,9 +54,21 @@ impl Stream {
         }
     }
 
+    /// The tenant's metric samples and series.
+    pub fn metrics(tenant: TenantId) -> Self {
+        Self {
+            tenant,
+            signal: RowSignal::Metrics,
+        }
+    }
+
     /// Every stream of `tenant`.
-    pub fn of(tenant: TenantId) -> [Self; 2] {
-        [Self::traces(tenant), Self::logs(tenant)]
+    pub fn of(tenant: TenantId) -> [Self; 3] {
+        [
+            Self::traces(tenant),
+            Self::logs(tenant),
+            Self::metrics(tenant),
+        ]
     }
 }
 
@@ -158,9 +172,62 @@ pub struct TenantBuffer {
     pub first_wal: Option<Position>,
     /// When the first record arrived.
     pub oldest: Option<Instant>,
+    /// The series of metric rows, counted in `bytes`.
+    pub series: SeriesSet,
 }
 
 impl TenantBuffer {
+    /// [`push_with_hours`](Self::push_with_hours) for metric samples and
+    /// their `series`, merged into the buffer's.
+    pub fn push_metric(
+        &mut self,
+        batch: RecordBatch,
+        series: Vec<SeriesRow>,
+        hours: Vec<DateTime<Utc>>,
+        wal: Position,
+        now: Instant,
+    ) {
+        if batch.num_rows() == 0 {
+            return;
+        }
+        self.push_with_hours(batch, hours, wal, now);
+        self.add_series(series);
+    }
+
+    /// Merges `series` into the buffer's, keeping `bytes` exact.
+    fn add_series(&mut self, series: Vec<SeriesRow>) {
+        let before = self.series.bytes();
+        self.series.add(series);
+        self.bytes = self.bytes - before + self.series.bytes();
+    }
+
+    /// Takes back `series`, as [`Self::add_series`] does.
+    fn absorb_series(&mut self, series: SeriesSet) {
+        let before = self.series.bytes();
+        self.series.absorb(series);
+        self.bytes = self.bytes - before + self.series.bytes();
+    }
+
+    /// Takes the series of each of `hours` out, in order; `bytes` keeps
+    /// what stays.
+    fn take_series(&mut self, hours: &[DateTime<Utc>]) -> Vec<SeriesSet> {
+        let starts: Vec<i64> = hours.iter().map(DateTime::timestamp_millis).collect();
+        let before = self.series.bytes();
+        let parts = self.series.take_hours(&starts);
+        self.bytes = self.bytes - before + self.series.bytes();
+        parts
+    }
+
+    /// The series as a batch, `None` without any.
+    ///
+    /// # Errors
+    /// An Arrow failure.
+    pub fn series_batch(&self) -> Result<Option<RecordBatch>, IngestError> {
+        if self.series.is_empty() {
+            return Ok(None);
+        }
+        self.series.batch().map(Some)
+    }
     /// Adds a batch that was logged at `wal`, keeping position order. The
     /// hours its rows fall in are taken here; a batch without the span
     /// timestamp column has none.
@@ -226,6 +293,7 @@ impl TenantBuffer {
             oldest: self.oldest,
             ..TenantBuffer::default()
         };
+        // Series are moved, not copied: the caller takes them apart.
         let mut parts: Vec<TenantBuffer> = hours.iter().map(|_| fresh()).collect();
         let mut rest = fresh();
         for entry in &self.entries {
@@ -330,6 +398,9 @@ impl TenantBuffer {
     /// Puts batches back in front after a failed flush. Every position in
     /// `earlier` is below every position here.
     pub fn restore(&mut self, mut earlier: TenantBuffer) {
+        let series = std::mem::take(&mut earlier.series);
+        earlier.bytes -= series.bytes();
+        self.absorb_series(series);
         if earlier.is_empty() {
             return;
         }
@@ -536,6 +607,23 @@ pub struct Flushing {
     /// The hour the rows were cut into, when the buffer spanned hours; a
     /// superseding intent carries it on.
     pub hour: Option<DateTime<Utc>>,
+    /// For metric rows: the set and the series file that go with `file`,
+    /// the samples file.
+    pub metric: Option<MetricPair>,
+}
+
+/// The series file and the set a metric flush's samples file goes with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricPair {
+    /// The set both files register under.
+    pub set: FileSetId,
+    /// The series file's id.
+    pub series: FileId,
+    /// The id the series were first assigned, kept when the set changes:
+    /// what the hot window announces for them.
+    pub series_origin: FileId,
+    /// The series file's layout.
+    pub series_layout: FileLayout,
 }
 
 impl Flushing {
@@ -550,6 +638,8 @@ impl Flushing {
 #[derive(Debug)]
 struct Unconfirmed {
     tenant: Stream,
+    /// The set to confirm, for a metric flush: both its files at once.
+    set: Option<FileSetId>,
     /// First record of the intent, which the checkpoint stays behind.
     first: Position,
     attempts: u32,
@@ -584,6 +674,8 @@ pub struct Bound {
     pub layout: Option<FileLayout>,
     /// The hour the rows were cut into, when the buffer spanned hours.
     pub hour: Option<DateTime<Utc>>,
+    /// For metric rows: the series file and set that go with `file`.
+    pub metric: Option<MetricPair>,
 }
 
 /// One of the flushes a buffer spanning hours is cut into.
@@ -597,6 +689,9 @@ pub struct FlushPart {
     pub batches: Vec<RecordBatch>,
     /// Scratch held for the attempt.
     pub held: Scratch,
+    /// For metric rows: the series file and set, and the series as a
+    /// batch.
+    pub metric: Option<(MetricPair, RecordBatch)>,
 }
 
 /// Copies of its inputs a flush holds while the file is prepared: the
@@ -715,6 +810,9 @@ pub struct Persisted {
     pub bytes: usize,
     /// When the file was registered.
     pub at: Instant,
+    /// For a metric flush: the series file and its rows as written,
+    /// counted in `bytes`.
+    pub series: Option<(FileId, Vec<HotBatch>)>,
 }
 
 /// What a hot-window scan sees for one tenant.
@@ -734,6 +832,19 @@ pub struct Snapshot {
     pub flushing: Vec<(FileId, Vec<HotBatch>)>,
     /// Rows flushed recently and still served; the querier skips these files.
     pub persisted: Vec<Persisted>,
+    /// The series of metric rows in the same states.
+    pub series: SeriesSnapshot,
+}
+
+/// What a hot-window scan sees of a metric stream's series.
+#[derive(Debug, Default)]
+pub struct SeriesSnapshot {
+    /// Series of the live rows.
+    pub live: Option<RecordBatch>,
+    /// Series being flushed, with the id their file was first assigned.
+    pub flushing: Vec<(FileId, RecordBatch)>,
+    /// Series flushed recently and still served, with their file's id.
+    pub persisted: Vec<(FileId, Vec<HotBatch>)>,
 }
 
 /// All tenant buffers.
@@ -1112,6 +1223,7 @@ impl Buffers {
             range,
             origin: file,
             hour,
+            metric: None,
         });
         Some((batches, lease))
     }
@@ -1166,15 +1278,155 @@ impl Buffers {
                 range,
                 origin: file,
                 hour: Some(hour),
+                metric: None,
             });
             cut.push(FlushPart {
                 file,
                 hour,
                 batches,
                 held,
+                metric: None,
             });
         }
         Ok(Some(cut))
+    }
+
+    /// [`begin_flush_split`](Self::begin_flush_split) for metric rows:
+    /// one flush per `(hour, samples file, pair)` in `parts`, the series
+    /// of the hour taken with its samples, each part's series built into
+    /// the batch its series file is encoded from. Rows of other hours stay
+    /// live with their series.
+    ///
+    /// # Errors
+    /// Rows without a time column, or a series batch that cannot be built;
+    /// nothing is cut then.
+    pub fn begin_metric_flush(
+        &mut self,
+        tenant: Stream,
+        layout: FileLayout,
+        range: (Position, Position),
+        parts: &[(DateTime<Utc>, FileId, MetricPair)],
+    ) -> Result<Option<Vec<FlushPart>>, IngestError> {
+        let Some(mut buffer) = self.tenants.remove(&tenant).filter(|b| !b.is_empty()) else {
+            return Ok(None);
+        };
+        let hours: Vec<_> = parts.iter().map(|(hour, _, _)| *hour).collect();
+        let (mut split, mut rest) = match buffer.split_by_hours(&hours) {
+            Ok(split) => split,
+            Err(e) => {
+                self.get_mut(tenant).restore(buffer);
+                return Err(e);
+            }
+        };
+        if split.iter().map(|p| p.rows).sum::<usize>() + rest.rows != buffer.rows {
+            self.get_mut(tenant).restore(buffer);
+            return Err(IngestError::Encode("rows lost in the cut by hour".into()));
+        }
+        for (part, series) in split.iter_mut().zip(buffer.take_series(&hours)) {
+            part.absorb_series(series);
+        }
+        rest.absorb_series(std::mem::take(&mut buffer.series));
+        let batches: Result<Vec<_>, _> = split.iter().map(|p| p.series.batch()).collect();
+        let batches = match batches {
+            Ok(b) => b,
+            Err(e) => {
+                let live = self.get_mut(tenant);
+                live.restore(rest);
+                for part in split {
+                    live.restore(part);
+                }
+                return Err(e);
+            }
+        };
+        if !rest.is_empty() || !rest.series.is_empty() {
+            self.get_mut(tenant).restore(rest);
+        }
+        let mut cut = Vec::with_capacity(split.len());
+        for (((hour, file, pair), part), series) in parts.iter().copied().zip(split).zip(batches) {
+            if part.is_empty() {
+                continue;
+            }
+            let samples = part.batches();
+            let held = self.hold_scratch(self.lease_bytes(tenant.signal, part.bytes));
+            self.flushing.entry(tenant).or_default().push(Flushing {
+                file,
+                buffer: part,
+                attempts: 0,
+                next_attempt: Instant::now(),
+                in_progress: true,
+                detached: 0,
+                layout: Some(layout),
+                range,
+                origin: file,
+                hour: Some(hour),
+                metric: Some(pair),
+            });
+            cut.push(FlushPart {
+                file,
+                hour,
+                batches: samples,
+                held,
+                metric: Some((pair, series)),
+            });
+        }
+        Ok(Some(cut))
+    }
+
+    /// The pair and the series batch of the pending metric flush of
+    /// `file`; `None` for a flush of other rows or none.
+    ///
+    /// # Errors
+    /// A series batch that cannot be built.
+    pub fn flushing_metric(
+        &self,
+        tenant: Stream,
+        file: FileId,
+    ) -> Result<Option<(MetricPair, RecordBatch)>, IngestError> {
+        let Some(entry) = self
+            .flushing
+            .get(&tenant)
+            .and_then(|l| l.iter().find(|f| f.file == file))
+        else {
+            return Ok(None);
+        };
+        let Some(pair) = entry.metric else {
+            return Ok(None);
+        };
+        Ok(Some((pair, entry.buffer.series.batch()?)))
+    }
+
+    /// Gives the pending metric flush of `old` the samples id `new` and
+    /// the series file and set of `pair`, keeping its rows, attempts,
+    /// backoff and origins; true when there was one.
+    pub fn rename_metric(
+        &mut self,
+        tenant: Stream,
+        old: FileId,
+        new: FileId,
+        pair: MetricPair,
+    ) -> bool {
+        match self
+            .flushing
+            .get_mut(&tenant)
+            .and_then(|l| l.iter_mut().find(|f| f.file == old))
+        {
+            Some(entry) if entry.metric.is_some() => {
+                entry.file = new;
+                entry.metric = Some(pair);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Most bytes merging `incoming` series rows into the live series of
+    /// `tenant` holds beyond them and the series already held.
+    pub fn series_merge_peak(&self, tenant: Stream, incoming: usize) -> usize {
+        self.tenants
+            .get(&tenant)
+            .map_or(SeriesSet::default().merge_peak(incoming), |b| {
+                b.series.merge_peak(incoming)
+            })
     }
 
     /// The hours the live rows of `tenant` fall in, in order.
@@ -1229,6 +1481,7 @@ impl Buffers {
                 range: bound.range,
                 origin,
                 hour: bound.hour,
+                metric: bound.metric,
             });
         }
     }
@@ -1245,6 +1498,7 @@ impl Buffers {
                 range: f.range,
                 layout: f.layout,
                 hour: f.hour,
+                metric: f.metric,
             })
     }
 
@@ -1344,33 +1598,71 @@ impl Buffers {
         rows: Vec<HotBatch>,
         now: Instant,
     ) {
-        if let Some(entry) = self.remove_flushing(tenant, file) {
-            self.unconfirmed.insert(
-                file,
-                Unconfirmed {
-                    tenant,
-                    first: entry.range.0,
-                    attempts: 0,
-                    next_attempt: now,
-                    in_progress: Arc::new(AtomicBool::new(false)),
-                },
-            );
-            let budget = entry.buffer.bytes;
-            let written = hot_batches_bytes(&rows);
-            let (batches, bytes) = if written <= budget {
-                (rows, written)
-            } else {
-                let flushed = entry.buffer.hot_batches();
-                let cost = hot_batches_bytes(&flushed);
-                (flushed, cost)
-            };
-            self.persisted.entry(tenant).or_default().push(Persisted {
-                file,
-                bytes,
-                batches,
-                at: now,
+        self.finish(tenant, file, rows, None, now);
+    }
+
+    /// [`finish_flush`](Self::finish_flush) for a metric flush whose set is
+    /// registered: its samples as written and `series`, its series file's
+    /// rows as written.
+    pub fn finish_metric_flush(
+        &mut self,
+        tenant: Stream,
+        file: FileId,
+        rows: Vec<HotBatch>,
+        series: Vec<HotBatch>,
+        now: Instant,
+    ) {
+        self.finish(tenant, file, rows, Some(series), now);
+    }
+
+    fn finish(
+        &mut self,
+        tenant: Stream,
+        file: FileId,
+        rows: Vec<HotBatch>,
+        series: Option<Vec<HotBatch>>,
+        now: Instant,
+    ) {
+        let Some(entry) = self.remove_flushing(tenant, file) else {
+            return;
+        };
+        self.unconfirmed.insert(
+            file,
+            Unconfirmed {
+                tenant,
+                set: entry.metric.map(|m| m.set),
+                first: entry.range.0,
+                attempts: 0,
+                next_attempt: now,
+                in_progress: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let budget = entry.buffer.bytes;
+        let series_written = series.as_deref().map_or(0, hot_batches_bytes);
+        let written = hot_batches_bytes(&rows) + series_written;
+        let (batches, series, bytes) = if written <= budget {
+            (rows, series, written)
+        } else {
+            let flushed = entry.buffer.hot_batches();
+            let series = entry.metric.and_then(|_| {
+                entry.buffer.series_batch().ok().flatten().map(|batch| {
+                    vec![HotBatch {
+                        batch,
+                        traces: None,
+                    }]
+                })
             });
-        }
+            let cost = hot_batches_bytes(&flushed) + series.as_deref().map_or(0, hot_batches_bytes);
+            (flushed, series, cost)
+        };
+        let series = entry.metric.zip(series).map(|(m, rows)| (m.series, rows));
+        self.persisted.entry(tenant).or_default().push(Persisted {
+            file,
+            bytes,
+            batches,
+            at: now,
+            series,
+        });
     }
 
     /// The intent could not be logged, so the rows are not bound to the file
@@ -1423,6 +1715,11 @@ impl Buffers {
         ))
     }
 
+    /// The set the confirmation of `file` confirms, for a metric flush.
+    pub fn confirmation_set(&self, file: FileId) -> Option<FileSetId> {
+        self.unconfirmed.get(&file).and_then(|e| e.set)
+    }
+
     /// Registered files whose confirmation has not landed.
     pub fn unconfirmed_count(&self) -> usize {
         self.unconfirmed.len()
@@ -1456,6 +1753,41 @@ impl Buffers {
                 })
                 .unwrap_or_default(),
             persisted: self.persisted.get(&tenant).cloned().unwrap_or_default(),
+            series: self.series_snapshot(tenant),
+        }
+    }
+
+    /// The series of a metric stream in every state; empty for another.
+    fn series_snapshot(&self, tenant: Stream) -> SeriesSnapshot {
+        if tenant.signal != RowSignal::Metrics {
+            return SeriesSnapshot::default();
+        }
+        let live = self
+            .tenants
+            .get(&tenant)
+            .and_then(|b| b.series_batch().ok().flatten());
+        let flushing = self
+            .flushing
+            .get(&tenant)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                let pair = f.metric?;
+                let batch = f.buffer.series_batch().ok().flatten()?;
+                Some((pair.series_origin, batch))
+            })
+            .collect();
+        let persisted = self
+            .persisted
+            .get(&tenant)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.series.clone())
+            .collect();
+        SeriesSnapshot {
+            live,
+            flushing,
+            persisted,
         }
     }
 
@@ -1784,6 +2116,7 @@ mod tests {
                 range: (at(20), at(21)),
                 layout: Some(FileLayout::current(8)),
                 hour: None,
+                metric: None,
             })
         );
         assert!(buffers.rename_flushing(tenant, old, new));

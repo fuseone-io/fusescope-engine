@@ -72,7 +72,30 @@ pub struct HotScanRequest {
     /// Whose rows: spans when absent, as in tickets from before logs.
     #[serde(default, skip_serializing_if = "RowSignal::is_traces")]
     pub signal: RowSignal,
+    /// For metrics: the samples or the series. Absent for other signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<MetricTable>,
 }
+
+/// One of the two tables of the metrics signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricTable {
+    /// `samples`.
+    Samples,
+    /// `time_series`.
+    Series,
+}
+
+/// The schema a scan's rows have: its signal's, for metrics its table's.
+pub fn scan_schema(scan: &HotScanRequest) -> arrow::datatypes::SchemaRef {
+    match (scan.signal, scan.table) {
+        (RowSignal::Metrics, Some(MetricTable::Series)) => fs_schema::metrics::series_schema_v1(),
+        (signal, _) => schema_of(signal),
+    }
+}
+
+const MILLIS_PER_HOUR: i64 = 3_600_000;
 
 impl HotScanRequest {
     /// Encodes the request as a Flight ticket.
@@ -120,15 +143,31 @@ pub fn apply(
         Ok(())
     };
     if request.ts_min.is_some() || request.ts_max.is_some() {
-        let ts = batch
-            .column(schema.index_of(col::TIMESTAMP)?)
-            .as_primitive::<TimestampNanosecondType>();
         let min = request.ts_min.unwrap_or(i64::MIN);
         let max = request.ts_max.unwrap_or(i64::MAX);
-        add(BooleanArray::from_iter(
-            ts.iter()
-                .map(|v| Some(v.is_some_and(|t| t >= min && t <= max))),
-        ))?;
+        if let Ok(index) = schema.index_of(col::TIMESTAMP) {
+            let ts = batch
+                .column(index)
+                .as_primitive::<TimestampNanosecondType>();
+            add(BooleanArray::from_iter(
+                ts.iter()
+                    .map(|v| Some(v.is_some_and(|t| t >= min && t <= max))),
+            ))?;
+        } else {
+            // Metric rows are timed in milliseconds; a series row stands
+            // for its whole hour.
+            let span = match request.table {
+                Some(MetricTable::Series) => MILLIS_PER_HOUR - 1,
+                _ => 0,
+            };
+            let ms = batch
+                .column(schema.index_of(fs_schema::metrics::col::UNIX_MILLI)?)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            let nanos = |m: i64| m.saturating_mul(1_000_000);
+            add(BooleanArray::from_iter(ms.iter().map(|v| {
+                Some(v.is_some_and(|m| nanos(m) <= max && nanos(m.saturating_add(span)) >= min))
+            })))?;
+        }
     }
     if let Some(services) = &request.services {
         let column = batch.column(schema.index_of("service_name")?);
@@ -302,7 +341,7 @@ impl Distinct {
                 column: column.clone(),
                 cap,
                 values: std::collections::BTreeSet::new(),
-                schema: schema_of(scan.signal),
+                schema: scan_schema(scan),
             }),
             _ => Err(Status::invalid_argument(
                 "a distinct scan projects exactly one column",
@@ -345,6 +384,35 @@ impl Distinct {
     }
 }
 
+/// The batches a scan reads, in every state: the samples or series of a
+/// metric stream as `scan` asks, the rows of another. Shared, not copied.
+fn scan_sources(
+    snapshot: &crate::buffer::Snapshot,
+    scan: &HotScanRequest,
+) -> Vec<crate::buffer::HotBatch> {
+    if scan.table == Some(MetricTable::Series) {
+        let as_hot = |batch: &RecordBatch| crate::buffer::HotBatch {
+            batch: batch.clone(),
+            traces: None,
+        };
+        let series = &snapshot.series;
+        return series
+            .live
+            .iter()
+            .map(as_hot)
+            .chain(series.flushing.iter().map(|(_, b)| as_hot(b)))
+            .chain(series.persisted.iter().flat_map(|(_, b)| b.iter().cloned()))
+            .collect();
+    }
+    snapshot
+        .live
+        .iter()
+        .chain(snapshot.flushing.iter().flat_map(|(_, b)| b.iter()))
+        .chain(snapshot.persisted.iter().flat_map(|p| p.batches.iter()))
+        .cloned()
+        .collect()
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
@@ -367,11 +435,7 @@ impl FlightService for HotService {
             signal: scan.signal,
         };
         let (snapshot, live_files) = self.shared.snapshot(stream).await;
-        let sources = snapshot
-            .live
-            .iter()
-            .chain(snapshot.flushing.iter().flat_map(|(_, b)| b.iter()))
-            .chain(snapshot.persisted.iter().flat_map(|p| p.batches.iter()));
+        let sources = scan_sources(&snapshot, &scan);
         // A batch whose trace set holds none of the requested traces is not
         // even filtered: the chunks and the persisted rows carry their set.
         let wanted: Option<std::collections::HashSet<[u8; 16]>> =
@@ -386,7 +450,7 @@ impl FlightService for HotService {
             .map(|cap| Distinct::for_request(&scan, cap))
             .transpose()?;
         let mut skipped = 0u64;
-        for source in sources {
+        for source in &sources {
             if let (Some(wanted), Some(traces)) = (&wanted, &source.traces) {
                 if !wanted.iter().any(|id| traces.binary_search(id).is_ok()) {
                     skipped += 1;
@@ -417,12 +481,14 @@ impl FlightService for HotService {
             .into_iter()
             .chain(snapshot.flushing.iter().map(|(id, _)| *id))
             .chain(snapshot.persisted.iter().map(|p| p.file))
+            .chain(snapshot.series.flushing.iter().map(|(id, _)| *id))
+            .chain(snapshot.series.persisted.iter().map(|(id, _)| *id))
             .map(|id| id.0.to_string())
             .collect();
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         debug!(tenant = %scan.tenant.0, signal = ?scan.signal, rows, persisted = persisted.len(), "hot scan");
 
-        let full = schema_of(scan.signal);
+        let full = scan_schema(&scan);
         let schema = match &scan.columns {
             Some(columns) => {
                 let indices = columns
@@ -522,6 +588,7 @@ mod tests {
             span_ids: None,
             distinct: None,
             signal: RowSignal::Traces,
+            table: None,
         };
         assert_eq!(
             HotScanRequest::from_ticket(&request.to_ticket()).unwrap(),
@@ -556,6 +623,7 @@ mod tests {
             span_ids: None,
             distinct: None,
             signal: RowSignal::Traces,
+            table: None,
         };
         let encoded = String::from_utf8(spans.to_ticket().ticket.to_vec()).unwrap();
         assert!(!encoded.contains("signal"), "{encoded}");

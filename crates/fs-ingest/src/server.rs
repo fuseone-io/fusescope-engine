@@ -1,4 +1,4 @@
-//! The OTLP trace and logs services.
+//! The OTLP trace, logs and metrics services.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -7,6 +7,10 @@ use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
 use opentelemetry_proto::tonic::collector::trace::v1::{
@@ -39,6 +43,19 @@ pub struct LogsReceiver {
 }
 
 impl LogsReceiver {
+    pub(crate) fn new(shared: Arc<Shared>) -> Self {
+        Self { shared }
+    }
+}
+
+/// gRPC handler of the metrics service. Cheap to clone; state lives in
+/// [`Shared`].
+#[derive(Clone)]
+pub struct MetricsReceiver {
+    shared: Arc<Shared>,
+}
+
+impl MetricsReceiver {
     pub(crate) fn new(shared: Arc<Shared>) -> Self {
         Self { shared }
     }
@@ -78,7 +95,9 @@ fn status_of(shared: &Shared, e: IngestError) -> Status {
         }
         IngestError::Capacity(what) => Status::resource_exhausted(what),
         IngestError::WalFull => Status::unavailable("write-ahead log full"),
-        IngestError::TooManyHours { .. } => Status::invalid_argument(e.to_string()),
+        IngestError::TooManyHours { .. } | IngestError::TooLarge { .. } => {
+            Status::invalid_argument(e.to_string())
+        }
         IngestError::Wal(_) | IngestError::Join(_) => {
             warn!(error = %e, "wal append failed");
             Status::unavailable("write-ahead log unavailable")
@@ -177,5 +196,45 @@ impl LogsService for LogsReceiver {
                 .into(),
         });
         Ok(Response::new(ExportLogsServiceResponse { partial_success }))
+    }
+}
+
+#[tonic::async_trait]
+impl MetricsService for MetricsReceiver {
+    async fn export(
+        &self,
+        request: Request<ExportMetricsServiceRequest>,
+    ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        let shared = &self.shared;
+        let tenant = shared.auth.authenticate(request.metadata()).await?;
+        let message = request.into_inner();
+        let payload = Bytes::from(message.encode_to_vec());
+        let now = Instant::now();
+        check_rate(shared, tenant, payload.len(), now)?;
+        let record = WalRecord {
+            version: crate::record::VERSION,
+            tenant,
+            signal: RecordSignal::Metrics,
+            payload,
+        };
+        let task_shared = Arc::clone(shared);
+        let outcome = run_ingest(shared, async move {
+            task_shared
+                .ingest_metrics(tenant, &message, record.encode(), now)
+                .await
+        })
+        .await?;
+        debug!(tenant = %tenant.0, points = outcome.accepted, rejected = outcome.rejected, "export");
+
+        let partial_success = (outcome.rejected > 0).then(|| ExportMetricsPartialSuccess {
+            rejected_data_points: i64::try_from(outcome.rejected).unwrap_or(i64::MAX),
+            error_message: format!(
+                "data points refused: {}",
+                outcome.detail.unwrap_or_default()
+            ),
+        });
+        Ok(Response::new(ExportMetricsServiceResponse {
+            partial_success,
+        }))
     }
 }

@@ -274,6 +274,7 @@ pub async fn run(
         span_ids: None,
         distinct: None,
         signal: fs_ingest::record::RowSignal::Traces,
+        table: None,
     };
     let (filtered, d) = timed(|| {
         batches

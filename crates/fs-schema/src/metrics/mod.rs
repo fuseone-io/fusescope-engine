@@ -13,9 +13,9 @@ mod identity;
 mod rows;
 mod schema;
 
-pub use expand::{Preflight, TooLarge, convert, preflight};
+pub use expand::{MAX_TRACKED_HOURS, Preflight, TooLarge, convert, preflight};
 pub use identity::{LE, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL, SCOPE_VERSION, TEMPORALITY};
-pub use rows::{MetricRows, SeriesRow, dedupe_series, series_batch};
+pub use rows::{MetricRows, SeriesRow, dedupe_series, series_batch, with_source};
 pub use schema::{
     SAMPLES_SCHEMA_VERSION, SERIES_SCHEMA_VERSION, col, samples_schema_v1, series_schema_v1,
 };

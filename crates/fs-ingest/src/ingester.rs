@@ -33,14 +33,17 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use fs_catalog::{Catalog, CatalogError, FileId, TenantId};
+use fs_catalog::{Catalog, CatalogError, FileId, FileSetId, MetricRole, TenantId};
 use fs_schema::logs::LogBatchBuilder;
+use fs_schema::metrics::{MetricLimits, MetricRows, SeriesRow, Source, TooLarge};
 use fs_schema::spans::SpanBatchBuilder;
 use fs_wal::{Event, Position, Wal};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use prost::Message;
@@ -50,11 +53,13 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::buffer::{Bound, Buffers, ConfirmAttempt, Reservation, Snapshot, Stream, TenantBuffer};
+use crate::buffer::{
+    Bound, Buffers, ConfirmAttempt, MetricPair, Reservation, Snapshot, Stream, TenantBuffer,
+};
 use crate::config::IngestConfig;
 use crate::ratelimit::RateLimiter;
 use crate::record::{FileLayout, FlushIntent, RecordSignal, RowSignal, WalRecord};
-use crate::server::{LogsReceiver, TraceReceiver};
+use crate::server::{LogsReceiver, MetricsReceiver, TraceReceiver};
 use crate::{IngestError, flush};
 
 /// Counters exposed for metrics and tests.
@@ -72,6 +77,13 @@ pub struct IngestStats {
     pub logs_rejected: AtomicU64,
     /// Log bodies truncated to the body limit.
     pub bodies_truncated: AtomicU64,
+    /// Metric data points accepted.
+    pub metric_points: AtomicU64,
+    /// Metric samples buffered, buckets and quantiles included.
+    pub metric_samples: AtomicU64,
+    /// Metric data points refused, by reason, in the order of
+    /// [`fs_schema::metrics::Rejection::ALL`].
+    pub metric_points_rejected: [AtomicU64; fs_schema::metrics::Rejection::ALL.len()],
     /// Requests refused by the throughput limiter.
     pub rate_limited: AtomicU64,
     /// Requests refused because buffers or WAL were full.
@@ -165,7 +177,7 @@ pub struct FlushStats {
 /// Permits of the flush semaphore for a configured `max_flushes`.
 /// Takes one injected failure when any is left: exactly as many as
 /// configured fire, whatever the number of concurrent attempts.
-fn take_injected(counter: &std::sync::atomic::AtomicU32) -> bool {
+pub(crate) fn take_injected(counter: &std::sync::atomic::AtomicU32) -> bool {
     let mut remaining = counter.load(Ordering::SeqCst);
     loop {
         if remaining == 0 {
@@ -189,8 +201,20 @@ fn confirm_permits(max_confirms: usize) -> usize {
     max_confirms.clamp(1, tokio::sync::Semaphore::MAX_PERMITS)
 }
 
-/// One flush of a cut: its id, its rows and the scratch held for them.
-type Cut = (FileId, Vec<RecordBatch>, crate::buffer::Scratch);
+/// For a metric flush: its pair, its series as a batch and its hour.
+pub(crate) type MetricAttempt = (MetricPair, RecordBatch, DateTime<Utc>);
+
+/// One flush of a cut: its id, its rows, the scratch held for them and,
+/// for metric rows, their pair and series.
+type Cut = (
+    FileId,
+    Vec<RecordBatch>,
+    crate::buffer::Scratch,
+    Option<MetricAttempt>,
+);
+
+/// The intents of a cut and its flushes, in the same order.
+type CutPlan = (Vec<FlushIntent>, Vec<Cut>);
 
 /// One flush attempt handed to its task: the rows as cut, the scratch lease
 /// held for them and the layout the intent recorded.
@@ -204,19 +228,21 @@ struct Attempt {
     /// The intent's layout; `None` for an intent logged before layouts were
     /// recorded, which uses the current layout and trusts the object it finds.
     layout: Option<FileLayout>,
+    /// For metric rows: their pair, series and hour.
+    metric: Option<MetricAttempt>,
 }
 
 /// Stage durations of one flush attempt, in nanoseconds.
 #[derive(Debug, Default)]
-struct StageTiming {
-    concat: u64,
-    sort: u64,
-    encode: u64,
-    upload: u64,
-    register: u64,
+pub(crate) struct StageTiming {
+    pub(crate) concat: u64,
+    pub(crate) sort: u64,
+    pub(crate) encode: u64,
+    pub(crate) upload: u64,
+    pub(crate) register: u64,
 }
 
-fn nanos(d: std::time::Duration) -> u64 {
+pub(crate) fn nanos(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -224,6 +250,8 @@ fn nanos(d: std::time::Duration) -> u64 {
 pub(crate) struct Converted {
     pub(crate) accepted: usize,
     pub(crate) rejected: usize,
+    /// Why the rejected were, when more than one reason applies.
+    pub(crate) detail: Option<String>,
 }
 
 /// State shared by the gRPC handler and the flusher.
@@ -232,30 +260,30 @@ pub struct Shared {
     pub(crate) auth: Authenticator,
     pub(crate) limiter: Option<StdMutex<RateLimiter>>,
     pub(crate) stats: Arc<IngestStats>,
-    flush_stats: Arc<FlushStats>,
-    wal: Arc<StdMutex<Wal>>,
-    writer: crate::walwriter::WalWriter,
-    instance: Uuid,
-    buffers: Mutex<Buffers>,
+    pub(crate) flush_stats: Arc<FlushStats>,
+    pub(crate) wal: Arc<StdMutex<Wal>>,
+    pub(crate) writer: crate::walwriter::WalWriter,
+    pub(crate) instance: Uuid,
+    pub(crate) buffers: Mutex<Buffers>,
     /// Requests hold it shared across WAL append and buffer push; a flush
     /// holds it exclusively while it takes a buffer and reads the WAL position.
-    gate: RwLock<()>,
-    flush_now: Notify,
-    coalesce_now: Notify,
-    confirm_now: Notify,
-    conversions: tokio::sync::Semaphore,
-    coalesces: Arc<tokio::sync::Semaphore>,
-    flushes: Arc<tokio::sync::Semaphore>,
-    confirms: Arc<tokio::sync::Semaphore>,
-    inject_register_failures: std::sync::atomic::AtomicU32,
-    inject_intent_failures: std::sync::atomic::AtomicU32,
-    inject_confirm_failures: std::sync::atomic::AtomicU32,
-    inject_index_failures: std::sync::atomic::AtomicU32,
-    push_delay_pending: std::sync::atomic::AtomicBool,
-    retry_delay_pending: std::sync::atomic::AtomicBool,
-    catalog: Catalog,
-    store: Arc<dyn ObjectStore>,
-    root: Path,
+    pub(crate) gate: RwLock<()>,
+    pub(crate) flush_now: Notify,
+    pub(crate) coalesce_now: Notify,
+    pub(crate) confirm_now: Notify,
+    pub(crate) conversions: tokio::sync::Semaphore,
+    pub(crate) coalesces: Arc<tokio::sync::Semaphore>,
+    pub(crate) flushes: Arc<tokio::sync::Semaphore>,
+    pub(crate) confirms: Arc<tokio::sync::Semaphore>,
+    pub(crate) inject_register_failures: std::sync::atomic::AtomicU32,
+    pub(crate) inject_intent_failures: std::sync::atomic::AtomicU32,
+    pub(crate) inject_confirm_failures: std::sync::atomic::AtomicU32,
+    pub(crate) inject_index_failures: std::sync::atomic::AtomicU32,
+    pub(crate) push_delay_pending: std::sync::atomic::AtomicBool,
+    pub(crate) retry_delay_pending: std::sync::atomic::AtomicBool,
+    pub(crate) catalog: Catalog,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) root: Path,
 }
 
 impl Shared {
@@ -263,7 +291,7 @@ impl Shared {
     /// every other admission and push, and reserves them until the rows are
     /// in a buffer. A request that would cross a cap is refused: the caps are
     /// ceilings, not watermarks.
-    async fn admit(
+    pub(crate) async fn admit(
         &self,
         stream: Stream,
         bytes: usize,
@@ -324,7 +352,7 @@ impl Shared {
 
     /// Appends through the group-commit writer; resolves once synced. The
     /// position stays tracked as travelling until the handle is dropped.
-    async fn append_wal(
+    pub(crate) async fn append_wal(
         &self,
         tenant: TenantId,
         record: Vec<u8>,
@@ -366,7 +394,11 @@ impl Shared {
             .spans_rejected
             .fetch_add(stats.spans_rejected, Ordering::Relaxed);
         let rejected = usize::try_from(stats.spans_rejected).unwrap_or(usize::MAX);
-        Ok(Converted { accepted, rejected })
+        Ok(Converted {
+            accepted,
+            rejected,
+            detail: None,
+        })
     }
 
     /// [`Self::ingest`] for a logs request, whose rows take their ids from
@@ -401,7 +433,11 @@ impl Shared {
             .bodies_truncated
             .fetch_add(stats.bodies_truncated, Ordering::Relaxed);
         let rejected = usize::try_from(stats.logs_rejected).unwrap_or(usize::MAX);
-        Ok(Converted { accepted, rejected })
+        Ok(Converted {
+            accepted,
+            rejected,
+            detail: None,
+        })
     }
 
     /// Admits a converted batch against the caps, logs its record and adds
@@ -481,7 +517,7 @@ impl Shared {
     }
 
     /// The live buffer crossed a flush threshold.
-    fn flush_is_due(&self, live: &TenantBuffer) -> bool {
+    pub(crate) fn flush_is_due(&self, live: &TenantBuffer) -> bool {
         live.rows >= self.config.flush_rows || live.bytes >= self.config.flush_bytes
     }
 
@@ -535,7 +571,14 @@ impl Shared {
                 }
                 None => FileId::derived(self.instance, tenant, first.segment, first.offset),
             };
-            if all_hours.len() <= 1 {
+            if stream.signal == RowSignal::Metrics {
+                let Some(cut) =
+                    self.metric_cut(&mut buffers, stream, layout, (first, end), &hours)?
+                else {
+                    return Ok(None);
+                };
+                cut
+            } else if all_hours.len() <= 1 {
                 let hour = hours.first().copied();
                 let file = file_at(hour);
                 let Some((batches, held)) =
@@ -543,7 +586,7 @@ impl Shared {
                 else {
                     return Ok(None);
                 };
-                (vec![intent(file, hour)], vec![(file, batches, held)])
+                (vec![intent(file, hour)], vec![(file, batches, held, None)])
             } else {
                 let parts: Vec<_> = hours.iter().map(|h| (file_at(Some(*h)), *h)).collect();
                 let Some(cut) = buffers.begin_flush_split(stream, layout, (first, end), &parts)?
@@ -554,11 +597,23 @@ impl Shared {
                 (
                     intents,
                     cut.into_iter()
-                        .map(|p| (p.file, p.batches, p.held))
+                        .map(|p| (p.file, p.batches, p.held, None))
                         .collect(),
                 )
             }
         };
+        self.log_intents(stream, intents, parts).await
+    }
+
+    /// Logs the intent of each flush of a cut; a flush whose intent could
+    /// not be logged goes back live. The flushes whose intent is durable.
+    async fn log_intents(
+        &self,
+        stream: Stream,
+        intents: Vec<FlushIntent>,
+        parts: Vec<Cut>,
+    ) -> Result<Option<Vec<Cut>>, IngestError> {
+        let tenant = stream.tenant;
         let mut logged = Vec::with_capacity(parts.len());
         let mut first_error = None;
         for (intent, part) in intents.into_iter().zip(parts) {
@@ -595,6 +650,66 @@ impl Shared {
             (true, None) => Ok(None),
             (false, _) => Ok(Some(logged)),
         }
+    }
+
+    /// The cut of a metric stream: one set a hour in `hours`, each pair's
+    /// ids derived from the rows' first position, the hour and its role,
+    /// with the intents that bind them.
+    fn metric_cut(
+        &self,
+        buffers: &mut Buffers,
+        stream: Stream,
+        layout: FileLayout,
+        (first, end): (Position, Position),
+        hours: &[DateTime<Utc>],
+    ) -> Result<Option<CutPlan>, IngestError> {
+        let tenant = stream.tenant;
+        let parts: Vec<_> = hours
+            .iter()
+            .map(|hour| {
+                let at = (first.segment, first.offset, *hour);
+                let series = FileId::derived_metric(self.instance, tenant, at, MetricRole::Series);
+                let pair = MetricPair {
+                    set: FileSetId::derived(
+                        self.instance,
+                        tenant,
+                        first.segment,
+                        first.offset,
+                        *hour,
+                    ),
+                    series,
+                    series_origin: series,
+                    series_layout: layout,
+                };
+                let samples =
+                    FileId::derived_metric(self.instance, tenant, at, MetricRole::Samples);
+                (*hour, samples, pair)
+            })
+            .collect();
+        let Some(cut) = buffers.begin_metric_flush(stream, layout, (first, end), &parts)? else {
+            return Ok(None);
+        };
+        let intents = cut
+            .iter()
+            .filter_map(|p| {
+                let (pair, _) = p.metric.as_ref()?;
+                Some(crate::metric_ingest::metric_intent(
+                    tenant,
+                    (p.file, layout),
+                    (first, end),
+                    p.hour,
+                    *pair,
+                ))
+            })
+            .collect();
+        let cut = cut
+            .into_iter()
+            .map(|p| {
+                let metric = p.metric.map(|(pair, series)| (pair, series, p.hour));
+                (p.file, p.batches, p.held, metric)
+            })
+            .collect();
+        Ok(Some((intents, cut)))
     }
 
     /// Steps 3 and 4: encode, upload, register, persist, checkpoint. On failure
@@ -865,7 +980,7 @@ impl Shared {
     async fn confirm(
         &self,
         stream: Stream,
-        file: FileId,
+        (file, set): (FileId, Option<FileSetId>),
         attempt: ConfirmAttempt,
         mut shutdown: Option<watch::Receiver<bool>>,
     ) {
@@ -876,10 +991,11 @@ impl Shared {
                 }
                 return Err(IngestError::Injected("catalog confirmation"));
             }
-            self.catalog
-                .confirm_file(file)
-                .await
-                .map_err(IngestError::from)
+            match set {
+                Some(set) => self.catalog.confirm_file_set(set).await,
+                None => self.catalog.confirm_file(file).await,
+            }
+            .map_err(IngestError::from)
         };
         let cancelled = async {
             match shutdown.as_mut() {
@@ -933,14 +1049,21 @@ impl Shared {
             let Ok(permit) = self.confirms.clone().try_acquire_owned() else {
                 break;
             };
-            let taken = self.buffers.lock().await.take_confirmation(Instant::now());
-            let Some((stream, file, attempt)) = taken else {
+            let taken = {
+                let mut buffers = self.buffers.lock().await;
+                buffers
+                    .take_confirmation(Instant::now())
+                    .map(|(stream, file, attempt)| {
+                        (stream, file, buffers.confirmation_set(file), attempt)
+                    })
+            };
+            let Some((stream, file, set, attempt)) = taken else {
                 break;
             };
             let shared = self.clone();
             let shutdown = shutdown.cloned();
             attempts.spawn(async move {
-                shared.confirm(stream, file, attempt, shutdown).await;
+                shared.confirm(stream, (file, set), attempt, shutdown).await;
                 drop(permit);
             });
         }
@@ -963,7 +1086,7 @@ impl Shared {
         attempts.shutdown().await;
     }
 
-    fn publish_unconfirmed(&self, buffers: &Buffers) {
+    pub(crate) fn publish_unconfirmed(&self, buffers: &Buffers) {
         self.flush_stats
             .unconfirmed
             .store(buffers.unconfirmed_count() as u64, Ordering::Relaxed);
@@ -984,10 +1107,33 @@ impl Shared {
             let Some(permit) = self.flush_permit(force).await else {
                 return;
             };
-            let taken = self.buffers.lock().await.take_flushing(stream, file);
+            let (taken, metric) = {
+                let mut buffers = self.buffers.lock().await;
+                let taken = buffers.take_flushing(stream, file);
+                let metric = match buffers.flushing_metric(stream, file) {
+                    Ok(metric) => {
+                        metric.zip(buffers.flushing_range(stream, file).and_then(|b| b.hour))
+                    }
+                    Err(e) => {
+                        warn!(tenant = %stream.tenant.0, file = %file.0, error = %e, "metric series could not be built; will retry");
+                        buffers.flush_failed(stream, file, Instant::now());
+                        continue;
+                    }
+                };
+                (taken, metric)
+            };
             let Some((batches, held, layout, origin)) = taken else {
                 continue;
             };
+            let metric = metric.map(|((pair, series), hour)| (pair, series, hour));
+            if stream.signal == RowSignal::Metrics && metric.is_none() {
+                warn!(tenant = %stream.tenant.0, file = %file.0, "a metric flush without its pair; will retry");
+                self.buffers
+                    .lock()
+                    .await
+                    .flush_failed(stream, file, Instant::now());
+                continue;
+            }
             self.stats.flush_retries.fetch_add(1, Ordering::Relaxed);
             debug!(tenant = %stream.tenant.0, signal = ?stream.signal, file = %file.0, rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(), "retrying flush");
             let delay = self
@@ -1001,6 +1147,7 @@ impl Shared {
                 batches,
                 held,
                 layout,
+                metric,
             };
             self.spawn_materialize(vec![attempt], permit, delay);
         }
@@ -1038,11 +1185,21 @@ impl Shared {
                     batches,
                     held,
                     layout,
+                    metric,
                 } = attempt;
-                if let Err(e) = shared
-                    .materialize(stream, file, origin, batches, held, layout)
-                    .await
-                {
+                let outcome = match metric {
+                    Some(metric) => {
+                        shared
+                            .materialize_metric(stream, file, origin, batches, held, layout, metric)
+                            .await
+                    }
+                    None => {
+                        shared
+                            .materialize(stream, file, origin, batches, held, layout)
+                            .await
+                    }
+                };
+                if let Err(e) = outcome {
                     error!(tenant = %stream.tenant.0, signal = ?stream.signal, error = %e, "flush error");
                 }
             }
@@ -1058,7 +1215,7 @@ impl Shared {
     /// end of the log when nothing is. The cut is chosen under the exclusive
     /// gate, so no request is between its append and its push: every record
     /// accepted after the cut is above it and replay still finds it.
-    async fn checkpoint_wal(&self) {
+    pub(crate) async fn checkpoint_wal(&self) {
         let started = Instant::now();
         let cut = {
             let _exclusive = self.gate.write().await;
@@ -1193,6 +1350,15 @@ impl Shared {
         };
         self.stats.hot_scan.observe(started.elapsed());
         let mut live_files = Vec::new();
+        if let (Some(p), RowSignal::Metrics) = (snapshot.live_first_wal, stream.signal) {
+            for hour in &snapshot.live_hours {
+                let at = (p.segment, p.offset, *hour);
+                for role in MetricRole::BOTH {
+                    live_files.push(FileId::derived_metric(self.instance, tenant, at, role));
+                }
+            }
+            return (snapshot, live_files);
+        }
         if let Some(p) = snapshot.live_first_wal {
             if snapshot.live_hours.is_empty() {
                 live_files.push(FileId::derived(self.instance, tenant, p.segment, p.offset));
@@ -1249,13 +1415,14 @@ impl Shared {
                     cuts += parts.len();
                     let attempts = parts
                         .into_iter()
-                        .map(|(file, batches, held)| Attempt {
+                        .map(|(file, batches, held, metric)| Attempt {
                             stream,
                             file,
                             origin: file,
                             batches,
                             held,
                             layout: Some(self.layout(stream.signal)),
+                            metric,
                         })
                         .collect();
                     self.spawn_materialize(attempts, permit, None);
@@ -1282,16 +1449,30 @@ impl Shared {
     }
 }
 
+/// The rows one record converted into, with its position and, for a
+/// metric record, the series of its samples.
+struct ReplayedRows {
+    stream: Stream,
+    position: Position,
+    batch: RecordBatch,
+    series: Vec<SeriesRow>,
+}
+
 /// Everything replay found: rows with their positions, and flush intents.
 struct Replayed {
-    rows: Vec<(Stream, Position, RecordBatch)>,
+    rows: Vec<ReplayedRows>,
     intents: Vec<FlushIntent>,
     records: usize,
     damaged: usize,
 }
 
 /// Reads the WAL from the checkpoint. Damaged records are counted and skipped.
-fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, IngestError> {
+fn replay(
+    limits: fs_schema::limits::Limits,
+    metrics: MetricLimits,
+    wal: &mut Wal,
+) -> Result<Replayed, IngestError> {
+    let instance = wal.instance_id();
     let mut out = Replayed {
         rows: Vec::new(),
         intents: Vec::new(),
@@ -1322,8 +1503,12 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                         };
                         let mut builder = SpanBatchBuilder::new(limits);
                         builder.append_request(&message)?;
-                        let stream = Stream::traces(record.tenant);
-                        out.rows.push((stream, entry.position, builder.finish()?));
+                        out.rows.push(ReplayedRows {
+                            stream: Stream::traces(record.tenant),
+                            position: entry.position,
+                            batch: builder.finish()?,
+                            series: Vec::new(),
+                        });
                     }
                     RecordSignal::Logs => {
                         let Some((seed, request)) =
@@ -1338,14 +1523,36 @@ fn replay(limits: fs_schema::limits::Limits, wal: &mut Wal) -> Result<Replayed, 
                         };
                         let mut builder = LogBatchBuilder::new(limits);
                         builder.append_request(&message, seed)?;
-                        let stream = Stream::logs(record.tenant);
-                        out.rows.push((stream, entry.position, builder.finish()?));
+                        out.rows.push(ReplayedRows {
+                            stream: Stream::logs(record.tenant),
+                            position: entry.position,
+                            batch: builder.finish()?,
+                            series: Vec::new(),
+                        });
                     }
                     RecordSignal::Metrics => {
-                        return Err(IngestError::Record(format!(
-                            "metric record at {:?} cannot be replayed by this engine yet",
-                            entry.position
-                        )));
+                        let Ok(message) = ExportMetricsServiceRequest::decode(record.payload)
+                        else {
+                            out.damaged += 1;
+                            continue;
+                        };
+                        // The request was accepted: its own bounds held then,
+                        // so only the bounds of each point apply again.
+                        let replayed = MetricLimits {
+                            max_points: usize::MAX,
+                            max_samples: usize::MAX,
+                            ..metrics
+                        };
+                        let source = metric_source(instance, entry.position);
+                        let rows = convert_metrics(&message, &limits, &replayed, source)?;
+                        if rows.samples.num_rows() > 0 {
+                            out.rows.push(ReplayedRows {
+                                stream: Stream::metrics(record.tenant),
+                                position: entry.position,
+                                batch: rows.samples,
+                                series: rows.series,
+                            });
+                        }
                     }
                     // An intent this engine cannot read was written by a newer
                     // one. Skipping it would send its rows back to live and
@@ -1387,7 +1594,7 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
     // the last logged, an earlier id having been given up, and the id of
     // the first logged is the origin: the one the hot window announced
     // from the start, taken from the log rather than derived again.
-    let mut latest: Vec<(FlushIntent, FileId)> = Vec::new();
+    let mut latest: Vec<(FlushIntent, FileId, Option<FileId>)> = Vec::new();
     for intent in replayed.intents {
         let same_range = |earlier: &FlushIntent| {
             earlier.tenant == intent.tenant
@@ -1395,31 +1602,81 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
                 && earlier.end == intent.end
                 && earlier.hour == intent.hour
         };
-        let origin = latest
+        let series_of = |i: &FlushIntent| {
+            i.metric
+                .as_ref()
+                .and_then(|m| m.file(MetricRole::Series))
+                .map(|f| f.file)
+        };
+        let (origin, series_origin) = latest
             .iter()
-            .find(|(earlier, _)| same_range(earlier))
-            .map_or(intent.file, |(_, origin)| *origin);
-        latest.retain(|(earlier, _)| !same_range(earlier));
-        latest.push((intent, origin));
+            .find(|(earlier, _, _)| same_range(earlier))
+            .map_or((intent.file, series_of(&intent)), |(_, origin, series)| {
+                (*origin, *series)
+            });
+        latest.retain(|(earlier, _, _)| !same_range(earlier));
+        latest.push((intent, origin, series_origin));
     }
-    let mut groups: Vec<(FlushIntent, FileId, TenantBuffer)> = latest
+    let mut groups: Vec<(FlushIntent, FileId, Option<FileId>, TenantBuffer)> = latest
         .into_iter()
-        .map(|(i, origin)| (i, origin, TenantBuffer::default()))
+        .map(|(i, origin, series)| (i, origin, series, TenantBuffer::default()))
         .collect();
-    for (stream, position, batch) in replayed.rows {
+    place_rows(&mut groups, &mut buffers, replayed.rows, now)?;
+    for (intent, origin, series_origin, buffer) in groups {
+        let metric = intent.metric.as_ref().and_then(|m| {
+            let series = m.file(MetricRole::Series)?;
+            Some(MetricPair {
+                set: m.set,
+                series: series.file,
+                series_origin: series_origin.unwrap_or(series.file),
+                series_layout: series.layout,
+            })
+        });
+        let bound = Bound {
+            file: intent.file,
+            range: (intent.first, intent.end),
+            layout: intent.layout,
+            hour: intent.hour_start(),
+            metric,
+        };
+        let stream = Stream {
+            tenant: intent.tenant,
+            signal: intent.signal,
+        };
+        buffers.insert_flushing(stream, bound, buffer, origin);
+    }
+    Ok(buffers)
+}
+
+/// Puts each replayed record's rows under the intents that cover them,
+/// cut by the intents' hours, and the rest live.
+fn place_rows(
+    groups: &mut [(FlushIntent, FileId, Option<FileId>, TenantBuffer)],
+    buffers: &mut Buffers,
+    rows: Vec<ReplayedRows>,
+    now: Instant,
+) -> Result<(), IngestError> {
+    for rows in rows {
+        let ReplayedRows {
+            stream,
+            position,
+            batch,
+            series,
+        } = rows;
+        let metric = stream.signal == RowSignal::Metrics;
         let covering: Vec<usize> = groups
             .iter()
             .enumerate()
-            .filter(|(_, (intent, _, _))| intent.covers(stream.tenant, stream.signal, position))
+            .filter(|(_, (intent, _, _, _))| intent.covers(stream.tenant, stream.signal, position))
             .map(|(i, _)| i)
             .collect();
         let whole = covering.iter().find(|i| {
             groups
                 .get(**i)
-                .is_some_and(|(intent, _, _)| intent.hour.is_none())
+                .is_some_and(|(intent, _, _, _)| intent.hour.is_none())
         });
         if let Some(i) = whole {
-            if let Some((_, _, buffer)) = groups.get_mut(*i) {
+            if let Some((_, _, _, buffer)) = groups.get_mut(*i) {
                 buffer.push(batch, position, now);
             }
             continue;
@@ -1429,36 +1686,127 @@ fn rebuild(replayed: Replayed, scratch: Arc<AtomicU64>) -> Result<Buffers, Inges
             .filter_map(|i| {
                 groups
                     .get(i)
-                    .and_then(|(intent, _, _)| intent.hour_start())
+                    .and_then(|(intent, _, _, _)| intent.hour_start())
                     .map(|hour| (i, hour))
             })
             .unzip();
         if hours.is_empty() {
-            buffers.get_mut(stream).push(batch, position, now);
+            push_replayed(
+                buffers.get_mut(stream),
+                batch,
+                series,
+                position,
+                now,
+                metric,
+            )?;
             continue;
         }
         let split = crate::hours::partition(&batch, &hours)?;
-        for (i, piece) in targets.into_iter().zip(split.by_hour) {
-            if let Some((_, _, buffer)) = groups.get_mut(i) {
-                buffer.push(piece, position, now);
+        let (mut by_hour, rest_series) = split_series(series, &hours);
+        for ((i, piece), series) in targets
+            .into_iter()
+            .zip(split.by_hour)
+            .zip(by_hour.drain(..))
+        {
+            if let Some((_, _, _, buffer)) = groups.get_mut(i) {
+                push_replayed(buffer, piece, series, position, now, metric)?;
             }
         }
-        buffers.get_mut(stream).push(split.rest, position, now);
+        push_replayed(
+            buffers.get_mut(stream),
+            split.rest,
+            rest_series,
+            position,
+            now,
+            metric,
+        )?;
     }
-    for (intent, origin, buffer) in groups {
-        let bound = Bound {
-            file: intent.file,
-            range: (intent.first, intent.end),
-            layout: intent.layout,
-            hour: intent.hour_start(),
-        };
-        let stream = Stream {
-            tenant: intent.tenant,
-            signal: intent.signal,
-        };
-        buffers.insert_flushing(stream, bound, buffer, origin);
+    Ok(())
+}
+
+/// Adds replayed rows to `buffer`: metric samples with their series and
+/// the hours they fall in, other rows as they are.
+fn push_replayed(
+    buffer: &mut TenantBuffer,
+    batch: RecordBatch,
+    series: Vec<SeriesRow>,
+    position: Position,
+    now: Instant,
+    metric: bool,
+) -> Result<(), IngestError> {
+    if !metric {
+        buffer.push(batch, position, now);
+        return Ok(());
     }
-    Ok(buffers)
+    let hours = crate::hours::hours_in(std::slice::from_ref(&batch))?
+        .into_iter()
+        .collect();
+    buffer.push_metric(batch, series, hours, position, now);
+    Ok(())
+}
+
+/// `series` split by the hour of each row: one list per hour of `hours`,
+/// in order, and the rest.
+fn split_series(
+    series: Vec<SeriesRow>,
+    hours: &[DateTime<Utc>],
+) -> (Vec<Vec<SeriesRow>>, Vec<SeriesRow>) {
+    let starts: Vec<i64> = hours.iter().map(DateTime::timestamp_millis).collect();
+    let mut parts: Vec<Vec<SeriesRow>> = hours.iter().map(|_| Vec::new()).collect();
+    let mut rest = Vec::new();
+    for row in series {
+        match starts.iter().position(|h| *h == row.unix_milli) {
+            Some(i) => {
+                if let Some(part) = parts.get_mut(i) {
+                    part.push(row);
+                }
+            }
+            None => rest.push(row),
+        }
+    }
+    (parts, rest)
+}
+
+/// The error of a request over a request-wide bound of `metrics`.
+pub(crate) fn too_large(e: TooLarge, metrics: &MetricLimits) -> IngestError {
+    match e {
+        TooLarge::Points(count) => IngestError::TooLarge {
+            what: "points",
+            count,
+            limit: metrics.max_points,
+        },
+        TooLarge::Samples(count) => IngestError::TooLarge {
+            what: "samples",
+            count,
+            limit: metrics.clamped().max_samples,
+        },
+    }
+}
+
+/// The source of a metric record at `position` of WAL `instance`.
+pub(crate) fn metric_source(instance: Uuid, position: Position) -> Source {
+    Source {
+        instance: *instance.as_bytes(),
+        segment: position.segment,
+        offset: position.offset,
+    }
+}
+
+/// Converts a metrics request: its preflight, then the rows it counted.
+///
+/// # Errors
+/// A request over its bounds, or an Arrow failure.
+fn convert_metrics(
+    message: &ExportMetricsServiceRequest,
+    limits: &fs_schema::limits::Limits,
+    metrics: &MetricLimits,
+    source: Source,
+) -> Result<MetricRows, IngestError> {
+    let checked = fs_schema::metrics::preflight(message, limits, metrics)
+        .map_err(|e| too_large(e, metrics))?;
+    Ok(fs_schema::metrics::convert(
+        message, limits, metrics, &checked, source,
+    )?)
 }
 
 /// The ingester role.
@@ -1499,7 +1847,7 @@ impl Ingester {
         let limiter = config
             .tenant_bytes_per_sec
             .map(|r| StdMutex::new(RateLimiter::new(r)));
-        let replayed = replay(config.limits, &mut wal)?;
+        let replayed = replay(config.limits, config.metrics, &mut wal)?;
         let (records, damaged, intents) =
             (replayed.records, replayed.damaged, replayed.intents.len());
         let flush_stats = Arc::new(FlushStats::default());
@@ -1655,10 +2003,13 @@ impl Ingester {
             .max_decoding_message_size(self.shared.config.max_message_bytes);
         let logs = LogsServiceServer::new(LogsReceiver::new(self.shared.clone()))
             .max_decoding_message_size(self.shared.config.max_message_bytes);
+        let metrics = MetricsServiceServer::new(MetricsReceiver::new(self.shared.clone()))
+            .max_decoding_message_size(self.shared.config.max_message_bytes);
         let mut server_shutdown = shutdown.clone();
         let server = tonic::transport::Server::builder()
             .add_service(service)
             .add_service(logs)
+            .add_service(metrics)
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
                 async move {
@@ -1748,8 +2099,17 @@ mod tests {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
-    use super::{Replayed, confirm_permits, rebuild};
+    use super::{Replayed, ReplayedRows, confirm_permits, rebuild};
     use crate::buffer::Stream;
+
+    fn spans(tenant: TenantId, position: Position, batch: RecordBatch) -> ReplayedRows {
+        ReplayedRows {
+            stream: Stream::traces(tenant),
+            position,
+            batch,
+            series: Vec::new(),
+        }
+    }
     use crate::record::{FlushIntent, RowSignal};
 
     /// 2026-10-22T14:00:00Z.
@@ -1814,13 +2174,13 @@ mod tests {
         };
         let replayed = Replayed {
             rows: vec![
-                (
-                    Stream::traces(tenant),
+                spans(
+                    tenant,
                     at(10),
                     span_batch(&[H14 + 1, H14 + HOUR + 1, H14 + 2]),
                 ),
-                (
-                    Stream::traces(tenant),
+                spans(
+                    tenant,
                     at(20),
                     span_batch(&[H14 + HOUR + 2, H14 + 2 * HOUR]),
                 ),
@@ -1904,8 +2264,8 @@ mod tests {
         };
         let replayed = Replayed {
             rows: vec![
-                (Stream::traces(tenant), at(10), batch(2)),
-                (Stream::traces(tenant), at(20), batch(3)),
+                spans(tenant, at(10), batch(2)),
+                spans(tenant, at(20), batch(3)),
             ],
             intents: vec![intent(first), intent(second)],
             records: 2,

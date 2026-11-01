@@ -361,9 +361,11 @@ impl Retention {
         fence: &LeaseFence,
     ) -> Result<Option<ExpiredFiles>, CompactError> {
         let mut result = Ok(None);
+        // A metric samples file expires with its series file, its set's.
         for signal in [
             Signal::Traces,
             Signal::Logs,
+            Signal::MetricSamples,
             Signal::TraceSummary,
             Signal::ServiceGraph1m,
             Signal::Usage1h,

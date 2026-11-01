@@ -75,12 +75,28 @@ impl SeriesRow {
         std::mem::size_of::<Self>() + self.heap_bytes()
     }
 
-    fn order(&self, other: &Self) -> Ordering {
+    /// The order series rows are kept in: name, fingerprint, hour. Rows
+    /// that compare equal are one series in one hour.
+    pub fn order(&self, other: &Self) -> Ordering {
         self.name
             .as_bytes()
             .cmp(other.name.as_bytes())
             .then(self.fingerprint.cmp(&other.fingerprint))
             .then(self.unix_milli.cmp(&other.unix_milli))
+    }
+
+    /// Takes `other`, a row of the same series and hour: its description
+    /// when it is preferred. Returns how many bytes this row grew by,
+    /// negative when it shrank.
+    pub fn absorb(&mut self, other: Self) -> isize {
+        if preferred(&other.description, &self.description) {
+            let signed = |n: usize| isize::try_from(n).unwrap_or(isize::MAX);
+            let grown = signed(other.description.len()) - signed(self.description.len());
+            self.description = other.description;
+            grown
+        } else {
+            0
+        }
     }
 }
 
@@ -105,12 +121,15 @@ fn preferred(a: &str, b: &str) -> bool {
     a.len() > b.len() || (a.len() == b.len() && a.as_bytes() < b.as_bytes())
 }
 
-/// The batch of `rows`, in their order, with [`series_schema_v1`].
+/// The batch of `rows`, `n` of them, in their order, with
+/// [`series_schema_v1`].
 ///
 /// # Errors
 /// An Arrow failure.
-pub fn series_batch(rows: &[SeriesRow]) -> Result<RecordBatch, SchemaError> {
-    let n = rows.len();
+pub fn series_batch<'a>(
+    rows: impl IntoIterator<Item = &'a SeriesRow>,
+    n: usize,
+) -> Result<RecordBatch, SchemaError> {
     let mut name = StringDictionaryBuilder::<Int32Type>::new();
     let mut temporality = StringDictionaryBuilder::<Int32Type>::new();
     let mut kind = StringDictionaryBuilder::<Int32Type>::new();
@@ -148,6 +167,40 @@ pub fn series_batch(rows: &[SeriesRow]) -> Result<RecordBatch, SchemaError> {
         Arc::new(unit.finish()),
     ];
     Ok(RecordBatch::try_new(series_schema_v1(), columns)?)
+}
+
+/// `samples` with each source order taken from `source`, its ordinal
+/// kept: what a request converted before its WAL position was known has
+/// once it is.
+///
+/// # Errors
+/// A batch without a source order column of the samples schema.
+pub fn with_source(samples: &RecordBatch, source: Source) -> Result<RecordBatch, SchemaError> {
+    use arrow::array::{Array, AsArray};
+    let index = samples
+        .schema()
+        .index_of(super::schema::col::SOURCE_ORDER)?;
+    let old = samples
+        .column(index)
+        .as_fixed_size_binary_opt()
+        .filter(|a| a.value_length() == SOURCE_ORDER_WIDTH)
+        .ok_or(SchemaError::Layout(
+            "metrics: a source order of another width",
+        ))?;
+    let mut order = FixedSizeBinaryBuilder::with_capacity(old.len(), SOURCE_ORDER_WIDTH);
+    for row in 0..old.len() {
+        let ordinal = old
+            .value(row)
+            .get(SOURCE_ORDER_BYTES - 4..)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map_or(0, u32::from_be_bytes);
+        order.append_value(source.order(ordinal))?;
+    }
+    let mut columns = samples.columns().to_vec();
+    if let Some(column) = columns.get_mut(index) {
+        *column = Arc::new(order.finish());
+    }
+    Ok(RecordBatch::try_new(samples.schema(), columns)?)
 }
 
 /// A request's samples, sorted by name, fingerprint, time and source
@@ -315,13 +368,9 @@ impl Sink for Builder {
     }
 }
 
-/// The most bytes [`super::convert`] holds at once for `p`.
-pub(crate) fn bytes_bound(p: &Preflight) -> usize {
-    let samples = p.samples.saturating_mul(std::mem::size_of::<Sample>());
-    let names = p
-        .series
-        .saturating_mul(std::mem::size_of::<Box<str>>() + DICTIONARY_ENTRY_BYTES)
-        .saturating_add(p.name_bytes.saturating_mul(2));
+/// What the rows of `p` hold once converted: the batch of samples and the
+/// series rows.
+pub(crate) fn rows_bound(p: &Preflight) -> usize {
     let series = p
         .series
         .saturating_mul(std::mem::size_of::<SeriesRow>())
@@ -334,10 +383,24 @@ pub(crate) fn bytes_bound(p: &Preflight) -> usize {
     let batch = p
         .samples
         .saturating_mul(SAMPLE_COLUMN_BYTES)
+        .saturating_add(p.name_bytes)
         .saturating_add(7 * COLUMN_OVERHEAD);
-    samples
-        .saturating_add(names)
-        .saturating_add(series)
-        .saturating_add(batch)
-        .saturating_add(p.scratch)
+    series.saturating_add(batch)
+}
+
+/// What converting `p` holds besides its rows, and only while it runs:
+/// the samples before their batch, their names and the traversal's
+/// scratch.
+pub(crate) fn transient_bound(p: &Preflight) -> usize {
+    let samples = p.samples.saturating_mul(std::mem::size_of::<Sample>());
+    let names = p
+        .series
+        .saturating_mul(std::mem::size_of::<Box<str>>() + DICTIONARY_ENTRY_BYTES)
+        .saturating_add(p.name_bytes);
+    samples.saturating_add(names).saturating_add(p.scratch)
+}
+
+/// The most bytes [`super::convert`] holds at once for `p`.
+pub(crate) fn bytes_bound(p: &Preflight) -> usize {
+    rows_bound(p).saturating_add(transient_bound(p))
 }

@@ -202,6 +202,14 @@ the sidecar, so the same `ingest.max_memory_bytes` admits fewer log bytes
 than span bytes. A binary without text sidecars ignores them; the files it
 purges leave theirs behind until a newer orphan sweep removes them.
 
+Metrics ingest (OTLP `MetricsService`) writes record code 4 and intents of
+version 4, which an engine without metrics refuses: roll out ingesters
+first, then queriers, and before a rollback flush and checkpoint every
+ingester (stop it cleanly) so no metric record or intent is left in a WAL.
+A metric flush writes two files of one set, samples and series; a set
+found registered in part stops the flush with `file set … is registered in
+part`, which no crash leaves: keep both objects and escalate.
+
 L2 compaction (`compactor.compact_l2`) is off by default. Roll out
 queriers first, then compactors with it off, then turn it on, and watch
 the compactor's RSS beside `fusescope_compaction_l2_peak_bytes`: the

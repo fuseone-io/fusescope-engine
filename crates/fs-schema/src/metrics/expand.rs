@@ -44,10 +44,18 @@ pub struct Preflight {
     pub name_bytes: usize,
     /// Attributes dropped or truncated on the way.
     pub stats: DropStats,
-    /// The most bytes the traversal holds for the levels and labels of one
-    /// point, whatever the request.
+    /// The most bytes the traversal held at once for the levels and labels
+    /// of one point of this request.
     pub scratch: usize,
+    /// Starts of the hours the samples fall in, in Unix milliseconds, in
+    /// order; at most [`MAX_TRACKED_HOURS`], `hours_over` past them.
+    pub hours: Vec<i64>,
+    /// The samples fall in more hours than [`MAX_TRACKED_HOURS`].
+    pub hours_over: bool,
 }
+
+/// Most distinct hours a preflight lists.
+pub const MAX_TRACKED_HOURS: usize = 1024;
 
 /// A request over a request-wide bound, refused whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +72,17 @@ impl Preflight {
     /// labels and texts.
     pub fn bytes_bound(&self) -> usize {
         super::rows::bytes_bound(self)
+    }
+
+    /// What the rows hold once converted, the samples' batch and the
+    /// series: what a buffer keeps.
+    pub fn rows_bound(&self) -> usize {
+        super::rows::rows_bound(self)
+    }
+
+    /// What converting holds besides the rows, only while it runs.
+    pub fn transient_bound(&self) -> usize {
+        super::rows::transient_bound(self)
     }
 }
 
@@ -96,7 +115,6 @@ pub fn preflight(
         Stop::Schema(_) => TooLarge::Samples(usize::MAX),
     })?;
     count.preflight.stats = stats;
-    count.preflight.scratch = scratch_bound(limits, &metrics);
     Ok(count.preflight)
 }
 
@@ -121,16 +139,6 @@ pub fn convert(
         Stop::TooLarge(_) => SchemaError::Layout("metrics: conversion past its preflight"),
     })?;
     builder.finish(source, checked.rejected, stats)
-}
-
-/// Three levels of at most `max_series_labels` attributes, each a key and
-/// a value whose text may grow to twice its cap, and the fused labels.
-fn scratch_bound(limits: &Limits, metrics: &MetricLimits) -> usize {
-    let cap = metrics.max_series_labels;
-    let pair =
-        2 * std::mem::size_of::<String>() + limits.max_key_bytes + 2 * limits.max_value_bytes;
-    let fused = 2 * std::mem::size_of::<(&str, &str)>();
-    cap.saturating_mul(3 * pair + 2 * fused)
 }
 
 fn count_points(request: &ExportMetricsServiceRequest) -> usize {
@@ -185,6 +193,8 @@ pub(crate) trait Sink {
     fn metric(&mut self);
     /// One series and sample of an accepted point.
     fn emit(&mut self, emit: &Emit<'_>) -> Result<(), Stop>;
+    /// The bytes the traversal holds for the point being expanded.
+    fn scratch(&mut self, _bytes: usize) {}
 }
 
 struct Count {
@@ -198,6 +208,10 @@ impl Sink for Count {
     }
 
     fn metric(&mut self) {}
+
+    fn scratch(&mut self, bytes: usize) {
+        self.preflight.scratch = self.preflight.scratch.max(bytes);
+    }
 
     fn emit(&mut self, emit: &Emit<'_>) -> Result<(), Stop> {
         let p = &mut self.preflight;
@@ -214,6 +228,14 @@ impl Sink for Count {
             .sum::<usize>();
         p.text_bytes += emit.key.name.len() + emit.key.unit.len() + emit.description.len();
         p.name_bytes += emit.key.name.len();
+        let hour = hour_of(emit.unix_milli);
+        if let Err(at) = p.hours.binary_search(&hour) {
+            if p.hours.len() < MAX_TRACKED_HOURS {
+                p.hours.insert(at, hour);
+            } else {
+                p.hours_over = true;
+            }
+        }
         Ok(())
     }
 }
@@ -350,12 +372,18 @@ fn point_level(
     at: &Context<'_>,
     attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
     extra: usize,
-    limits: &Limits,
-    cap: usize,
+    (limits, cap): (&Limits, usize),
     stats: &mut DropStats,
+    sink: &mut impl Sink,
 ) -> Result<Level, TooManyLabels> {
     let point = Level::new("point", &[], attributes, limits, cap, stats)?;
     let mut scratch = Vec::new();
+    sink.scratch(
+        (at.resource.held() + at.scope.held() + point.held()) * 2
+            + (at.resource.pairs.len() + at.scope.pairs.len() + point.pairs.len() + 8)
+                * 4
+                * std::mem::size_of::<(&str, &str)>(),
+    );
     let mut generated: Vec<(&'static str, &str)> = generated(at, "", Temporality::Unspecified)
         .into_iter()
         .collect();
@@ -440,7 +468,7 @@ fn number(
     if value.is_nan() {
         return Ok(());
     }
-    let Ok(level) = point_level(at, &point.attributes, 0, limits, cap, stats) else {
+    let Ok(level) = point_level(at, &point.attributes, 0, (limits, cap), stats, sink) else {
         sink.reject(Rejection::TooManyLabels, 1);
         return Ok(());
     };
@@ -527,7 +555,7 @@ fn histogram(
             return Ok(());
         }
     };
-    let Ok(level) = point_level(at, &point.attributes, 1, limits, cap, stats) else {
+    let Ok(level) = point_level(at, &point.attributes, 1, (limits, cap), stats, sink) else {
         sink.reject(Rejection::TooManyLabels, 1);
         return Ok(());
     };
@@ -628,7 +656,7 @@ fn summary(
         sink.reject(Rejection::MalformedSummary, 1);
         return Ok(());
     }
-    let Ok(level) = point_level(at, &point.attributes, 1, limits, cap, stats) else {
+    let Ok(level) = point_level(at, &point.attributes, 1, (limits, cap), stats, sink) else {
         sink.reject(Rejection::TooManyLabels, 1);
         return Ok(());
     };
