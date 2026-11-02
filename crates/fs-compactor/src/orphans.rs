@@ -49,7 +49,7 @@ use crate::CompactError;
 const CHUNK: usize = 1000;
 
 /// The kinds of partition under a tenant, in walk order.
-const KINDS: [&str; 15] = [
+const KINDS: [&str; 21] = [
     "traces/l0",
     "traces/l1",
     "traces/l2",
@@ -64,7 +64,13 @@ const KINDS: [&str; 15] = [
     "logs/l2",
     "logs/index/ngram",
     "metrics/samples/l0",
+    "metrics/samples/l1",
+    "metrics/samples/l2",
     "metrics/series/l0",
+    "metrics/series/l1",
+    "metrics/series/l2",
+    "metrics/index/postings",
+    "metrics/derived/metric_metadata",
 ];
 
 /// Bounds of the sweep.
@@ -446,6 +452,7 @@ fn owners(path: &str) -> Vec<String> {
     match path.rsplit_once('.').map(|(_, ext)| ext) {
         Some("tix") => fs_index::owners_of_sidecar(path),
         Some("ngb") => fs_index::text_index::owners_of_sidecar(path),
+        Some("pst") => fs_index::postings::owners_of_sidecar(path),
         _ => vec![path.to_owned()],
     }
 }

@@ -1,4 +1,4 @@
-//! The bucket layout of span and log files and their sidecars, parsed strictly:
+//! The bucket layout of span, log and metric files and their sidecars, parsed strictly:
 //! anything the engine would not write is not the engine's.
 //!
 //! ```text
@@ -8,6 +8,10 @@
 //! t/{tenant uuid}/logs/index/ngram/dt=YYYY-MM-DD[/hr=HH]/{file uuid}.ngb
 //! t/{tenant uuid}/traces/derived/{trace_summary|service_graph_1m}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! t/{tenant uuid}/derived/{attribute_keys|log_attribute_keys|usage_1h}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
+//! t/{tenant uuid}/metrics/{samples|series}/l{0|1}/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
+//! t/{tenant uuid}/metrics/{samples|series}/l2/dt=YYYY-MM-DD/{file uuid}.parquet
+//! t/{tenant uuid}/metrics/index/postings/dt=YYYY-MM-DD[/hr=HH]/{file uuid}.pst
+//! t/{tenant uuid}/metrics/derived/metric_metadata/dt=YYYY-MM-DD/hr=HH/{file uuid}.parquet
 //! ```
 //!
 //! A derived table is partitioned by the hour of the compaction pass that
@@ -18,14 +22,15 @@
 pub struct EngineObject {
     /// Tenant id, as written in the path.
     pub tenant: String,
-    /// Compaction level of a span or log file; `None` for a sidecar.
+    /// Compaction level of a span, log or metric file; `None` for a
+    /// sidecar or a derived table.
     pub level: Option<u8>,
     /// `dt=YYYY-MM-DD/hr=HH`, or `dt=YYYY-MM-DD` for an L2 file and its
     /// sidecar.
     pub partition: String,
     /// File id, as written in the path.
     pub id: String,
-    /// True for a `trace_id` or text sidecar.
+    /// True for a `trace_id`, text or postings sidecar.
     pub sidecar: bool,
     /// True for a derived table file.
     pub derived: bool,
@@ -44,37 +49,47 @@ impl EngineObject {
         if !is_uuid(tenant) {
             return None;
         }
-        let (level, sidecar, derived) = match parts.next()? {
-            "traces" => match parts.next()? {
-                "l0" => (Some(0), false, false),
-                "l1" => (Some(1), false, false),
-                "l2" => (Some(2), false, false),
-                "index" => {
-                    if parts.next()? != "trace_id" {
-                        return None;
-                    }
-                    (None, true, false)
-                }
-                "derived" => match parts.next()? {
-                    "trace_summary" | "service_graph_1m" => (None, false, true),
+        let (level, sidecar, derived, expected) = match parts.next()? {
+            signal @ ("traces" | "logs") => match parts.next()? {
+                "l0" => (Some(0), false, false, "parquet"),
+                "l1" => (Some(1), false, false, "parquet"),
+                "l2" => (Some(2), false, false, "parquet"),
+                "index" => match (signal, parts.next()?) {
+                    ("traces", "trace_id") => (None, true, false, "tix"),
+                    ("logs", "ngram") => (None, true, false, "ngb"),
+                    _ => return None,
+                },
+                "derived" if signal == "traces" => match parts.next()? {
+                    "trace_summary" | "service_graph_1m" => (None, false, true, "parquet"),
                     _ => return None,
                 },
                 _ => return None,
             },
-            "logs" => match parts.next()? {
-                "l0" => (Some(0), false, false),
-                "l1" => (Some(1), false, false),
-                "l2" => (Some(2), false, false),
+            "metrics" => match parts.next()? {
+                "samples" | "series" => match parts.next()? {
+                    "l0" => (Some(0), false, false, "parquet"),
+                    "l1" => (Some(1), false, false, "parquet"),
+                    "l2" => (Some(2), false, false, "parquet"),
+                    _ => return None,
+                },
                 "index" => {
-                    if parts.next()? != "ngram" {
+                    if parts.next()? != "postings" {
                         return None;
                     }
-                    (None, true, false)
+                    (None, true, false, "pst")
+                }
+                "derived" => {
+                    if parts.next()? != "metric_metadata" {
+                        return None;
+                    }
+                    (None, false, true, "parquet")
                 }
                 _ => return None,
             },
             "derived" => match parts.next()? {
-                "attribute_keys" | "log_attribute_keys" | "usage_1h" => (None, false, true),
+                "attribute_keys" | "log_attribute_keys" | "usage_1h" => {
+                    (None, false, true, "parquet")
+                }
                 _ => return None,
             },
             _ => return None,
@@ -93,11 +108,6 @@ impl EngineObject {
             _ => return None,
         };
         let (id, ext) = file.rsplit_once('.')?;
-        let expected = match (sidecar, path.split('/').nth(2) == Some("logs")) {
-            (false, _) => "parquet",
-            (true, false) => "tix",
-            (true, true) => "ngb",
-        };
         if ext != expected || !is_uuid(id) {
             return None;
         }
@@ -249,6 +259,42 @@ mod tests {
     }
 
     #[test]
+    fn the_metric_layout_parses() {
+        for role in ["samples", "series"] {
+            for level in 0..=1u8 {
+                let file = EngineObject::parse(&format!(
+                    "t/{T}/metrics/{role}/l{level}/dt=2026-10-24/hr=14/{F}.parquet"
+                ))
+                .unwrap();
+                assert_eq!(
+                    (file.level, file.sidecar, file.derived),
+                    (Some(level), false, false)
+                );
+            }
+            let day = EngineObject::parse(&format!(
+                "t/{T}/metrics/{role}/l2/dt=2026-10-24/{F}.parquet"
+            ))
+            .unwrap();
+            assert_eq!(
+                (day.level, day.partition.as_str()),
+                (Some(2), "dt=2026-10-24")
+            );
+        }
+        for pst in [
+            format!("t/{T}/metrics/index/postings/dt=2026-10-24/hr=14/{F}.pst"),
+            format!("t/{T}/metrics/index/postings/dt=2026-10-24/{F}.pst"),
+        ] {
+            let postings = EngineObject::parse(&pst).unwrap();
+            assert!(postings.sidecar && !postings.derived, "{pst}");
+        }
+        let metadata = EngineObject::parse(&format!(
+            "t/{T}/metrics/derived/metric_metadata/dt=2026-10-24/hr=14/{F}.parquet"
+        ))
+        .unwrap();
+        assert!(metadata.derived && !metadata.sidecar);
+    }
+
+    #[test]
     fn anything_else_fails_closed() {
         for path in [
             "t/notes.parquet",
@@ -269,6 +315,14 @@ mod tests {
             &format!("t/{T}/traces/index/trace_id/dt=2026-10-24/hr=14/{F}.ngb"),
             &format!("t/{T}/traces/index/ngram/dt=2026-10-24/hr=14/{F}.ngb"),
             &format!("t/{T}/metrics/l0/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/metrics/samples/l3/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/metrics/series/l2/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/metrics/other/l0/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/metrics/index/postings/dt=2026-10-24/hr=14/{F}.tix"),
+            &format!("t/{T}/metrics/index/other/dt=2026-10-24/hr=14/{F}.pst"),
+            &format!("t/{T}/metrics/derived/other/dt=2026-10-24/hr=14/{F}.parquet"),
+            &format!("t/{T}/metrics/samples/l0/dt=2026-10-24/hr=14/{F}.pst"),
+            &format!("t/{T}/logs/derived/trace_summary/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l3/dt=2026-10-24/hr=14/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-10-24/hr=24/{F}.parquet"),
             &format!("t/{T}/traces/l0/dt=2026-1-24/hr=14/{F}.parquet"),

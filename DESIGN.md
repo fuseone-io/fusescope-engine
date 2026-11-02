@@ -1178,8 +1178,10 @@ forgotten, never deleted.
 
 Deletion is a protocol with registration, through one row per path in
 `engine_orphan` and a transaction advisory lock per path. The sweep records
-an object's first sighting without a row (a sidecar has a row when the span
-file of any level it could belong to has one). Once the sighting is older
+an object's first sighting without a row (a sidecar has a row when the span,
+log or metric series file of any level it could belong to has one). Metric
+files of every level and role, postings and metadata contributions are
+walked and parsed like the rest. Once the sighting is older
 than `compactor.orphan_ttl_secs` the sweep marks the row `deleting` in a
 transaction that takes the path's lock first and reads the file rows by a
 statement of its own after, so a registration that held the lock has
