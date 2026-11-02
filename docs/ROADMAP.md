@@ -300,7 +300,14 @@ C5 landed after C6.
   (`a_metric_file_is_refused_without_its_partner_and_expires_with_it`); a
   series merge allocates one exact run, its peak counting requests on
   their way (`adding_allocates_one_exact_run_within_the_merge_peak`).
-  Next: step 2, metric compaction with the duplicate kept across L0, L1
+  Review round 2: a metric record of version 1, of an unknown mapping or
+  damaged past the checksum stops the start
+  (`a_metric_record_that_cannot_convert_as_accepted_stops_the_start`); a
+  set missing either file fails listings of both signals in one snapshot;
+  one merge lease per tenant covers whichever request merges first
+  (`the_merge_lease_covers_a_request_that_merges_after_a_later_one`);
+  per-point limits have ceilings; points are counted before the walk is
+  measured. Next: step 2, metric compaction with the duplicate kept across L0, L1
   and L2.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
