@@ -192,7 +192,7 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
         .await
         .unwrap()
         .id;
-    write_set(&db.catalog, &store, tenant, &request(&["a", "b"], 2.0, 0)).await;
+    let (_, alone, _) = write_set(&db.catalog, &store, tenant, &request(&["a", "b"], 2.0, 0)).await;
     let (_, _, unpaired) =
         write_set(&db.catalog, &store, tenant, &request(&["c"], 3.0, 60_000)).await;
     write_set(&db.catalog, &store, other, &request(&["z"; 1], 9.0, 0)).await;
@@ -272,12 +272,15 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
         1
     );
 
-    // A file whose set's partner is gone is not served.
-    sqlx::query("update engine_file set state = 2 where id = $1")
-        .bind(unpaired)
-        .execute(db.catalog.pool())
-        .await
-        .unwrap();
+    // A file whose set's partner is gone fails the query rather than
+    // answering without it, of either table.
+    for gone in [unpaired, alone] {
+        sqlx::query("update engine_file set state = 2 where id = $1")
+            .bind(gone)
+            .execute(db.catalog.pool())
+            .await
+            .unwrap();
+    }
     let fresh = Querier::new(
         db.catalog.clone(),
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
@@ -285,9 +288,18 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
         QueryLimits::default(),
     )
     .unwrap();
+    for table in ["samples", "time_series"] {
+        let err = fresh
+            .collect(tenant, &format!("select count(*) from {table}"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("registered in part"), "{table}: {err}");
+    }
     assert_eq!(
-        total(&query(&fresh, tenant, "select count(*) from samples").await),
-        2
+        total(&query(&fresh, other, "select count(*) from samples").await),
+        1,
+        "another tenant's sets are its own"
     );
     db.finish().await;
 }

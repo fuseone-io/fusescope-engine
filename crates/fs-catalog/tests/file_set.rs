@@ -188,10 +188,12 @@ async fn a_set_registered_in_part_or_elsewhere_is_refused_not_healed() {
         db.catalog.register_file_set(set, &files).await,
         Err(CatalogError::PartialFileSet { .. })
     ));
-    assert_eq!(
-        visible(&db, t, Signal::MetricSamples).await,
-        vec![],
-        "served only in pairs"
+    assert!(
+        matches!(
+            db.catalog.all_visible_files(t, Signal::MetricSamples).await,
+            Err(CatalogError::PartialFileSet { set: s }) if s == set.0
+        ),
+        "never served without its pair"
     );
 
     let other = pair(t, ten() + Duration::hours(1));
@@ -295,7 +297,7 @@ async fn the_catalog_refuses_metric_files_without_a_set_others_with_one_and_two_
 }
 
 #[tokio::test]
-async fn a_metric_file_is_served_only_beside_its_partner_and_expires_with_it() {
+async fn a_metric_file_is_refused_without_its_partner_and_expires_with_it() {
     let Some(db) = TestDb::new().await else {
         return;
     };
@@ -322,21 +324,43 @@ async fn a_metric_file_is_served_only_beside_its_partner_and_expires_with_it() {
         .await
         .unwrap();
 
-    // Quarantining one file hides the other.
-    sqlx::query("update engine_file set state = 2 where id = $1")
-        .bind(fresh[1].id)
-        .execute(db.catalog.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        visible(&db, t, Signal::MetricSamples).await,
-        vec![expired[0].id]
-    );
-    sqlx::query("update engine_file set state = 1 where id = $1")
-        .bind(fresh[1].id)
-        .execute(db.catalog.pool())
-        .await
-        .unwrap();
+    // A visible file whose partner is not fails the listing of its signal
+    // rather than answering without the set, whichever file is gone.
+    let fresh_set: uuid::Uuid =
+        sqlx::query_scalar("select file_set from engine_file where id = $1")
+            .bind(fresh[0].id)
+            .fetch_one(db.catalog.pool())
+            .await
+            .unwrap();
+    let everything = TimeRange {
+        start: ten() - Duration::days(36_500),
+        end: ten() + Duration::days(36_500),
+    };
+    for (gone, listed) in [
+        (fresh[1].id, Signal::MetricSamples),
+        (fresh[0].id, Signal::MetricSeries),
+    ] {
+        for state in [2, 1] {
+            sqlx::query("update engine_file set state = $2 where id = $1")
+                .bind(gone)
+                .bind(state)
+                .execute(db.catalog.pool())
+                .await
+                .unwrap();
+            let all = db.catalog.all_visible_files(t, listed).await;
+            let ranged = db.catalog.visible_files(t, listed, everything).await;
+            for outcome in [all, ranged] {
+                if state == 2 {
+                    assert!(
+                        matches!(outcome, Err(CatalogError::PartialFileSet { set }) if set == fresh_set),
+                        "{listed:?}: {outcome:?}"
+                    );
+                } else {
+                    assert_eq!(outcome.unwrap().len(), 2, "{listed:?}");
+                }
+            }
+        }
+    }
 
     let generation = db
         .catalog

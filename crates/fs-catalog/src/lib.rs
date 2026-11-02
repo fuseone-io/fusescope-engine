@@ -114,8 +114,9 @@ pub enum CatalogError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// Only one file of a set is registered. No crash of this version
-    /// leaves that, so nothing is healed: the writer stops.
+    /// Only one file of a set is registered, or visible. No crash of this
+    /// version leaves that, so nothing is healed: the writer stops and a
+    /// listing fails.
     #[error("file set {set} is registered in part")]
     PartialFileSet {
         /// The set.

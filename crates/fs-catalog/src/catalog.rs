@@ -145,19 +145,20 @@ impl Catalog {
     /// oldest first.
     ///
     /// # Errors
-    /// Database failure, or a row with values outside the domain.
+    /// Database failure, a row with values outside the domain, or a metric
+    /// file visible without its partner.
     pub async fn visible_files(
         &self,
         tenant: TenantId,
         signal: Signal,
         range: TimeRange,
     ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, FileRow>(&format!(
+        let rows = sqlx::query_as::<_, ListedRow>(&format!(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted,
+                    {UNPAIRED}
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3 and ts_min <= $5 and ts_max >= $4
-               and {PAIRED}
              order by ts_min, id"
         ))
         .bind(tenant)
@@ -167,25 +168,26 @@ impl Catalog {
         .bind(range.end)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(FileRecord::try_from).collect()
+        paired(rows)
     }
 
     /// Every visible file of one tenant and signal, oldest first. Used to warm
     /// querier caches; `visible_files` serves bounded lookups.
     ///
     /// # Errors
-    /// Database failure, or a row with values outside the domain.
+    /// Database failure, a row with values outside the domain, or a metric
+    /// file visible without its partner.
     pub async fn all_visible_files(
         &self,
         tenant: TenantId,
         signal: Signal,
     ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, FileRow>(&format!(
+        let rows = sqlx::query_as::<_, ListedRow>(&format!(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted,
+                    {UNPAIRED}
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3
-               and {PAIRED}
              order by ts_min, id"
         ))
         .bind(tenant)
@@ -193,7 +195,7 @@ impl Catalog {
         .bind(FileState::Visible.code())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(FileRecord::try_from).collect()
+        paired(rows)
     }
 
     /// Latest `ts_max` among visible files of a tenant and signal: how far the
@@ -502,12 +504,32 @@ impl Catalog {
     }
 }
 
-/// A metric file is served only beside the other file of its set, visible
-/// too; `$3` is the visible state.
-const PAIRED: &str = "(file_set is null or exists (
+/// The set of a metric file whose partner is not visible too, `$3` being
+/// the visible state; null for a file of no set or of a complete one.
+const UNPAIRED: &str = "case when file_set is not null and not exists (
     select 1 from engine_file p
     where p.tenant_id = engine_file.tenant_id and p.file_set = engine_file.file_set
-      and p.id <> engine_file.id and p.state = $3))";
+      and p.id <> engine_file.id and p.state = $3) then file_set end as unpaired_set";
+
+/// A listed file and whether its set is complete.
+#[derive(sqlx::FromRow)]
+struct ListedRow {
+    #[sqlx(flatten)]
+    file: FileRow,
+    unpaired_set: Option<uuid::Uuid>,
+}
+
+/// The listed files, or [`CatalogError::PartialFileSet`] when one is of a
+/// set whose other file is not visible: no crash leaves that, so a query
+/// fails rather than answer without half of a flush.
+fn paired(rows: Vec<ListedRow>) -> Result<Vec<FileRecord>, CatalogError> {
+    rows.into_iter()
+        .map(|row| match row.unpaired_set {
+            Some(set) => Err(CatalogError::PartialFileSet { set }),
+            None => FileRecord::try_from(row.file),
+        })
+        .collect()
+}
 
 /// When a registration becomes eligible for compaction.
 #[derive(Clone, Copy)]

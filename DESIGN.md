@@ -472,7 +472,8 @@ fingerprint, time and source order; a bloom filter on `metric_name`. The
 
 A tenant's SQL session has both as tables, `samples` and `time_series`,
 over the files of complete sets and the hot window; `unix_milli` prunes
-files and hours, and a file whose partner is not visible is not read.
+files and hours, and a file whose partner is not visible fails the
+query with `file set … is registered in part` rather than answer without it.
 
 The fingerprint (version 1) hashes the resource, scope and point levels
 apart, then the series' name, type, unit, temporality, monotonicity and

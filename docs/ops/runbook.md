@@ -207,8 +207,9 @@ version 4, which an engine without metrics refuses: roll out ingesters
 first, then queriers, and before a rollback flush and checkpoint every
 ingester (stop it cleanly) so no metric record or intent is left in a WAL.
 A metric flush writes two files of one set, samples and series; a set
-found registered in part stops the flush with `file set … is registered in
-part`, which no crash leaves: keep both objects and escalate. Refused
+found registered or visible in part stops the flush, or fails the
+tenant's metric queries, with `file set … is registered in part`, which no
+crash leaves: keep both objects and escalate. Refused
 points are counted by reason in
 `fusescope_ingest_metric_points_rejected_total`; a rising
 `exponential_histogram` means a sender needs explicit buckets until M3
