@@ -353,18 +353,18 @@ impl<'a> Keys<'a> {
     }
 
     /// The next `limit` rows in merged order, as `(input, row)`, each the
-    /// last of its fingerprint and millisecond. `pending` carries the row
-    /// a run may still replace across groups.
+    /// last of its name, fingerprint and millisecond. `pending` carries the
+    /// row a run may still replace across groups.
     fn next_group(
         &self,
         heads: &mut BinaryHeap<Head>,
-        pending: &mut Option<(u64, i64, usize, usize)>,
+        pending: &mut Option<Pending>,
         limit: usize,
     ) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         while out.len() < limit.max(1) {
-            let Some(Reverse((_, fingerprint, time, _, input, at))) = heads.pop() else {
-                out.extend(pending.take().map(|(_, _, i, r)| (i, r)));
+            let Some(Reverse((rank, fingerprint, time, _, input, at))) = heads.pop() else {
+                out.extend(pending.take().map(|p| (p.input, p.row)));
                 break;
             };
             if let Some(next) = self.head(input, at + 1) {
@@ -375,21 +375,26 @@ impl<'a> Keys<'a> {
                 .get(input)
                 .and_then(|s| s.get(at))
                 .map_or(0, |r| *r as usize);
+            let next = Pending {
+                key: (rank, fingerprint, time),
+                input,
+                row,
+            };
             match pending {
-                Some((f, t, _, _)) if *f == fingerprint && *t == time => {
-                    *pending = Some((fingerprint, time, input, row));
-                }
-                _ => {
-                    out.extend(
-                        pending
-                            .replace((fingerprint, time, input, row))
-                            .map(|(_, _, i, r)| (i, r)),
-                    );
-                }
+                Some(p) if p.key == next.key => *pending = Some(next),
+                _ => out.extend(pending.replace(next).map(|p| (p.input, p.row))),
             }
         }
         out
     }
+}
+
+/// The row a run of one name, fingerprint and millisecond keeps so far.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    key: (u32, u64, i64),
+    input: usize,
+    row: usize,
 }
 
 #[cfg(test)]

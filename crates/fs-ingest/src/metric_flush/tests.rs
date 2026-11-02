@@ -291,3 +291,39 @@ fn of_two_ingesters_at_the_same_position_the_winner_is_stable() {
     assert!(forward.contains(&("cpu".into(), T0_MS, 2.0)));
     assert!(!forward.contains(&("cpu".into(), T0_MS, 1.0)));
 }
+
+/// The samples of `rows` with every fingerprint made `fingerprint`.
+fn with_fingerprint(samples: &RecordBatch, fingerprint: u64) -> RecordBatch {
+    let mut columns = samples.columns().to_vec();
+    if let Some(column) = columns.get_mut(2) {
+        *column = std::sync::Arc::new(arrow::array::UInt64Array::from(vec![
+            fingerprint;
+            samples.num_rows()
+        ]));
+    }
+    RecordBatch::try_new(samples.schema(), columns).unwrap()
+}
+
+/// Two metrics of one fingerprint at one millisecond, in two batches of
+/// one flush, are two samples: a duplicate is one name, fingerprint and
+/// millisecond.
+#[test]
+fn samples_of_two_names_at_one_fingerprint_and_millisecond_are_both_kept() {
+    let cpu = rows(&request("cpu", &[(0, 1.0, "a")]), 1);
+    let mem = rows(&request("mem", &[(0, 2.0, "a")]), 2);
+    let prepared = prepare_samples(
+        TenantId::new(),
+        &Path::from(""),
+        FileId::new(),
+        hour(),
+        &[
+            with_fingerprint(&cpu.samples, 7),
+            with_fingerprint(&mem.samples, 7),
+        ],
+        FileLayout::current(16),
+    )
+    .unwrap();
+    let got = values(&prepared);
+    assert!(got.contains(&("cpu".into(), T0_MS, 1.0)), "{got:?}");
+    assert!(got.contains(&("mem".into(), T0_MS, 2.0)), "{got:?}");
+}
