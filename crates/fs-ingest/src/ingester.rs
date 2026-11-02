@@ -1781,8 +1781,9 @@ pub(crate) fn metric_source(instance: Uuid, position: Position) -> Source {
 ///
 /// # Errors
 /// A record that cannot be converted as it was accepted: of version 1,
-/// whose limits are lost, under rules this engine does not convert by, or
-/// damaged though its frame passed the log's checksum. Skipping it would
+/// whose limits are lost, under rules this engine does not convert by,
+/// with a limit past this engine's ceilings, or damaged though its frame
+/// passed the log's checksum. Skipping it would
 /// lose or change rows acknowledged, so the replay stops. Or an Arrow
 /// failure.
 fn replay_metric(
@@ -1813,6 +1814,11 @@ fn replay_metric(
             )));
         }
     };
+    if let Some((limit, value)) = conversion.outside_domain() {
+        return Err(refuse(format!(
+            "carries {limit} {value}, past what this engine converts under; flush and checkpoint it with the engine that wrote it (stop that one cleanly) before upgrading"
+        )));
+    }
     let message = ExportMetricsServiceRequest::decode(request)
         .map_err(|e| refuse(format!("is damaged: its request does not parse ({e})")))?;
     // The request was accepted: its own bounds held then, so only the

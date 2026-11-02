@@ -60,6 +60,39 @@ impl MetricConversion {
         }
     }
 
+    /// The first limit this engine would convert under other than as
+    /// recorded, clamping it into its domain, and its recorded value; a
+    /// record of an engine before the ceilings may carry one.
+    pub fn outside_domain(&self) -> Option<(&'static str, usize)> {
+        let clamped = MetricLimits {
+            max_histogram_buckets: self.max_histogram_buckets,
+            max_summary_quantiles: self.max_summary_quantiles,
+            max_series_labels: self.max_series_labels,
+            ..MetricLimits::default()
+        }
+        .clamped();
+        [
+            (
+                "max_histogram_buckets",
+                self.max_histogram_buckets,
+                clamped.max_histogram_buckets,
+            ),
+            (
+                "max_summary_quantiles",
+                self.max_summary_quantiles,
+                clamped.max_summary_quantiles,
+            ),
+            (
+                "max_series_labels",
+                self.max_series_labels,
+                clamped.max_series_labels,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, recorded, applied)| recorded != applied)
+        .map(|(name, recorded, _)| (name, recorded))
+    }
+
     /// `limits` and `metrics` with this conversion's values in place of
     /// theirs; the bounds of a whole request stay `metrics`'.
     pub fn apply(&self, limits: &Limits, metrics: &MetricLimits) -> (Limits, MetricLimits) {
@@ -164,6 +197,16 @@ mod tests {
         assert_eq!(
             applied_metrics.max_points,
             MetricLimits::default().max_points
+        );
+
+        assert_eq!(conversion.outside_domain(), None);
+        let wide = MetricConversion {
+            max_series_labels: MetricLimits::MAX_SERIES_LABELS + 1,
+            ..conversion
+        };
+        assert_eq!(
+            wide.outside_domain(),
+            Some(("max_series_labels", MetricLimits::MAX_SERIES_LABELS + 1))
         );
 
         let mut newer = payload.to_vec();

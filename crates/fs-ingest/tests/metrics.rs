@@ -653,6 +653,21 @@ async fn a_metric_record_that_cannot_convert_as_accepted_stops_the_start() {
         ..conversion
     };
     let short = conversion.payload(&[]).slice(..HEADER_BYTES - 1);
+    // Accepted by a writer before the ceilings: 4500 bounds under 5000.
+    let wide = MetricConversion {
+        max_histogram_buckets: 5000,
+        ..conversion
+    };
+    let mut buckets = metrics(1, 0);
+    if let Some(Data::Histogram(h)) =
+        &mut buckets.resource_metrics[0].scope_metrics[0].metrics[1].data
+    {
+        let point = &mut h.data_points[0];
+        point.explicit_bounds = (0..4500).map(f64::from).collect();
+        point.bucket_counts = vec![0; 4501];
+        point.count = 0;
+    }
+    let past_ceiling = wide.payload(&buckets.encode_to_vec());
     let garbled = conversion.payload(&[0xff; 8]);
     for (case, record, reason) in [
         (
@@ -674,6 +689,11 @@ async fn a_metric_record_that_cannot_convert_as_accepted_stops_the_start() {
             "garbled request",
             record(VERSION_METRIC_RECORD, garbled),
             "damaged",
+        ),
+        (
+            "past a ceiling",
+            record(VERSION_METRIC_RECORD, past_ceiling),
+            "max_histogram_buckets 5000",
         ),
     ] {
         let err = refused_start(&db, &record);

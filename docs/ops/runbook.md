@@ -205,7 +205,9 @@ purges leave theirs behind until a newer orphan sweep removes them.
 Metrics ingest (OTLP `MetricsService`) writes record code 4 at record
 version 5 and intents of version 4, which an engine without them refuses:
 roll out ingesters first, then queriers. Metric records of version 1,
-written before records carried their conversion limits, stop the start
+written before records carried their conversion limits, and records
+carrying a limit past this engine's ceilings (`max_histogram_buckets`,
+`max_summary_quantiles` or `max_series_labels` above 4096) stop the start
 of this engine: stop the ingesters that wrote them cleanly, so they flush
 and checkpoint, before upgrading. Before a rollback flush and checkpoint
 every

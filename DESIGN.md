@@ -173,7 +173,8 @@ arriving meanwhile:
   under those, so a restart with other limits writes the same rows under
   the same ids. A metric record that cannot convert as it was accepted
   stops the replay with its position: of a mapping version the engine
-  does not convert, damaged though its frame passed the checksum, or of
+  does not convert, with a limit past the engine's ceilings (a record of
+  an engine before them), damaged though its frame passed the checksum, or of
   version 1, which carries the request alone and whose limits are lost.
   What either walk
   of a request holds at once, its levels, labels, names and rendering, is
