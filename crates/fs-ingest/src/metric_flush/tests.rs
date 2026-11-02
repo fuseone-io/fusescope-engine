@@ -198,7 +198,10 @@ fn canonical_metric_input_gives_the_pinned_bytes_for_each_version() {
     let input = rows(&request("cpu", &[(0, 1.5, "a"), (1, -0.0, "b")]), 7);
     let tenant = TenantId(uuid::Uuid::from_bytes([1; 16]));
     let id = FileId(uuid::Uuid::from_bytes([2; 16]));
-    let pinned = [(4, PINNED_SAMPLES, PINNED_SERIES)];
+    let pinned = [
+        (4, PINNED_SAMPLES, PINNED_SERIES),
+        (5, PINNED_SAMPLES, PINNED_SERIES_V2),
+    ];
     assert_eq!(
         pinned.map(|(version, _, _)| version),
         *FileLayout::written_versions(RowSignal::Metrics)
@@ -245,6 +248,7 @@ fn hex(bytes: &[u8]) -> String {
 
 const PINNED_SAMPLES: &str = "f96c050d0dda0449e2a2850fbf5ddb58b317d851831598245bdc23b00403b86e";
 const PINNED_SERIES: &str = "4f0fd1e3582f66a43a79cb1b950aa4eb1a0d3fd364a73cd9cfc2e9273de16eb2";
+const PINNED_SERIES_V2: &str = "790b8c744b400276cfd67cd2636323fb1fc5feda45e960724e126f96220de4da";
 
 /// Two ingesters at the same WAL positions write the same sample: the one
 /// whose instance sorts last wins, whichever input comes first, so any

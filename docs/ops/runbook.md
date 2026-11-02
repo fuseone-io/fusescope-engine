@@ -203,14 +203,17 @@ than span bytes. A binary without text sidecars ignores them; the files it
 purges leave theirs behind until a newer orphan sweep removes them.
 
 Metrics ingest (OTLP `MetricsService`) writes record code 4 at record
-version 5 and intents of version 4, which an engine without them refuses:
+version 5 under mapping version 2, intents of version 4 and metric files of
+layout 5 (series v2), which an engine without them refuses:
 roll out ingesters first, then queriers. Metric records of version 1,
 written before records carried their conversion limits, and records
 carrying a limit past this engine's ceilings (`max_histogram_buckets`,
 `max_summary_quantiles` or `max_series_labels` above 4096) stop the start
 of this engine: stop the ingesters that wrote them cleanly, so they flush
-and checkpoint, before upgrading. Before a rollback flush and checkpoint
-every
+and checkpoint, before upgrading. From the first record of mapping 2 or
+the first metric file of layout 5 an engine before them is not rolled back
+to without flushing and checkpointing every ingester first. Before a
+rollback flush and checkpoint every
 ingester (stop it cleanly) so no metric record or intent is left in a WAL.
 A metric flush writes two files of one set, samples and series; a set
 found registered or visible in part stops the flush, or fails the

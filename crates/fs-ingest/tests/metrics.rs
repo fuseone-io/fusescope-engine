@@ -606,6 +606,77 @@ async fn a_request_past_its_points_is_refused_before_its_walk_is_measured() {
     db.finish().await;
 }
 
+/// The series rows of the series files under `bucket`.
+fn series_in(bucket: &std::path::Path) -> Vec<fs_schema::metrics::SeriesRow> {
+    objects(bucket, "/metrics/series/")
+        .iter()
+        .flat_map(|path| {
+            let reader =
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap())
+                    .unwrap();
+            let schema = Arc::clone(reader.schema());
+            reader
+                .build()
+                .unwrap()
+                .flat_map(|batch| {
+                    let batch = batch.unwrap().with_schema(Arc::clone(&schema)).unwrap();
+                    fs_schema::metrics::series_rows(&batch).unwrap()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A record of mapping 1, logged before label origins, replays with
+/// legacy origins; the same series received live under mapping 2 merges
+/// with it in the buffer, no collision, the known origins kept.
+#[tokio::test]
+async fn a_replayed_mapping_1_record_and_live_mapping_2_rows_are_one_series() {
+    use fs_ingest::metric_record::MetricConversion;
+    use fs_ingest::record::{RecordSignal, VERSION_METRIC_RECORD, WalRecord};
+    use prost::Message as _;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let config = test_config();
+    let older = MetricConversion {
+        mapping: 1,
+        ..MetricConversion::current(&config.limits, &config.metrics)
+    };
+    let record = WalRecord {
+        version: VERSION_METRIC_RECORD,
+        tenant,
+        signal: RecordSignal::Metrics,
+        payload: older.payload(&metrics(2, 0).encode_to_vec()),
+    };
+    let h = start(&db.catalog, wal_with(&record), test_config()).await;
+    h.export(metrics(2, 1), &token).await;
+    h.ingester.flush_all().await;
+    let series = series_in(&h.bucket());
+    assert_eq!(
+        series.len(),
+        2 + 4,
+        "two gauges and the histogram's series, once each"
+    );
+    assert!(
+        series
+            .iter()
+            .all(|s| s.label_meta.iter().all(|m| m.level().is_some())),
+        "every origin known"
+    );
+    assert_eq!(
+        h.ingester
+            .stats()
+            .metric_series_collisions
+            .load(Ordering::Relaxed),
+        0
+    );
+    h.stop().await;
+    db.finish().await;
+}
+
 /// Why the start of an ingester whose WAL holds `record` fails.
 fn refused_start(db: &TestDb, record: &fs_ingest::record::WalRecord) -> String {
     let dir = wal_with(record);
@@ -678,7 +749,7 @@ async fn a_metric_record_that_cannot_convert_as_accepted_stops_the_start() {
         (
             "newer mapping",
             record(VERSION_METRIC_RECORD, newer.payload(&request)),
-            "mapping version 2",
+            "mapping version 3",
         ),
         (
             "short header",

@@ -151,9 +151,10 @@ columns the Go backend reads (`time_series_v4`, `samples_v4`), and
 `observed/0.145.0` rows (Apache-2.0).
 
 A data point becomes one or more series, each with one sample. These
-rules are mapping version 1 (`fs_schema::metrics::MAPPING_VERSION`), which
+rules are mapping version 2 (`fs_schema::metrics::MAPPING_VERSION`), which
 each metric WAL record names; any change to the rows a request converts
-into takes a new version.
+into takes a new version. Version 1 is the same but records no label
+origin: a record of it converts with every origin legacy.
 
 | OTLP | Series | type | temporality | is_monotonic | unit | Source |
 |---|---|---|---|---|---|---|
@@ -240,3 +241,23 @@ and millisecond. A series row: one per fingerprint and hour, the hour of
 its samples; of differing descriptions the longest in bytes, then the
 least in byte order. Not stored: `env`, `attrs`, `scope_attrs`,
 `resource_attrs` and `__normalized`, which the Go backend does not read.
+
+**Label origins** (mapping 2, engine): each label keeps the level it won
+from, resource, scope or point, and the OTLP types its value was received
+as (`Str`, `Int`, `Double`, `Bool`, `Slice`, `Map`, `Bytes`); the
+generated `__scope.*__` are scope strings, `__name__`, `__temporality__`,
+`le` and `quantile` point strings [obs §5, `attr_type`]. Only the winner
+of a key is kept: a value shadowed by another level leaves no origin and
+no metadata row, unlike the reference, which writes one for each level,
+since only the winner can be queried. The level is part of a series'
+identity, the types are not: Int `1` and Str `"1"` render and hash alike
+and are one series whose types accumulate.
+
+**Identity** (engine): a series is its name, fingerprint, type,
+temporality, monotonicity, unit, labels and the level of each label; the
+fingerprint is never used alone, samples are keyed by name, fingerprint
+and time. Two rows of one name, fingerprint and hour merge only when
+their identities agree, a legacy origin, from a row of series v1,
+agreeing with any level and taking it; two identities under one key are
+both kept, a collision counted once a key, and a reader that must choose
+fails closed.

@@ -10,11 +10,14 @@ use opentelemetry_proto::tonic::metrics::v1::{
 
 use super::canonical::{Capped, double};
 use super::identity::{
-    ALWAYS_GENERATED, HASHER_BYTES, LE, Level, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL,
+    ALWAYS_GENERATED, HASHER_BYTES, LE, Label, Level, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL,
     SCOPE_VERSION, SeriesKey, TEMPORALITY, TooManyLabels, fingerprint, labels,
 };
+use super::label_meta::{Datatype, LabelLevel, LabelMeta};
 use super::rows::{Builder, MetricRows};
-use super::{MetricLimits, MetricType, Rejection, Rejections, Source, Temporality};
+use super::{
+    MAPPING_VERSION, MetricLimits, MetricType, Rejection, Rejections, Source, Temporality,
+};
 use crate::SchemaError;
 use crate::limits::{DropStats, Limits};
 
@@ -155,8 +158,29 @@ pub fn convert(
     checked: &Preflight,
     source: Source,
 ) -> Result<MetricRows, SchemaError> {
+    convert_mapping(MAPPING_VERSION, request, limits, metrics, checked, source)
+}
+
+/// [`convert`] under `mapping`, a version this engine converts by: under
+/// 1, every label origin is legacy.
+///
+/// # Errors
+/// As [`convert`], or a mapping this engine does not convert by.
+pub fn convert_mapping(
+    mapping: u8,
+    request: &ExportMetricsServiceRequest,
+    limits: &Limits,
+    metrics: &MetricLimits,
+    checked: &Preflight,
+    source: Source,
+) -> Result<MetricRows, SchemaError> {
+    if !super::converts(mapping) {
+        return Err(SchemaError::Layout(
+            "metrics: a mapping this engine does not convert by",
+        ));
+    }
     let metrics = metrics.clamped();
-    let mut builder = Builder::with_capacity(checked);
+    let mut builder = Builder::with_capacity(checked, mapping);
     let mut stats = DropStats::default();
     walk(request, limits, &metrics, &mut builder, &mut stats).map_err(|e| match e {
         Stop::Schema(e) => e,
@@ -166,7 +190,7 @@ pub fn convert(
 }
 
 /// Bytes of one label of a series being built.
-const LABEL: usize = std::mem::size_of::<(&str, &str)>();
+const LABEL: usize = std::mem::size_of::<Label<'static>>();
 
 /// Bytes of the text of a bucket's bound or a quantile.
 const GENERATED_TEXT: usize = 1024;
@@ -313,7 +337,7 @@ pub(crate) struct Emit<'a> {
     pub(crate) key: SeriesKey<'a>,
     pub(crate) description: &'a str,
     pub(crate) fingerprint: u64,
-    pub(crate) labels: &'a [(&'a str, &'a str)],
+    pub(crate) labels: &'a [Label<'a>],
     pub(crate) unix_milli: i64,
     pub(crate) value: f64,
     pub(crate) flags: u32,
@@ -362,7 +386,7 @@ impl Sink for Count {
         p.label_bytes += emit
             .labels
             .iter()
-            .map(|(k, v)| k.len() + v.len())
+            .map(|(k, v, _)| k.len() + v.len())
             .sum::<usize>();
         p.text_bytes += emit.key.name.len() + emit.key.unit.len() + emit.description.len();
         p.name_bytes += emit.key.name.len();
@@ -494,14 +518,23 @@ fn generated<'a>(
     at: &Context<'a>,
     name: &'a str,
     temporality: Temporality,
-) -> [(&'static str, &'a str); ALWAYS_GENERATED] {
+) -> [Label<'a>; ALWAYS_GENERATED] {
+    let (point, scope) = (
+        generated_meta(LabelLevel::Point),
+        generated_meta(LabelLevel::Scope),
+    );
     [
-        (NAME, name),
-        (TEMPORALITY, temporality.as_str()),
-        (SCOPE_NAME, at.name),
-        (SCOPE_VERSION, at.version),
-        (SCOPE_SCHEMA_URL, at.schema_url),
+        (NAME, name, point),
+        (TEMPORALITY, temporality.as_str(), point),
+        (SCOPE_NAME, at.name, scope),
+        (SCOPE_VERSION, at.version, scope),
+        (SCOPE_SCHEMA_URL, at.schema_url, scope),
     ]
+}
+
+/// The origin of a label the engine generates at `level`: a string.
+fn generated_meta(level: LabelLevel) -> LabelMeta {
+    LabelMeta::native(level, Datatype::Str)
 }
 
 /// The point's attributes, and whether its series fit the label cap with
@@ -516,11 +549,11 @@ fn point_level(
 ) -> Result<Level, TooManyLabels> {
     let point = Level::new("point", &[], attributes, limits, cap, stats)?;
     let mut scratch = Vec::new();
-    let mut generated: Vec<(&'static str, &str)> = generated(at, "", Temporality::Unspecified)
+    let mut generated: Vec<Label<'_>> = generated(at, "", Temporality::Unspecified)
         .into_iter()
         .collect();
     if extra > 0 {
-        generated.push((LE, ""));
+        generated.push((LE, "", generated_meta(LabelLevel::Point)));
     }
     let fits = labels(
         [at.resource, at.scope, &point],
@@ -555,11 +588,11 @@ fn emit_series(
     cap: usize,
     sink: &mut impl Sink,
 ) -> Result<(), Stop> {
-    let mut generated: Vec<(&'static str, &str)> = generated(at, key.name, key.temporality)
+    let mut generated: Vec<Label<'_>> = generated(at, key.name, key.temporality)
         .into_iter()
         .collect();
-    if let Some(extra) = key.generated {
-        generated.push(extra);
+    if let Some((label, value)) = key.generated {
+        generated.push((label, value, generated_meta(LabelLevel::Point)));
     }
     let mut fused = Vec::new();
     labels([at.resource, at.scope, point], &generated, cap, &mut fused)

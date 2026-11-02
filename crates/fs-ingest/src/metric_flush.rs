@@ -20,7 +20,9 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use fs_catalog::{FileId, Level, MetricRole, NewFile, TenantId, TimeRange};
-use fs_schema::metrics::{SOURCE_ORDER_BYTES, col, samples_schema_v1, series_schema_v1};
+use fs_schema::metrics::{
+    SOURCE_ORDER_BYTES, col, samples_schema_v1, series_schema_v1, series_schema_v2,
+};
 use object_store::path::Path;
 use parquet::arrow::ArrowWriter;
 
@@ -147,10 +149,21 @@ pub fn prepare_series(
     layout: FileLayout,
 ) -> Result<Prepared, IngestError> {
     check_layout(&layout, RowSignal::Metrics)?;
-    let schema = series_schema_v1();
-    if series.schema().fields() != schema.fields() {
+    if series.schema().fields() != series_schema_v2().fields() {
         return Err(IngestError::Encode("series rows of another schema".into()));
     }
+    let (schema, series) = if layout.version == FileLayout::METRIC_VERSION {
+        (series_schema_v2(), series.clone())
+    } else {
+        let schema = series_schema_v1();
+        let columns = series
+            .columns()
+            .get(..schema.fields().len())
+            .unwrap_or_default()
+            .to_vec();
+        (Arc::clone(&schema), RecordBatch::try_new(schema, columns)?)
+    };
+    let series = &series;
     let path = metric_path(root, tenant, MetricRole::Series, hour, id);
     let mut out = Vec::new();
     let mut writer = ArrowWriter::try_new(

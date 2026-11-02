@@ -170,8 +170,9 @@ arriving meanwhile:
   and the limits its conversion applied (`max_key_bytes`,
   `max_value_bytes`, `max_histogram_buckets`, `max_summary_quantiles`,
   `max_series_labels`) ahead of the request as received: a replay converts
-  under those, so a restart with other limits writes the same rows under
-  the same ids. A metric record that cannot convert as it was accepted
+  under those and under its mapping, 1 or 2, so a restart with other
+  limits writes the same rows under the same ids; the intent fixes the
+  file layout, 5 writing series v2 and 4 series v1. A metric record that cannot convert as it was accepted
   stops the replay with its position: of a mapping version the engine
   does not convert, with a limit past the engine's ceilings (a record of
   an engine before them), damaged though its frame passed the checksum, or of
@@ -467,12 +468,20 @@ A data point becomes one or more series, each with one sample; the rules
 are in `crates/fs-schema/MAPPING.md` ("Metrics"), from the OTLP
 definitions and the write contract observed from a known corpus.
 
-`time_series` (series, version 1): `metric_name`, `temporality`
+`time_series` (series, version 2): `metric_name`, `temporality`
 (`Delta`, `Cumulative`, `Unspecified`), `type` (`Gauge`, `Sum`,
 `Histogram`, `Summary`), `is_monotonic`, `fingerprint` (UInt64),
 `unix_milli` (the hour, Int64), `labels` (Map(Utf8, Utf8), not a JSON
-string), `description`, `unit`; one row a fingerprint and hour, sorted by
-name, fingerprint and hour. Labels fuse the resource, scope and point
+string), `description`, `unit`, and `label_metadata`, a `List<UInt16>` no
+table shows, one entry a label in the order of `labels`: level in bits
+15–12 (1 resource, 2 scope, 3 point), bits 11–8 reserved, bit 7 legacy,
+the types seen in bits 6–0 (Str, Int, Double, Bool, Slice, Map, Bytes). A
+native entry has a level, at least one type and no legacy bit; a legacy
+one, for a row of version 1, is bit 7 alone; anything else fails the read.
+One row a series and hour, sorted by name, fingerprint, hour, the rest of
+the identity and the levels, a legacy one last. Version 1, without
+`label_metadata`, is still read, its origins legacy, and written for the
+intents of layout 4. Labels fuse the resource, scope and point
 attributes with the generated `__name__`, `__temporality__`,
 `__scope.name__`, `__scope.version__`, `__scope.schema_url__`, `le` and
 `quantile`, which no attribute overrides; `attrs`, `scope_attrs` and
@@ -497,7 +506,16 @@ apart, then the series' name, type, unit, temporality, monotonicity and
 `le` or `quantile`: series whose labels match only because one level
 shadows another stay apart, and two declarations of one identity that
 differ in type, unit, temporality or monotonicity become two series under
-the same labels, which `metrics.select` refuses rather than merge.
+the same labels, which `metrics.select` refuses rather than merge. A
+series is its name, fingerprint, type, temporality, monotonicity, unit,
+labels and their levels; every merge, in a request, a buffer, a flush and
+a compaction, joins two rows of one name, fingerprint and hour only when
+their identities agree, a legacy level agreeing with any and taking it,
+and accumulates the types; two identities of one key are both kept, never
+merged, counted once a key in a request, a buffer or a file
+(`fusescope_ingest_metric_series_collisions_total`), and `metrics.select`
+fails closed on such a key. Joins and deduplication use the name and the
+fingerprint together, never the fingerprint alone.
 Exponential histograms are refused point by point until M3 step 4.
 A request is bounded before conversion by `ingest.max_metric_points_per_request`
 (100 000), `max_metric_samples_per_request` (1 000 000, at most

@@ -1,4 +1,4 @@
-//! Metric samples and series, version 1, and the OTLP metrics to Arrow
+//! Metric samples, version 1, series, versions 1 and 2, and the OTLP metrics to Arrow
 //! conversion (`MAPPING.md`, "Metrics").
 //!
 //! A request converts in two passes over one traversal: [`preflight`]
@@ -8,24 +8,37 @@
 //! allocated.
 
 mod canonical;
+mod decode;
 mod expand;
 mod identity;
+mod label_meta;
 mod rows;
 mod schema;
 
 pub use expand::{
-    MAX_TRACKED_HOURS, Preflight, TooLarge, check_points, convert, preflight, walk_bound,
+    MAX_TRACKED_HOURS, Preflight, TooLarge, check_points, convert, convert_mapping, preflight,
+    walk_bound,
 };
 pub use identity::{LE, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL, SCOPE_VERSION, TEMPORALITY};
-pub use rows::{MetricRows, SeriesRow, dedupe_series, series_batch, with_source};
+pub use label_meta::{Conflict, Datatype, LabelLevel, LabelMeta};
+pub use rows::{
+    MetricRows, SeriesRow, dedupe_series, series_batch, series_batch_of, series_rows, with_source,
+};
 pub use schema::{
     SAMPLES_SCHEMA_VERSION, SERIES_SCHEMA_VERSION, col, samples_schema_v1, series_schema_v1,
+    series_schema_v2,
 };
 
 /// Version of the rules a request converts by: `MAPPING.md` ("Metrics"),
-/// the canonical text, fingerprint version 1 and the schemas of version 1.
-/// Any change to the rows a request converts into takes a new version.
-pub const MAPPING_VERSION: u8 = 1;
+/// the canonical text, fingerprint version 1 and the schemas. Any change
+/// to the rows a request converts into takes a new version. Version 1
+/// knew no label origin; version 2 records each label's level and type.
+pub const MAPPING_VERSION: u8 = 2;
+
+/// Whether this engine converts under `mapping`.
+pub fn converts(mapping: u8) -> bool {
+    (1..=MAPPING_VERSION).contains(&mapping)
+}
 
 /// Bytes of a sample's source order: the WAL instance, segment and offset
 /// of its record and its ordinal in the request.
@@ -48,6 +61,13 @@ pub enum MetricType {
 }
 
 impl MetricType {
+    /// The type `text` stores, `None` for another.
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Gauge, Self::Sum, Self::Histogram, Self::Summary]
+            .into_iter()
+            .find(|t| t.as_str() == text)
+    }
+
     /// The stored text.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -71,6 +91,13 @@ pub enum Temporality {
 }
 
 impl Temporality {
+    /// The temporality `text` stores, `None` for another.
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Unspecified, Self::Delta, Self::Cumulative]
+            .into_iter()
+            .find(|t| t.as_str() == text)
+    }
+
     /// The stored text.
     pub fn as_str(self) -> &'static str {
         match self {

@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use arrow::array::AsArray;
 use arrow::datatypes::{Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type};
+use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
@@ -705,6 +708,7 @@ fn of_one_series_and_hour_the_longest_description_wins_then_the_least_bytes() {
         unit: "".into(),
         description: description.into(),
         labels: Box::new([]),
+        label_meta: Box::new([]),
     };
     // "é" and "ab" are two bytes each; "ab" sorts before "é".
     let mut rows = vec![row("é"), row("a"), row("ab"), row("")];
@@ -721,7 +725,7 @@ fn series_batches_have_the_series_schema() {
         vec![gauge("g", vec![number(1.0, vec![kv("a", "b")])])],
     ));
     let batch = series_batch(&rows.series, rows.series.len()).unwrap();
-    assert_eq!(batch.schema(), series_schema_v1());
+    assert_eq!(batch.schema(), series_schema_v2());
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(
         batch.column(4).as_primitive::<UInt64Type>().value(0),
@@ -754,4 +758,172 @@ fn a_request_converted_before_its_position_was_known_takes_it_after() {
     let known = convert(&req, &limits, &metrics, &checked, SOURCE).unwrap();
     assert_eq!(with_source(&early.samples, SOURCE).unwrap(), known.samples);
     assert_eq!(checked.hours, vec![T0_MS]);
+}
+
+fn series(
+    name: &str,
+    fingerprint: u64,
+    level: Option<LabelLevel>,
+    datatype: Datatype,
+) -> SeriesRow {
+    let meta = level.map_or(LabelMeta::LEGACY, |l| LabelMeta::native(l, datatype));
+    SeriesRow {
+        fingerprint,
+        unix_milli: T0_MS,
+        name: name.into(),
+        kind: MetricType::Gauge,
+        temporality: Temporality::Unspecified,
+        monotonic: false,
+        unit: "".into(),
+        description: "".into(),
+        labels: vec![("host".into(), "1".into())].into(),
+        label_meta: vec![meta].into(),
+    }
+}
+
+/// A row of series v1, its origin legacy, merges with the same series of
+/// v2 and takes its origin; legacy rows alone stay legacy; two levels
+/// stay two identities, one collision; the types seen accumulate.
+#[test]
+fn a_legacy_origin_merges_with_a_known_one_and_two_levels_collide() {
+    let point = Some(LabelLevel::Point);
+    let mut rows = vec![
+        series("m", 7, None, Datatype::Str),
+        series("m", 7, point, Datatype::Int),
+        series("m", 7, point, Datatype::Str),
+    ];
+    assert_eq!(dedupe_series(&mut rows), 0);
+    assert_eq!(rows.len(), 1);
+    let meta = *rows.first().unwrap().label_meta.first().unwrap();
+    assert_eq!(meta.level(), point);
+    assert_eq!(
+        meta.datatypes().collect::<Vec<_>>(),
+        [Datatype::Str, Datatype::Int]
+    );
+
+    let mut legacy = vec![
+        series("m", 7, None, Datatype::Str),
+        series("m", 7, None, Datatype::Str),
+    ];
+    assert_eq!(dedupe_series(&mut legacy), 0);
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(
+        *legacy.first().unwrap().label_meta.first().unwrap(),
+        LabelMeta::LEGACY
+    );
+
+    let mut two = vec![
+        series("m", 7, Some(LabelLevel::Resource), Datatype::Str),
+        series("m", 7, point, Datatype::Str),
+        series("m", 7, point, Datatype::Str),
+    ];
+    assert_eq!(dedupe_series(&mut two), 1, "one key, counted once");
+    assert_eq!(two.len(), 2);
+}
+
+/// Two metrics of one fingerprint and different names are two series,
+/// never merged and not a collision of one key.
+#[test]
+fn one_fingerprint_under_two_names_is_two_series() {
+    let point = Some(LabelLevel::Point);
+    let mut rows = vec![
+        series("a", 7, point, Datatype::Str),
+        series("b", 7, point, Datatype::Str),
+    ];
+    assert_eq!(dedupe_series(&mut rows), 0);
+    assert_eq!(rows.len(), 2);
+}
+
+/// Series read back as written, version 2 with their origins, version 1
+/// with legacy ones; an origin of no level and no legacy bit is refused.
+#[test]
+fn series_rows_round_trip_both_versions_and_refuse_damaged_origins() {
+    let mut rows = vec![
+        series("m", 7, Some(LabelLevel::Scope), Datatype::Map),
+        series("n", 8, None, Datatype::Str),
+    ];
+    rows.sort_by(SeriesRow::order);
+    let v2 = series_batch(&rows, rows.len()).unwrap();
+    assert_eq!(series_rows(&v2).unwrap(), rows);
+    let v1 = series_batch_of(1, &rows, rows.len()).unwrap();
+    assert_eq!(v1.schema(), series_schema_v1());
+    let read = series_rows(&v1).unwrap();
+    assert!(
+        read.iter()
+            .all(|r| r.label_meta.iter().all(|m| *m == LabelMeta::LEGACY))
+    );
+    assert_eq!(read.first().unwrap().labels, rows.first().unwrap().labels);
+
+    let mut damaged = rows.clone();
+    damaged.first_mut().unwrap().label_meta = vec![LabelMeta::decode(0x3001).unwrap()].into();
+    let batch = series_batch(&damaged, 2).unwrap();
+    let zeroed = {
+        use arrow::array::{ListArray, UInt16Array};
+        let list = ListArray::new(
+            Arc::new(arrow::datatypes::Field::new(
+                "item",
+                arrow::datatypes::DataType::UInt16,
+                false,
+            )),
+            arrow::buffer::OffsetBuffer::from_lengths([1, 1]),
+            Arc::new(UInt16Array::from(vec![0u16, 0x0080])),
+            None,
+        );
+        let mut columns = batch.columns().to_vec();
+        *columns.last_mut().unwrap() = Arc::new(list);
+        RecordBatch::try_new(batch.schema(), columns).unwrap()
+    };
+    assert!(
+        series_rows(&zeroed).is_err(),
+        "a zero without the legacy bit"
+    );
+}
+
+/// Under mapping 2 each label keeps the level it won from and the type it
+/// was received as, the generated ones theirs; under mapping 1 every
+/// origin is legacy and nothing else changes.
+#[test]
+fn mapping_2_records_each_labels_origin_and_mapping_1_none() {
+    let int = KeyValue {
+        key: "port".into(),
+        value: Some(AnyValue {
+            value: Some(Value::IntValue(8080)),
+        }),
+        ..KeyValue::default()
+    };
+    let req = request(
+        vec![kv("service.name", "api"), kv("host", "r")],
+        vec![kv("lib.mode", "x")],
+        vec![gauge("g", vec![number(1.0, vec![kv("host", "p"), int])])],
+    );
+    let (checked, rows) = convert_all(&req);
+    let row = rows.series.first().unwrap();
+    let origin = |key: &str| {
+        let at = row.labels.iter().position(|(k, _)| &**k == key).unwrap();
+        let meta = *row.label_meta.get(at).unwrap();
+        (meta.level().unwrap(), meta.datatypes().collect::<Vec<_>>())
+    };
+    assert_eq!(
+        origin("host"),
+        (LabelLevel::Resource, vec![Datatype::Str]),
+        "the winner's"
+    );
+    assert_eq!(origin("port"), (LabelLevel::Point, vec![Datatype::Int]));
+    assert_eq!(origin("lib.mode"), (LabelLevel::Scope, vec![Datatype::Str]));
+    assert_eq!(origin(SCOPE_NAME), (LabelLevel::Scope, vec![Datatype::Str]));
+    assert_eq!(
+        origin(TEMPORALITY),
+        (LabelLevel::Point, vec![Datatype::Str])
+    );
+    assert_eq!(row.label_meta.len(), row.labels.len());
+
+    let limits = Limits::default();
+    let older =
+        convert_mapping(1, &req, &limits, &MetricLimits::default(), &checked, SOURCE).unwrap();
+    let old = older.series.first().unwrap();
+    assert!(old.label_meta.iter().all(|m| *m == LabelMeta::LEGACY));
+    assert_eq!(old.labels, row.labels);
+    assert_eq!(old.fingerprint, row.fingerprint);
+    assert_eq!(older.samples, rows.samples);
+    assert!(convert_mapping(3, &req, &limits, &MetricLimits::default(), &checked, SOURCE).is_err());
 }

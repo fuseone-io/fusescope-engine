@@ -215,13 +215,19 @@ impl FileLayout {
     /// sized by it; it never shipped and is refused like any other.
     pub const CURRENT_VERSION: u32 = 4;
 
+    /// Version of the current encoder of metric files: version 4 with
+    /// series of schema version 2, which keeps each label's origin;
+    /// version 4 still writes series of version 1 for its intents.
+    pub const METRIC_VERSION: u32 = 5;
+
     /// Versions this engine writes for rows of `signal`: the current one
     /// and those whose intents may still be in a log. Log and metric
     /// files exist only from version 4 on.
     pub fn written_versions(signal: RowSignal) -> &'static [u32] {
         match signal {
             RowSignal::Traces => &[3, 4],
-            RowSignal::Logs | RowSignal::Metrics => &[4],
+            RowSignal::Logs => &[4],
+            RowSignal::Metrics => &[4, 5],
         }
     }
 
@@ -247,7 +253,13 @@ impl FileLayout {
             max_bytes_per_row_group: text.max_bytes_per_row_group,
             max_bytes_per_file: text.max_bytes_per_file,
         });
+        let version = if signal == RowSignal::Metrics {
+            Self::METRIC_VERSION
+        } else {
+            Self::CURRENT_VERSION
+        };
         Self {
+            version,
             text_index,
             ..Self::current(row_group_rows)
         }

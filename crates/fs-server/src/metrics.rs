@@ -986,6 +986,12 @@ fn render_ingest_rows(out: &mut String, i: &fs_ingest::IngestStats) {
         "Metric samples buffered, buckets and quantiles included",
         i.metric_samples.load(Ordering::Relaxed),
     );
+    counter(
+        out,
+        "fusescope_ingest_metric_series_collisions_total",
+        "Keys of metric series, name, fingerprint and hour, found holding a second identity",
+        i.metric_series_collisions.load(Ordering::Relaxed),
+    );
     let rejected: Vec<(&str, u64)> = fs_schema::metrics::Rejection::ALL
         .iter()
         .zip(&i.metric_points_rejected)
@@ -1091,6 +1097,7 @@ mod tests {
             "fusescope_ingest_log_bodies_truncated_total 1\n",
             "fusescope_ingest_metric_points_total 4\n",
             "fusescope_ingest_metric_samples_total 9\n",
+            "fusescope_ingest_metric_series_collisions_total 0\n",
             "fusescope_ingest_metric_points_rejected_total{reason=\"exponential_histogram\"} 6\n",
             "fusescope_ingest_metric_points_rejected_total{reason=\"stale_histogram\"} 0\n",
         ] {

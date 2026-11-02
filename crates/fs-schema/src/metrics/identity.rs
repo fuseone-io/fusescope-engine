@@ -5,6 +5,7 @@ use opentelemetry_proto::tonic::common::v1::KeyValue;
 use twox_hash::XxHash3_64;
 
 use super::canonical::{Capped, render, render_scratch, rendered_len};
+use super::label_meta::{Datatype, LabelLevel, LabelMeta};
 use super::{MetricType, Temporality};
 use crate::limits::{DropStats, Limits};
 
@@ -34,12 +35,12 @@ pub(crate) const ALWAYS_GENERATED: usize = 5;
 /// order, and their hash.
 #[derive(Debug, Default)]
 pub(crate) struct Level {
-    pub(crate) pairs: Vec<(String, String)>,
+    pub(crate) pairs: Vec<(String, String, Datatype)>,
     pub(crate) hash: u64,
 }
 
 /// Bytes of one pair of a level.
-const PAIR: usize = std::mem::size_of::<(String, String)>();
+const PAIR: usize = std::mem::size_of::<(String, String, Datatype)>();
 
 /// What building a level holds, bounded before it is built.
 #[derive(Debug, Clone, Copy, Default)]
@@ -71,13 +72,18 @@ impl Level {
         if attributes.len() > cap {
             return Err(TooManyLabels);
         }
-        let mut pairs: Vec<(String, String)> = Vec::with_capacity(attributes.len());
+        let mut pairs: Vec<(String, String, Datatype)> = Vec::with_capacity(attributes.len());
         for kv in attributes {
             if kv.key.is_empty() || kv.key.len() > limits.max_key_bytes {
                 stats.attributes_dropped += 1;
                 continue;
             }
-            let Some(value) = kv.value.as_ref().and_then(|v| v.value.as_ref()) else {
+            let Some((value, datatype)) = kv
+                .value
+                .as_ref()
+                .and_then(|v| v.value.as_ref())
+                .and_then(|v| Some((v, Datatype::of(v)?)))
+            else {
                 stats.attributes_dropped += 1;
                 continue;
             };
@@ -90,11 +96,11 @@ impl Level {
             if out.truncated {
                 stats.values_truncated += 1;
             }
-            pairs.push((kv.key.clone(), text));
+            pairs.push((kv.key.clone(), text, datatype));
         }
         // Stable: of a run of one key the last is the last received.
         pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        let mut kept: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+        let mut kept: Vec<(String, String, Datatype)> = Vec::with_capacity(pairs.len());
         for pair in pairs {
             match kept.last_mut() {
                 Some(last) if last.0 == pair.0 => *last = pair,
@@ -107,7 +113,7 @@ impl Level {
             hash.str(s);
         }
         hash.u64(kept.len() as u64);
-        for (k, v) in &kept {
+        for (k, v, _) in &kept {
             hash.str(k);
             hash.str(v);
         }
@@ -151,11 +157,11 @@ impl Level {
 
     /// Bytes it holds: its pairs as allocated and their texts.
     pub(crate) fn held(&self) -> usize {
-        self.pairs.capacity() * std::mem::size_of::<(String, String)>()
+        self.pairs.capacity() * PAIR
             + self
                 .pairs
                 .iter()
-                .map(|(k, v)| k.capacity() + v.capacity())
+                .map(|(k, v, _)| k.capacity() + v.capacity())
                 .sum::<usize>()
     }
 }
@@ -197,20 +203,25 @@ pub(crate) fn fingerprint(levels: [&Level; 3], key: &SeriesKey<'_>) -> u64 {
     hash.finish()
 }
 
-/// The labels of a series of the point whose levels are `levels`: the
-/// generated ones, then the resource's, the scope's and the point's, the
-/// first of a key winning, in key byte order. `None` past `cap` labels.
+/// A label of a series being built: key, value and origin.
+pub(crate) type Label<'a> = (&'a str, &'a str, LabelMeta);
+
+/// The labels of a series of the point whose levels are `levels`, the
+/// resource's, the scope's and the point's: the generated ones, then
+/// theirs, the first of a key winning, in key byte order, each with the
+/// origin of the one that won. `None` past `cap` labels.
 pub(crate) fn labels<'a>(
     levels: [&'a Level; 3],
-    generated: &[(&'static str, &'a str)],
+    generated: &[Label<'a>],
     cap: usize,
-    out: &mut Vec<(&'a str, &'a str)>,
+    out: &mut Vec<Label<'a>>,
 ) -> Option<()> {
     out.clear();
     out.extend(generated.iter().copied());
-    for level in levels {
-        for (k, v) in &level.pairs {
-            out.push((k.as_str(), v.as_str()));
+    let kinds = [LabelLevel::Resource, LabelLevel::Scope, LabelLevel::Point];
+    for (level, kind) in levels.into_iter().zip(kinds) {
+        for (k, v, datatype) in &level.pairs {
+            out.push((k.as_str(), v.as_str(), LabelMeta::native(kind, *datatype)));
         }
     }
     // Stable, so of one key the first pushed, the most preferred, leads.
@@ -286,7 +297,10 @@ mod tests {
         let a = level("point", &[kv("b", "1"), kv("a", "x"), kv("b", "2")]);
         assert_eq!(
             a.pairs,
-            vec![("a".into(), "x".into()), ("b".into(), "2".into())]
+            vec![
+                ("a".into(), "x".into(), Datatype::Str),
+                ("b".into(), "2".into(), Datatype::Str)
+            ]
         );
         let b = level("point", &[kv("a", "x"), kv("b", "2")]);
         assert_eq!(a.hash, b.hash);
@@ -294,6 +308,7 @@ mod tests {
 
     #[test]
     fn generated_labels_then_resource_then_scope_then_point_win() {
+        let generated = LabelMeta::native(LabelLevel::Point, Datatype::Str);
         let resource = level("resource", &[kv("zone", "resource"), kv("__name__", "r")]);
         let scope = level("scope", &[kv("zone", "scope"), kv("region", "scope")]);
         let point = level(
@@ -303,20 +318,22 @@ mod tests {
         let mut out = Vec::new();
         labels(
             [&resource, &scope, &point],
-            &[("__name__", "m.bucket"), ("le", "1")],
+            &[("__name__", "m.bucket", generated), ("le", "1", generated)],
             320,
             &mut out,
         )
         .unwrap();
+        let str = |level| LabelMeta::native(level, Datatype::Str);
         assert_eq!(
             out,
             vec![
-                ("__name__", "m.bucket"),
-                ("host", "point"),
-                ("le", "1"),
-                ("region", "scope"),
-                ("zone", "resource"),
-            ]
+                ("__name__", "m.bucket", generated),
+                ("host", "point", str(LabelLevel::Point)),
+                ("le", "1", generated),
+                ("region", "scope", str(LabelLevel::Scope)),
+                ("zone", "resource", str(LabelLevel::Resource)),
+            ],
+            "each label with the origin of the one that won"
         );
         assert!(labels([&resource, &scope, &point], &[], 3, &mut out).is_none());
     }

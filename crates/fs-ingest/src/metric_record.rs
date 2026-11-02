@@ -134,13 +134,13 @@ impl MetricConversion {
     ///
     /// # Errors
     /// A payload shorter than its header or a limit this platform cannot
-    /// hold, or a mapping version other than [`MAPPING_VERSION`].
+    /// hold, or a mapping version this engine does not convert by.
     pub fn split(payload: &[u8]) -> Result<(Self, &[u8]), MetricPayloadError> {
         let (header, request) = payload
             .split_at_checked(HEADER_BYTES)
             .ok_or(MetricPayloadError::Damaged)?;
         let (&mapping, limits) = header.split_first().ok_or(MetricPayloadError::Damaged)?;
-        if mapping != MAPPING_VERSION {
+        if !fs_schema::metrics::converts(mapping) {
             return Err(MetricPayloadError::Mapping(mapping));
         }
         let mut values = limits.chunks_exact(8).map(|b| {

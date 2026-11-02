@@ -90,7 +90,7 @@ pub enum MetricTable {
 /// The schema a scan's rows have: its signal's, for metrics its table's.
 pub fn scan_schema(scan: &HotScanRequest) -> arrow::datatypes::SchemaRef {
     match (scan.signal, scan.table) {
-        (RowSignal::Metrics, Some(MetricTable::Series)) => fs_schema::metrics::series_schema_v1(),
+        (RowSignal::Metrics, Some(MetricTable::Series)) => fs_schema::metrics::series_schema_v2(),
         (signal, _) => schema_of(signal),
     }
 }

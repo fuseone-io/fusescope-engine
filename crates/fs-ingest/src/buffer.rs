@@ -178,7 +178,8 @@ pub struct TenantBuffer {
 
 impl TenantBuffer {
     /// [`push_with_hours`](Self::push_with_hours) for metric samples and
-    /// their `series`, merged into the buffer's.
+    /// their `series`, merged into the buffer's; how many keys came to hold
+    /// more than one identity.
     pub fn push_metric(
         &mut self,
         batch: RecordBatch,
@@ -186,19 +187,21 @@ impl TenantBuffer {
         hours: Vec<DateTime<Utc>>,
         wal: Position,
         now: Instant,
-    ) {
+    ) -> usize {
         if batch.num_rows() == 0 {
-            return;
+            return 0;
         }
         self.push_with_hours(batch, hours, wal, now);
-        self.add_series(series);
+        self.add_series(series)
     }
 
-    /// Merges `series` into the buffer's, keeping `bytes` exact.
-    fn add_series(&mut self, series: Vec<SeriesRow>) {
+    /// Merges `series` into the buffer's, keeping `bytes` exact; how many
+    /// keys came to hold more than one identity.
+    fn add_series(&mut self, series: Vec<SeriesRow>) -> usize {
         let before = self.series.bytes();
-        self.series.add(series);
+        let collisions = self.series.add(series);
         self.bytes = self.bytes - before + self.series.bytes();
+        collisions
     }
 
     /// Takes back `series`, as [`Self::add_series`] does.
@@ -1957,6 +1960,7 @@ mod tests {
             unit: "".into(),
             description: "".into(),
             labels: Vec::new().into(),
+            label_meta: Vec::new().into(),
         }
     }
 

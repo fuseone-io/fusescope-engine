@@ -18,7 +18,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{CatalogError, FileId, FileSetId, MetricRole, NewFile, TenantId};
 use fs_schema::limits::Limits;
 use fs_schema::metrics::{
-    MetricLimits, Rejections, Source, check_points, convert, preflight, walk_bound, with_source,
+    MetricLimits, Rejections, Source, check_points, convert_mapping, preflight, walk_bound,
+    with_source,
 };
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use tracing::{info, warn};
@@ -37,6 +38,13 @@ use crate::record::{FileLayout, FlushIntent, MetricFile, MetricIntent, RowSignal
 /// written, and the writer's peak.
 type Written = (NewFile, Vec<HotBatch>, Vec<HotBatch>, usize);
 
+/// The source of a request converted before its WAL position is known.
+const UNKNOWN_SOURCE: Source = Source {
+    instance: [0; 16],
+    segment: 0,
+    offset: 0,
+};
+
 impl Shared {
     /// Holds the traversals' scratch, bounded from `message`'s sizes,
     /// before the preflight walks it; kept until conversion ends.
@@ -53,6 +61,29 @@ impl Shared {
             .ok_or(IngestError::Capacity(
                 "ingester memory full, hot-window retention pending",
             ))
+    }
+
+    /// Holds as scratch under the cap what converting `checked` holds
+    /// only while it runs, beyond the walk's own, and the merge of its
+    /// series into the buffer's; the rows that stay are admitted apart,
+    /// with the margin of their flush.
+    async fn hold_conversion(
+        &self,
+        stream: Stream,
+        checked: &fs_schema::metrics::Preflight,
+    ) -> Result<(Scratch, crate::buffer::SeriesMerge), IngestError> {
+        let buffers = self.buffers.lock().await;
+        let full = || IngestError::Capacity("ingester memory full, hot-window retention pending");
+        let held = buffers
+            .try_hold_scratch(
+                checked.transient_bound().saturating_sub(checked.scratch),
+                self.config.max_memory_bytes,
+            )
+            .ok_or_else(full)?;
+        let merge = buffers
+            .hold_series_merge(stream, checked.series, self.config.max_memory_bytes)
+            .ok_or_else(full)?;
+        Ok((held, merge))
     }
 
     /// Counts `message`, admits what converting it holds, converts it under
@@ -106,33 +137,18 @@ impl Shared {
             .filter_map(|ms| Utc.timestamp_millis_opt(*ms).single())
             .collect();
         let stream = Stream::metrics(tenant);
-        // What converting holds only while it runs, the merge of its series
-        // into the buffer's included, is held as scratch under the cap; the
-        // rows that stay are admitted with the margin of their flush.
-        let (transient, incoming) = {
-            let buffers = self.buffers.lock().await;
-            let full =
-                || IngestError::Capacity("ingester memory full, hot-window retention pending");
-            let held = buffers
-                .try_hold_scratch(
-                    checked.transient_bound().saturating_sub(checked.scratch),
-                    self.config.max_memory_bytes,
-                )
-                .ok_or_else(full)?;
-            let merge = buffers
-                .hold_series_merge(stream, checked.series, self.config.max_memory_bytes)
-                .ok_or_else(full)?;
-            (held, merge)
-        };
+        let (transient, incoming) = self.hold_conversion(stream, &checked).await?;
         let reservation = self
             .admit(stream, checked.rows_bound(), checked.samples, &hours)
             .await?;
-        let unknown = Source {
-            instance: [0; 16],
-            segment: 0,
-            offset: 0,
-        };
-        let rows = convert(message, limits, metrics, &checked, unknown)?;
+        let rows = convert_mapping(
+            conversion.mapping,
+            message,
+            limits,
+            metrics,
+            &checked,
+            UNKNOWN_SOURCE,
+        )?;
         drop(walk);
         drop(slot);
         let samples_rows = rows.samples.num_rows();
@@ -143,12 +159,16 @@ impl Shared {
             metric_source(self.instance, tracked.position),
         )?;
         drop(rows.samples);
-        let (due, coalesce) = {
+        let (due, coalesce, collided) = {
             let mut buffers = self.buffers.lock().await;
             let was_due = self.flush_is_due(buffers.get_mut(stream));
-            buffers
-                .get_mut(stream)
-                .push_metric(samples, rows.series, hours, tracked.position, now);
+            let collided = buffers.get_mut(stream).push_metric(
+                samples,
+                rows.series,
+                hours,
+                tracked.position,
+                now,
+            );
             drop(reservation);
             drop(transient);
             drop(incoming);
@@ -157,6 +177,7 @@ impl Shared {
             (
                 self.flush_is_due(live) && !was_due,
                 live.request_batches() == self.config.coalesce_batches,
+                rows.collisions + collided,
             )
         };
         if due {
@@ -166,6 +187,9 @@ impl Shared {
             self.coalesce_now.notify_one();
         }
         self.count_metrics(accepted, samples_rows, &rejected);
+        self.stats
+            .metric_series_collisions
+            .fetch_add(collided as u64, Ordering::Relaxed);
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         Ok(Converted {
             accepted,

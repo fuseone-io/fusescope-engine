@@ -56,16 +56,25 @@ impl SeriesSet {
         self.len().saturating_add(incoming).saturating_mul(ROW)
     }
 
-    /// Adds `rows`, keeping one row a series and hour.
-    pub fn add(&mut self, mut rows: Vec<SeriesRow>) {
-        dedupe_series(&mut rows);
-        rows.retain_mut(|row| !self.refine(row));
+    /// Adds `rows`, keeping one row a series and hour, merged as
+    /// [`SeriesRow::absorb`] does; returns how many keys, name,
+    /// fingerprint and hour, came to hold more than one identity.
+    pub fn add(&mut self, mut rows: Vec<SeriesRow>) -> usize {
+        let mut collisions = dedupe_series(&mut rows);
+        rows.retain_mut(|row| match self.refine(row) {
+            Refined::Merged => false,
+            Refined::New => true,
+            Refined::Collided => {
+                collisions += 1;
+                true
+            }
+        });
         if rows.is_empty() {
             #[cfg(test)]
             {
                 self.peak = 0;
             }
-            return;
+            return collisions;
         }
         self.heap += rows.iter().map(SeriesRow::heap_bytes).sum::<usize>();
         let tail = std::mem::take(&mut self.tail);
@@ -85,23 +94,32 @@ impl SeriesSet {
         }
         #[cfg(not(test))]
         let _ = run;
+        collisions
     }
 
-    /// Takes the description of `row` into the row of its series and hour
-    /// already held; false when none is.
-    fn refine(&mut self, row: &mut SeriesRow) -> bool {
-        let found = match self.main.binary_search_by(|r| r.order(row)) {
-            Ok(at) => self.main.get_mut(at),
-            Err(_) => match self.tail.binary_search_by(|r| r.order(row)) {
-                Ok(at) => self.tail.get_mut(at),
-                Err(_) => None,
-            },
-        };
-        let Some(kept) = found else {
-            return false;
-        };
-        self.heap = self.heap.saturating_add_signed(kept.absorb(row));
-        true
+    /// Merges `row` into the row of its series and hour already held. A
+    /// key held under one identity only and now another is a collision.
+    fn refine(&mut self, row: &mut SeriesRow) -> Refined {
+        let mut held = 0;
+        for run in [&mut self.main, &mut self.tail] {
+            let start = run.partition_point(|r| key(r, row) == Ordering::Less);
+            let end = start
+                + run.get(start..).map_or(0, |rest| {
+                    rest.partition_point(|r| key(r, row) == Ordering::Equal)
+                });
+            for kept in run.get_mut(start..end).into_iter().flatten() {
+                if let Some(grown) = kept.absorb(row) {
+                    self.heap = self.heap.saturating_add_signed(grown);
+                    return Refined::Merged;
+                }
+            }
+            held += end - start;
+        }
+        if held == 1 {
+            Refined::Collided
+        } else {
+            Refined::New
+        }
     }
 
     /// Merges `tail` into a new `main`.
@@ -178,6 +196,25 @@ impl SeriesSet {
     }
 }
 
+/// What became of a row added to a set.
+enum Refined {
+    /// Merged into the row of its series and hour.
+    Merged,
+    /// New, of a key not held.
+    New,
+    /// New, of a key held under one other identity.
+    Collided,
+}
+
+/// The order of the keys rows are kept by: name, fingerprint and hour.
+fn key(a: &SeriesRow, b: &SeriesRow) -> Ordering {
+    a.name
+        .as_bytes()
+        .cmp(b.name.as_bytes())
+        .then(a.fingerprint.cmp(&b.fingerprint))
+        .then(a.unix_milli.cmp(&b.unix_milli))
+}
+
 /// The rows of `a` and `b`, in order, sorted runs both, `len` of them,
 /// in one allocation of exactly `len`.
 fn merge(a: impl Iterator<Item = SeriesRow>, b: Vec<SeriesRow>, len: usize) -> Vec<SeriesRow> {
@@ -207,7 +244,7 @@ fn merge_sorted(
 
 #[cfg(test)]
 mod tests {
-    use fs_schema::metrics::{MetricType, Temporality};
+    use fs_schema::metrics::{Datatype, LabelLevel, LabelMeta, MetricType, Temporality};
 
     use super::*;
 
@@ -224,7 +261,47 @@ mod tests {
             unit: "".into(),
             description: description.into(),
             labels: vec![("k".into(), fingerprint.to_string().into())].into(),
+            label_meta: vec![LabelMeta::native(LabelLevel::Point, Datatype::Str)].into(),
         }
+    }
+
+    fn with_level(mut row: SeriesRow, level: Option<LabelLevel>, datatype: Datatype) -> SeriesRow {
+        row.label_meta =
+            vec![level.map_or(LabelMeta::LEGACY, |l| LabelMeta::native(l, datatype))].into();
+        row
+    }
+
+    /// A row of a legacy origin and the same series of a known one are one
+    /// row, the known origin and every type seen kept; another level of
+    /// the same key is a second identity, counted once however often it
+    /// comes back.
+    #[test]
+    fn a_buffer_merges_legacy_and_known_origins_and_counts_a_collision_once() {
+        let mut set = SeriesSet::default();
+        assert_eq!(
+            set.add(vec![with_level(row(1, 1, ""), None, Datatype::Str)]),
+            0
+        );
+        assert_eq!(
+            set.add(vec![with_level(
+                row(1, 1, ""),
+                Some(LabelLevel::Point),
+                Datatype::Int
+            )]),
+            0
+        );
+        assert_eq!(set.add(vec![row(1, 1, "")]), 0);
+        assert_eq!(set.len(), 1);
+        let meta = *set.rows().next().unwrap().label_meta.first().unwrap();
+        assert_eq!(meta.level(), Some(LabelLevel::Point));
+        assert_eq!(
+            meta.datatypes().collect::<Vec<_>>(),
+            [Datatype::Str, Datatype::Int]
+        );
+        let resource = || with_level(row(1, 1, ""), Some(LabelLevel::Resource), Datatype::Str);
+        assert_eq!(set.add(vec![resource()]), 1);
+        assert_eq!(set.add(vec![resource()]), 0, "the same identity again");
+        assert_eq!(set.len(), 2);
     }
 
     fn keys(set: &SeriesSet) -> Vec<(u64, i64, String)> {

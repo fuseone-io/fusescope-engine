@@ -85,6 +85,9 @@ pub struct IngestStats {
     /// Metric data points refused, by reason, in the order of
     /// [`fs_schema::metrics::Rejection::ALL`].
     pub metric_points_rejected: [AtomicU64; fs_schema::metrics::Rejection::ALL.len()],
+    /// Keys of metric series, name, fingerprint and hour, found holding a
+    /// second identity, in a request or a buffer.
+    pub metric_series_collisions: AtomicU64,
     /// Requests refused by the throughput limiter.
     pub rate_limited: AtomicU64,
     /// Requests refused because buffers or WAL were full.
@@ -1830,7 +1833,7 @@ fn replay_metric(
     };
     let (limits, replayed) = conversion.apply(&limits, &replayed);
     let source = metric_source(instance, entry.position);
-    let rows = convert_metrics(&message, &limits, &replayed, source)?;
+    let rows = convert_metrics(conversion.mapping, &message, &limits, &replayed, source)?;
     if rows.samples.num_rows() > 0 {
         out.rows.push(ReplayedRows {
             stream: Stream::metrics(record.tenant),
@@ -1843,6 +1846,7 @@ fn replay_metric(
 }
 
 fn convert_metrics(
+    mapping: u8,
     message: &ExportMetricsServiceRequest,
     limits: &fs_schema::limits::Limits,
     metrics: &MetricLimits,
@@ -1850,8 +1854,8 @@ fn convert_metrics(
 ) -> Result<MetricRows, IngestError> {
     let checked = fs_schema::metrics::preflight(message, limits, metrics)
         .map_err(|e| too_large(e, metrics))?;
-    Ok(fs_schema::metrics::convert(
-        message, limits, metrics, &checked, source,
+    Ok(fs_schema::metrics::convert_mapping(
+        mapping, message, limits, metrics, &checked, source,
     )?)
 }
 
