@@ -13,7 +13,9 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryReservation;
 use datafusion::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use datafusion::parquet::arrow::ProjectionMask;
-use datafusion::parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
+use datafusion::parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, RowFilter, RowSelection, RowSelector,
+};
 use fs_catalog::{FileRecord, Level};
 use fs_index::postings::Postings;
 use fs_schema::metrics::{SeriesRow, col, series_row_sizes, series_rows, series_schema_version};
@@ -30,10 +32,6 @@ use crate::metric_index::MetricIndexCache;
 
 /// Rows a series file is read in.
 const BATCH_ROWS: usize = 8192;
-
-/// Bytes of one selector of a row selection, and of the range it comes
-/// from.
-const SELECTOR_BYTES: usize = 48;
 
 /// The label every series row carries with its name.
 const NAME_LABEL: &str = "__name__";
@@ -226,9 +224,7 @@ impl Sources<'_> {
                     if rows.is_empty() {
                         return Ok(false);
                     }
-                    selected.try_grow(runs(&rows).saturating_mul(SELECTOR_BYTES))?;
-                    let selection =
-                        RowSelection::from_consecutive_ranges(consecutive(&rows), total);
+                    let selection = selection(&rows, total, &selected)?;
                     drop((rows, held));
                     builder = builder.with_row_selection(selection);
                 }
@@ -282,6 +278,31 @@ impl Sources<'_> {
         reservation.shrink(bytes);
         Ok(())
     }
+}
+
+/// What [`selection`] reserves for `runs` runs: up to two selectors a run
+/// and the final skip, in a vector that grows geometrically from four,
+/// and once more for the copy the reader splits off one row group at a
+/// time.
+pub(super) fn selection_bytes(runs: usize) -> usize {
+    runs.saturating_mul(4)
+        .saturating_add(4)
+        .saturating_mul(std::mem::size_of::<RowSelector>())
+        .saturating_mul(2)
+}
+
+/// The selection of `rows` of a file of `total` rows, its bytes reserved in
+/// `held` before it is built.
+pub(super) fn selection(
+    rows: &RoaringBitmap,
+    total: usize,
+    held: &MemoryReservation,
+) -> Result<RowSelection, QueryError> {
+    held.try_grow(selection_bytes(runs(rows)))?;
+    Ok(RowSelection::from_consecutive_ranges(
+        consecutive(rows),
+        total,
+    ))
 }
 
 /// How many runs of consecutive rows `rows` holds.

@@ -401,22 +401,10 @@ impl TableProvider for SignalTable {
         let hot_exec: Option<Arc<dyn ExecutionPlan>> = if hot_batches.is_empty() {
             None
         } else {
-            if let Some(charge) = &self.hot_charge {
-                let copies = hot_batches
-                    .iter()
-                    .filter(|b| b.schema().fields() != projected_schema.fields())
-                    .map(arrow::record_batch::RecordBatch::get_array_memory_size)
-                    .sum();
-                if !charge(copies) {
-                    return Err(hot_exhausted(&[]));
-                }
-            }
             // Flight hydrates dictionaries in transit; bring every column back
             // to the declared type so the union sees one schema.
-            let coerced = hot_batches
-                .iter()
-                .map(|b| coerce_to_schema(b, &projected_schema))
-                .collect::<Result<Vec<_>, _>>()?;
+            let coerced =
+                coerce_charged(&hot_batches, &projected_schema, self.hot_charge.as_ref())?;
             Some(MemorySourceConfig::try_new_exec(
                 &[coerced],
                 Arc::clone(&projected_schema),
@@ -527,6 +515,34 @@ fn pinned_traces(pruning: &Pruning) -> Option<Vec<[u8; 16]>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+/// [`coerce_to_schema`] of each of `batches`, the columns each one casts
+/// charged to `charge` before the batch is kept; a refused charge fails
+/// with no more than that batch made.
+fn coerce_charged(
+    batches: &[arrow::record_batch::RecordBatch],
+    schema: &arrow::datatypes::SchemaRef,
+    charge: Option<&crate::hot::Charge>,
+) -> DfResult<Vec<arrow::record_batch::RecordBatch>> {
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let coerced = coerce_to_schema(batch, schema)?;
+        if let Some(charge) = charge {
+            let cast: Vec<arrow::array::ArrayRef> = coerced
+                .columns()
+                .iter()
+                .zip(batch.columns())
+                .filter(|(made, given)| made.data_type() != given.data_type())
+                .map(|(made, _)| Arc::clone(made))
+                .collect();
+            if !cast.is_empty() && !charge(fs_ingest::hot::held_bytes_of(&cast)) {
+                return Err(hot_exhausted(&[]));
+            }
+        }
+        out.push(coerced);
+    }
+    Ok(out)
+}
+
 /// Casts every column whose type differs from `schema` to the declared type.
 fn coerce_to_schema(
     batch: &arrow::record_batch::RecordBatch,
@@ -552,4 +568,66 @@ fn coerce_to_schema(
         Arc::clone(schema),
         columns,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    #[test]
+    fn each_coerced_batch_is_charged_before_it_is_kept() {
+        let hydrated = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let declared = Arc::new(Schema::new(vec![
+            Field::new(
+                "name",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let batch = |offset: i64| {
+            let names: Vec<String> = (0..4096)
+                .map(|i| format!("name-{}", (i + offset) % 3000))
+                .collect();
+            RecordBatch::try_new(
+                Arc::clone(&hydrated),
+                vec![
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(Int64Array::from_iter_values(0..4096)),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = [batch(0), batch(7)];
+        let charges = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&charges);
+        let charge: crate::hot::Charge = Arc::new(move |bytes| {
+            recorded.lock().unwrap().push(bytes);
+            true
+        });
+        let coerced = coerce_charged(&batches, &declared, Some(&charge)).unwrap();
+        let charges = charges.lock().unwrap().clone();
+        assert_eq!(charges.len(), 2, "one charge a batch made");
+        for (made, charged) in coerced.iter().zip(&charges) {
+            let cast = [Arc::clone(made.column(0))];
+            assert!(
+                *charged >= fs_ingest::hot::held_bytes_of(&cast),
+                "{charged}"
+            );
+        }
+        let refuse: crate::hot::Charge = Arc::new(|_| false);
+        assert!(matches!(
+            coerce_charged(&batches, &declared, Some(&refuse)),
+            Err(datafusion::error::DataFusionError::ResourcesExhausted(_))
+        ));
+    }
 }

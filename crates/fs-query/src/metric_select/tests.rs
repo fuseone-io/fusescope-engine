@@ -577,3 +577,30 @@ fn merging_charges_the_merged_list() {
         fused.capacity() * std::mem::size_of::<Series>()
     );
 }
+
+#[test]
+fn a_row_selection_is_reserved_at_its_selectors_before_it_is_built() {
+    let selector = std::mem::size_of::<datafusion::parquet::arrow::arrow_reader::RowSelector>();
+    for runs in [1usize, 2, 1000] {
+        assert!(
+            series::selection_bytes(runs) >= 4 * selector * runs,
+            "{runs} runs"
+        );
+    }
+    let rows: roaring::RoaringBitmap = (0..1000u32).map(|n| n * 3).collect();
+    let need = series::selection_bytes(1000);
+    let short = reservation(need - 1);
+    let err = series::selection(&rows, 3000, &short).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            QueryError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
+        ),
+        "{err}"
+    );
+    assert_eq!(short.size(), 0);
+    let exact = reservation(need);
+    let selection = series::selection(&rows, 3000, &exact).unwrap();
+    assert_eq!(exact.size(), need);
+    assert_eq!(selection.row_count(), 1000);
+}
