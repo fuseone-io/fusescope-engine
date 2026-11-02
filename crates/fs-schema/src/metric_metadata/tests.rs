@@ -50,11 +50,15 @@ fn labels_are_listed_by_level_and_type_and_their_times_widen() {
     );
     let mut counts = MetadataCounts::default();
     assert_eq!(
-        counts.add_series(&series, (T0_MS + 5, T0_MS + 9), 0, usize::MAX),
+        counts
+            .add_series(&series, (T0_MS + 5, T0_MS + 9), 0, usize::MAX)
+            .unwrap(),
         None
     );
     assert_eq!(
-        counts.add_series(&series, (T0_MS + 1, T0_MS + 7), 0, usize::MAX),
+        counts
+            .add_series(&series, (T0_MS + 1, T0_MS + 7), 0, usize::MAX)
+            .unwrap(),
         None
     );
     let rows = listed(&counts);
@@ -99,14 +103,19 @@ fn a_full_count_is_set_aside_and_listing_resumes_at_its_entry() {
     let series = row("m", &refs);
     let mut whole = MetadataCounts::default();
     assert_eq!(
-        whole.add_series(&series, (T0_MS, T0_MS), 0, usize::MAX),
+        whole
+            .add_series(&series, (T0_MS, T0_MS), 0, usize::MAX)
+            .unwrap(),
         None
     );
     let budget = 3 * MetadataCounts::entry_bytes("m", "k00", "v0");
     let mut counts = MetadataCounts::default();
     let mut chunks = Vec::new();
     let mut from = 0;
-    while let Some(next) = counts.add_series(&series, (T0_MS, T0_MS), from, budget) {
+    while let Some(next) = counts
+        .add_series(&series, (T0_MS, T0_MS), from, budget)
+        .unwrap()
+    {
         assert!(counts.estimated_bytes() <= budget);
         chunks.push(counts.take());
         from = next;
@@ -171,7 +180,9 @@ fn the_v1_fixture_is_written_byte_for_byte() {
         ],
     );
     let mut counts = MetadataCounts::default();
-    counts.add_series(&series, (T0_MS, T0_MS + 60_000), 0, usize::MAX);
+    counts
+        .add_series(&series, (T0_MS, T0_MS + 60_000), 0, usize::MAX)
+        .unwrap();
     let fixture = bytes::Bytes::from_static(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/metric_metadata_v1.parquet"
@@ -227,7 +238,10 @@ fn a_count_admits_its_lookup_key_and_entries_within_its_budget() {
     let mut counts = MetadataCounts::default();
     let mut from = 0;
     let mut chunks = 0;
-    while let Some(next) = counts.add_series(&series, (T0_MS, T0_MS), from, budget) {
+    while let Some(next) = counts
+        .add_series(&series, (T0_MS, T0_MS), from, budget)
+        .unwrap()
+    {
         assert!(
             counts.estimated_bytes() <= budget,
             "{}",
@@ -238,5 +252,29 @@ fn a_count_admits_its_lookup_key_and_entries_within_its_budget() {
         from = next;
     }
     assert!(chunks >= 2);
+    assert!(counts.estimated_bytes() <= budget);
+}
+
+/// One entry larger than the budget, or a lookup key that would grow past
+/// it, is refused, even into empty counts: the budget is a ceiling.
+#[test]
+fn an_entry_past_the_budget_is_refused_even_alone() {
+    let long = "v".repeat(10_000);
+    let series = row(
+        "m",
+        &[(
+            "k",
+            long.as_str(),
+            meta(LabelLevel::Point, &[Datatype::Str]),
+        )],
+    );
+    let budget = MetadataCounts::entry_bytes("m", "k", &long) - 1;
+    let mut counts = MetadataCounts::default();
+    assert!(
+        counts
+            .add_series(&series, (T0_MS, T0_MS), 0, budget)
+            .is_err()
+    );
+    assert!(counts.is_empty());
     assert!(counts.estimated_bytes() <= budget);
 }

@@ -1175,7 +1175,10 @@ index, in a third, and in the last the series row each input decodes and
 the rows of the key being merged, each admitted, by a size found from the
 batch's arrays, before it is decoded), the samples file four, the series
 file two, its postings two, metadata two (the key an entry is looked up by
-admitted before it grows), usage one, the row groups being gathered one.
+admitted before it grows, and an entry that does not fit even alone
+failing the pass), usage one, the row groups being gathered one. Sizes are
+read off the arrays in place, dictionaries included, so sizing a batch
+allocates nothing but the sizes.
 Every file's footer is checked, signal, version and columns, before
 anything is planned: a version this engine does not read fails the pass
 with its inputs visible. A part's allocation is admitted before it is

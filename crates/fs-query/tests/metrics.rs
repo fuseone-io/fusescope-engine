@@ -371,7 +371,9 @@ fn metadata_of(first: i64, last: i64) -> Vec<u8> {
         label_meta: vec![LabelMeta::native(LabelLevel::Resource, Datatype::Str)].into(),
     };
     let mut counts = fs_schema::metric_metadata::MetadataCounts::default();
-    counts.add_series(&row, (first, last), 0, usize::MAX);
+    counts
+        .add_series(&row, (first, last), 0, usize::MAX)
+        .unwrap();
     fs_schema::metric_metadata::encode(&counts).unwrap()
 }
 

@@ -421,7 +421,10 @@ impl Run<'_> {
         let metadata_budget = budget.share(Part::Metadata) / 3;
         for row in series {
             let mut from = 0;
-            while let Some(next) = self.metadata.add_series(row, times, from, metadata_budget) {
+            while let Some(next) = self
+                .metadata
+                .add_series(row, times, from, metadata_budget)?
+            {
                 self.publish_metadata(budget).await?;
                 from = next;
             }

@@ -97,15 +97,19 @@ impl MetadataCounts {
     /// its `from`th entry on, a label and type each, within `budget` bytes,
     /// every allocation admitted before it is made. Before a new entry, or
     /// the key it is looked up by, would take the counts past it, listing
-    /// stops and the entry to resume at is returned; a count holds one
-    /// entry at least. `None` once the row is listed.
+    /// stops and the entry to resume at is returned. `None` once the row is
+    /// listed.
+    ///
+    /// # Errors
+    /// An entry that does not fit the budget even in empty counts.
     pub fn add_series(
         &mut self,
         row: &SeriesRow,
         (first, last): (i64, i64),
         from: usize,
         budget: usize,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, SchemaError> {
+        let past = || SchemaError::Layout("metric_metadata: an entry past its budget alone");
         let entries = row
             .labels
             .iter()
@@ -118,8 +122,11 @@ impl MetadataCounts {
                 [&*row.name, key, level.as_str(), datatype.as_str(), value].map(str::as_bytes);
             let needed = key_len(fields);
             let grown = needed.saturating_sub(self.scratch.capacity());
-            if grown > 0 && !self.is_empty() && self.bytes.saturating_add(grown) > budget {
-                return Some(at);
+            if grown > 0 && self.bytes.saturating_add(grown) > budget {
+                if self.is_empty() {
+                    return Err(past());
+                }
+                return Ok(Some(at));
             }
             let before = self.scratch.capacity();
             encode_key(&mut self.scratch, fields);
@@ -130,14 +137,17 @@ impl MetadataCounts {
                 continue;
             }
             let cost = ENTRY_OVERHEAD + needed;
-            if !self.is_empty() && self.bytes.saturating_add(cost) > budget {
-                return Some(at);
+            if self.bytes.saturating_add(cost) > budget {
+                if self.is_empty() {
+                    return Err(past());
+                }
+                return Ok(Some(at));
             }
             self.bytes = self.bytes.saturating_add(cost);
             self.entries
                 .insert(self.scratch.as_slice().into(), (first, last));
         }
-        None
+        Ok(None)
     }
 
     /// The counts so far, `self` starting from none.
