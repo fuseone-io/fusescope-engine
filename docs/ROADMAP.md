@@ -307,7 +307,8 @@ C5 landed after C6.
   one merge lease per tenant covers whichever request merges first
   (`the_merge_lease_covers_a_request_that_merges_after_a_later_one`);
   per-point limits have ceilings; points are counted before the walk is
-  measured. Next: step 2, metric compaction with the duplicate kept across L0, L1
+  measured. Review round 3: a record carrying a limit past the ceilings
+  stops the start rather than replay under the clamped one. Next: step 2, metric compaction with the duplicate kept across L0, L1
   and L2.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
