@@ -275,16 +275,29 @@ pub async fn scan_with(
     scan_charged(address, request, timeout, tls, Arc::new(|_| true)).await
 }
 
-/// Bytes one array holds besides its buffers.
-const ARRAY_BYTES: usize = 128;
+/// Bytes one array holds besides its buffers, its `Arc` included, at
+/// most: every array of the engine's schemas, dictionaries hydrated or
+/// not, children included, fits.
+pub const ARRAY_BYTES: usize = 256;
 
-/// What `batch` keeps alive: each distinct allocation its buffers share,
-/// once, at its capacity, and every array of it, children included.
+/// Bytes a vector of batches holds for each of them, at twice its length.
+pub const BATCH_SLOT_BYTES: usize = 2 * std::mem::size_of::<RecordBatch>();
+
+/// What `batch` keeps alive: the batch and its vector of columns, at
+/// twice their number, each distinct allocation its buffers share, once,
+/// at its capacity, and every array of it, children included.
 pub fn held_bytes(batch: &RecordBatch) -> usize {
-    held_bytes_of(batch.columns())
+    batch_bytes(batch.num_columns()) + held_bytes_of(batch.columns())
 }
 
-/// [`held_bytes`] of `columns`.
+/// The bytes of a batch of `columns` columns besides its arrays: itself
+/// and its vector of columns at twice their number.
+pub fn batch_bytes(columns: usize) -> usize {
+    std::mem::size_of::<RecordBatch>() + 2 * columns * std::mem::size_of::<arrow::array::ArrayRef>()
+}
+
+/// The arrays of `columns`, their children and their buffers, as
+/// [`held_bytes`] counts them.
 pub fn held_bytes_of(columns: &[arrow::array::ArrayRef]) -> usize {
     let mut seen = std::collections::HashSet::new();
     let mut bytes = 0usize;
@@ -367,7 +380,9 @@ pub async fn scan_charged(
         let mut batches = Vec::new();
         loop {
             match stream.try_next().await {
-                Ok(Some(batch)) if charge(held_bytes(&batch)) => batches.push(batch),
+                Ok(Some(batch)) if charge(held_bytes(&batch) + BATCH_SLOT_BYTES) => {
+                    batches.push(batch);
+                }
                 Ok(Some(_)) => {
                     return Err(IngestError::HotScanBudget {
                         ingester: address.to_owned(),
@@ -648,6 +663,65 @@ impl FlightService for HotService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A type with every dictionary replaced by its values, as Flight
+    /// hydrates them.
+    fn hydrated(data_type: &DataType) -> DataType {
+        match data_type {
+            DataType::Dictionary(_, values) => hydrated(values),
+            DataType::List(item) => DataType::List(Arc::new(
+                item.as_ref()
+                    .clone()
+                    .with_data_type(hydrated(item.data_type())),
+            )),
+            DataType::Map(entries, sorted) => DataType::Map(
+                Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(hydrated(entries.data_type())),
+                ),
+                *sorted,
+            ),
+            DataType::Struct(fields) => DataType::Struct(
+                fields
+                    .iter()
+                    .map(|f| f.as_ref().clone().with_data_type(hydrated(f.data_type())))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// The largest array, with its `Arc`, among `array` and its children.
+    fn largest(array: &arrow::array::ArrayRef) -> usize {
+        let own = std::mem::size_of_val(array.as_ref()) + 2 * std::mem::size_of::<usize>();
+        array
+            .to_data()
+            .child_data()
+            .iter()
+            .map(|child| largest(&arrow::array::make_array(child.clone())))
+            .fold(own, usize::max)
+    }
+
+    #[test]
+    fn every_array_of_the_engine_schemas_fits_its_charge() {
+        let schemas = [
+            schema_of(RowSignal::Traces),
+            schema_of(RowSignal::Logs),
+            schema_of(RowSignal::Metrics),
+            fs_schema::metrics::series_schema_v1(),
+            fs_schema::metrics::series_schema_v2(),
+        ];
+        for schema in schemas {
+            for field in schema.fields() {
+                for data_type in [field.data_type().clone(), hydrated(field.data_type())] {
+                    let size = largest(&arrow::array::new_empty_array(&data_type));
+                    assert!(size <= ARRAY_BYTES, "{} {data_type}: {size}", field.name());
+                }
+            }
+        }
+    }
 
     #[test]
     fn ticket_round_trip() {

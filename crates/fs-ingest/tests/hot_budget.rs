@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use arrow::array::StringArray;
+use arrow::array::{ArrayRef, MapBuilder, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -122,11 +122,25 @@ impl FlightService for Prebuilt {
 /// The messages of `MESSAGES` batches of one text column of about
 /// `MESSAGE` bytes each.
 async fn messages() -> Vec<FlightData> {
-    let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+    let mut labels = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for row in 0..64 {
+        labels.keys().append_value("host");
+        labels.values().append_value(format!("h{row}"));
+        labels.append(true).unwrap();
+    }
+    let labels: ArrayRef = Arc::new(labels.finish());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("body", DataType::Utf8, false),
+        Field::new("labels", labels.data_type().clone(), false),
+    ]));
     let batches = (0..MESSAGES).map(|n| {
         let text = format!("{n:08}").repeat(MESSAGE / 8 / 64);
         let column = StringArray::from_iter_values(std::iter::repeat_n(text.as_str(), 64));
-        Ok(RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(column)]).unwrap())
+        Ok(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(column), Arc::clone(&labels)],
+        )
+        .unwrap())
     });
     FlightDataEncoderBuilder::new()
         .build(futures_util::stream::iter(batches.collect::<Vec<_>>()))
@@ -211,6 +225,7 @@ async fn a_decoded_batch_is_charged_before_it_is_kept() {
         .iter()
         .map(|m| m.data_body.len() + m.data_header.len())
         .collect();
+    let wire_sizes = wire.clone();
     let (address, _) = serve(messages).await;
     let timeout = Duration::from_secs(30);
 
@@ -221,19 +236,50 @@ async fn a_decoded_batch_is_charged_before_it_is_kept() {
         .unwrap_err();
     assert!(matches!(err, IngestError::HotScanBudget { .. }), "{err}");
 
+    // What the decoded batches charged, the messages' own charges apart.
     let charged = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&charged);
     let all = Arc::new(move |bytes: usize| {
-        counted.fetch_add(bytes, Ordering::SeqCst);
+        if !wire_sizes.contains(&bytes) {
+            counted.fetch_add(bytes, Ordering::SeqCst);
+        }
         true
     });
     let answer = scan_charged(&address, &request(), timeout, None, all)
         .await
         .unwrap();
-    let held: usize = answer.batches.iter().map(fs_ingest::hot::held_bytes).sum();
+    let held = answer.batches.capacity() * std::mem::size_of::<RecordBatch>()
+        + answer.batches.iter().map(kept_by).sum::<usize>();
     assert!(
         charged.load(Ordering::SeqCst) >= held,
         "charged {} for batches holding {held}",
         charged.load(Ordering::SeqCst)
     );
+}
+
+/// What `batch` keeps alive, measured: the batch, its vector of columns,
+/// every array and child at its size with its `Arc`, and every distinct
+/// allocation of their buffers at its capacity.
+fn kept_by(batch: &RecordBatch) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes =
+        std::mem::size_of::<RecordBatch>() + batch.num_columns() * std::mem::size_of::<ArrayRef>();
+    let mut pending: Vec<ArrayRef> = batch.columns().to_vec();
+    while let Some(array) = pending.pop() {
+        bytes += std::mem::size_of_val(array.as_ref()) + 2 * std::mem::size_of::<usize>();
+        let data = array.to_data();
+        let nulls = data.nulls().map(|n| n.inner().inner().clone());
+        for buffer in data.buffers().iter().chain(nulls.iter()) {
+            if seen.insert(buffer.data_ptr().as_ptr().addr()) {
+                bytes += buffer.capacity();
+            }
+        }
+        pending.extend(
+            data.child_data()
+                .iter()
+                .cloned()
+                .map(arrow::array::make_array),
+        );
+    }
+    bytes
 }
