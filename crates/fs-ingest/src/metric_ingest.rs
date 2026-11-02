@@ -16,7 +16,7 @@ use std::time::Instant;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{CatalogError, FileId, FileSetId, MetricRole, NewFile, TenantId};
-use fs_schema::metrics::{Rejections, Source, convert, preflight, with_source};
+use fs_schema::metrics::{Rejections, Source, convert, preflight, walk_bound, with_source};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use tracing::{info, warn};
 
@@ -34,6 +34,22 @@ use crate::record::{FileLayout, FlushIntent, MetricFile, MetricIntent, RowSignal
 type Written = (NewFile, Vec<HotBatch>, Vec<HotBatch>, usize);
 
 impl Shared {
+    /// Holds the traversals' scratch, bounded from `message`'s sizes,
+    /// before the preflight walks it; kept until conversion ends.
+    async fn hold_walk(
+        &self,
+        message: &ExportMetricsServiceRequest,
+    ) -> Result<crate::buffer::Scratch, IngestError> {
+        let bound = walk_bound(message, &self.config.limits, &self.config.metrics);
+        self.buffers
+            .lock()
+            .await
+            .try_hold_scratch(bound, self.config.max_memory_bytes)
+            .ok_or(IngestError::Capacity(
+                "ingester memory full, hot-window retention pending",
+            ))
+    }
+
     /// Counts `message`, admits what converting it holds, converts it, logs
     /// `record` and adds the samples and series to the tenant's metric
     /// buffer. A request with no sample is answered without the log.
@@ -54,6 +70,7 @@ impl Shared {
             .await
             .map_err(|_| IngestError::Backpressure("conversions closed"))?;
         let metrics = &self.config.metrics;
+        let walk = self.hold_walk(message).await?;
         let checked =
             preflight(message, &self.config.limits, metrics).map_err(|e| too_large(e, metrics))?;
         let rejected = checked.rejected;
@@ -87,7 +104,10 @@ impl Shared {
         let (transient, incoming) = {
             let mut buffers = self.buffers.lock().await;
             let (merge, incoming) = buffers.series_merge_peak(stream, checked.series);
-            let bytes = checked.transient_bound().saturating_add(merge);
+            let bytes = checked
+                .transient_bound()
+                .saturating_sub(checked.scratch)
+                .saturating_add(merge);
             let held = buffers
                 .try_hold_scratch(bytes, self.config.max_memory_bytes)
                 .ok_or(IngestError::Capacity(
@@ -104,6 +124,7 @@ impl Shared {
             offset: 0,
         };
         let rows = convert(message, &self.config.limits, metrics, &checked, unknown)?;
+        drop(walk);
         drop(slot);
         let samples_rows = rows.samples.num_rows();
         let _shared = self.gate.read().await;

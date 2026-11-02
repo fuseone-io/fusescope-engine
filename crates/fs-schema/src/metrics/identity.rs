@@ -4,7 +4,7 @@
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use twox_hash::XxHash3_64;
 
-use super::canonical::{Capped, render};
+use super::canonical::{Capped, render, render_scratch, rendered_len};
 use super::{MetricType, Temporality};
 use crate::limits::{DropStats, Limits};
 
@@ -38,6 +38,20 @@ pub(crate) struct Level {
     pub(crate) hash: u64,
 }
 
+/// Bytes of one pair of a level.
+const PAIR: usize = std::mem::size_of::<(String, String)>();
+
+/// What building a level holds, bounded before it is built.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LevelBound {
+    /// At most while it is built.
+    pub(crate) building: usize,
+    /// At most once built.
+    pub(crate) held: usize,
+    /// At most its pairs.
+    pub(crate) pairs: usize,
+}
+
 /// Why a level cannot form series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TooManyLabels;
@@ -67,7 +81,7 @@ impl Level {
                 stats.attributes_dropped += 1;
                 continue;
             };
-            let mut text = String::new();
+            let mut text = String::with_capacity(rendered_len(value, limits.max_value_bytes));
             let mut out = Capped::new(&mut text, limits.max_value_bytes);
             if render(value, &mut out).is_none() {
                 stats.attributes_dropped += 1;
@@ -105,6 +119,36 @@ impl Level {
 }
 
 impl Level {
+    /// Found without allocating, at least the bytes [`Level::new`] holds
+    /// for `attributes` at once, and the bytes the level holds then: its
+    /// pairs before and after their repeats are resolved, the sort's
+    /// scratch, the texts and the rendering of one value.
+    pub(crate) fn bound(attributes: &[KeyValue], limits: &Limits, cap: usize) -> LevelBound {
+        if attributes.len() > cap {
+            return LevelBound::default();
+        }
+        let mut texts = 0usize;
+        let mut render = 0usize;
+        for kv in attributes {
+            let Some(value) = kv.value.as_ref().and_then(|v| v.value.as_ref()) else {
+                continue;
+            };
+            if kv.key.is_empty() || kv.key.len() > limits.max_key_bytes {
+                continue;
+            }
+            let text = rendered_len(value, limits.max_value_bytes);
+            texts = texts.saturating_add(kv.key.len()).saturating_add(text);
+            render = render.max(render_scratch(value));
+        }
+        let pairs = attributes.len().saturating_mul(PAIR);
+        let held = pairs.saturating_add(texts);
+        LevelBound {
+            building: held.saturating_add(pairs.saturating_mul(2).max(render)),
+            held,
+            pairs: attributes.len(),
+        }
+    }
+
     /// Bytes it holds: its pairs as allocated and their texts.
     pub(crate) fn held(&self) -> usize {
         self.pairs.capacity() * std::mem::size_of::<(String, String)>()
@@ -175,21 +219,21 @@ pub(crate) fn labels<'a>(
     (out.len() <= cap).then_some(())
 }
 
-/// xxh3-64 over a length-prefixed encoding.
-struct Hasher(Vec<u8>);
+/// xxh3-64 over a length-prefixed encoding, streamed.
+struct Hasher(XxHash3_64);
 
 impl Hasher {
     fn new() -> Self {
-        Self(Vec::with_capacity(256))
+        Self(XxHash3_64::new())
     }
 
     fn u64(&mut self, n: u64) {
-        self.0.extend_from_slice(&n.to_le_bytes());
+        std::hash::Hasher::write(&mut self.0, &n.to_le_bytes());
     }
 
     fn bytes(&mut self, b: &[u8]) {
         self.u64(b.len() as u64);
-        self.0.extend_from_slice(b);
+        std::hash::Hasher::write(&mut self.0, b);
     }
 
     fn str(&mut self, s: &str) {
@@ -197,9 +241,12 @@ impl Hasher {
     }
 
     fn finish(&self) -> u64 {
-        XxHash3_64::oneshot(&self.0)
+        std::hash::Hasher::finish(&self.0)
     }
 }
+
+/// Bytes a [`Hasher`] holds: its buffer and secret.
+pub(crate) const HASHER_BYTES: usize = 1024;
 
 #[cfg(test)]
 mod tests {

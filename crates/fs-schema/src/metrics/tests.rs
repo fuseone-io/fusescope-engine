@@ -512,6 +512,80 @@ fn the_preflight_counts_what_convert_builds_and_bounds_what_it_holds() {
     );
 }
 
+/// What the traversal is seen to hold, by the capacities it allocated,
+/// never passes the bound found before it from the request's sizes, for
+/// wide levels, nested values, buckets and quantiles alike.
+#[test]
+fn the_traversal_holds_no_more_than_its_bound_found_before_it() {
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValueList};
+
+    let any = |value| AnyValue { value: Some(value) };
+    let nested = |i: usize| KeyValue {
+        key: format!("nested{i}"),
+        value: Some(any(Value::KvlistValue(KeyValueList {
+            values: (0..200)
+                .map(|j| KeyValue {
+                    key: format!("k{}", j % 50),
+                    value: Some(any(Value::ArrayValue(ArrayValue {
+                        values: vec![
+                            any(Value::DoubleValue(0.1)),
+                            any(Value::BytesValue(vec![1; 99])),
+                        ],
+                    }))),
+                    ..KeyValue::default()
+                })
+                .collect(),
+        }))),
+        ..KeyValue::default()
+    };
+    let wide: Vec<KeyValue> = (0..300)
+        .map(|i| kv(&format!("attr{i}"), &"v\u{1}".repeat(i * 9)))
+        .chain((0..3).map(nested))
+        .collect();
+    let summary = Metric {
+        name: "s".repeat(500),
+        data: Some(Data::Summary(Summary {
+            data_points: vec![SummaryDataPoint {
+                attributes: wide.clone(),
+                time_unix_nano: T0,
+                count: 2,
+                sum: 1.0,
+                quantile_values: vec![ValueAtQuantile {
+                    quantile: f64::from_bits(1),
+                    value: 1.0,
+                }],
+                ..SummaryDataPoint::default()
+            }],
+        })),
+        ..Metric::default()
+    };
+    let mut point = bounded(vec![1.0, 2.0], vec![1, 1, 1]);
+    point.attributes = wide.iter().take(40).cloned().collect();
+    let req = request(
+        wide.clone(),
+        wide.iter().rev().take(9).cloned().collect(),
+        vec![
+            histogram("h", point),
+            gauge("g", vec![number(1.0, wide.clone())]),
+            summary,
+        ],
+    );
+    let limits = Limits::default();
+    for metrics in [
+        MetricLimits::default(),
+        MetricLimits {
+            max_series_labels: 1000,
+            ..MetricLimits::default()
+        },
+    ] {
+        let bound = walk_bound(&req, &limits, &metrics);
+        let measured = super::expand::measure(&req, &limits, &metrics);
+        assert!(measured > 0);
+        assert!(measured <= bound, "{measured} held, bound {bound}");
+        assert_eq!(preflight(&req, &limits, &metrics).unwrap().scratch, bound);
+    }
+}
+
 #[test]
 fn requests_past_their_point_or_sample_cap_are_refused_whole() {
     let points = |n: usize| {

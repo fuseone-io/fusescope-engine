@@ -10,8 +10,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 
 use super::canonical::{Capped, double};
 use super::identity::{
-    ALWAYS_GENERATED, LE, Level, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL, SCOPE_VERSION,
-    SeriesKey, TEMPORALITY, TooManyLabels, fingerprint, labels,
+    ALWAYS_GENERATED, HASHER_BYTES, LE, Level, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL,
+    SCOPE_VERSION, SeriesKey, TEMPORALITY, TooManyLabels, fingerprint, labels,
 };
 use super::rows::{Builder, MetricRows};
 use super::{MetricLimits, MetricType, Rejection, Rejections, Source, Temporality};
@@ -44,8 +44,8 @@ pub struct Preflight {
     pub name_bytes: usize,
     /// Attributes dropped or truncated on the way.
     pub stats: DropStats,
-    /// The most bytes the traversal held at once for the levels and labels
-    /// of one point of this request.
+    /// At least the bytes either traversal holds at once for the levels,
+    /// labels and names of one point of this request: [`walk_bound`].
     pub scratch: usize,
     /// Starts of the hours the samples fall in, in Unix milliseconds, in
     /// order; at most [`MAX_TRACKED_HOURS`], `hours_over` past them.
@@ -87,7 +87,7 @@ impl Preflight {
 }
 
 /// Counts and validates `request` under `limits` and `metrics`, building
-/// nothing but one level of attributes at a time.
+/// nothing but one point's levels at a time, within [`walk_bound`].
 ///
 /// # Errors
 /// A request over `max_points` or `max_samples`, counted before the rest
@@ -105,9 +105,12 @@ pub fn preflight(
     let mut count = Count {
         preflight: Preflight {
             points,
+            scratch: walk_bound(request, limits, &metrics),
             ..Preflight::default()
         },
         max_samples: metrics.max_samples,
+        #[cfg(test)]
+        measured: 0,
     };
     let mut stats = DropStats::default();
     walk(request, limits, &metrics, &mut count, &mut stats).map_err(|e| match e {
@@ -116,6 +119,30 @@ pub fn preflight(
     })?;
     count.preflight.stats = stats;
     Ok(count.preflight)
+}
+
+/// The most bytes a preflight of `request` was seen to hold for its levels
+/// and labels, by their capacities.
+#[cfg(test)]
+pub(crate) fn measure(
+    request: &ExportMetricsServiceRequest,
+    limits: &Limits,
+    metrics: &MetricLimits,
+) -> usize {
+    let metrics = metrics.clamped();
+    let mut count = Count {
+        preflight: Preflight::default(),
+        max_samples: metrics.max_samples,
+        measured: 0,
+    };
+    let _ = walk(
+        request,
+        limits,
+        &metrics,
+        &mut count,
+        &mut DropStats::default(),
+    );
+    count.measured
 }
 
 /// Builds `request`'s samples and series, as `checked` counted them; the
@@ -139,6 +166,101 @@ pub fn convert(
         Stop::TooLarge(_) => SchemaError::Layout("metrics: conversion past its preflight"),
     })?;
     builder.finish(source, checked.rejected, stats)
+}
+
+/// Bytes of one label of a series being built.
+const LABEL: usize = std::mem::size_of::<(&str, &str)>();
+
+/// Bytes of the text of a bucket's bound or a quantile.
+const GENERATED_TEXT: usize = 1024;
+
+/// Found without allocating, at least the bytes either traversal of
+/// `request` holds at once besides what its sink keeps: the levels of a
+/// point, built and being built, its labels and their sort, the names and
+/// cumulative buckets of its metric, a bound's text, the hasher, and the
+/// hours a preflight lists.
+pub fn walk_bound(
+    request: &ExportMetricsServiceRequest,
+    limits: &Limits,
+    metrics: &MetricLimits,
+) -> usize {
+    let metrics = metrics.clamped();
+    let cap = metrics.max_series_labels;
+    let mut peak = 0usize;
+    for resource_metrics in &request.resource_metrics {
+        let attributes = resource_metrics
+            .resource
+            .as_ref()
+            .map_or(&[][..], |r| r.attributes.as_slice());
+        let resource = Level::bound(attributes, limits, cap);
+        peak = peak.max(resource.building);
+        for scope_metrics in &resource_metrics.scope_metrics {
+            let attributes = scope_metrics
+                .scope
+                .as_ref()
+                .map_or(&[][..], |s| s.attributes.as_slice());
+            let scope = Level::bound(attributes, limits, cap);
+            peak = peak.max(resource.held.saturating_add(scope.building));
+            let levels = (
+                resource.held.saturating_add(scope.held),
+                resource.pairs + scope.pairs,
+            );
+            for metric in &scope_metrics.metrics {
+                peak = peak.max(metric_bound(metric, levels, limits, &metrics));
+            }
+        }
+    }
+    peak.saturating_add(HASHER_BYTES)
+        .saturating_add(MAX_TRACKED_HOURS * std::mem::size_of::<i64>())
+}
+
+/// [`walk_bound`] of the points of `metric`, beside `levels`, the bytes
+/// and pairs of their resource and scope.
+fn metric_bound(
+    metric: &Metric,
+    (held, pairs): (usize, usize),
+    limits: &Limits,
+    metrics: &MetricLimits,
+) -> usize {
+    let cap = metrics.max_series_labels;
+    let point = |attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue], extra: usize| {
+        let level = Level::bound(attributes, limits, cap);
+        let labels = (pairs + level.pairs + ALWAYS_GENERATED + 1)
+            .saturating_mul(3)
+            .saturating_add(2 * (ALWAYS_GENERATED + 1))
+            .saturating_mul(LABEL);
+        held.saturating_add(
+            level
+                .building
+                .max(level.held.saturating_add(labels).saturating_add(extra)),
+        )
+    };
+    // Six names of the metric's and a suffix, each up to twice its text.
+    let names = metric.name.len().saturating_add(16).saturating_mul(12);
+    match &metric.data {
+        Some(Data::Gauge(g)) => g.data_points.iter().map(|p| point(&p.attributes, 0)).max(),
+        Some(Data::Sum(s)) => s.data_points.iter().map(|p| point(&p.attributes, 0)).max(),
+        Some(Data::Histogram(h)) => h
+            .data_points
+            .iter()
+            .map(|p| {
+                let buckets = p
+                    .bucket_counts
+                    .len()
+                    .clamp(1, metrics.max_histogram_buckets + 1)
+                    .saturating_mul(std::mem::size_of::<u64>());
+                let extra = names.saturating_add(buckets).saturating_add(GENERATED_TEXT);
+                point(&p.attributes, extra)
+            })
+            .max(),
+        Some(Data::Summary(s)) => s
+            .data_points
+            .iter()
+            .map(|p| point(&p.attributes, names.saturating_add(GENERATED_TEXT)))
+            .max(),
+        Some(Data::ExponentialHistogram(_)) | None => None,
+    }
+    .unwrap_or(0)
 }
 
 fn count_points(request: &ExportMetricsServiceRequest) -> usize {
@@ -200,6 +322,9 @@ pub(crate) trait Sink {
 struct Count {
     preflight: Preflight,
     max_samples: usize,
+    /// The most bytes the traversal was seen to hold.
+    #[cfg(test)]
+    measured: usize,
 }
 
 impl Sink for Count {
@@ -209,8 +334,9 @@ impl Sink for Count {
 
     fn metric(&mut self) {}
 
+    #[cfg(test)]
     fn scratch(&mut self, bytes: usize) {
-        self.preflight.scratch = self.preflight.scratch.max(bytes);
+        self.measured = self.measured.max(bytes);
     }
 
     fn emit(&mut self, emit: &Emit<'_>) -> Result<(), Stop> {
@@ -378,25 +504,25 @@ fn point_level(
 ) -> Result<Level, TooManyLabels> {
     let point = Level::new("point", &[], attributes, limits, cap, stats)?;
     let mut scratch = Vec::new();
-    sink.scratch(
-        (at.resource.held() + at.scope.held() + point.held()) * 2
-            + (at.resource.pairs.len() + at.scope.pairs.len() + point.pairs.len() + 8)
-                * 4
-                * std::mem::size_of::<(&str, &str)>(),
-    );
     let mut generated: Vec<(&'static str, &str)> = generated(at, "", Temporality::Unspecified)
         .into_iter()
         .collect();
     if extra > 0 {
         generated.push((LE, ""));
     }
-    labels(
+    let fits = labels(
         [at.resource, at.scope, &point],
         &generated,
         cap,
         &mut scratch,
-    )
-    .ok_or(TooManyLabels)?;
+    );
+    sink.scratch(
+        at.resource.held()
+            + at.scope.held()
+            + point.held()
+            + (scratch.capacity() + generated.capacity()) * LABEL,
+    );
+    fits.ok_or(TooManyLabels)?;
     Ok(point)
 }
 
@@ -426,6 +552,12 @@ fn emit_series(
     let mut fused = Vec::new();
     labels([at.resource, at.scope, point], &generated, cap, &mut fused)
         .ok_or(SchemaError::Layout("metrics: labels past a checked cap"))?;
+    sink.scratch(
+        at.resource.held()
+            + at.scope.held()
+            + point.held()
+            + (fused.capacity() + generated.capacity()) * LABEL,
+    );
     let fingerprint = fingerprint([at.resource, at.scope, point], &key);
     sink.emit(&Emit {
         key,

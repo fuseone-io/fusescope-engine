@@ -18,12 +18,26 @@
 //! The text is cut at a byte cap on a UTF-8 boundary, and rendering stops
 //! there, so a value is never held past the cap.
 
-use std::fmt::Write as _;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
+/// Bytes of base64 encoded at a time, into a buffer on the stack.
+const BASE64_SLICE: usize = 3 * 1024;
+
+/// Where canonical text goes: a capped string, or a count of what would
+/// be written.
+pub(crate) trait Text: std::fmt::Write {
+    /// Appends `s`, cut at the cap.
+    fn push(&mut self, s: &str);
+    /// True once the cap is reached.
+    fn full(&self) -> bool;
+    /// True when nothing is kept but the length.
+    fn counting(&self) -> bool {
+        false
+    }
+}
 
 /// Text up to a byte cap: what is written past it is dropped, and the text
 /// kept ends on a UTF-8 boundary.
@@ -42,7 +56,9 @@ impl<'a> Capped<'a> {
             truncated: false,
         }
     }
+}
 
+impl Text for Capped<'_> {
     fn full(&self) -> bool {
         self.truncated
     }
@@ -72,9 +88,74 @@ impl std::fmt::Write for Capped<'_> {
     }
 }
 
+/// The length of a text up to a cap, kept without the text: at least that
+/// of the text, a key-value list counted with every entry, repeats too.
+struct Counted {
+    len: usize,
+    cap: usize,
+}
+
+impl Text for Counted {
+    fn full(&self) -> bool {
+        self.len >= self.cap
+    }
+
+    fn push(&mut self, s: &str) {
+        self.len = self.len.saturating_add(s.len()).min(self.cap);
+    }
+
+    fn counting(&self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Write for Counted {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.push(s);
+        Ok(())
+    }
+}
+
+/// At least the bytes of the canonical text of `value` cut at `cap`, and
+/// at most `cap`, found without allocating.
+pub(crate) fn rendered_len(value: &Value, cap: usize) -> usize {
+    let mut out = Counted { len: 0, cap };
+    let _ = render(value, &mut out);
+    out.len
+}
+
+/// The most bytes rendering `value` holds besides its text: of each
+/// key-value list on the way to its deepest, the entries and their sort.
+pub(crate) fn render_scratch(value: &Value) -> usize {
+    match value {
+        Value::ArrayValue(array) => array
+            .values
+            .iter()
+            .filter_map(|v| v.value.as_ref())
+            .map(render_scratch)
+            .max()
+            .unwrap_or(0),
+        Value::KvlistValue(list) => {
+            let entries = list.values.len().saturating_mul(2 * KV_ENTRY);
+            let inner = list
+                .values
+                .iter()
+                .filter_map(|kv| kv.value.as_ref().and_then(|v| v.value.as_ref()))
+                .map(render_scratch)
+                .max()
+                .unwrap_or(0);
+            entries.saturating_add(inner)
+        }
+        _ => 0,
+    }
+}
+
+/// Bytes of one entry of a key-value list being rendered.
+const KV_ENTRY: usize = std::mem::size_of::<(&str, &AnyValue)>();
+
 /// Writes the canonical text of `value`; `None` for a value with none, an
 /// empty `AnyValue` or a string table reference.
-pub(crate) fn render(value: &Value, out: &mut Capped<'_>) -> Option<()> {
+pub(crate) fn render(value: &Value, out: &mut impl Text) -> Option<()> {
     match value {
         Value::StringValue(s) => out.push(s),
         Value::BoolValue(b) => out.push(if *b { "true" } else { "false" }),
@@ -91,7 +172,7 @@ pub(crate) fn render(value: &Value, out: &mut Capped<'_>) -> Option<()> {
 
 /// The canonical decimal of `d`. Rust's `Display` for `f64` is the shortest
 /// text that parses back to the same value and never uses an exponent.
-pub(crate) fn double(d: f64, out: &mut Capped<'_>) {
+pub(crate) fn double(d: f64, out: &mut impl Text) {
     if d.is_nan() {
         out.push("NaN");
     } else if d.is_infinite() {
@@ -101,18 +182,20 @@ pub(crate) fn double(d: f64, out: &mut Capped<'_>) {
     }
 }
 
-fn base64(bytes: &[u8], out: &mut Capped<'_>) {
+fn base64(bytes: &[u8], out: &mut impl Text) {
+    let mut text = [0u8; BASE64_SLICE / 3 * 4];
     // In slices of three bytes, which encode to whole base64 quads, so the
     // text is the encoding of the whole and stops at the cap.
-    for chunk in bytes.chunks(3 * 1024) {
+    for chunk in bytes.chunks(BASE64_SLICE) {
         if out.full() {
             return;
         }
-        out.push(&BASE64.encode(chunk));
+        let n = BASE64.encode_slice(chunk, &mut text).unwrap_or(0);
+        out.push(std::str::from_utf8(text.get(..n).unwrap_or_default()).unwrap_or_default());
     }
 }
 
-fn json(value: &Value, out: &mut Capped<'_>) {
+fn json(value: &Value, out: &mut impl Text) {
     if out.full() {
         return;
     }
@@ -145,6 +228,21 @@ fn json(value: &Value, out: &mut Capped<'_>) {
                 json_any(item, out);
             }
             out.push("]");
+        }
+        Value::KvlistValue(list) if out.counting() => {
+            out.push("{");
+            for kv in &list.values {
+                if let Some(item) = kv.value.as_ref() {
+                    if out.full() {
+                        return;
+                    }
+                    out.push(",");
+                    json_string(&kv.key, out);
+                    out.push(":");
+                    json_any(item, out);
+                }
+            }
+            out.push("}");
         }
         Value::KvlistValue(list) => {
             let mut entries: Vec<(&str, &AnyValue)> = Vec::with_capacity(list.values.len());
@@ -179,14 +277,14 @@ fn json(value: &Value, out: &mut Capped<'_>) {
     }
 }
 
-fn json_any(value: &AnyValue, out: &mut Capped<'_>) {
+fn json_any(value: &AnyValue, out: &mut impl Text) {
     match value.value.as_ref() {
         Some(v) => json(v, out),
         None => out.push("null"),
     }
 }
 
-fn json_string(s: &str, out: &mut Capped<'_>) {
+fn json_string(s: &str, out: &mut impl Text) {
     out.push("\"");
     let mut start = 0;
     for (i, c) in s.char_indices() {
@@ -306,6 +404,45 @@ mod tests {
             values: vec![kv("k\u{1}", Value::StringValue("\u{7f}/".into()))],
         });
         assert_eq!(text(&control, usize::MAX).0, "{\"k\\u0001\":\"\u{7f}/\"}");
+    }
+
+    /// The length found without the text is never short of the text,
+    /// whatever the cap, and is exact but for a list's repeated keys.
+    #[test]
+    fn a_counted_length_covers_the_text_without_building_it() {
+        let nested = Value::KvlistValue(KeyValueList {
+            values: vec![
+                kv("b", Value::StringValue("first\u{1}".into())),
+                kv("a", Value::BytesValue(vec![1; 5000])),
+                kv("b", Value::DoubleValue(f64::NAN)),
+                kv(
+                    "c",
+                    Value::ArrayValue(ArrayValue {
+                        values: vec![any(Value::IntValue(-7)), AnyValue { value: None }],
+                    }),
+                ),
+            ],
+        });
+        let values = [
+            Value::StringValue("aé\"".into()),
+            Value::IntValue(i64::MIN),
+            Value::DoubleValue(f64::from_bits(1)),
+            Value::BoolValue(false),
+            Value::BytesValue(vec![9; 7000]),
+            nested.clone(),
+        ];
+        for value in &values {
+            for cap in [0, 1, 3, 10, 100, 8192, usize::MAX] {
+                let (text, _) = text(value, cap);
+                let counted = rendered_len(value, cap);
+                assert!(counted >= text.len() && counted <= cap, "{value:?} {cap}");
+                if !matches!(value, Value::KvlistValue(_)) {
+                    assert_eq!(counted, text.len(), "{value:?} {cap}");
+                }
+            }
+        }
+        assert_eq!(render_scratch(&Value::IntValue(1)), 0);
+        assert_eq!(render_scratch(&nested), 4 * 2 * KV_ENTRY);
     }
 
     #[test]
