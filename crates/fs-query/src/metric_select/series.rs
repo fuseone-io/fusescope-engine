@@ -75,66 +75,78 @@ impl Narrow {
         }
     }
 
-    /// The rows of a file its postings allow, its bitmaps' bytes reserved
-    /// before they are combined; `None` when they do not narrow it.
-    fn rows(
+    /// The rows of a file its postings allow and their charge, three
+    /// times the bitmaps combined at twice their encoded bytes: the rows so
+    /// far, the union being built and their intersection. The charge is
+    /// reserved before any of them is built and held until the caller
+    /// drops it with the rows. `None` when the postings do not narrow it.
+    pub(super) fn rows(
         &self,
         postings: &Postings,
-        reservation: &mut MemoryReservation,
-    ) -> Result<Option<RoaringBitmap>, QueryError> {
-        let sources: Vec<(&str, Vec<&RoaringBitmap>)> = match self {
-            Self::Matchers(matchers) => matchers
-                .iter()
-                .filter(|m| m.requires_label())
-                .map(|m| (&*m.name, accepted(postings, m)))
-                .collect(),
-            Self::Names(names) => vec![(
-                NAME_LABEL,
-                names
-                    .iter()
-                    .filter_map(|n| postings.rows(NAME_LABEL, n))
-                    .collect(),
-            )],
-        };
-        if sources.is_empty() {
+        reservation: &MemoryReservation,
+    ) -> Result<Option<(RoaringBitmap, MemoryReservation)>, QueryError> {
+        let groups = self.groups();
+        if groups == 0 {
             return Ok(None);
         }
-        let bytes: usize = sources
-            .iter()
-            .flat_map(|(_, bitmaps)| bitmaps.iter().map(|b| b.serialized_size()))
-            .sum::<usize>()
-            .saturating_mul(2);
-        reservation.try_grow(bytes)?;
+        let mut bytes = 0usize;
+        for group in 0..groups {
+            self.each_bitmap(postings, group, &mut |bitmap| {
+                bytes = bytes.saturating_add(bitmap.serialized_size().saturating_mul(2));
+            });
+        }
+        let charge = bytes.saturating_mul(3);
+        reservation.try_grow(charge)?;
+        let held = reservation.split(charge);
         let mut rows: Option<RoaringBitmap> = None;
-        for (_, bitmaps) in sources {
+        for group in 0..groups {
             let mut union = RoaringBitmap::new();
-            for bitmap in bitmaps {
-                union |= bitmap;
-            }
+            self.each_bitmap(postings, group, &mut |bitmap| union |= bitmap);
             rows = Some(match rows {
                 Some(rows) => rows & union,
                 None => union,
             });
         }
-        reservation.shrink(bytes);
-        Ok(rows)
+        Ok(rows.map(|rows| (rows, held)))
+    }
+
+    /// The bitmaps that intersect: one group a label-requiring matcher, or
+    /// the one of the names.
+    fn groups(&self) -> usize {
+        match self {
+            Self::Matchers(matchers) => matchers.iter().filter(|m| m.requires_label()).count(),
+            Self::Names(_) => 1,
+        }
+    }
+
+    /// Hands `f` each bitmap of `group`, whose union it accepts.
+    fn each_bitmap(&self, postings: &Postings, group: usize, f: &mut dyn FnMut(&RoaringBitmap)) {
+        match self {
+            Self::Matchers(matchers) => {
+                if let Some(matcher) = matchers.iter().filter(|m| m.requires_label()).nth(group) {
+                    accepted(postings, matcher, f);
+                }
+            }
+            Self::Names(names) => names
+                .iter()
+                .filter_map(|n| postings.rows(NAME_LABEL, n))
+                .for_each(f),
+        }
     }
 }
 
-/// The bitmaps of the values of `matcher`'s label it accepts.
-fn accepted<'a>(postings: &'a Postings, matcher: &Matcher) -> Vec<&'a RoaringBitmap> {
+/// Hands `f` the bitmap of each value of `matcher`'s label it accepts.
+fn accepted(postings: &Postings, matcher: &Matcher, f: &mut dyn FnMut(&RoaringBitmap)) {
     if let Some(value) = matcher.equal_to() {
-        return postings.rows(&matcher.name, value).into_iter().collect();
+        postings.rows(&matcher.name, value).into_iter().for_each(f);
+        return;
     }
-    postings
-        .keys()
-        .filter(|(key, _)| *key == &*matcher.name)
-        .flat_map(|(key, values)| {
-            values
-                .filter(|value| matcher.matches(value))
-                .filter_map(move |value| postings.rows(key, value))
-        })
-        .collect()
+    for (key, values) in postings.keys().filter(|(key, _)| *key == &*matcher.name) {
+        values
+            .filter(|value| matcher.matches(value))
+            .filter_map(|value| postings.rows(key, value))
+            .for_each(&mut *f);
+    }
 }
 
 /// Where a selector's series rows come from.
@@ -144,6 +156,8 @@ pub(crate) struct Sources<'a> {
     pub(crate) files: Vec<FileRecord>,
     /// The hot window's series rows.
     pub(crate) hot: Vec<RecordBatch>,
+    /// What `hot` is charged to, for as long as it is held.
+    pub(crate) _hot_held: Arc<MemoryReservation>,
     pub(crate) postings: &'a MetricIndexCache,
     pub(crate) window: Window,
 }
@@ -205,18 +219,17 @@ impl Sources<'_> {
         })?;
         let total = usize::try_from(builder.metadata().file_metadata().num_rows()).unwrap_or(0);
         let mut builder = builder.with_batch_size(BATCH_ROWS);
-        let mut selected = 0;
+        let selected = reservation.new_empty();
         if file.level != Level::L0 && narrow.uses_postings() {
             if let Some(postings) = self.postings.postings(file, version).await {
-                if let Some(rows) = narrow.rows(&postings, reservation)? {
+                if let Some((rows, held)) = narrow.rows(&postings, reservation)? {
                     if rows.is_empty() {
                         return Ok(false);
                     }
-                    let ranges = runs(&rows);
-                    selected = ranges.saturating_mul(SELECTOR_BYTES);
-                    reservation.try_grow(selected)?;
+                    selected.try_grow(runs(&rows).saturating_mul(SELECTOR_BYTES))?;
                     let selection =
                         RowSelection::from_consecutive_ranges(consecutive(&rows), total);
+                    drop((rows, held));
                     builder = builder.with_row_selection(selection);
                 }
             }
@@ -241,7 +254,7 @@ impl Sources<'_> {
             let batch = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())?;
             self.visit_batch((&batch, &file.path), narrow, reservation, visit)?;
         }
-        reservation.shrink(selected);
+        drop(selected);
         Ok(true)
     }
 

@@ -5,8 +5,7 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    ArrayRef, Float64Array, Int64Array, ListArray, MapArray, StringArray, StringBuilder,
-    StructArray,
+    ArrayRef, Float64Builder, Int64Builder, ListArray, MapArray, StringBuilder, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
@@ -18,6 +17,19 @@ use crate::QueryError;
 
 /// Bytes of one kept sample: its time and value.
 const SAMPLE_BYTES: usize = 16;
+
+/// Buffers of the answer's arrays, each rounded up to [`BUFFER_ROUNDING`]:
+/// offsets and bytes of keys and values, offsets of the map and both
+/// lists, times and values.
+const BUFFERS: usize = 9;
+
+/// Bytes an Arrow buffer rounds its capacity up to.
+const BUFFER_ROUNDING: usize = 64;
+
+/// The answer's arrays, keys, values, entries, map, times, values and
+/// both lists, and the bytes each holds itself besides its buffers.
+const ARRAYS: usize = 8;
+const ARRAY_BYTES: usize = 128;
 
 /// One series of the answer: its labels, sorted by key, none empty, and
 /// its samples in time order.
@@ -76,6 +88,7 @@ pub(crate) fn fuse(
     series.sort_by(|a, b| a.labels.cmp(&b.labels));
     reservation.shrink(series.len() / 2 * std::mem::size_of::<Series>());
     let mut built = 0usize;
+    reservation.try_grow(series.len() * std::mem::size_of::<Series>())?;
     let mut out: Vec<Series> = Vec::with_capacity(series.len());
     for next in series {
         match out.last_mut() {
@@ -143,25 +156,32 @@ pub(crate) fn batch(
     reservation: &mut MemoryReservation,
 ) -> Result<RecordBatch, QueryError> {
     let labels: usize = series.iter().map(|s| s.labels.len()).sum();
-    let text: usize = series
-        .iter()
-        .flat_map(|s| s.labels.iter())
-        .map(|(k, v)| k.len() + v.len())
-        .sum();
+    let pairs = || series.iter().flat_map(|s| s.labels.iter());
+    let key_bytes: usize = pairs().map(|(k, _)| k.len()).sum();
+    let value_bytes: usize = pairs().map(|(_, v)| v.len()).sum();
     let samples: usize = series.iter().map(|s| s.samples.len()).sum();
     let too_many = || QueryError::TooManyRows(usize::try_from(i32::MAX).unwrap_or(usize::MAX));
-    if i32::try_from(text).is_err()
-        || i32::try_from(labels).is_err()
-        || i32::try_from(samples).is_err()
+    if [key_bytes, value_bytes, labels, samples]
+        .iter()
+        .any(|n| i32::try_from(*n).is_err())
     {
         return Err(too_many());
     }
-    reservation.try_grow(text + labels * 8 + samples * SAMPLE_BYTES + series.len() * 12)?;
+    let offsets = |n: usize| (n + 1) * 4;
+    reservation.try_grow(
+        key_bytes
+            + value_bytes
+            + 2 * offsets(labels)
+            + 3 * offsets(series.len())
+            + samples * SAMPLE_BYTES
+            + BUFFERS * BUFFER_ROUNDING
+            + ARRAYS * ARRAY_BYTES,
+    )?;
     let (mut keys, mut values) = (
-        StringBuilder::with_capacity(labels, text),
-        StringBuilder::with_capacity(labels, text),
+        StringBuilder::with_capacity(labels, key_bytes),
+        StringBuilder::with_capacity(labels, value_bytes),
     );
-    for (key, value) in series.iter().flat_map(|s| s.labels.iter()) {
+    for (key, value) in pairs() {
         keys.append_value(key);
         values.append_value(value);
     }
@@ -178,18 +198,25 @@ pub(crate) fn batch(
         None,
         true,
     )?;
+    let (mut times, mut points) = (
+        Int64Builder::with_capacity(samples),
+        Float64Builder::with_capacity(samples),
+    );
+    for (time, value) in series.iter().flat_map(|s| s.samples.iter()) {
+        times.append_value(*time);
+        points.append_value(*value);
+    }
     let lengths = || series.iter().map(|s| s.samples.len());
-    let flat = || series.iter().flat_map(|s| s.samples.iter());
     let times = ListArray::try_new(
         item(DataType::Int64),
         OffsetBuffer::from_lengths(lengths()),
-        Arc::new(Int64Array::from_iter_values(flat().map(|(t, _)| *t))),
+        Arc::new(times.finish()),
         None,
     )?;
     let values = ListArray::try_new(
         item(DataType::Float64),
         OffsetBuffer::from_lengths(lengths()),
-        Arc::new(Float64Array::from_iter_values(flat().map(|(_, v)| *v))),
+        Arc::new(points.finish()),
         None,
     )?;
     Ok(RecordBatch::try_new(
@@ -211,8 +238,14 @@ pub(crate) fn text_batch(
     if i32::try_from(text).is_err() {
         return Err(QueryError::TooManyRows(values.len()));
     }
-    reservation.try_grow(text + values.len() * 4)?;
+    reservation.try_grow(text + (values.len() + 1) * 4 + 2 * BUFFER_ROUNDING + ARRAY_BYTES)?;
     let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
-    let column = StringArray::from_iter_values(values.iter().map(|v| &**v));
-    Ok(RecordBatch::try_new(schema, vec![Arc::new(column)])?)
+    let mut column = StringBuilder::with_capacity(values.len(), text);
+    for value in values {
+        column.append_value(value);
+    }
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(column.finish())],
+    )?)
 }

@@ -451,3 +451,129 @@ fn the_answer_is_a_sorted_non_null_map_and_aligned_lists() {
     assert_eq!(map.value(1).column(1).as_string::<i32>().value(1), "b");
     assert_eq!(map.null_count(), 0);
 }
+
+fn postings_of(hosts: usize) -> fs_index::postings::Postings {
+    let binding = fs_index::postings::Binding {
+        path: "t/x/metrics/series/l1/dt=2026-10-24/hr=14/a.parquet".into(),
+        sha256: [1; 32],
+        schema_version: 2,
+        row_count: u32::try_from(hosts * 2).unwrap(),
+    };
+    let mut builder = fs_index::postings::PostingsBuilder::new(usize::MAX);
+    for row in 0..hosts * 2 {
+        let host = format!("h{:06}", row / 2);
+        let zone = if row % 2 == 0 { "eu" } else { "us" };
+        builder
+            .add(
+                row as u64,
+                [("__name__", "cpu"), ("host", host.as_str()), ("zone", zone)],
+            )
+            .unwrap();
+    }
+    fs_index::postings::Postings::decode(&builder.finish(&binding).unwrap(), &binding).unwrap()
+}
+
+#[test]
+fn postings_rows_are_charged_until_they_are_dropped() {
+    let postings = postings_of(20_000);
+    let matchers: Arc<[Matcher]> = compile(
+        &[
+            raw("host", MatchType::Regex, "h0.*"),
+            raw("zone", MatchType::Equal, "us"),
+        ],
+        LIMITS,
+        &mut reservation(1 << 24),
+    )
+    .unwrap()
+    .into();
+    let narrow = series::Narrow::Matchers(matchers);
+
+    let tight = reservation(64 * 1024);
+    let err = narrow.rows(&postings, &tight).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            QueryError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
+        ),
+        "a broad regex over many values is refused before its union is built: {err}"
+    );
+    assert_eq!(tight.size(), 0);
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+    let roomy = MemoryConsumer::new("test").register(&pool);
+    let (rows, held) = narrow.rows(&postings, &roomy).unwrap().unwrap();
+    assert_eq!(rows.len(), 20_000, "every odd row");
+    assert!(rows.iter().all(|r| r % 2 == 1));
+    assert!(
+        held.size() >= 2 * rows.serialized_size(),
+        "{} for {}",
+        held.size(),
+        rows.serialized_size()
+    );
+    assert_eq!(pool.reserved(), held.size(), "held while the rows are");
+    drop((rows, held));
+    assert_eq!(pool.reserved(), 0);
+
+    let none: Arc<[Matcher]> = compile(
+        &[raw("host", MatchType::NotEqual, "x")],
+        LIMITS,
+        &mut reservation(1 << 24),
+    )
+    .unwrap()
+    .into();
+    assert!(
+        series::Narrow::Matchers(none)
+            .rows(&postings, &roomy)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn the_answer_charges_what_its_arrays_hold() {
+    let keys = "k".repeat(300);
+    let values = "v".repeat(5000);
+    let rows: Vec<Series> = (0..50)
+        .map(|n| {
+            let value = format!("{values}{n}");
+            series(
+                &[("__name__", &keys), ("host", &value)],
+                &[(1, 1.0), (2, 2.0)],
+            )
+        })
+        .collect();
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+    let mut charged = MemoryConsumer::new("test").register(&pool);
+    let answer = batch(&rows, &mut charged).unwrap();
+    assert!(
+        charged.size() >= answer.get_array_memory_size(),
+        "charged {} for arrays of {}",
+        charged.size(),
+        answer.get_array_memory_size()
+    );
+    let listed: Vec<Box<str>> = (0..300).map(|n| format!("{values}{n}").into()).collect();
+    let mut charged = MemoryConsumer::new("test").register(&pool);
+    let answer = super::output::text_batch("value", &listed, &mut charged).unwrap();
+    assert!(
+        charged.size() >= answer.get_array_memory_size(),
+        "charged {} for a listing of {}",
+        charged.size(),
+        answer.get_array_memory_size()
+    );
+}
+
+#[test]
+fn merging_charges_the_merged_list() {
+    let input: Vec<Series> = (0..1000)
+        .map(|n| series(&[("a", &n.to_string())], &[(1, 1.0)]))
+        .collect();
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+    let mut charged = MemoryConsumer::new("test").register(&pool);
+    let fused = fuse(input, 10_000, &mut charged).unwrap();
+    assert!(
+        charged.size() >= fused.capacity() * std::mem::size_of::<Series>(),
+        "charged {} for a list of {}",
+        charged.size(),
+        fused.capacity() * std::mem::size_of::<Series>()
+    );
+}

@@ -1102,13 +1102,40 @@ fn gauge(
     }
 }
 
+/// `hot_cpu` of each of `hosts`, one point at `ms`.
+fn gauges(
+    hosts: &[String],
+    ms: i64,
+) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+    let mut request = gauge(&hosts[0], &[(ms, 1.0)]);
+    let metric = &mut request.resource_metrics[0].scope_metrics[0].metrics[0];
+    let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge)) =
+        &mut metric.data
+    else {
+        panic!("a gauge");
+    };
+    let point = gauge.data_points[0].clone();
+    gauge.data_points = hosts
+        .iter()
+        .map(|host| {
+            let mut point = point.clone();
+            point.attributes[0].value = Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                value: Some(
+                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                        host.clone(),
+                    ),
+                ),
+            });
+            point
+        })
+        .collect();
+    request
+}
+
 #[tokio::test]
 async fn the_hot_window_and_files_answer_together() {
-    use fs_ingest::{IngestConfig, Ingester};
     use fs_schema::limits::Limits;
     use fs_schema::metrics::{MetricLimits, Source, convert, preflight};
-    use fs_wal::{Wal, WalConfig};
-    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
 
     let Some(db) = TestDb::new().await else {
         return;
@@ -1174,13 +1201,63 @@ async fn the_hot_window_and_files_answer_together() {
         .await
         .unwrap();
 
+    let ingester = start_ingester(&db, dir.path(), &store).await;
+    export(ingester.otlp, &token, gauge("h", &[(recent, 5.0)])).await;
+
+    let q = Querier::new(
+        db.catalog.clone(),
+        store,
+        None,
+        QueryLimits {
+            timeout: Duration::from_secs(30),
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let body = json!({
+        "matchers": [m("__name__", "=", "hot_cpu"), m("host", "=", "h")],
+        "start_unix_milli": now - 60_000, "end_unix_milli": now + 60_000,
+    });
+    let answer = select(&q, tenant, body).await.unwrap();
+    assert_eq!(answer.len(), 1, "{answer:?}");
+    assert_eq!(answer[0].1, [old, recent]);
+    assert_eq!(
+        answer[0].2,
+        [1.0, 5.0],
+        "the hot window's later write wins its time"
+    );
+    ingester.stop().await;
+    db.finish().await;
+}
+
+/// An ingester serving its hot window, heartbeating into the catalog.
+struct HotIngester {
+    otlp: std::net::SocketAddr,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<(), fs_ingest::IngestError>>,
+}
+
+impl HotIngester {
+    async fn stop(self) {
+        self.shutdown.send(true).unwrap();
+        self.task.await.unwrap().unwrap();
+    }
+}
+
+async fn start_ingester(
+    db: &TestDb,
+    dir: &std::path::Path,
+    store: &Arc<LocalFileSystem>,
+) -> HotIngester {
+    use fs_ingest::{IngestConfig, Ingester};
+    use fs_wal::{Wal, WalConfig};
     let config = IngestConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         hot_listen: Some("127.0.0.1:0".parse().unwrap()),
         flush_interval: Duration::from_secs(3600),
         ..IngestConfig::default()
     };
-    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    let wal = Wal::open(WalConfig::new(dir.join("wal"))).unwrap();
     let ingester = Arc::new(
         Ingester::new(
             config,
@@ -1210,38 +1287,76 @@ async fn the_hot_window_and_files_answer_together() {
         .heartbeat("ingester-hot", &hot.to_string())
         .await
         .unwrap();
+    HotIngester {
+        otlp,
+        shutdown,
+        task,
+    }
+}
+
+async fn export(
+    otlp: std::net::SocketAddr,
+    token: &str,
+    request: opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
+) {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
     let mut client = MetricsServiceClient::connect(format!("http://{otlp}"))
         .await
         .unwrap();
-    let mut export = tonic::Request::new(gauge("h", &[(recent, 5.0)]));
+    let mut export = tonic::Request::new(request);
     export
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
     client.export(export).await.unwrap();
+}
 
-    let q = Querier::new(
+#[tokio::test]
+async fn a_hot_answer_past_the_pool_fails_before_it_is_held() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let tenant = db.tenant("acme").await;
+    let (token, _) = db
+        .catalog
+        .create_token(tenant, "collector", fs_catalog::TokenScope::Ingest)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp_millis();
+    let ingester = start_ingester(&db, dir.path(), &store).await;
+    for chunk in 0..4 {
+        let hosts: Vec<String> = (0..2000).map(|n| format!("host-{chunk}-{n:06}")).collect();
+        export(ingester.otlp, &token, gauges(&hosts, now - 1000)).await;
+    }
+    let body = json!({"matchers": [m("__name__", "=", "hot_cpu")], "start_unix_milli": now - 60_000, "end_unix_milli": now + 60_000});
+    let roomy = Querier::new(
         db.catalog.clone(),
-        store,
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        None,
+        QueryLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        select(&roomy, tenant, body.clone()).await.unwrap().len(),
+        8000
+    );
+    let tight = Querier::new(
+        db.catalog.clone(),
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
         None,
         QueryLimits {
-            timeout: Duration::from_secs(30),
+            memory_bytes: 256 * 1024,
             ..QueryLimits::default()
         },
     )
     .unwrap();
-    let body = json!({
-        "matchers": [m("__name__", "=", "hot_cpu"), m("host", "=", "h")],
-        "start_unix_milli": now - 60_000, "end_unix_milli": now + 60_000,
-    });
-    let answer = select(&q, tenant, body).await.unwrap();
-    assert_eq!(answer.len(), 1, "{answer:?}");
-    assert_eq!(answer[0].1, [old, recent]);
-    assert_eq!(
-        answer[0].2,
-        [1.0, 5.0],
-        "the hot window's later write wins its time"
+    let err = select(&tight, tenant, body).await.unwrap_err();
+    assert!(
+        matches!(err, QueryError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(ref m)) if m.contains("hot window")),
+        "the answer is refused as it arrives: {err}"
     );
-    shutdown.send(true).unwrap();
-    task.await.unwrap().unwrap();
+    ingester.stop().await;
     db.finish().await;
 }

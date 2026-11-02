@@ -8,7 +8,8 @@ use std::time::Duration;
 use arrow::record_batch::RecordBatch;
 use chrono::{Duration as ChronoDuration, Utc};
 use fs_catalog::{Catalog, FileId, TenantId};
-use fs_ingest::hot::{HotScanRequest, HotScanResponse, MetricTable, scan_schema, scan_with};
+pub use fs_ingest::hot::Charge;
+use fs_ingest::hot::{HotScanRequest, HotScanResponse, MetricTable, scan_charged, scan_schema};
 use fs_ingest::record::RowSignal;
 use tracing::{debug, warn};
 
@@ -66,6 +67,9 @@ pub struct HotResult {
     pub excluded_files: HashSet<FileId>,
     /// Ingesters that were alive but did not answer in time.
     pub unavailable: Vec<String>,
+    /// Ingesters whose answer the charge refused: the scan is over its
+    /// budget, not partial.
+    pub exhausted: Vec<String>,
 }
 
 /// Decides whether a query touches the recent window and runs the fan-out.
@@ -124,6 +128,25 @@ impl HotWindow {
         columns: Option<Vec<String>>,
         distinct: Option<usize>,
     ) -> Result<HotResult, fs_catalog::CatalogError> {
+        let free: Charge = Arc::new(|_| true);
+        self.scan_charged(tenant, (signal, table), pruning, (columns, distinct), &free)
+            .await
+    }
+
+    /// [`HotWindow::scan`], every message of every answer charged to
+    /// `charge` before it is decoded; an ingester whose answer `charge`
+    /// refuses is reported in [`HotResult::exhausted`].
+    ///
+    /// # Errors
+    /// Catalog failure while listing ingesters.
+    pub async fn scan_charged(
+        &self,
+        tenant: TenantId,
+        (signal, table): (RowSignal, Option<MetricTable>),
+        pruning: &Pruning,
+        (columns, distinct): (Option<Vec<String>>, Option<usize>),
+        charge: &Charge,
+    ) -> Result<HotResult, fs_catalog::CatalogError> {
         let stale = ChronoDuration::from_std(self.config.stale_after)
             .unwrap_or(ChronoDuration::seconds(10));
         let ingesters = self.catalog.live_ingesters(stale).await?;
@@ -146,10 +169,11 @@ impl HotWindow {
             let request = request.clone();
             let timeout = self.config.timeout;
             let tls = self.tls.as_ref();
+            let charge = Arc::clone(charge);
             async move {
                 (
                     ingester.id.clone(),
-                    scan_with(&ingester.address, &request, timeout, tls).await,
+                    scan_charged(&ingester.address, &request, timeout, tls, charge).await,
                 )
             }
         });
@@ -160,6 +184,11 @@ impl HotWindow {
         }
         let mut result = HotResult::default();
         for (id, outcome) in futures_util::future::join_all(calls).await {
+            if let Err(fs_ingest::IngestError::HotScanBudget { .. }) = outcome {
+                warn!(ingester = %id, "hot window answer past the memory budget");
+                result.exhausted.push(id);
+                continue;
+            }
             let outcome = outcome.map_err(|e| e.to_string()).and_then(|response| {
                 if answers_signal(&response, &request) {
                     Ok(response)

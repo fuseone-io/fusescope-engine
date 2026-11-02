@@ -54,6 +54,8 @@ pub struct SignalTable {
     source_order: bool,
     /// An ingester that does not answer fails the scan.
     hot_required: bool,
+    /// What the hot window's answers are charged to before they are held.
+    hot_charge: Option<crate::hot::Charge>,
 }
 
 /// The files a scan opens and what the text index made of them.
@@ -119,6 +121,7 @@ impl SignalTable {
             text_index: None,
             source_order: false,
             hot_required: false,
+            hot_charge: None,
         }
     }
 
@@ -127,6 +130,15 @@ impl SignalTable {
     #[must_use]
     pub fn with_source_order(mut self) -> Self {
         self.source_order = self.table == Some(MetricTable::Samples);
+        self
+    }
+
+    /// Charges the hot window's answers to `charge` as they arrive, and
+    /// the copies that bring them to the table's types before those are
+    /// made; a refused charge fails the scan as resources exhausted.
+    #[must_use]
+    pub fn with_hot_charge(mut self, charge: crate::hot::Charge) -> Self {
+        self.hot_charge = Some(charge);
         self
     }
 
@@ -348,16 +360,20 @@ impl TableProvider for SignalTable {
         let mut excluded = std::collections::HashSet::new();
         if let Some((hot, warnings)) = &self.hot {
             if hot.touches_recent(&pruning) {
+                let free: crate::hot::Charge = Arc::new(|_| true);
                 let result = hot
-                    .scan(
+                    .scan_charged(
                         self.tenant,
                         (self.signal, self.table),
                         &pruning,
-                        projected_names.clone(),
-                        None,
+                        (projected_names.clone(), None),
+                        self.hot_charge.as_ref().unwrap_or(&free),
                     )
                     .await
                     .map_err(|e| external(e.into()))?;
+                if !result.exhausted.is_empty() {
+                    return Err(hot_exhausted(&result.exhausted));
+                }
                 if self.hot_required && !result.unavailable.is_empty() {
                     return Err(external(QueryError::HotUnavailable(result.unavailable)));
                 }
@@ -385,6 +401,16 @@ impl TableProvider for SignalTable {
         let hot_exec: Option<Arc<dyn ExecutionPlan>> = if hot_batches.is_empty() {
             None
         } else {
+            if let Some(charge) = &self.hot_charge {
+                let copies = hot_batches
+                    .iter()
+                    .filter(|b| b.schema().fields() != projected_schema.fields())
+                    .map(arrow::record_batch::RecordBatch::get_array_memory_size)
+                    .sum();
+                if !charge(copies) {
+                    return Err(hot_exhausted(&[]));
+                }
+            }
             // Flight hydrates dictionaries in transit; bring every column back
             // to the declared type so the union sees one schema.
             let coerced = hot_batches
@@ -480,6 +506,14 @@ impl SignalTable {
         )?;
         Ok(Some(Arc::new(measured)))
     }
+}
+
+/// A hot window answer past its charge, from `ingesters` when known.
+fn hot_exhausted(ingesters: &[String]) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::ResourcesExhausted(format!(
+        "hot window answers past the memory pool {}",
+        ingesters.join(", ")
+    ))
 }
 
 /// The 16-byte trace ids the filters pin; `None` when they pin none.

@@ -487,6 +487,7 @@ impl Querier {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut reservation =
             MemoryConsumer::new("metrics.select").register(&ctx.runtime_env().memory_pool);
+        let samples_held = Arc::new(reservation.new_empty());
         let samples = crate::signal_table::SignalTable::metrics(
             fs_ingest::hot::MetricTable::Samples,
             tenant,
@@ -496,6 +497,7 @@ impl Querier {
         )
         .with_source_order()
         .with_hot_window(Arc::clone(&self.hot), Arc::clone(&warnings))
+        .with_hot_charge(crate::metric_select::hot_charge(&samples_held))
         .requiring_hot_window();
         let frame = ctx.read_table(Arc::new(samples))?;
         let batch = self

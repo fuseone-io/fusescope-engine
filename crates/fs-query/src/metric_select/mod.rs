@@ -271,17 +271,21 @@ impl Context<'_> {
             ..Pruning::default()
         };
         let mut hot = crate::hot::HotResult::default();
+        let held = Arc::new(reservation.new_empty());
         if self.hot.touches_recent(&pruning) {
             hot = self
                 .hot
-                .scan(
+                .scan_charged(
                     self.tenant,
                     (RowSignal::Metrics, Some(MetricTable::Series)),
                     &pruning,
-                    None,
-                    None,
+                    (None, None),
+                    &hot_charge(&held),
                 )
                 .await?;
+            if !hot.exhausted.is_empty() {
+                return Err(hot_exhausted(&hot.exhausted));
+            }
             match warnings {
                 _ if hot.unavailable.is_empty() => {}
                 Some(warnings) => {
@@ -293,12 +297,6 @@ impl Context<'_> {
                 }
                 None => return Err(QueryError::HotUnavailable(hot.unavailable)),
             }
-            let bytes: usize = hot
-                .batches
-                .iter()
-                .map(RecordBatch::get_array_memory_size)
-                .sum();
-            reservation.try_grow(bytes)?;
         }
         let files: Vec<_> = self
             .cache
@@ -325,6 +323,7 @@ impl Context<'_> {
             store: Arc::clone(self.store),
             files,
             hot: hot.batches,
+            _hot_held: held,
             postings: self.postings,
             window,
         })
@@ -405,6 +404,22 @@ impl Context<'_> {
             .metric_index_pruned
             .fetch_add(visited.pruned, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// A charge of the hot window's answers to `held`, refused past the pool.
+pub(crate) fn hot_charge(held: &Arc<MemoryReservation>) -> crate::hot::Charge {
+    let held = Arc::clone(held);
+    Arc::new(move |bytes| held.try_grow(bytes).is_ok())
+}
+
+/// What a hot window answer past the pool fails with.
+pub(crate) fn hot_exhausted(ingesters: &[String]) -> QueryError {
+    QueryError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(
+        format!(
+            "hot window answers of {} past the memory pool",
+            ingesters.join(", ")
+        ),
+    ))
 }
 
 /// The identity of each key of `rows`: the rows of one hour merged as
