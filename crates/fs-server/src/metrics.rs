@@ -398,6 +398,7 @@ impl Metrics {
             return;
         };
         render_compaction(out, &stats.compaction);
+        render_metric_compaction(out, &stats.compaction);
         render_usage(out, &stats.compaction);
         render_orphans(out, &stats.orphans);
         render_retention(out, &stats.retention);
@@ -614,6 +615,50 @@ fn render_usage(out: &mut String, c: &fs_compactor::CompactorStats) {
         "fusescope_usage_peak_bytes",
         "Most bytes of usage counts one pass held at once since start",
         c.usage_peak_bytes.load(Ordering::Relaxed),
+    );
+}
+
+fn render_metric_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    for (name, help, value) in [
+        (
+            "fusescope_compaction_metric_passes_total",
+            "Metric L0 to L1 passes that swapped sets in",
+            load(&c.metric_passes),
+        ),
+        (
+            "fusescope_compaction_metric_l2_passes_total",
+            "Metric L1 to L2 passes that swapped sets in",
+            load(&c.metric_l2_passes),
+        ),
+        (
+            "fusescope_compaction_metric_accounted_total",
+            "Metric accounting passes that committed",
+            load(&c.metric_accounted),
+        ),
+        (
+            "fusescope_compaction_metric_collisions_total",
+            "Keys of metric series written holding more than one identity, once a file",
+            load(&c.metric_collisions),
+        ),
+        (
+            "fusescope_compaction_metric_over_budget_total",
+            "Metric hours or days passed over, their oldest set past the pass budget",
+            load(&c.metric_over_budget),
+        ),
+        (
+            "fusescope_compaction_postings_abandoned_total",
+            "Metric series files published without postings",
+            load(&c.postings_abandoned),
+        ),
+    ] {
+        counter(out, name, help, value);
+    }
+    gauge(
+        out,
+        "fusescope_compaction_metric_peak_bytes",
+        "Most bytes one metric pass held, every part of its budget together",
+        load(&c.metric_peak_bytes),
     );
 }
 
@@ -1217,6 +1262,33 @@ mod tests {
                 || l.split_once(' ')
                     .is_some_and(|(_, v)| v.parse::<u64>().is_ok())
         }));
+    }
+
+    #[test]
+    fn renders_metric_compaction() {
+        let metrics = Metrics::default();
+        let compactor = Arc::new(fs_compactor::Stats::default());
+        let c = &compactor.compaction;
+        c.metric_passes.fetch_add(3, Ordering::Relaxed);
+        c.metric_l2_passes.fetch_add(1, Ordering::Relaxed);
+        c.metric_accounted.fetch_add(2, Ordering::Relaxed);
+        c.metric_collisions.fetch_add(4, Ordering::Relaxed);
+        c.metric_over_budget.fetch_add(5, Ordering::Relaxed);
+        c.postings_abandoned.fetch_add(6, Ordering::Relaxed);
+        c.metric_peak_bytes.fetch_max(1 << 20, Ordering::Relaxed);
+        metrics.register_compactor(Arc::clone(&compactor));
+        let page = metrics.render();
+        for line in [
+            "fusescope_compaction_metric_passes_total 3\n",
+            "fusescope_compaction_metric_l2_passes_total 1\n",
+            "fusescope_compaction_metric_accounted_total 2\n",
+            "fusescope_compaction_metric_collisions_total 4\n",
+            "fusescope_compaction_metric_over_budget_total 5\n",
+            "fusescope_compaction_postings_abandoned_total 6\n",
+            "# TYPE fusescope_compaction_metric_peak_bytes gauge\nfusescope_compaction_metric_peak_bytes 1048576\n",
+        ] {
+            assert!(page.contains(line), "{line}{page}");
+        }
     }
 
     #[test]

@@ -613,6 +613,10 @@ fn default_text_index_bytes_per_row_group() -> usize {
     fs_index::TextIndexLimits::DEFAULT.max_bytes_per_row_group
 }
 
+fn default_metric_pass_bytes() -> usize {
+    fs_compactor::DEFAULT_METRIC_PASS_BYTES
+}
+
 fn default_usage_max_bytes() -> usize {
     64 << 20
 }
@@ -822,6 +826,15 @@ pub struct CompactorConfig {
     /// never roll back past it after. Off stops new log passes only.
     #[serde(default)]
     pub compact_logs: bool,
+    /// Also compact metric sets, L0 to L1 and with `compact_l2` L1 to L2.
+    /// Off by default, the sets are only accounted; turn it on once every
+    /// querier, compactor and ingester is upgraded, and never roll back
+    /// past it after.
+    #[serde(default)]
+    pub compact_metrics: bool,
+    /// The one budget of a metric pass; between 16 MiB and 8 GiB.
+    #[serde(default = "default_metric_pass_bytes")]
+    pub metric_pass_bytes: usize,
     /// Bloom bytes both blooms of one row group of a log L1 file's text
     /// sidecar may take together; at most 64 MiB.
     #[serde(default = "default_text_index_bytes_per_row_group")]
@@ -923,6 +936,8 @@ impl Default for CompactorConfig {
             service_graph_max_spans: default_service_graph_max_spans(),
             service_graph_max_bytes: default_service_graph_max_bytes(),
             compact_logs: false,
+            compact_metrics: false,
+            metric_pass_bytes: default_metric_pass_bytes(),
             text_index_max_bytes_per_row_group: default_text_index_bytes_per_row_group(),
             text_index_max_bytes_per_file: default_text_index_bytes_per_file(),
             usage_max_bytes: default_usage_max_bytes(),
@@ -999,8 +1014,8 @@ impl CompactorConfig {
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
                 inject_put_hold: None,
-                compact_metrics: false,
-                metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
+                compact_metrics: self.compact_metrics,
+                metric_pass_bytes: self.metric_pass_bytes,
             },
             orphan_interval: std::time::Duration::from_secs(self.orphan_interval_secs),
             sweep: fs_compactor::SweepConfig {
@@ -1270,6 +1285,11 @@ impl Config {
         self.compactor.text_index_limits()?;
         if !(1 << 20..=compact::MAX_USAGE_BYTES).contains(&self.compactor.usage_max_bytes) {
             return invalid("compactor.usage_max_bytes must be between 1 MiB and 1 GiB");
+        }
+        if !(fs_compactor::MIN_METRIC_PASS_BYTES..=fs_compactor::MAX_METRIC_PASS_BYTES)
+            .contains(&self.compactor.metric_pass_bytes)
+        {
+            return invalid("compactor.metric_pass_bytes must be between 16 MiB and 8 GiB");
         }
         if self.compactor.l2_output_bytes == 0
             || self.compactor.l2_target_bytes == 0
@@ -2050,6 +2070,41 @@ mod tests {
             let config =
                 Config::parse(&format!("{MINIMAL}[ingest]\ntoken_cache_secs = {secs}\n")).unwrap();
             assert_eq!(config.validate(&secrets).is_ok(), ok, "{secs}");
+        }
+    }
+
+    #[test]
+    fn metric_compaction_is_configured_and_its_budget_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let defaults = Config::parse(MINIMAL).unwrap();
+        let compaction = defaults.compactor.to_compactor(4).compaction;
+        assert!(!compaction.compact_metrics);
+        assert_eq!(
+            compaction.metric_pass_bytes,
+            fs_compactor::DEFAULT_METRIC_PASS_BYTES
+        );
+        let on = Config::parse(&format!(
+            "{MINIMAL}[compactor]\ncompact_metrics = true\nmetric_pass_bytes = 67108864\n"
+        ))
+        .unwrap();
+        on.validate(&secrets).unwrap();
+        let compaction = on.compactor.to_compactor(4).compaction;
+        assert!(compaction.compact_metrics);
+        assert_eq!(compaction.metric_pass_bytes, 64 << 20);
+        for (bytes, ok) in [
+            (fs_compactor::MIN_METRIC_PASS_BYTES, true),
+            (fs_compactor::MAX_METRIC_PASS_BYTES, true),
+            (fs_compactor::MIN_METRIC_PASS_BYTES - 1, false),
+            (fs_compactor::MAX_METRIC_PASS_BYTES + 1, false),
+        ] {
+            let config = Config::parse(&format!(
+                "{MINIMAL}[compactor]\nmetric_pass_bytes = {bytes}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.validate(&secrets).is_ok(), ok, "{bytes}");
         }
     }
 
