@@ -1454,10 +1454,12 @@ memory pool before it is held; a refused reservation is
 `RESOURCE_EXHAUSTED` (`fusescope_query_metric_selects_total`). The hot
 window's answers, series and samples alike, are charged message by
 message as they arrive, a message's bytes before it is decoded and what
-the batch decoded from it keeps alive (each allocation its buffers share,
-once, at its capacity, and every array) before the batch is kept; a
-batch brought back to the table's types is charged for the columns it
-casts before it is kept. An answer past the pool stops with no more than
+the batch decoded from it keeps alive before the batch is kept: each
+allocation its buffers share, once, at its capacity, 256 bytes for every
+array and child, a bound every array of the engine's schemas fits, the
+batch itself, its vector of columns and its slot in the answer, both
+vectors at twice their length. A batch brought back to the table's types
+is charged the same way for the columns it casts, before it is kept. An answer past the pool stops with no more than
 one message of each ingester, at most the client's 4 MiB message limit,
 and the batch made from it beyond what the pool admitted, and fails the
 select as resources exhausted, never as partial. A row selection from
