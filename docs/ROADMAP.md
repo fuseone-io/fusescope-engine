@@ -310,6 +310,24 @@ C5 landed after C6.
   measured. Review round 3: a record carrying a limit past the ceilings
   stops the start rather than replay under the clamped one. Next: step 2, metric compaction with the duplicate kept across L0, L1
   and L2.
+- Step 2, compaction, metadata and postings (design revision 3 and the
+  reviewer's correction). Done: mapping 2 and series v2 with
+  `label_metadata`, levels in the identity, types accumulated, a legacy
+  origin taking a known one, collisions kept and counted in every merge
+  (`a_legacy_origin_merges_with_a_known_one_and_two_levels_collide`,
+  `a_replayed_mapping_1_record_and_live_mapping_2_rows_are_one_series`);
+  usage v2 counting metric samples by their own fields and
+  `metric_metadata` v1, pinned; postings v1 bound to their series file,
+  `roaring` 0.11.3 checked on Rust 1.85; the orphan sweep of metric
+  objects, postings owned by their series file; catalog inputs, swaps and
+  accounting by set, retention waiting for a set's accounting; metric L0
+  to L1 and L1 to L2 passes within one budget, sets closing as files fill,
+  and the accounting pass with `compact_metrics` off
+  (`crates/fs-compactor/tests/metrics.rs`, among them
+  `a_duplicate_across_l0_l1_and_l2_keeps_the_largest_source_order`); the
+  SQL table `metadata` and `usage_1h` of format v2. Next: step 3,
+  `metrics.select` joining on name and fingerprint, deduplicating
+  fragments and failing closed on a key of two identities.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
 - `metrics.select` typed action; PromQL stays in Go ([ADR 0002](adr/0002-promql-stays-in-go.md)) through `flightprometheus`.
