@@ -204,8 +204,11 @@ purges leave theirs behind until a newer orphan sweep removes them.
 
 Metrics ingest (OTLP `MetricsService`) writes record code 4 at record
 version 5 and intents of version 4, which an engine without them refuses:
-roll out ingesters first, then queriers, and before a rollback flush and
-checkpoint every
+roll out ingesters first, then queriers. Metric records of version 1,
+written before records carried their conversion limits, stop the start
+of this engine: stop the ingesters that wrote them cleanly, so they flush
+and checkpoint, before upgrading. Before a rollback flush and checkpoint
+every
 ingester (stop it cleanly) so no metric record or intent is left in a WAL.
 A metric flush writes two files of one set, samples and series; a set
 found registered or visible in part stops the flush, or fails the

@@ -579,12 +579,32 @@ fn wal_with(record: &fs_ingest::record::WalRecord) -> tempfile::TempDir {
     dir
 }
 
-/// A metric record of version 1 carries the request alone and replays
-/// under the engine's limits; one of a mapping version this engine does
-/// not convert stops the start rather than lose its rows.
+/// Why the start of an ingester whose WAL holds `record` fails.
+fn refused_start(db: &TestDb, record: &fs_ingest::record::WalRecord) -> String {
+    let dir = wal_with(record);
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    match Ingester::new(
+        test_config(),
+        db.catalog.clone(),
+        store,
+        Path::from(""),
+        wal,
+    ) {
+        Ok(_) => panic!("the start must fail"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A metric record the replay cannot convert as it was accepted stops the
+/// start, naming its position and why, rather than lose or change rows
+/// acknowledged: one of version 1, whose limits are lost, one of a
+/// mapping version this engine does not convert, and one whose payload
+/// passed the log's checksum but does not parse.
 #[tokio::test]
-async fn an_older_record_replays_and_one_of_an_unknown_mapping_stops_the_start() {
-    use fs_ingest::metric_record::MetricConversion;
+async fn a_metric_record_that_cannot_convert_as_accepted_stops_the_start() {
+    use fs_ingest::metric_record::{HEADER_BYTES, MetricConversion};
     use fs_ingest::record::{RecordSignal, VERSION, VERSION_METRIC_RECORD, WalRecord};
     use prost::Message as _;
 
@@ -593,37 +613,48 @@ async fn an_older_record_replays_and_one_of_an_unknown_mapping_stops_the_start()
     };
     let (tenant, _) = db.tenant().await;
     let request = metrics(3, 0).encode_to_vec();
-    let older = WalRecord {
-        version: VERSION,
-        tenant,
-        signal: RecordSignal::Metrics,
-        payload: request.clone().into(),
-    };
-    let h = start(&db.catalog, wal_with(&older), test_config()).await;
-    h.ingester.flush_all().await;
-    let samples = db.files(tenant, Signal::MetricSamples).await;
-    assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].row_count, 3 + 4, "the gauges and the histogram");
-    h.stop().await;
-
     let config = test_config();
-    let mut conversion = MetricConversion::current(&config.limits, &config.metrics);
-    conversion.mapping = fs_schema::metrics::MAPPING_VERSION + 1;
-    let newer = WalRecord {
-        version: VERSION_METRIC_RECORD,
+    let conversion = MetricConversion::current(&config.limits, &config.metrics);
+    let record = |version, payload: bytes::Bytes| WalRecord {
+        version,
         tenant,
         signal: RecordSignal::Metrics,
-        payload: conversion.payload(&request),
+        payload,
     };
-    let dir = wal_with(&newer);
-    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
-    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
-    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
-    let err = match Ingester::new(config, db.catalog.clone(), store, Path::from(""), wal) {
-        Ok(_) => panic!("a record of an unknown mapping must stop the start"),
-        Err(e) => e.to_string(),
+    let newer = MetricConversion {
+        mapping: fs_schema::metrics::MAPPING_VERSION + 1,
+        ..conversion
     };
-    assert!(err.contains("mapping version 2"), "{err}");
+    let short = conversion.payload(&[]).slice(..HEADER_BYTES - 1);
+    let garbled = conversion.payload(&[0xff; 8]);
+    for (case, record, reason) in [
+        (
+            "version 1",
+            record(VERSION, request.clone().into()),
+            "carries no conversion limits",
+        ),
+        (
+            "newer mapping",
+            record(VERSION_METRIC_RECORD, newer.payload(&request)),
+            "mapping version 2",
+        ),
+        (
+            "short header",
+            record(VERSION_METRIC_RECORD, short),
+            "damaged",
+        ),
+        (
+            "garbled request",
+            record(VERSION_METRIC_RECORD, garbled),
+            "damaged",
+        ),
+    ] {
+        let err = refused_start(&db, &record);
+        assert!(
+            err.contains(reason) && err.contains("Position"),
+            "{case}: {err}"
+        );
+    }
     db.finish().await;
 }
 

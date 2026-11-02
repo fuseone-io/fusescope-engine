@@ -28,7 +28,7 @@ pub const VERSION_METRIC_INTENT: u8 = 4;
 /// of the request, the mapping version and the limits it was converted
 /// under ([`crate::metric_record`]). A reader of the previous version
 /// meets it and fails; a metric record of [`VERSION`] carries the request
-/// alone and converts under the engine's limits.
+/// alone, its limits lost, and stops the replay.
 pub const VERSION_METRIC_RECORD: u8 = 5;
 
 /// Bytes of the seed at the head of a [`RecordSignal::Logs`] payload.

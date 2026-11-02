@@ -1777,13 +1777,14 @@ pub(crate) fn metric_source(instance: Uuid, position: Position) -> Source {
 /// # Errors
 /// A request over its bounds, or an Arrow failure.
 /// Converts a metric `record` read at `entry` into `out`'s rows, under the
-/// limits the record carries; a record of [`crate::record::VERSION`]
-/// carries the request alone and converts under `limits` and `metrics`.
-/// A damaged payload is counted and skipped.
+/// limits the record carries.
 ///
 /// # Errors
-/// A record under rules this engine does not convert by: skipping it would
-/// lose rows acknowledged, so the replay stops. Or an Arrow failure.
+/// A record that cannot be converted as it was accepted: of version 1,
+/// whose limits are lost, under rules this engine does not convert by, or
+/// damaged though its frame passed the log's checksum. Skipping it would
+/// lose or change rows acknowledged, so the replay stops. Or an Arrow
+/// failure.
 fn replay_metric(
     record: &WalRecord,
     entry: &fs_wal::Entry,
@@ -1791,27 +1792,29 @@ fn replay_metric(
     (limits, metrics): (fs_schema::limits::Limits, MetricLimits),
     out: &mut Replayed,
 ) -> Result<(), IngestError> {
-    let (conversion, request) = if record.version == crate::record::VERSION_METRIC_RECORD {
-        match MetricConversion::split(&record.payload) {
-            Ok((conversion, request)) => (Some(conversion), request),
-            Err(MetricPayloadError::Damaged) => {
-                out.damaged += 1;
-                return Ok(());
-            }
-            Err(MetricPayloadError::Mapping(mapping)) => {
-                return Err(IngestError::Record(format!(
-                    "metric record at {:?} is of mapping version {mapping}, which this engine does not convert; it was written by a newer one",
-                    entry.position
-                )));
-            }
+    let refuse =
+        |why: String| IngestError::Record(format!("metric record at {:?} {why}", entry.position));
+    if record.version != crate::record::VERSION_METRIC_RECORD {
+        return Err(refuse(format!(
+            "is of version {}, which carries no conversion limits; flush and checkpoint it with the engine that wrote it (stop that one cleanly) before upgrading",
+            record.version
+        )));
+    }
+    let (conversion, request) = match MetricConversion::split(&record.payload) {
+        Ok(split) => split,
+        Err(MetricPayloadError::Damaged) => {
+            return Err(refuse(
+                "is damaged: its conversion header is short or out of range".into(),
+            ));
         }
-    } else {
-        (None, &record.payload[..])
+        Err(MetricPayloadError::Mapping(mapping)) => {
+            return Err(refuse(format!(
+                "is of mapping version {mapping}, which this engine does not convert; it was written by a newer one"
+            )));
+        }
     };
-    let Ok(message) = ExportMetricsServiceRequest::decode(request) else {
-        out.damaged += 1;
-        return Ok(());
-    };
+    let message = ExportMetricsServiceRequest::decode(request)
+        .map_err(|e| refuse(format!("is damaged: its request does not parse ({e})")))?;
     // The request was accepted: its own bounds held then, so only the
     // bounds of each point apply again, as the record says they were.
     let replayed = MetricLimits {
@@ -1819,10 +1822,7 @@ fn replay_metric(
         max_samples: usize::MAX,
         ..metrics
     };
-    let (limits, replayed) = match conversion {
-        Some(conversion) => conversion.apply(&limits, &replayed),
-        None => (limits, replayed),
-    };
+    let (limits, replayed) = conversion.apply(&limits, &replayed);
     let source = metric_source(instance, entry.position);
     let rows = convert_metrics(&message, &limits, &replayed, source)?;
     if rows.samples.num_rows() > 0 {

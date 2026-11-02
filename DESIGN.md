@@ -171,9 +171,11 @@ arriving meanwhile:
   `max_value_bytes`, `max_histogram_buckets`, `max_summary_quantiles`,
   `max_series_labels`) ahead of the request as received: a replay converts
   under those, so a restart with other limits writes the same rows under
-  the same ids, and a mapping version the engine does not convert stops
-  it. A metric record of version 1 carries the request alone and converts
-  under the engine's limits. What either walk
+  the same ids. A metric record that cannot convert as it was accepted
+  stops the replay with its position: of a mapping version the engine
+  does not convert, damaged though its frame passed the checksum, or of
+  version 1, which carries the request alone and whose limits are lost.
+  What either walk
   of a request holds at once, its levels, labels, names and rendering, is
   bounded from the request's sizes without allocating and held as scratch
   before the preflight, which validates and counts every point before any
