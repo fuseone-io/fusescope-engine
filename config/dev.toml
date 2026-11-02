@@ -46,6 +46,12 @@ spill_dir = "./data/spill"
 trace_index_cache_bytes = 268435456
 # Text sidecars kept for body searches of log files; 0 reads every file the catalog keeps.
 text_index_cache_bytes = 268435456
+# Postings of metric series files kept for selectors, at most 1 GiB; 0 reads every series file.
+metric_index_cache_bytes = 67108864
+# Bounds of metrics.select and metrics.label_*.
+metrics_max_series = 100000
+metrics_max_matchers = 64
+metrics_max_regex_bytes = 65536
 
 [compactor]
 purge_interval_secs = 60

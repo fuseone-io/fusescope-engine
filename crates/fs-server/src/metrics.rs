@@ -536,9 +536,10 @@ impl Metrics {
             counter(
                 out,
                 "fusescope_query_metadata_lookups_total",
-                "metadata.* actions served",
+                "metadata.* and metrics.label_* actions served",
                 q.metadata_lookups.load(Ordering::Relaxed),
             );
+            render_metric_queries(out, q);
             counter(
                 out,
                 "fusescope_query_plannings_total",
@@ -616,6 +617,39 @@ fn render_usage(out: &mut String, c: &fs_compactor::CompactorStats) {
         "Most bytes of usage counts one pass held at once since start",
         c.usage_peak_bytes.load(Ordering::Relaxed),
     );
+}
+
+fn render_metric_queries(out: &mut String, q: &fs_query::QueryStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    for (name, help, value) in [
+        (
+            "fusescope_query_metric_selects_total",
+            "metrics.select actions served",
+            load(&q.metric_selects),
+        ),
+        (
+            "fusescope_query_metric_ambiguous_total",
+            "Selects refused because a series held more than one identity",
+            load(&q.metric_ambiguous),
+        ),
+        (
+            "fusescope_query_metric_index_fetches_total",
+            "Postings sidecars fetched from the bucket",
+            load(&q.metric_index_fetches),
+        ),
+        (
+            "fusescope_query_metric_index_misses_total",
+            "Series files read without postings: none, unusable or no room",
+            load(&q.metric_index_misses),
+        ),
+        (
+            "fusescope_query_metric_index_pruned_total",
+            "Series files a metric action left unread by their postings",
+            load(&q.metric_index_pruned),
+        ),
+    ] {
+        counter(out, name, help, value);
+    }
 }
 
 fn render_metric_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
@@ -1331,6 +1365,11 @@ mod tests {
         query.plannings.fetch_add(2, Ordering::Relaxed);
         query.trace_lookups.fetch_add(3, Ordering::Relaxed);
         query.metadata_lookups.fetch_add(4, Ordering::Relaxed);
+        query.metric_selects.fetch_add(11, Ordering::Relaxed);
+        query.metric_ambiguous.fetch_add(12, Ordering::Relaxed);
+        query.metric_index_fetches.fetch_add(13, Ordering::Relaxed);
+        query.metric_index_misses.fetch_add(14, Ordering::Relaxed);
+        query.metric_index_pruned.fetch_add(15, Ordering::Relaxed);
         query.prepared.store(5, Ordering::Relaxed);
         query.prepared_bytes.store(9, Ordering::Relaxed);
         metrics.register_query(query);
@@ -1347,6 +1386,15 @@ mod tests {
             page.contains("fusescope_query_metadata_lookups_total 4\n"),
             "{page}"
         );
+        for line in [
+            "fusescope_query_metric_selects_total 11\n",
+            "fusescope_query_metric_ambiguous_total 12\n",
+            "fusescope_query_metric_index_fetches_total 13\n",
+            "fusescope_query_metric_index_misses_total 14\n",
+            "fusescope_query_metric_index_pruned_total 15\n",
+        ] {
+            assert!(page.contains(line), "{line}{page}");
+        }
         assert!(
             page.contains(
                 "# TYPE fusescope_query_prepared_plans gauge\nfusescope_query_prepared_plans 5\n"

@@ -696,6 +696,21 @@ pub struct QuerySection {
     /// disables them and every search reads every file the catalog keeps.
     #[serde(default = "default_text_index_cache_bytes")]
     pub text_index_cache_bytes: usize,
+    /// Decoded postings of metric series files kept in memory for metric
+    /// selectors, at most 1 GiB. Zero disables them and every selector
+    /// reads every series file of its window.
+    #[serde(default = "default_metric_index_cache_bytes")]
+    pub metric_index_cache_bytes: usize,
+    /// Most series a `metrics.select` resolves, 1 to 1 000 000.
+    #[serde(default = "default_metrics_max_series")]
+    pub metrics_max_series: usize,
+    /// Most matchers a metric action carries, 1 to 1024.
+    #[serde(default = "default_metrics_max_matchers")]
+    pub metrics_max_matchers: usize,
+    /// Most bytes of regex a metric action's matchers carry together, 1 to
+    /// 1 MiB.
+    #[serde(default = "default_metrics_max_regex_bytes")]
+    pub metrics_max_regex_bytes: usize,
     /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
     /// oldest is dropped and its ticket plans again.
     #[serde(default = "default_prepared_plans")]
@@ -718,6 +733,10 @@ impl Default for QuerySection {
             spill_dir: None,
             trace_index_cache_bytes: default_trace_index_cache_bytes(),
             text_index_cache_bytes: default_text_index_cache_bytes(),
+            metric_index_cache_bytes: default_metric_index_cache_bytes(),
+            metrics_max_series: default_metrics_max_series(),
+            metrics_max_matchers: default_metrics_max_matchers(),
+            metrics_max_regex_bytes: default_metrics_max_regex_bytes(),
             prepared_plans: default_prepared_plans(),
             prepared_bytes: default_prepared_bytes(),
             prepared_ttl_secs: default_prepared_ttl(),
@@ -734,6 +753,10 @@ impl QuerySection {
             max_rows: self.max_rows,
             trace_index_cache_bytes: self.trace_index_cache_bytes,
             text_index_cache_bytes: self.text_index_cache_bytes,
+            metric_index_cache_bytes: self.metric_index_cache_bytes,
+            metrics_max_series: self.metrics_max_series,
+            metrics_max_matchers: self.metrics_max_matchers,
+            metrics_max_regex_bytes: self.metrics_max_regex_bytes,
             prepared_plans: self.prepared_plans,
             prepared_bytes: self.prepared_bytes,
             prepared_ttl: std::time::Duration::from_secs(self.prepared_ttl_secs),
@@ -748,6 +771,22 @@ fn default_trace_index_cache_bytes() -> usize {
 
 fn default_text_index_cache_bytes() -> usize {
     256 * 1024 * 1024
+}
+
+fn default_metric_index_cache_bytes() -> usize {
+    fs_query::QueryLimits::default().metric_index_cache_bytes
+}
+
+fn default_metrics_max_series() -> usize {
+    fs_query::QueryLimits::default().metrics_max_series
+}
+
+fn default_metrics_max_matchers() -> usize {
+    fs_query::QueryLimits::default().metrics_max_matchers
+}
+
+fn default_metrics_max_regex_bytes() -> usize {
+    fs_query::QueryLimits::default().metrics_max_regex_bytes
 }
 
 fn default_prepared_plans() -> usize {
@@ -1524,11 +1563,23 @@ impl Config {
         Ok(())
     }
 
-    /// Checks internal consistency. Connectivity is checked by the server.
-    ///
-    /// # Errors
-    /// A description of the first problem found.
-    pub fn validate(&self, secrets: &Secrets) -> Result<(), ServerError> {
+    fn validate_metric_queries(&self) -> Result<(), ServerError> {
+        use fs_query::metric_select::{MAX_MATCHERS, MAX_REGEX_BYTES, MAX_SERIES};
+        let query = &self.query;
+        if query.metric_index_cache_bytes > fs_query::metric_index::MetricIndexCache::MAX_BYTES
+            || !(1..=MAX_SERIES).contains(&query.metrics_max_series)
+            || !(1..=MAX_MATCHERS).contains(&query.metrics_max_matchers)
+            || !(1..=MAX_REGEX_BYTES).contains(&query.metrics_max_regex_bytes)
+        {
+            return Err(ServerError::InvalidConfig(format!(
+                "query.metric_index_cache_bytes must be at most {}, query.metrics_max_series between 1 and {MAX_SERIES}, query.metrics_max_matchers between 1 and {MAX_MATCHERS}, query.metrics_max_regex_bytes between 1 and {MAX_REGEX_BYTES}",
+                fs_query::metric_index::MetricIndexCache::MAX_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_bucket(&self, secrets: &Secrets) -> Result<(), ServerError> {
         let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
         match self.bucket.kind {
             BucketKind::S3 => {
@@ -1557,6 +1608,16 @@ impl Config {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Checks internal consistency. Connectivity is checked by the server.
+    ///
+    /// # Errors
+    /// A description of the first problem found.
+    pub fn validate(&self, secrets: &Secrets) -> Result<(), ServerError> {
+        let invalid = |m: &str| Err(ServerError::InvalidConfig(m.to_owned()));
+        self.validate_bucket(secrets)?;
         if self.catalog_url(secrets).is_none() {
             return invalid("catalog url missing: set FS_CATALOG_URL or catalog.url");
         }
@@ -1567,6 +1628,7 @@ impl Config {
             return invalid("wal.segment_max_bytes must be at least 1 MiB");
         }
         self.validate_compactor()?;
+        self.validate_metric_queries()?;
         self.ingest.to_ingest_config()?;
         if self.ingest.flush_rows == 0 || self.ingest.flush_bytes == 0 {
             return invalid("ingest.flush_rows and ingest.flush_bytes must be positive");
@@ -2105,6 +2167,59 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(config.validate(&secrets).is_ok(), ok, "{bytes}");
+        }
+    }
+
+    #[test]
+    fn metric_query_limits_are_configured_and_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let keys = "[query]\nmetric_index_cache_bytes = 0\nmetrics_max_series = 7\nmetrics_max_matchers = 8\nmetrics_max_regex_bytes = 9\n";
+        let config = Config::parse(&format!("{MINIMAL}{keys}")).unwrap();
+        config.validate(&secrets).unwrap();
+        let limits = config.query.to_limits();
+        assert_eq!(
+            (
+                limits.metric_index_cache_bytes,
+                limits.metrics_max_series,
+                limits.metrics_max_matchers,
+                limits.metrics_max_regex_bytes
+            ),
+            (0, 7, 8, 9)
+        );
+        let defaults = Config::parse(MINIMAL).unwrap().query.to_limits();
+        let expected = fs_query::QueryLimits::default();
+        assert_eq!(
+            (
+                defaults.metric_index_cache_bytes,
+                defaults.metrics_max_series,
+                defaults.metrics_max_matchers,
+                defaults.metrics_max_regex_bytes
+            ),
+            (
+                expected.metric_index_cache_bytes,
+                expected.metrics_max_series,
+                expected.metrics_max_matchers,
+                expected.metrics_max_regex_bytes
+            )
+        );
+        for (key, value, ok) in [
+            ("metric_index_cache_bytes", 1 << 30, true),
+            ("metric_index_cache_bytes", (1 << 30) + 1, false),
+            ("metrics_max_series", 0, false),
+            ("metrics_max_series", 1_000_000, true),
+            ("metrics_max_series", 1_000_001, false),
+            ("metrics_max_matchers", 0, false),
+            ("metrics_max_matchers", 1024, true),
+            ("metrics_max_matchers", 1025, false),
+            ("metrics_max_regex_bytes", 0, false),
+            ("metrics_max_regex_bytes", 1 << 20, true),
+            ("metrics_max_regex_bytes", (1 << 20) + 1, false),
+        ] {
+            let config = Config::parse(&format!("{MINIMAL}[query]\n{key} = {value}\n")).unwrap();
+            assert_eq!(config.validate(&secrets).is_ok(), ok, "{key} = {value}");
         }
     }
 
