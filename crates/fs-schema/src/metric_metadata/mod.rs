@@ -216,12 +216,15 @@ pub struct RowOrder {
 }
 
 impl RowOrder {
-    /// Checks the next `batch` of the file, of format v1.
+    /// Checks the next `batch` of the file, of the columns and types of
+    /// format v1, whatever metadata its schema carries.
     ///
     /// # Errors
-    /// A row as above, or a batch of another layout.
+    /// A row as above, or a batch of other columns.
     pub fn check(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
-        check_schema(&batch.schema())?;
+        if batch.schema().fields() != schema().fields() {
+            return Err(OTHER);
+        }
         let text: Vec<&StringArray> = (0..5)
             .map(|i| batch.column(i).as_string_opt::<i32>().ok_or(OTHER))
             .collect::<Result<_, _>>()?;

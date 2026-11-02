@@ -813,13 +813,14 @@ mod sandbox {
             )
             .await
             .unwrap();
-        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 9]);
+        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 10]);
         assert_eq!(
             strings(&tables, "table_name"),
             [
                 "attribute_keys",
                 "log_attribute_keys",
                 "logs",
+                "metadata",
                 "samples",
                 "service_graph_1m",
                 "spans",

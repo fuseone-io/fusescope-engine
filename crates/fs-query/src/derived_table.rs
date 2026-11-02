@@ -53,8 +53,8 @@ pub type RowChecker =
 pub struct RowCheck {
     /// The columns `check` reads.
     pub columns: &'static [&'static str],
-    /// A checker for one file.
-    pub check: fn() -> RowChecker,
+    /// A checker for one file, of the schema its footer carries.
+    pub check: fn(&arrow::datatypes::Schema) -> RowChecker,
 }
 
 /// Per path, whether its footer and rows passed the checks, shared by every
@@ -163,7 +163,7 @@ impl DerivedTable {
             source,
         })?;
         if let Some(rows) = self.rows {
-            check_rows(store, file, size, rows).await?;
+            check_rows(store, file, size, (rows, &schema)).await?;
         }
         *done = true;
         Ok(())
@@ -175,7 +175,7 @@ async fn check_rows(
     store: &Arc<dyn ObjectStore>,
     file: &FileRecord,
     size: u64,
-    rows: RowCheck,
+    (rows, schema): (RowCheck, &arrow::datatypes::Schema),
 ) -> Result<(), QueryError> {
     let reader = Footer {
         store: Arc::clone(store),
@@ -190,7 +190,7 @@ async fn check_rows(
         .with_projection(mask)
         .build()
         .map_err(datafusion::error::DataFusionError::from)?;
-    let mut check = (rows.check)();
+    let mut check = (rows.check)(schema);
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(datafusion::error::DataFusionError::from)?;
         check(&batch).map_err(|source| QueryError::DerivedTable {

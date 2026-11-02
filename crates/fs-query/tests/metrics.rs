@@ -138,7 +138,10 @@ async fn write_set(
     };
     let rows = convert(request, &limits, &metrics, &checked, source).unwrap();
     let hour = Utc.timestamp_millis_opt(HOUR_MS).unwrap();
-    let layout = FileLayout::current(1024);
+    let layout = FileLayout {
+        version: FileLayout::METRIC_VERSION,
+        ..FileLayout::current(1024)
+    };
     let (samples_id, series_id) = (FileId::new(), FileId::new());
     let samples = prepare_samples(
         tenant,
@@ -313,6 +316,233 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
         total(&query(&fresh, other, "select count(*) from samples").await),
         1,
         "another tenant's sets are its own"
+    );
+    db.finish().await;
+}
+
+/// Registers `bytes` as a contribution of `signal` of `tenant` at `path`.
+async fn contribution(
+    catalog: &Catalog,
+    store: &LocalFileSystem,
+    (tenant, signal, path): (TenantId, fs_catalog::Signal, String),
+    bytes: Vec<u8>,
+) {
+    use object_store::ObjectStoreExt;
+    let id = FileId::new();
+    let hour = Utc.timestamp_millis_opt(HOUR_MS).unwrap();
+    store
+        .put(&Path::from(path.as_str()), bytes.clone().into())
+        .await
+        .unwrap();
+    let file = fs_catalog::NewFile {
+        id,
+        origin: id,
+        tenant_id: tenant,
+        signal,
+        level: fs_catalog::Level::L1,
+        path,
+        size_bytes: i64::try_from(bytes.len()).unwrap(),
+        row_count: 1,
+        range: fs_catalog::TimeRange {
+            start: hour,
+            end: hour + chrono::Duration::minutes(59),
+        },
+        services: Vec::new(),
+        summary: None,
+        content_sha256: None,
+        usage_accounted: true,
+    };
+    catalog.register_file(&file).await.unwrap();
+    catalog.confirm_file(id).await.unwrap();
+}
+
+fn metadata_of(first: i64, last: i64) -> Vec<u8> {
+    use fs_schema::metrics::{Datatype, LabelLevel, LabelMeta, MetricType, Temporality};
+    let row = fs_schema::metrics::SeriesRow {
+        fingerprint: 1,
+        unix_milli: HOUR_MS,
+        name: "cpu".into(),
+        kind: MetricType::Gauge,
+        temporality: Temporality::Unspecified,
+        monotonic: false,
+        unit: "".into(),
+        description: "".into(),
+        labels: vec![("host".into(), "a".into())].into(),
+        label_meta: vec![LabelMeta::native(LabelLevel::Resource, Datatype::Str)].into(),
+    };
+    let mut counts = fs_schema::metric_metadata::MetadataCounts::default();
+    counts.add_series(&row, (first, last), 0, usize::MAX);
+    fs_schema::metric_metadata::encode(&counts).unwrap()
+}
+
+/// `metadata` aggregates every contribution by its key, the least first
+/// and greatest last; a contribution out of its domain fails the query.
+#[tokio::test]
+async fn metadata_aggregates_its_contributions_and_refuses_a_damaged_one() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let path = |n: u8| {
+        format!(
+            "t/{}/metrics/derived/metric_metadata/dt=2026-10-24/hr=14/{}.parquet",
+            tenant.0,
+            uuid::Uuid::from_bytes([n; 16])
+        )
+    };
+    let signal = fs_catalog::Signal::MetricMetadata;
+    contribution(
+        &db.catalog,
+        &store,
+        (tenant, signal, path(1)),
+        metadata_of(HOUR_MS + 5, HOUR_MS + 9),
+    )
+    .await;
+    contribution(
+        &db.catalog,
+        &store,
+        (tenant, signal, path(2)),
+        metadata_of(HOUR_MS + 1, HOUR_MS + 7),
+    )
+    .await;
+    let querier = Querier::new(
+        db.catalog.clone(),
+        store.clone(),
+        None,
+        QueryLimits::default(),
+    )
+    .unwrap();
+    let rows = query(
+        &querier,
+        tenant,
+        "select attr_type, attr_datatype, first_reported_unix_milli, last_reported_unix_milli
+         from metadata where metric_name = 'cpu' and attr_name = 'host'",
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1,
+        "one row a key"
+    );
+    let batch = &rows[0];
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "resource");
+    assert_eq!(batch.column(1).as_string::<i32>().value(0), "Str");
+    assert_eq!(
+        batch.column(2).as_primitive::<Int64Type>().value(0),
+        HOUR_MS + 1
+    );
+    assert_eq!(
+        batch.column(3).as_primitive::<Int64Type>().value(0),
+        HOUR_MS + 9
+    );
+
+    let other = Querier::new(
+        db.catalog.clone(),
+        store.clone(),
+        None,
+        QueryLimits::default(),
+    )
+    .unwrap();
+    let reversed = {
+        use arrow::array::{Int64Array, StringArray};
+        let schema = fs_schema::metric_metadata::schema();
+        let text = |v: &str| -> arrow::array::ArrayRef { Arc::new(StringArray::from(vec![v])) };
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                text("cpu"),
+                text("host"),
+                text("resource"),
+                text("Str"),
+                text("b"),
+                Arc::new(Int64Array::from(vec![HOUR_MS + 9])),
+                Arc::new(Int64Array::from(vec![HOUR_MS + 1])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            datafusion::parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.into_inner().unwrap()
+    };
+    contribution(&db.catalog, &store, (tenant, signal, path(3)), reversed).await;
+    let err = other
+        .collect(tenant, "select count(*) from metadata")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("first reported after its last"), "{err}");
+    db.finish().await;
+}
+
+/// A contribution of format v2 counts metric samples beside v1 ones.
+#[tokio::test]
+async fn usage_1h_reads_metric_samples_of_format_v2() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let tenant = db
+        .catalog
+        .create_tenant(&NewTenant::with_defaults("acme"))
+        .await
+        .unwrap()
+        .id;
+    let mut counts = fs_schema::usage::UsageCounts::new(fs_schema::usage::UsageSignal::Samples);
+    let hour = HOUR_MS * 1_000_000;
+    counts
+        .add_samples((hour, Some("api")), 3, 69, usize::MAX)
+        .unwrap();
+    let bytes = fs_schema::usage::encode_hour(&counts, hour).unwrap();
+    let path = format!(
+        "t/{}/derived/usage_1h/dt=2026-10-24/hr=14/{}.parquet",
+        tenant.0,
+        uuid::Uuid::now_v7()
+    );
+    contribution(
+        &db.catalog,
+        &store,
+        (tenant, fs_catalog::Signal::Usage1h, path),
+        bytes,
+    )
+    .await;
+    let querier = Querier::new(
+        db.catalog.clone(),
+        store.clone(),
+        None,
+        QueryLimits::default(),
+    )
+    .unwrap();
+    let rows = query(&querier, tenant, "select signal, rows, bytes from usage_1h").await;
+    let batch = &rows[0];
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::UInt8Type>()
+            .value(0),
+        3
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0),
+        3
+    );
+    assert_eq!(
+        batch
+            .column(2)
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0),
+        69
     );
     db.finish().await;
 }

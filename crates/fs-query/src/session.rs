@@ -18,7 +18,7 @@ use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use fs_catalog::{Signal, TenantId};
 use fs_schema::attribute_keys::{self, KeyTable};
-use fs_schema::{service_graph, trace_summary, usage};
+use fs_schema::{metric_metadata, service_graph, trace_summary, usage};
 
 use crate::QueryError;
 use crate::derived_table::{DerivedTable, RowCheck, SchemaCheck, VerifiedPaths};
@@ -138,6 +138,15 @@ pub fn tenant_session(
         ),
     )?;
     schema.register_table(
+        metric_metadata::TABLE.into(),
+        metadata_table(
+            tenant,
+            Arc::clone(&cache),
+            store_url.clone(),
+            Arc::clone(&verified),
+        )?,
+    )?;
+    schema.register_table(
         usage::TABLE.into(),
         usage_table(tenant, cache, store_url.clone(), verified)?,
     )?;
@@ -202,6 +211,65 @@ fn register_signal_tables(
     Ok(())
 }
 
+/// The tenant's `metadata`: every contribution of `metric_metadata`, one
+/// row a metric, attribute, level, type and value, first reported the
+/// least and last the greatest.
+fn metadata_table(
+    tenant: TenantId,
+    cache: Arc<FileCache>,
+    store_url: ObjectStoreUrl,
+    verified: VerifiedPaths,
+) -> Result<Arc<dyn TableProvider>, QueryError> {
+    use datafusion::functions_aggregate::expr_fn::{max, min};
+    use datafusion::logical_expr::{LogicalPlanBuilder, col};
+    use metric_metadata::columns;
+
+    let contributions = DerivedTable::new(
+        tenant,
+        cache,
+        store_url,
+        Signal::MetricMetadata,
+        metric_metadata::schema(),
+        metric_metadata::check_schema,
+        verified,
+    )
+    .with_row_check(RowCheck {
+        columns: &[
+            columns::METRIC_NAME,
+            columns::ATTR_NAME,
+            columns::ATTR_TYPE,
+            columns::ATTR_DATATYPE,
+            columns::ATTR_STRING_VALUE,
+            columns::FIRST_REPORTED,
+            columns::LAST_REPORTED,
+        ],
+        check: |_| {
+            let mut order = metric_metadata::RowOrder::default();
+            Box::new(move |batch| order.check(batch))
+        },
+    });
+    let plan = LogicalPlanBuilder::scan(
+        metric_metadata::TABLE,
+        datafusion::datasource::provider_as_source(Arc::new(contributions)),
+        None,
+    )?
+    .aggregate(
+        vec![
+            col(columns::METRIC_NAME),
+            col(columns::ATTR_NAME),
+            col(columns::ATTR_TYPE),
+            col(columns::ATTR_DATATYPE),
+            col(columns::ATTR_STRING_VALUE),
+        ],
+        vec![
+            min(col(columns::FIRST_REPORTED)).alias(columns::FIRST_REPORTED),
+            max(col(columns::LAST_REPORTED)).alias(columns::LAST_REPORTED),
+        ],
+    )?
+    .build()?;
+    Ok(Arc::new(datafusion::datasource::ViewTable::new(plan, None)))
+}
+
 /// The tenant's `usage_1h`: every contribution summed, one row per
 /// signal, service and hour.
 fn usage_table(
@@ -226,8 +294,9 @@ fn usage_table(
     .with_time_columns(&[columns::HOUR])
     .with_row_check(RowCheck {
         columns: usage::ROW_KEY_COLUMNS,
-        check: || {
-            let mut order = usage::RowOrder::default();
+        check: |schema| {
+            let version = usage::schema_version(schema).unwrap_or(usage::SCHEMA_VERSION);
+            let mut order = usage::RowOrder::of_version(version);
             Box::new(move |batch| order.check(batch))
         },
     });
@@ -266,7 +335,7 @@ fn keys_table(
             |schema| attribute_keys::check_schema(schema, KeyTable::Spans).map(|_| ()),
             RowCheck {
                 columns: KEY_ROW_COLUMNS,
-                check: || Box::new(|batch| attribute_keys::check_rows(batch, KeyTable::Spans)),
+                check: |_| Box::new(|batch| attribute_keys::check_rows(batch, KeyTable::Spans)),
             },
         ),
         KeyTable::Logs => (
@@ -274,7 +343,7 @@ fn keys_table(
             |schema| attribute_keys::check_schema(schema, KeyTable::Logs).map(|_| ()),
             RowCheck {
                 columns: KEY_ROW_COLUMNS,
-                check: || Box::new(|batch| attribute_keys::check_rows(batch, KeyTable::Logs)),
+                check: |_| Box::new(|batch| attribute_keys::check_rows(batch, KeyTable::Logs)),
             },
         ),
     };
