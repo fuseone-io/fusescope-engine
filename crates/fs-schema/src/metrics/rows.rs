@@ -117,7 +117,19 @@ impl SeriesRow {
     /// Whether `other` is this series in this hour: one key and agreeing
     /// levels.
     pub fn same_series(&self, other: &Self) -> bool {
-        self.key_order(other) == Ordering::Equal
+        self.unix_milli == other.unix_milli && self.same_identity(other)
+    }
+
+    /// Whether `other` is this series in any hour: one identity, the
+    /// levels of its labels agreeing.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.fingerprint == other.fingerprint
+            && self.kind == other.kind
+            && self.temporality == other.temporality
+            && self.monotonic == other.monotonic
+            && self.unit == other.unit
+            && self.labels == other.labels
             && self.label_meta.len() == other.label_meta.len()
             && self
                 .label_meta
