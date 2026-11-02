@@ -1083,9 +1083,15 @@ compactors with `compact_l2` off, then `compact_l2` on.
 
 ### 7.3 Usage
 
-`usage_1h` holds, per tenant, signal (spans 1, logs 2), service and hour,
-the rows and the usage logical bytes (version 1, `fs_schema::usage`) that
-reached the engine. The logical bytes of a row are the payload of its
+`usage_1h` holds, per tenant, signal (spans 1, logs 2, metric samples 3),
+service and hour, the rows and the usage logical bytes (version 1,
+`fs_schema::usage`) that reached the engine. A metric sample costs its
+name's bytes, its time (8), value (8) and flags (4), never its series, so
+the cost of a stream does not depend on how often it was flushed; its
+service is the `service.name` label of its series. Contributions of spans
+and logs are written in format v1, those of samples in format v2, the
+same layout under version 2, which a reader of v1 refuses: queriers roll
+out first. The logical bytes of a row are the payload of its
 fields after the ingest limits: a primitive by its width, a string or a
 binary by its bytes, a map by its keys and values, recursively; they leave
 out compression, offsets, validity, dictionaries and Parquet overhead, and

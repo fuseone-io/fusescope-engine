@@ -321,3 +321,104 @@ fn a_full_count_is_set_aside_before_a_new_key_would_pass_the_budget() {
     );
     assert_eq!(some.len(), services.len() / 2, "only the rows taken");
 }
+
+/// A batch of samples of `names`, at `ms` each.
+fn samples(names: &[&str], ms: i64) -> RecordBatch {
+    use crate::metrics::{SOURCE_ORDER_BYTES, samples_schema_v1};
+    use arrow::array::{
+        FixedSizeBinaryArray, Float64Array, Int64Array, StringDictionaryBuilder, UInt32Array,
+    };
+    let n = names.len();
+    let mut name = StringDictionaryBuilder::<arrow::datatypes::Int32Type>::new();
+    let mut temporality = StringDictionaryBuilder::<arrow::datatypes::Int32Type>::new();
+    for each in names {
+        name.append_value(each);
+        temporality.append_value("Cumulative");
+    }
+    RecordBatch::try_new(
+        samples_schema_v1(),
+        vec![
+            Arc::new(name.finish()),
+            Arc::new(temporality.finish()),
+            Arc::new(UInt64Array::from(vec![7u64; n])),
+            Arc::new(Int64Array::from(vec![ms; n])),
+            Arc::new(Float64Array::from(vec![1.5; n])),
+            Arc::new(UInt32Array::from(vec![0u32; n])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(
+                    [9u8; SOURCE_ORDER_BYTES],
+                    n,
+                ))
+                .unwrap(),
+            ),
+        ],
+    )
+    .unwrap()
+}
+
+/// A sample costs its name, time, value and flags, never its
+/// fingerprint, temporality or source order; its service is the one
+/// given, its hour that of its time. Samples are written in format v2.
+#[test]
+fn a_metric_sample_counts_its_name_time_value_and_flags() {
+    let ms = 1_792_678_623_000i64;
+    let batch = samples(&["cpu", "memory"], ms);
+    assert_eq!(
+        row_bytes(&batch, UsageSignal::Samples).unwrap(),
+        [3 + 20, 6 + 20]
+    );
+    let services: ArrayRef = Arc::new(StringArray::from(vec![Some("api"), None]));
+    let rows = UsageRows::samples(&batch, &services).unwrap();
+    let mut counts = UsageCounts::new(UsageSignal::Samples);
+    assert!(
+        counts
+            .absorb_from(&rows, 0, usize::MAX, None)
+            .unwrap()
+            .is_none()
+    );
+    let hour = ms.div_euclid(3_600_000) * 3_600_000_000_000;
+    assert_eq!(counts.hours(), [hour]);
+    let encoded = encode_hour(&counts, hour).unwrap();
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(encoded.clone())).unwrap();
+    assert_eq!(schema_version(reader.schema()).unwrap(), SCHEMA_VERSION_V2);
+    assert_eq!(
+        decode(bytes::Bytes::from(encoded)).unwrap(),
+        [
+            (3, None, hour, 1, 26),
+            (3, Some("api".to_owned()), hour, 1, 23)
+        ]
+    );
+    let short: ArrayRef = Arc::new(StringArray::from(vec![Some("api")]));
+    assert!(UsageRows::samples(&batch, &short).is_err());
+}
+
+/// Format v1 admits spans and logs only, v2 metric samples too, and
+/// neither another signal.
+#[test]
+fn metric_samples_are_admitted_in_format_v2_only() {
+    let hour = 1_792_677_600_000_000_000i64;
+    let mut v1 = RowOrder::default();
+    let mut v2 = RowOrder::of_version(SCHEMA_VERSION_V2);
+    let batch = |signal: u8| {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(UInt8Array::from(vec![signal])),
+                Arc::new(StringArray::from(vec![Some("api")])),
+                Arc::new(TimestampNanosecondArray::from(vec![hour]).with_timezone("UTC")),
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(UInt64Array::from(vec![1u64])),
+            ],
+        )
+        .unwrap()
+    };
+    assert!(v1.check(&batch(3)).is_err());
+    assert!(v2.check(&batch(3)).is_ok());
+    assert!(
+        RowOrder::of_version(SCHEMA_VERSION_V2)
+            .check(&batch(4))
+            .is_err()
+    );
+    assert!(check_schema(&schema_v2()).is_ok());
+}

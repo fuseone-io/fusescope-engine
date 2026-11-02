@@ -9,8 +9,15 @@
 //! the columns derived from others ([`derived_columns`]). Every sum is
 //! checked: an overflow is an error, never a saturated count.
 //!
+//! The usage logical bytes of a metric sample, version 1, are its name's
+//! bytes, its time (8), value (8) and flags (4): its fingerprint,
+//! temporality and source order are derived or the engine's own, and its
+//! series, labels included, is not charged, so what a stream costs does
+//! not depend on how often it was flushed.
+//!
 //! A contribution is the counts of one pass for one hour, written as one
-//! file of format v1; the table sums every contribution.
+//! file: format v1 for spans and logs, v2, which adds metric samples, for
+//! samples. The table sums every contribution.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -29,8 +36,10 @@ use crate::SchemaError;
 
 /// Version of the usage logical bytes.
 pub const BYTES_VERSION: u32 = 1;
-/// Version of the contribution format.
+/// Version of the contribution format of spans and logs.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Version of the contribution format that admits metric samples.
+pub const SCHEMA_VERSION_V2: u32 = 2;
 /// `fusescope.signal` of a contribution.
 pub const SIGNAL: &str = "usage_1h";
 /// SQL table name.
@@ -38,7 +47,7 @@ pub const TABLE: &str = "usage_1h";
 
 /// Column names of a contribution.
 pub mod columns {
-    /// Signal code of the rows counted: 1 spans, 2 logs.
+    /// Signal code of the rows counted: 1 spans, 2 logs, 3 metric samples.
     pub const SIGNAL: &str = "signal";
     /// Service of the rows, null for rows without one.
     pub const SERVICE_NAME: &str = "service_name";
@@ -59,6 +68,8 @@ pub enum UsageSignal {
     Spans,
     /// Log rows, signal 2.
     Logs,
+    /// Metric samples, signal 3, counted in format v2.
+    Samples,
 }
 
 impl UsageSignal {
@@ -67,6 +78,15 @@ impl UsageSignal {
         match self {
             Self::Spans => 1,
             Self::Logs => 2,
+            Self::Samples => 3,
+        }
+    }
+
+    /// The contribution format its counts are written in.
+    pub fn schema_version(self) -> u32 {
+        match self {
+            Self::Spans | Self::Logs => SCHEMA_VERSION,
+            Self::Samples => SCHEMA_VERSION_V2,
         }
     }
 }
@@ -88,6 +108,10 @@ pub fn derived_columns(signal: UsageSignal) -> Vec<&'static str> {
         }
         UsageSignal::Logs => {
             out.extend(crate::logs::LOG_PROMOTED.iter().map(|p| p.column));
+        }
+        UsageSignal::Samples => {
+            use crate::metrics::col;
+            out.extend([col::TEMPORALITY, col::FINGERPRINT, col::SOURCE_ORDER]);
         }
     }
     out
@@ -247,6 +271,38 @@ impl UsageRows {
             sizes,
             hours,
             services,
+        })
+    }
+
+    /// The samples of `batch`, a batch of the samples schema, each of
+    /// the service in `services`, one a sample, null for none.
+    ///
+    /// # Errors
+    /// A batch without `unix_milli`, services of another length, a type
+    /// the version does not size, or an overflow.
+    pub fn samples(batch: &RecordBatch, services: &ArrayRef) -> Result<Self, SchemaError> {
+        if services.len() != batch.num_rows() {
+            return Err(SchemaError::Layout("usage: a service for every sample"));
+        }
+        let sizes = row_bytes(batch, UsageSignal::Samples)?;
+        let hours = batch
+            .column_by_name(crate::metrics::col::UNIX_MILLI)
+            .ok_or(SchemaError::Layout("usage: no unix_milli column"))?
+            .as_primitive_opt::<arrow::datatypes::Int64Type>()
+            .ok_or(SchemaError::Layout("usage: unix_milli is not Int64"))?
+            .values()
+            .iter()
+            .map(|ms| {
+                ms.div_euclid(3_600_000)
+                    .checked_mul(HOUR_NANOS)
+                    .ok_or(OVERFLOW)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            signal: UsageSignal::Samples,
+            sizes,
+            hours,
+            services: arrow::compute::cast(services, &DataType::Utf8)?,
         })
     }
 
@@ -461,7 +517,7 @@ impl UsageCounts {
         unnamed.into_iter().chain(named)
     }
 
-    /// The contribution of `hour` as a batch of format v1.
+    /// The contribution of `hour` as a batch of its signal's format.
     ///
     /// # Errors
     /// Arrow failure.
@@ -481,54 +537,79 @@ impl UsageCounts {
                 rows.iter().map(|r| r.2).collect::<Vec<_>>(),
             )),
         ];
-        Ok(RecordBatch::try_new(schema(), columns)?)
+        Ok(RecordBatch::try_new(
+            schema_of(self.signal.schema_version()),
+            columns,
+        )?)
     }
 }
 
 /// Exact physical layout of format v1.
 pub fn schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
-    SCHEMA
-        .get_or_init(|| {
-            let metadata = [
-                ("fusescope.signal".to_owned(), SIGNAL.to_owned()),
-                (
-                    "fusescope.schema_version".to_owned(),
-                    SCHEMA_VERSION.to_string(),
-                ),
-                (
-                    "fusescope.usage_bytes_version".to_owned(),
-                    BYTES_VERSION.to_string(),
-                ),
-            ];
-            Arc::new(Schema::new_with_metadata(
-                vec![
-                    Field::new(columns::SIGNAL, DataType::UInt8, false),
-                    Field::new(columns::SERVICE_NAME, DataType::Utf8, true),
-                    Field::new(
-                        columns::HOUR,
-                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                        false,
-                    ),
-                    Field::new(columns::ROWS, DataType::UInt64, false),
-                    Field::new(columns::BYTES, DataType::UInt64, false),
-                ],
-                metadata.into_iter().collect(),
-            ))
-        })
-        .clone()
+    SCHEMA.get_or_init(|| layout(SCHEMA_VERSION)).clone()
+}
+
+/// Exact physical layout of format v2: v1's, its version apart.
+pub fn schema_v2() -> SchemaRef {
+    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+    SCHEMA.get_or_init(|| layout(SCHEMA_VERSION_V2)).clone()
+}
+
+fn schema_of(version: u32) -> SchemaRef {
+    if version == SCHEMA_VERSION_V2 {
+        schema_v2()
+    } else {
+        schema()
+    }
+}
+
+fn layout(version: u32) -> SchemaRef {
+    let metadata = [
+        ("fusescope.signal".to_owned(), SIGNAL.to_owned()),
+        ("fusescope.schema_version".to_owned(), version.to_string()),
+        (
+            "fusescope.usage_bytes_version".to_owned(),
+            BYTES_VERSION.to_string(),
+        ),
+    ];
+    Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new(columns::SIGNAL, DataType::UInt8, false),
+            Field::new(columns::SERVICE_NAME, DataType::Utf8, true),
+            Field::new(
+                columns::HOUR,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(columns::ROWS, DataType::UInt64, false),
+            Field::new(columns::BYTES, DataType::UInt64, false),
+        ],
+        metadata.into_iter().collect(),
+    ))
 }
 
 /// Refuses another signal, version, physical type, order or nullability.
 ///
 /// # Errors
-/// The schema is not exactly format v1 with usage bytes v1.
+/// The schema is not exactly format v1 or v2 with usage bytes v1.
 pub fn check_schema(found: &Schema) -> Result<(), SchemaError> {
-    let expected = schema();
-    if found.metadata() != expected.metadata() || found.fields() != expected.fields() {
-        return Err(SchemaError::Layout("usage_1h format v1"));
-    }
-    Ok(())
+    schema_version(found).map(|_| ())
+}
+
+/// The format of a contribution's schema, checked as [`check_schema`]
+/// does.
+///
+/// # Errors
+/// As [`check_schema`].
+pub fn schema_version(found: &Schema) -> Result<u32, SchemaError> {
+    [SCHEMA_VERSION, SCHEMA_VERSION_V2]
+        .into_iter()
+        .find(|v| {
+            let expected = schema_of(*v);
+            found.metadata() == expected.metadata() && found.fields() == expected.fields()
+        })
+        .ok_or(SchemaError::Layout("usage_1h format v1 or v2"))
 }
 
 /// One row of a contribution: signal code, service, hour in nanoseconds,
@@ -538,18 +619,28 @@ pub type UsageRow = (u8, Option<String>, i64, u64, u64);
 /// The columns [`RowOrder`] reads.
 pub const ROW_KEY_COLUMNS: &[&str] = &[columns::SIGNAL, columns::SERVICE_NAME, columns::HOUR];
 
-/// Refuses rows a sum would misread: a signal other than spans or logs,
-/// an hour not on the hour, or keys out of the order [`encode_hour`]
-/// writes them, strictly ascending by `(signal, hour, service)` with no
-/// service first, which is how a `(signal, service, hour)` listed twice
-/// shows. Batch by batch, holding one key, so a file is checked in the
-/// memory of its largest batch.
+/// Refuses rows a sum would misread: a signal outside the format's, spans
+/// or logs in v1 and metric samples too in v2, an hour not on the hour,
+/// or keys out of the order [`encode_hour`] writes them, strictly
+/// ascending by `(signal, hour, service)` with no service first, which is
+/// how a `(signal, service, hour)` listed twice shows. Batch by batch,
+/// holding one key, so a file is checked in the memory of its largest
+/// batch. The default checks format v1.
 #[derive(Debug, Default)]
 pub struct RowOrder {
     last: Option<(u8, i64, Option<String>)>,
+    samples: bool,
 }
 
 impl RowOrder {
+    /// The check of a file of format `version`.
+    pub fn of_version(version: u32) -> Self {
+        Self {
+            last: None,
+            samples: version == SCHEMA_VERSION_V2,
+        }
+    }
+
     /// Checks the next `batch` of the file, with at least
     /// [`ROW_KEY_COLUMNS`].
     ///
@@ -576,9 +667,9 @@ impl RowOrder {
                 hour.value(i),
                 service.is_valid(i).then(|| service.value(i)),
             );
-            if !matches!(key.0, 1 | 2) {
+            if !(matches!(key.0, 1 | 2) || (self.samples && key.0 == 3)) {
                 return Err(SchemaError::Layout(
-                    "usage_1h row of a signal other than spans or logs",
+                    "usage_1h row of a signal outside its format",
                 ));
             }
             if key.1.rem_euclid(HOUR_NANOS) != 0 {
@@ -609,12 +700,12 @@ impl RowOrder {
     }
 }
 
-/// [`RowOrder`] over the whole file.
+/// [`RowOrder`] of format `version` over the whole file.
 ///
 /// # Errors
 /// As [`RowOrder::check`].
-pub fn check_rows(batches: &[RecordBatch]) -> Result<(), SchemaError> {
-    let mut order = RowOrder::default();
+pub fn check_rows(version: u32, batches: &[RecordBatch]) -> Result<(), SchemaError> {
+    let mut order = RowOrder::of_version(version);
     batches.iter().try_for_each(|batch| order.check(batch))
 }
 
@@ -637,12 +728,13 @@ pub fn encode_hour(counts: &UsageCounts, hour: i64) -> Result<Vec<u8>, SchemaErr
 /// Decodes and validates a contribution into `(signal, service, hour, rows, bytes)` rows.
 ///
 /// # Errors
-/// It is not a `usage_1h` format-v1 file, or [`check_rows`] refuses it.
+/// It is not a `usage_1h` file of format v1 or v2, or [`check_rows`]
+/// refuses it.
 pub fn decode(bytes: bytes::Bytes) -> Result<Vec<UsageRow>, SchemaError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
-    check_schema(builder.schema())?;
+    let version = schema_version(builder.schema())?;
     let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
-    check_rows(&batches)?;
+    check_rows(version, &batches)?;
     let mut out = Vec::new();
     for batch in batches {
         let signal = batch

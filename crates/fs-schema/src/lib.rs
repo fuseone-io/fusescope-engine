@@ -11,6 +11,7 @@ mod columns;
 pub mod fingerprint;
 pub mod limits;
 pub mod logs;
+pub mod metric_metadata;
 pub mod metrics;
 pub mod parquet;
 pub mod service_graph;
