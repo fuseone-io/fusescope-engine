@@ -80,7 +80,7 @@ impl<'a> Cursor<'a> {
         self.bytes.len().saturating_sub(self.at)
     }
 
-    pub(crate) fn take(&mut self, len: usize) -> Result<&[u8], IndexError> {
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], IndexError> {
         let end = self
             .at
             .checked_add(len)

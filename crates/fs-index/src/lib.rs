@@ -61,6 +61,16 @@ pub enum IndexError {
     NotBound(&'static str),
 }
 
+/// What decoding a sidecar allocates at most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeCost {
+    /// Heap the decoded sidecar keeps.
+    pub retained: usize,
+    /// Heap the decoder uses and frees on the way; the peak is at most
+    /// `retained + scratch`.
+    pub scratch: usize,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

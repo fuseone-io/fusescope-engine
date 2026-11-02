@@ -20,8 +20,8 @@
 
 use std::ops::Range;
 
-use crate::IndexError;
 use crate::frame::{self, Cursor, HEADER_LEN};
+use crate::{DecodeCost, IndexError};
 
 /// Bytes of a trace id.
 pub const TRACE_ID_BYTES: usize = 16;
@@ -274,16 +274,6 @@ pub fn sidecar_path(parquet: &str) -> Option<String> {
 
 /// Bytes of one `String` beyond its characters.
 const STRING_OVERHEAD: usize = 24;
-
-/// What decoding a sidecar allocates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodeCost {
-    /// Heap the decoded index keeps: its entries and file paths.
-    pub retained: usize,
-    /// Scratch the decoder uses and frees: the slice of path references
-    /// sorted to check for duplicates.
-    pub scratch: usize,
-}
 
 /// Bytes `has_duplicates` allocates for `files` paths: one reference per
 /// path, exactly, and nothing for fewer than two.

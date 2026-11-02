@@ -23,8 +23,10 @@ use std::collections::BTreeMap;
 
 use roaring::RoaringBitmap;
 
-use crate::IndexError;
 use crate::frame::{self, Cursor};
+use crate::{DecodeCost, IndexError};
+
+mod cost;
 
 /// Format version this engine writes and reads.
 pub const VERSION: u8 = 1;
@@ -253,6 +255,15 @@ impl Postings {
             return Err(IndexError::BadBody("bytes after the last key"));
         }
         Ok(Self { entries })
+    }
+
+    /// What [`decode`](Self::decode) allocates for `bytes` at most, found
+    /// without allocating, so a reader can reserve it first.
+    ///
+    /// # Errors
+    /// Whatever `decode` refuses but a binding other than the expected one.
+    pub fn decode_cost(bytes: &[u8]) -> Result<DecodeCost, IndexError> {
+        cost::decode_cost(bytes)
     }
 
     /// The rows holding `key` with `value`, `None` for none.
