@@ -1170,10 +1170,15 @@ valid, and the next level, or the reader, deduplicates.
 Every byte a pass holds is admitted against one budget,
 `compactor.metric_pass_bytes` (512 MiB, clamped within 16 MiB and 8 GiB by
 the compactor itself), split in sixteenths: inputs four (each file's
-metadata and costliest row in one half, its chunks, planned from the page
-index, in the other), the samples file four, the series file two, its
-postings two, metadata two, usage one, the row groups being gathered and
-the key's series rows one. A part's allocation is admitted before it is
+metadata and costliest row in a third, its chunks, planned from the page
+index, in a third, and in the last the series row each input decodes and
+the rows of the key being merged, each admitted, by a size found from the
+batch's arrays, before it is decoded), the samples file four, the series
+file two, its postings two, metadata two (the key an entry is looked up by
+admitted before it grows), usage one, the row groups being gathered one.
+Every file's footer is checked, signal, version and columns, before
+anything is planned: a version this engine does not read fails the pass
+with its inputs visible. A part's allocation is admitted before it is
 made; a unit whose oldest set cannot be read within the inputs' share is
 passed over and counted (`fusescope_compaction_metric_over_budget_total`).
 The highest total a pass held is `fusescope_compaction_metric_peak_bytes`.

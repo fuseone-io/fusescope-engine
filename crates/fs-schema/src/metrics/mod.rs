@@ -22,7 +22,8 @@ pub use expand::{
 pub use identity::{LE, NAME, QUANTILE, SCOPE_NAME, SCOPE_SCHEMA_URL, SCOPE_VERSION, TEMPORALITY};
 pub use label_meta::{Conflict, Datatype, LabelLevel, LabelMeta};
 pub use rows::{
-    MetricRows, SeriesRow, dedupe_series, series_batch, series_batch_of, series_rows, with_source,
+    MetricRows, SeriesRow, dedupe_series, series_batch, series_batch_of, series_row_sizes,
+    series_rows, with_source,
 };
 pub use schema::{
     SAMPLES_SCHEMA_VERSION, SERIES_SCHEMA_VERSION, check_samples_schema, col, samples_schema_v1,

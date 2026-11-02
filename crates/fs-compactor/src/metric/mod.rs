@@ -207,7 +207,7 @@ impl Compactor {
             let version = series_schema_version(footer(&series)?.as_ref())?;
             let more = samples_layout.metadata_bytes + series_layout.metadata_bytes;
             let floor = 2 * (samples_layout.floor + series_layout.floor);
-            if metadata + floors + more + floor > share / 2 {
+            if metadata + floors + more + floor > share / 3 {
                 break;
             }
             metadata += more;
@@ -222,11 +222,12 @@ impl Compactor {
         if opened.is_empty() {
             return Ok(None);
         }
-        // Half the share is the files' metadata and their costliest rows,
-        // admitted above; the other half their chunks, each read as two at
-        // most, so no file's chunk passes what is held for it.
+        // A third of the share is the files' metadata and their costliest
+        // rows, admitted above; a third their chunks, each read as two at
+        // most, so no file's chunk passes what is held for it; a third the
+        // rows the inputs decode and the key's, admitted as they are.
         let files = 2 * opened.len();
-        let chunk = (share / 2) / (2 * files);
+        let chunk = (share / 3) / (2 * files);
         let held: usize = opened
             .iter()
             .map(|(_, (_, sl), (_, rl, _))| 2 * (chunk.max(sl.floor) + chunk.max(rl.floor)))
@@ -261,6 +262,7 @@ impl Compactor {
                 .into_iter()
                 .map(|(set, samples, series)| (samples, series, !set.samples.usage_accounted))
                 .collect(),
+            &mut budget,
         )
         .await?;
         let mut run = Run {
@@ -288,7 +290,7 @@ impl Compactor {
         };
         let mut writer = run.new_writer(&budget)?;
         while let Some(key) = merge.next_key()? {
-            let (series, collided) = merge.take_series(&key).await?;
+            let (series, collided) = merge.take_series(&key, &mut budget).await?;
             merge.start_group();
             run.group(
                 &mut merge,
@@ -309,6 +311,8 @@ impl Compactor {
             if let Some(w) = writer.as_mut() {
                 w.end_group(&mut budget);
             }
+            drop(series);
+            merge.end_group(&mut budget);
         }
         if let Some(w) = writer.take().filter(|w| !w.is_empty()) {
             run.close(w, &mut budget).await?;

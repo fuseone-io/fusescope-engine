@@ -18,10 +18,11 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt32Type, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use fs_schema::metrics::{
-    SOURCE_ORDER_BYTES, SOURCE_ORDER_WIDTH, SeriesRow, Temporality, col, series_rows,
-    series_schema_v1, series_schema_v2,
+    SOURCE_ORDER_BYTES, SOURCE_ORDER_WIDTH, SeriesRow, Temporality, col, series_row_sizes,
+    series_rows, series_schema_v1, series_schema_v2,
 };
 
+use super::budget::{Budget, Part};
 use crate::CompactError;
 use crate::read;
 
@@ -136,11 +137,16 @@ impl SampleCursor {
     }
 }
 
-/// One series file being read, a row decoded at a time.
+/// One series file being read, a row decoded at a time, each admitted
+/// before it is.
 struct SeriesCursor {
     input: read::Input,
     /// Its series schema version, read off its footer.
     version: u32,
+    /// What each row of the batch decodes to, found from its arrays.
+    sizes: Vec<usize>,
+    /// What the head holds.
+    head_bytes: usize,
     batch: Option<RecordBatch>,
     row: usize,
     head: Option<SeriesRow>,
@@ -156,6 +162,8 @@ pub(crate) struct Merge {
     /// duplicates included, and their least and greatest time.
     pub(crate) uncounted: u64,
     pub(crate) uncounted_times: (i64, i64),
+    /// What the series rows of the key being merged hold.
+    group_bytes: usize,
 }
 
 impl Merge {
@@ -166,6 +174,7 @@ impl Merge {
     /// A store or Parquet failure reading the first batches.
     pub(crate) async fn open(
         inputs: Vec<(read::Input, (read::Input, u32), bool)>,
+        budget: &mut Budget,
     ) -> Result<Self, CompactError> {
         let mut merge = Self {
             samples: Vec::with_capacity(inputs.len()),
@@ -173,6 +182,7 @@ impl Merge {
             pending: None,
             uncounted: 0,
             uncounted_times: (i64::MAX, i64::MIN),
+            group_bytes: 0,
         };
         for (samples, (series, version), uncounted) in inputs {
             merge.samples.push(SampleCursor {
@@ -184,6 +194,8 @@ impl Merge {
             merge.series.push(SeriesCursor {
                 input: series,
                 version,
+                sizes: Vec::new(),
+                head_bytes: 0,
                 batch: None,
                 row: 0,
                 head: None,
@@ -191,7 +203,7 @@ impl Merge {
         }
         for i in 0..merge.samples.len() {
             merge.load_samples(i).await?;
-            merge.load_series(i).await?;
+            merge.load_series(i, budget).await?;
         }
         Ok(merge)
     }
@@ -231,6 +243,11 @@ impl Merge {
         self.uncounted_times = (i64::MAX, i64::MIN);
     }
 
+    /// The key's series rows are no longer held.
+    pub(crate) fn end_group(&mut self, budget: &mut Budget) {
+        budget.give(Part::Inputs, std::mem::take(&mut self.group_bytes));
+    }
+
     /// The series rows of `key`, merged as a request merges them, in
     /// order, and whether they hold more than one identity.
     ///
@@ -239,6 +256,7 @@ impl Merge {
     pub(crate) async fn take_series(
         &mut self,
         key: &Key,
+        budget: &mut Budget,
     ) -> Result<(Vec<SeriesRow>, bool), CompactError> {
         let mut kept: Vec<SeriesRow> = Vec::new();
         while let Some(i) = self.series_min() {
@@ -257,8 +275,13 @@ impl Merge {
                 .head
                 .take()
                 .ok_or(CompactError::Merge("a head lost"))?;
-            self.load_series(i).await?;
-            if !kept.iter_mut().any(|k| k.absorb(&mut row).is_some()) {
+            let bytes = std::mem::take(&mut cursor.head_bytes);
+            self.load_series(i, budget).await?;
+            if kept.iter_mut().any(|k| k.absorb(&mut row).is_some()) {
+                drop(row);
+                budget.give(Part::Inputs, bytes);
+            } else {
+                self.group_bytes += bytes;
                 kept.push(row);
             }
         }
@@ -371,19 +394,29 @@ impl Merge {
         Ok(())
     }
 
-    async fn load_series(&mut self, i: usize) -> Result<(), CompactError> {
+    /// Decodes the next row of input `i` as its head, what it holds
+    /// admitted first, and what sizing its batch holds too.
+    async fn load_series(&mut self, i: usize, budget: &mut Budget) -> Result<(), CompactError> {
         let Some(cursor) = self.series.get_mut(i) else {
             return Ok(());
         };
         loop {
             if let Some(batch) = cursor.batch.as_ref() {
                 if cursor.row < batch.num_rows() {
+                    let bytes = cursor.sizes.get(cursor.row).copied().unwrap_or(0);
+                    budget.take(Part::Inputs, bytes)?;
                     let mut rows = series_rows(&batch.slice(cursor.row, 1))?;
                     cursor.row += 1;
                     cursor.head = rows.pop();
+                    cursor.head_bytes = bytes;
                     return Ok(());
                 }
             }
+            budget.give(
+                Part::Inputs,
+                cursor.sizes.capacity() * std::mem::size_of::<usize>(),
+            );
+            cursor.sizes = Vec::new();
             let Some((batch, _)) = cursor.input.next().await? else {
                 cursor.batch = None;
                 cursor.head = None;
@@ -394,7 +427,13 @@ impl Merge {
             } else {
                 series_schema_v1()
             };
-            cursor.batch = Some(batch.with_schema(schema)?);
+            let batch = batch.with_schema(schema)?;
+            budget.take(
+                Part::Inputs,
+                batch.num_rows() * std::mem::size_of::<usize>(),
+            )?;
+            cursor.sizes = series_row_sizes(&batch)?;
+            cursor.batch = Some(batch);
             cursor.row = 0;
         }
     }
@@ -403,4 +442,139 @@ impl Merge {
 /// The start of the hour of `unix_milli`.
 pub(crate) fn hour_of(unix_milli: i64) -> i64 {
     unix_milli - unix_milli.rem_euclid(MILLIS_PER_HOUR)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use fs_schema::limits::Limits;
+    use fs_schema::metrics::{MetricLimits, Source, convert, preflight, series_batch};
+    use object_store::local::LocalFileSystem;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    };
+
+    use super::*;
+    use crate::metric::budget::MIN_METRIC_PASS_BYTES;
+
+    fn request(hosts: &[&str]) -> ExportMetricsServiceRequest {
+        let wide = "w".repeat(1024);
+        let data_points = hosts
+            .iter()
+            .map(|host| NumberDataPoint {
+                attributes: vec![KeyValue {
+                    key: "host".into(),
+                    value: Some(AnyValue {
+                        value: Some(Value::StringValue(format!("{host}{wide}"))),
+                    }),
+                    ..KeyValue::default()
+                }],
+                time_unix_nano: 1_792_677_600_000_000_000,
+                value: Some(NumberValue::AsDouble(1.0)),
+                ..NumberDataPoint::default()
+            })
+            .collect();
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "cpu".into(),
+                        data: Some(Data::Gauge(Gauge { data_points })),
+                        ..Metric::default()
+                    }],
+                    ..ScopeMetrics::default()
+                }],
+                ..ResourceMetrics::default()
+            }],
+        }
+    }
+
+    async fn put(store: &Arc<dyn ObjectStore>, path: &str, batch: &RecordBatch) -> i64 {
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        let size = i64::try_from(bytes.len()).unwrap();
+        store
+            .put(&object_store::path::Path::from(path), bytes.into())
+            .await
+            .unwrap();
+        size
+    }
+
+    /// The row each input decodes is admitted before it is, and the rows
+    /// of the key being merged stay held until the group ends.
+    #[tokio::test]
+    async fn the_rows_inputs_decode_and_the_key_holds_are_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let request = request(&["a", "b"]);
+        let (limits, metrics) = (Limits::default(), MetricLimits::default());
+        let checked = preflight(&request, &limits, &metrics).unwrap();
+        let source = Source {
+            instance: [1; 16],
+            segment: 1,
+            offset: 1,
+        };
+        let rows = convert(&request, &limits, &metrics, &checked, source).unwrap();
+        let series = series_batch(&rows.series, rows.series.len()).unwrap();
+        let sizes = series_row_sizes(&series).unwrap();
+        let (first, second) = (*sizes.first().unwrap(), *sizes.get(1).unwrap());
+        let samples_size = put(&store, "s.parquet", &rows.samples).await;
+        let series_size = put(&store, "r.parquet", &series).await;
+        let (samples, _) = read::Input::bounded(
+            Arc::clone(&store),
+            ("s.parquet", samples_size),
+            &fs_schema::metrics::samples_schema_v1(),
+            &[],
+        )
+        .await
+        .unwrap();
+        let (series_input, layout) = read::Input::bounded(
+            Arc::clone(&store),
+            ("r.parquet", series_size),
+            &series_schema_v2(),
+            &[],
+        )
+        .await
+        .unwrap();
+        let series_input = series_input.with_chunks(layout.plan(usize::MAX, 1024));
+        let samples = samples.with_chunks(
+            read::Input::bounded(
+                Arc::clone(&store),
+                ("s.parquet", samples_size),
+                &fs_schema::metrics::samples_schema_v1(),
+                &[],
+            )
+            .await
+            .unwrap()
+            .1
+            .plan(usize::MAX, 1024),
+        );
+        let mut budget = Budget::new(MIN_METRIC_PASS_BYTES);
+        let mut merge = Merge::open(vec![(samples, (series_input, 2), true)], &mut budget)
+            .await
+            .unwrap();
+        let sizing = 2 * std::mem::size_of::<usize>();
+        assert_eq!(budget.held(Part::Inputs), first + sizing, "the first head");
+        let key = merge.next_key().unwrap().unwrap();
+        let (kept, _) = merge.take_series(&key, &mut budget).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            budget.held(Part::Inputs),
+            first + second + sizing,
+            "the key's row and the next head"
+        );
+        merge.end_group(&mut budget);
+        assert_eq!(budget.held(Part::Inputs), second + sizing);
+        assert!(budget.peak() >= first + second);
+    }
 }

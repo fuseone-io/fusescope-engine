@@ -1097,3 +1097,45 @@ async fn a_metric_file_of_a_version_this_engine_does_not_read_fails_the_pass() {
         f.db.finish().await;
     }
 }
+
+/// Eight sets of one wide series: the head every input decodes, held
+/// together while the key's rows are merged, is admitted against the
+/// budget and seen in the peak, which stays within the budget.
+#[tokio::test]
+async fn the_rows_inputs_decode_are_held_within_the_budget() {
+    let Some(f) = fixture().await else {
+        return;
+    };
+    let wide = "w".repeat(4096);
+    let mut request = gauge("cpu", &[("h", 1, 1.0)]);
+    if let Some(Data::Gauge(g)) = request.resource_metrics[0].scope_metrics[0].metrics[0]
+        .data
+        .as_mut()
+    {
+        g.data_points[0].attributes = (0..64).map(|k| kv(&format!("k{k}"), &wide)).collect();
+    }
+    for offset in 0..8 {
+        l0_set(&f, &request, (source(1, offset + 1), 2, 5)).await;
+    }
+    let row = series_of(&f, &visible(&f, Signal::MetricSeries).await[0])
+        .await
+        .remove(0);
+    let budget = 128 << 20;
+    let me = fence(&f).await;
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            metric_pass_bytes: budget,
+            ..config()
+        },
+    );
+    c.compact_metrics_once(&me).await.unwrap().unwrap();
+    let peak = usize::try_from(c.stats().metric_peak_bytes.load(Ordering::Relaxed)).unwrap();
+    assert!(
+        peak >= 8 * row.bytes(),
+        "{peak} held, {} decoded",
+        8 * row.bytes()
+    );
+    assert!(peak <= budget, "{peak}");
+    f.db.finish().await;
+}

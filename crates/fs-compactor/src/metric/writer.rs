@@ -156,8 +156,6 @@ pub(crate) struct SetWriter {
     /// Series rows of the row group being gathered, and their bytes.
     pending: Vec<SeriesRow>,
     pending_bytes: usize,
-    /// Bytes of the series rows of the group the pass holds.
-    group_bytes: usize,
     postings: Option<PostingsBuilder>,
     row_group_rows: usize,
     /// Least and greatest sample time, and series hour.
@@ -222,7 +220,6 @@ impl SetWriter {
             gathered: Gathered::default(),
             pending: Vec::new(),
             pending_bytes: 0,
-            group_bytes: 0,
             postings: Some(PostingsBuilder::new(budget.share(Part::Postings))),
             row_group_rows: row_group_rows.max(1),
             times: (i64::MAX, i64::MIN),
@@ -266,10 +263,6 @@ impl SetWriter {
         collided: bool,
         budget: &mut Budget,
     ) -> Result<(), CompactError> {
-        if self.group_bytes == 0 {
-            self.group_bytes = rows.iter().map(SeriesRow::bytes).sum();
-            budget.take(Part::Gather, self.group_bytes)?;
-        }
         for row in rows {
             let bytes = row.bytes();
             if !self.pending.is_empty()
@@ -300,17 +293,13 @@ impl SetWriter {
         Ok(())
     }
 
-    /// The group's series rows are no longer held.
+    /// The group's samples and series rows are gathered or written.
     pub(crate) fn end_group(&mut self, budget: &mut Budget) {
-        self.group_bytes = 0;
         self.charge_gather(budget);
     }
 
     fn charge_gather(&self, budget: &mut Budget) {
-        budget.set(
-            Part::Gather,
-            self.gathered.bytes + self.pending_bytes + self.group_bytes,
-        );
+        budget.set(Part::Gather, self.gathered.bytes + self.pending_bytes);
     }
 
     /// Writes `sample` of `key` into the set.

@@ -179,3 +179,64 @@ fn the_v1_fixture_is_written_byte_for_byte() {
     assert_eq!(encode(&counts).unwrap(), fixture.to_vec());
     assert_eq!(decode(fixture).unwrap().len(), 4);
 }
+
+/// Keys compare field by field whatever bytes the fields hold, a zero
+/// byte included, and decode to their fields.
+#[test]
+fn keys_encode_in_the_order_of_their_fields_and_decode_back() {
+    let key = |fields: [&str; 5]| {
+        let mut out = Vec::new();
+        encode_key(&mut out, fields.map(str::as_bytes));
+        out
+    };
+    let a = key(["m", "a", "point", "Str", "x"]);
+    let b = key(["m", "a\u{0}b", "point", "Str", "x"]);
+    let c = key(["m", "ab", "point", "Str", "x"]);
+    let d = key(["m\u{0}", "", "point", "Str", "x"]);
+    assert!(a < b && b < c, "a < a\\0b < ab");
+    assert!(
+        key(["m", "zzz", "scope", "Str", "x"]) < d,
+        "the first field first"
+    );
+    assert_eq!(
+        decode_key(&b),
+        ["m", "a\u{0}b", "point", "Str", "x"].map(String::from)
+    );
+}
+
+/// What a count holds, its lookup key included, never passes its budget
+/// but for one entry, however long the texts.
+#[test]
+fn a_count_admits_its_lookup_key_and_entries_within_its_budget() {
+    let long = "v".repeat(10_000);
+    let labels: Vec<(String, String)> = (0..8)
+        .map(|i| (format!("k{i}"), format!("{long}{i}")))
+        .collect();
+    let refs: Vec<(&str, &str, LabelMeta)> = labels
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str(),
+                v.as_str(),
+                meta(LabelLevel::Point, &[Datatype::Str]),
+            )
+        })
+        .collect();
+    let series = row("m", &refs);
+    let budget = 3 * MetadataCounts::entry_bytes("m", "k0", &labels.first().unwrap().1);
+    let mut counts = MetadataCounts::default();
+    let mut from = 0;
+    let mut chunks = 0;
+    while let Some(next) = counts.add_series(&series, (T0_MS, T0_MS), from, budget) {
+        assert!(
+            counts.estimated_bytes() <= budget,
+            "{}",
+            counts.estimated_bytes()
+        );
+        drop(counts.take());
+        chunks += 1;
+        from = next;
+    }
+    assert!(chunks >= 2);
+    assert!(counts.estimated_bytes() <= budget);
+}

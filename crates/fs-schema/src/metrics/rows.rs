@@ -272,6 +272,15 @@ pub fn series_rows(batch: &RecordBatch) -> Result<Vec<SeriesRow>, SchemaError> {
     super::decode::series_rows(batch)
 }
 
+/// What [`SeriesRow::bytes`] of each row of a batch of the series schema
+/// comes to, found from its arrays before any row is built.
+///
+/// # Errors
+/// A batch of other columns.
+pub fn series_row_sizes(batch: &RecordBatch) -> Result<Vec<usize>, SchemaError> {
+    super::decode::series_row_sizes(batch)
+}
+
 /// `samples` with each source order taken from `source`, its ordinal
 /// kept: what a request converted before its WAL position was known has
 /// once it is.

@@ -113,3 +113,52 @@ pub(crate) fn series_rows(batch: &RecordBatch) -> Result<Vec<SeriesRow>, SchemaE
     }
     Ok(rows)
 }
+
+/// What [`SeriesRow::bytes`] of each row of `batch`, of the series schema
+/// version 1 or 2, comes to, found from its arrays without building a row.
+pub(crate) fn series_row_sizes(batch: &RecordBatch) -> Result<Vec<usize>, SchemaError> {
+    let schema = batch.schema();
+    let lengths = |name: &str| -> Result<Vec<usize>, SchemaError> {
+        let column = cast(batch.column(schema.index_of(name)?), &DataType::Utf8)?;
+        Ok(column
+            .as_string::<i32>()
+            .iter()
+            .map(|v| v.map_or(0, str::len))
+            .collect())
+    };
+    let (names, units, descriptions) = (
+        lengths(col::METRIC_NAME)?,
+        lengths(col::UNIT)?,
+        lengths(col::DESCRIPTION)?,
+    );
+    let labels = batch
+        .column(schema.index_of(col::LABELS)?)
+        .as_map_opt()
+        .ok_or(OTHER)?;
+    let keys = cast(labels.keys(), &DataType::Utf8)?;
+    let values = cast(labels.values(), &DataType::Utf8)?;
+    let (keys, values) = (keys.as_string::<i32>(), values.as_string::<i32>());
+    let offsets = labels.value_offsets();
+    let label = std::mem::size_of::<(Box<str>, Box<str>)>() + std::mem::size_of::<LabelMeta>();
+    (0..batch.num_rows())
+        .map(|row| {
+            let bound = |i: usize| {
+                offsets
+                    .get(i)
+                    .and_then(|o| usize::try_from(*o).ok())
+                    .ok_or(OTHER)
+            };
+            let (start, end) = (bound(row)?, bound(row + 1)?);
+            let texts: usize = (start..end)
+                .map(|i| keys.value(i).len() + values.value(i).len())
+                .sum();
+            let at = |v: &[usize]| v.get(row).copied().unwrap_or(0);
+            Ok(std::mem::size_of::<SeriesRow>()
+                + at(&names)
+                + at(&units)
+                + at(&descriptions)
+                + (end - start) * label
+                + texts)
+        })
+        .collect()
+}

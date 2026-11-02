@@ -927,3 +927,25 @@ fn mapping_2_records_each_labels_origin_and_mapping_1_none() {
     assert_eq!(older.samples, rows.samples);
     assert!(convert_mapping(3, &req, &limits, &MetricLimits::default(), &checked, SOURCE).is_err());
 }
+
+/// The size found from a batch is the size of the row it decodes to.
+#[test]
+fn series_row_sizes_are_those_of_the_rows_decoded() {
+    let mut rows = vec![
+        series("m", 7, Some(LabelLevel::Scope), Datatype::Map),
+        series("longer name", 8, None, Datatype::Str),
+    ];
+    rows.sort_by(SeriesRow::order);
+    for batch in [
+        series_batch(&rows, 2).unwrap(),
+        series_batch_of(1, &rows, 2).unwrap(),
+    ] {
+        let sizes = series_row_sizes(&batch).unwrap();
+        let decoded: Vec<usize> = series_rows(&batch)
+            .unwrap()
+            .iter()
+            .map(SeriesRow::bytes)
+            .collect();
+        assert_eq!(sizes, decoded);
+    }
+}

@@ -8,7 +8,8 @@ use crate::CompactError;
 /// What a pass holds memory for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Part {
-    /// The inputs: their metadata, two chunks each and a decoded row.
+    /// The inputs: their metadata, two chunks each, the row each decodes
+    /// and the rows of the key being merged.
     Inputs = 0,
     /// The samples file being written: its buffers, row group and footer.
     Samples = 1,
@@ -79,6 +80,11 @@ impl Budget {
         }
         self.set(part, self.held(part) + bytes);
         Ok(())
+    }
+
+    /// Frees `bytes` of what `part` holds.
+    pub(crate) fn give(&mut self, part: Part, bytes: usize) {
+        self.set(part, self.held(part).saturating_sub(bytes));
     }
 
     /// Records what `part` holds, as measured after an allocation it

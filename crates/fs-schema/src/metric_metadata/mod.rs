@@ -48,9 +48,6 @@ pub mod columns {
     pub const LAST_REPORTED: &str = "last_reported_unix_milli";
 }
 
-/// The key of a row.
-type Key = (String, String, &'static str, &'static str, String);
-
 /// Bytes an entry holds besides its texts: its tree node, key and times.
 const ENTRY_OVERHEAD: usize = 160;
 
@@ -59,17 +56,20 @@ const OTHER: SchemaError = SchemaError::Layout("metric_metadata format v1");
 /// What one pass saw, by key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataCounts {
-    entries: BTreeMap<Key, (i64, i64)>,
+    /// By key, encoded as [`encode_key`] does, in the order of the fields.
+    entries: BTreeMap<Box<[u8]>, (i64, i64)>,
     bytes: usize,
+    /// The key being looked up, reused, its capacity counted in `bytes`.
+    scratch: Vec<u8>,
 }
 
 impl MetadataCounts {
-    /// What one entry of these texts holds.
+    /// What one entry of these texts holds, of the longest level and type.
     pub fn entry_bytes(metric: &str, attr: &str, value: &str) -> usize {
-        ENTRY_OVERHEAD + metric.len() + attr.len() + value.len()
+        ENTRY_OVERHEAD + key_len([metric, attr, "resource", "Double", value].map(str::as_bytes))
     }
 
-    /// What the entries hold, by [`Self::entry_bytes`].
+    /// What the entries and the key being looked up hold.
     pub fn estimated_bytes(&self) -> usize {
         self.bytes
     }
@@ -94,10 +94,11 @@ impl MetadataCounts {
     }
 
     /// Lists the labels of `row`, whose samples span `first` to `last`, from
-    /// its `from`th entry on, a label and type each, within `budget` bytes.
-    /// Before a new entry would take the counts past it, listing stops and
-    /// the entry to resume at is returned; a count holds one entry at least.
-    /// `None` once the row is listed.
+    /// its `from`th entry on, a label and type each, within `budget` bytes,
+    /// every allocation admitted before it is made. Before a new entry, or
+    /// the key it is looked up by, would take the counts past it, listing
+    /// stops and the entry to resume at is returned; a count holds one
+    /// entry at least. `None` once the row is listed.
     pub fn add_series(
         &mut self,
         row: &SeriesRow,
@@ -113,24 +114,28 @@ impl MetadataCounts {
             .filter_map(|(label, meta)| Some((label, meta.level()?, *meta)))
             .flat_map(|(label, level, meta)| meta.datatypes().map(move |d| (label, level, d)));
         for (at, ((key, value), level, datatype)) in entries.enumerate().skip(from) {
-            let entry = (
-                row.name.to_string(),
-                key.to_string(),
-                level.as_str(),
-                datatype.as_str(),
-                value.to_string(),
-            );
-            if let Some(times) = self.entries.get_mut(&entry) {
+            let fields =
+                [&*row.name, key, level.as_str(), datatype.as_str(), value].map(str::as_bytes);
+            let needed = key_len(fields);
+            let grown = needed.saturating_sub(self.scratch.capacity());
+            if grown > 0 && !self.is_empty() && self.bytes.saturating_add(grown) > budget {
+                return Some(at);
+            }
+            let before = self.scratch.capacity();
+            encode_key(&mut self.scratch, fields);
+            self.bytes = self.bytes.saturating_add(self.scratch.capacity() - before);
+            if let Some(times) = self.entries.get_mut(self.scratch.as_slice()) {
                 times.0 = times.0.min(first);
                 times.1 = times.1.max(last);
                 continue;
             }
-            let cost = Self::entry_bytes(&row.name, key, value);
+            let cost = ENTRY_OVERHEAD + needed;
             if !self.is_empty() && self.bytes.saturating_add(cost) > budget {
                 return Some(at);
             }
             self.bytes = self.bytes.saturating_add(cost);
-            self.entries.insert(entry, (first, last));
+            self.entries
+                .insert(self.scratch.as_slice().into(), (first, last));
         }
         None
     }
@@ -146,23 +151,74 @@ impl MetadataCounts {
     /// # Errors
     /// Arrow failure.
     pub fn batch(&self) -> Result<RecordBatch, SchemaError> {
-        let text = |f: fn(&Key) -> &str| -> ArrayRef {
-            Arc::new(StringArray::from_iter_values(self.entries.keys().map(f)))
+        let keys: Vec<[String; 5]> = self.entries.keys().map(|k| decode_key(k)).collect();
+        let text = |i: usize| -> ArrayRef {
+            Arc::new(StringArray::from_iter_values(
+                keys.iter().map(|k| k.get(i).map_or("", String::as_str)),
+            ))
         };
         let times = |f: fn(&(i64, i64)) -> i64| -> ArrayRef {
             Arc::new(Int64Array::from_iter_values(self.entries.values().map(f)))
         };
         let columns = vec![
-            text(|k| &k.0),
-            text(|k| &k.1),
-            text(|k| k.2),
-            text(|k| k.3),
-            text(|k| &k.4),
+            text(0),
+            text(1),
+            text(2),
+            text(3),
+            text(4),
             times(|t| t.0),
             times(|t| t.1),
         ];
         Ok(RecordBatch::try_new(schema(), columns)?)
     }
+}
+
+/// Bytes [`encode_key`] writes for `fields`.
+fn key_len(fields: [&[u8]; 5]) -> usize {
+    fields
+        .iter()
+        .map(|f| f.len() + f.iter().fold(0, |n, b| n + usize::from(*b == 0)) + 2)
+        .sum()
+}
+
+/// Writes `fields` into `out` so keys compare as bytes as their fields
+/// compare in turn: a zero byte as `0x00 0xff`, each field ended by
+/// `0x00 0x00`.
+fn encode_key(out: &mut Vec<u8>, fields: [&[u8]; 5]) {
+    out.clear();
+    out.reserve_exact(key_len(fields));
+    for field in fields {
+        for byte in field {
+            out.push(*byte);
+            if *byte == 0 {
+                out.push(0xff);
+            }
+        }
+        out.extend_from_slice(&[0, 0]);
+    }
+}
+
+/// The fields of a key [`encode_key`] wrote.
+fn decode_key(key: &[u8]) -> [String; 5] {
+    let mut fields: [Vec<u8>; 5] = Default::default();
+    let mut at = 0;
+    let mut bytes = key.iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == 0 {
+            if bytes.next() == Some(0) {
+                at += 1;
+                continue;
+            }
+            if let Some(field) = fields.get_mut(at) {
+                field.push(0);
+            }
+            continue;
+        }
+        if let Some(field) = fields.get_mut(at) {
+            field.push(byte);
+        }
+    }
+    fields.map(|f| String::from_utf8(f).unwrap_or_default())
 }
 
 /// Exact physical layout of format v1.
