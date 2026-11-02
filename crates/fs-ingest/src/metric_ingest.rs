@@ -18,7 +18,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{CatalogError, FileId, FileSetId, MetricRole, NewFile, TenantId};
 use fs_schema::limits::Limits;
 use fs_schema::metrics::{
-    MetricLimits, Rejections, Source, convert, preflight, walk_bound, with_source,
+    MetricLimits, Rejections, Source, check_points, convert, preflight, walk_bound, with_source,
 };
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use tracing::{info, warn};
@@ -78,6 +78,7 @@ impl Shared {
             .map_err(|_| IngestError::Backpressure("conversions closed"))?;
         let (limits, metrics) = conversion.apply(&self.config.limits, &self.config.metrics);
         let (limits, metrics) = (&limits, &metrics);
+        check_points(message, metrics).map_err(|e| too_large(e, metrics))?;
         let walk = self.hold_walk(message, (limits, metrics)).await?;
         let checked = preflight(message, limits, metrics).map_err(|e| too_large(e, metrics))?;
         let rejected = checked.rejected;

@@ -579,6 +579,33 @@ fn wal_with(record: &fs_ingest::record::WalRecord) -> tempfile::TempDir {
     dir
 }
 
+/// A request past its point cap is refused for that, counted before the
+/// walk's scratch is measured and held: not for memory it never needed.
+#[tokio::test]
+async fn a_request_past_its_points_is_refused_before_its_walk_is_measured() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (_, token) = db.tenant().await;
+    let mut config = test_config();
+    config.metrics.max_points = 2;
+    config.max_memory_bytes = 1024;
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), config).await;
+    let mut client = MetricsServiceClient::connect(format!("http://{}", h.addr))
+        .await
+        .unwrap();
+    let mut r = Request::new(metrics(3, 0));
+    r.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    let status = client.export(r).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("points"), "{status:?}");
+    h.stop().await;
+    db.finish().await;
+}
+
 /// Why the start of an ingester whose WAL holds `record` fails.
 fn refused_start(db: &TestDb, record: &fs_ingest::record::WalRecord) -> String {
     let dir = wal_with(record);

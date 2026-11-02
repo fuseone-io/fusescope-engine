@@ -98,10 +98,7 @@ pub fn preflight(
     metrics: &MetricLimits,
 ) -> Result<Preflight, TooLarge> {
     let metrics = metrics.clamped();
-    let points = count_points(request);
-    if points > metrics.max_points {
-        return Err(TooLarge::Points(points));
-    }
+    let points = check_points(request, &metrics)?;
     let mut count = Count {
         preflight: Preflight {
             points,
@@ -261,6 +258,21 @@ fn metric_bound(
         Some(Data::ExponentialHistogram(_)) | None => None,
     }
     .unwrap_or(0)
+}
+
+/// The data points `request` carries, counted without walking them.
+///
+/// # Errors
+/// More than `max_points`.
+pub fn check_points(
+    request: &ExportMetricsServiceRequest,
+    metrics: &MetricLimits,
+) -> Result<usize, TooLarge> {
+    let points = count_points(request);
+    if points > metrics.clamped().max_points {
+        return Err(TooLarge::Points(points));
+    }
+    Ok(points)
 }
 
 fn count_points(request: &ExportMetricsServiceRequest) -> usize {
