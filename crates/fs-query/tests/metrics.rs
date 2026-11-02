@@ -192,9 +192,9 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
         .await
         .unwrap()
         .id;
-    let (_, alone, _) = write_set(&db.catalog, &store, tenant, &request(&["a", "b"], 2.0, 0)).await;
-    let (_, _, unpaired) =
-        write_set(&db.catalog, &store, tenant, &request(&["c"], 3.0, 60_000)).await;
+    let (_, samples, series) =
+        write_set(&db.catalog, &store, tenant, &request(&["a", "b"], 2.0, 0)).await;
+    write_set(&db.catalog, &store, tenant, &request(&["c"], 3.0, 60_000)).await;
     write_set(&db.catalog, &store, other, &request(&["z"; 1], 9.0, 0)).await;
     let querier = Querier::new(
         db.catalog.clone(),
@@ -273,13 +273,34 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
     );
 
     // A file whose set's partner is gone fails the query rather than
-    // answering without it, of either table.
-    for gone in [unpaired, alone] {
-        sqlx::query("update engine_file set state = 2 where id = $1")
-            .bind(gone)
-            .execute(db.catalog.pool())
-            .await
+    // answering without it, of either table, whichever file is gone.
+    for gone in [samples, series] {
+        for state in [2, 1] {
+            sqlx::query("update engine_file set state = $2 where id = $1")
+                .bind(gone)
+                .bind(state)
+                .execute(db.catalog.pool())
+                .await
+                .unwrap();
+            let fresh = Querier::new(
+                db.catalog.clone(),
+                Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+                None,
+                QueryLimits::default(),
+            )
             .unwrap();
+            for table in ["samples", "time_series"] {
+                let outcome = fresh
+                    .collect(tenant, &format!("select count(*) from {table}"))
+                    .await;
+                if state == 2 {
+                    let err = outcome.unwrap_err().to_string();
+                    assert!(err.contains("registered in part"), "{table}: {err}");
+                } else {
+                    assert_eq!(total(&outcome.unwrap()), 3, "{table}");
+                }
+            }
+        }
     }
     let fresh = Querier::new(
         db.catalog.clone(),
@@ -288,14 +309,6 @@ async fn samples_and_series_are_read_from_their_set_and_isolated_by_tenant() {
         QueryLimits::default(),
     )
     .unwrap();
-    for table in ["samples", "time_series"] {
-        let err = fresh
-            .collect(tenant, &format!("select count(*) from {table}"))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("registered in part"), "{table}: {err}");
-    }
     assert_eq!(
         total(&query(&fresh, other, "select count(*) from samples").await),
         1,

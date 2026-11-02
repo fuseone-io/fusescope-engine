@@ -153,22 +153,7 @@ impl Catalog {
         signal: Signal,
         range: TimeRange,
     ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, ListedRow>(&format!(
-            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted,
-                    {UNPAIRED}
-             from engine_file
-             where tenant_id = $1 and signal = $2 and state = $3 and ts_min <= $5 and ts_max >= $4
-             order by ts_min, id"
-        ))
-        .bind(tenant)
-        .bind(signal.code())
-        .bind(FileState::Visible.code())
-        .bind(range.start)
-        .bind(range.end)
-        .fetch_all(&self.pool)
-        .await?;
-        paired(rows)
+        self.listed(tenant, signal, Some(range)).await
     }
 
     /// Every visible file of one tenant and signal, oldest first. Used to warm
@@ -182,20 +167,66 @@ impl Catalog {
         tenant: TenantId,
         signal: Signal,
     ) -> Result<Vec<FileRecord>, CatalogError> {
-        let rows = sqlx::query_as::<_, ListedRow>(&format!(
+        self.listed(tenant, signal, None).await
+    }
+
+    /// The visible files of `tenant` and `signal` overlapping `range`, or
+    /// every one. For a metric signal, the files of both metric signals in
+    /// that range are checked for a set missing a file, in the snapshot
+    /// of the listing: a set missing its samples fails a listing of
+    /// series as much as one of samples.
+    async fn listed(
+        &self,
+        tenant: TenantId,
+        signal: Signal,
+        range: Option<TimeRange>,
+    ) -> Result<Vec<FileRecord>, CatalogError> {
+        let (start, end) = (range.map(|r| r.start), range.map(|r| r.end));
+        let mut tx = self.pool.begin().await?;
+        if matches!(signal, Signal::MetricSamples | Signal::MetricSeries) {
+            sqlx::query("set transaction isolation level repeatable read, read only")
+                .execute(&mut *tx)
+                .await?;
+            let broken: Option<uuid::Uuid> = sqlx::query_scalar(
+                "select f.file_set from engine_file f
+                 where f.tenant_id = $1 and f.signal in ($2, $3) and f.state = $4
+                   and f.file_set is not null
+                   and ($5::timestamptz is null or (f.ts_min <= $6 and f.ts_max >= $5))
+                   and not exists (
+                     select 1 from engine_file p
+                     where p.tenant_id = f.tenant_id and p.file_set = f.file_set
+                       and p.id <> f.id and p.state = $4)
+                 limit 1",
+            )
+            .bind(tenant)
+            .bind(Signal::MetricSamples.code())
+            .bind(Signal::MetricSeries.code())
+            .bind(FileState::Visible.code())
+            .bind(start)
+            .bind(end)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(set) = broken {
+                return Err(CatalogError::PartialFileSet { set });
+            }
+        }
+        let rows = sqlx::query_as::<_, FileRow>(
             "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
-                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted,
-                    {UNPAIRED}
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
              from engine_file
              where tenant_id = $1 and signal = $2 and state = $3
-             order by ts_min, id"
-        ))
+               and ($4::timestamptz is null or (ts_min <= $5 and ts_max >= $4))
+             order by ts_min, id",
+        )
         .bind(tenant)
         .bind(signal.code())
         .bind(FileState::Visible.code())
-        .fetch_all(&self.pool)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&mut *tx)
         .await?;
-        paired(rows)
+        tx.commit().await?;
+        rows.into_iter().map(FileRecord::try_from).collect()
     }
 
     /// Latest `ts_max` among visible files of a tenant and signal: how far the
@@ -502,33 +533,6 @@ impl Catalog {
     pub async fn watch(&self) -> Result<Watcher, CatalogError> {
         Watcher::connect(&self.pool).await
     }
-}
-
-/// The set of a metric file whose partner is not visible too, `$3` being
-/// the visible state; null for a file of no set or of a complete one.
-const UNPAIRED: &str = "case when file_set is not null and not exists (
-    select 1 from engine_file p
-    where p.tenant_id = engine_file.tenant_id and p.file_set = engine_file.file_set
-      and p.id <> engine_file.id and p.state = $3) then file_set end as unpaired_set";
-
-/// A listed file and whether its set is complete.
-#[derive(sqlx::FromRow)]
-struct ListedRow {
-    #[sqlx(flatten)]
-    file: FileRow,
-    unpaired_set: Option<uuid::Uuid>,
-}
-
-/// The listed files, or [`CatalogError::PartialFileSet`] when one is of a
-/// set whose other file is not visible: no crash leaves that, so a query
-/// fails rather than answer without half of a flush.
-fn paired(rows: Vec<ListedRow>) -> Result<Vec<FileRecord>, CatalogError> {
-    rows.into_iter()
-        .map(|row| match row.unpaired_set {
-            Some(set) => Err(CatalogError::PartialFileSet { set }),
-            None => FileRecord::try_from(row.file),
-        })
-        .collect()
 }
 
 /// When a registration becomes eligible for compaction.

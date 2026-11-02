@@ -336,10 +336,7 @@ async fn a_metric_file_is_refused_without_its_partner_and_expires_with_it() {
         start: ten() - Duration::days(36_500),
         end: ten() + Duration::days(36_500),
     };
-    for (gone, listed) in [
-        (fresh[1].id, Signal::MetricSamples),
-        (fresh[0].id, Signal::MetricSeries),
-    ] {
+    for gone in [fresh[0].id, fresh[1].id] {
         for state in [2, 1] {
             sqlx::query("update engine_file set state = $2 where id = $1")
                 .bind(gone)
@@ -347,16 +344,18 @@ async fn a_metric_file_is_refused_without_its_partner_and_expires_with_it() {
                 .execute(db.catalog.pool())
                 .await
                 .unwrap();
-            let all = db.catalog.all_visible_files(t, listed).await;
-            let ranged = db.catalog.visible_files(t, listed, everything).await;
-            for outcome in [all, ranged] {
-                if state == 2 {
-                    assert!(
-                        matches!(outcome, Err(CatalogError::PartialFileSet { set }) if set == fresh_set),
-                        "{listed:?}: {outcome:?}"
-                    );
-                } else {
-                    assert_eq!(outcome.unwrap().len(), 2, "{listed:?}");
+            for listed in [Signal::MetricSamples, Signal::MetricSeries] {
+                let all = db.catalog.all_visible_files(t, listed).await;
+                let ranged = db.catalog.visible_files(t, listed, everything).await;
+                for outcome in [all, ranged] {
+                    if state == 2 {
+                        assert!(
+                            matches!(outcome, Err(CatalogError::PartialFileSet { set }) if set == fresh_set),
+                            "{listed:?} without {gone:?}: {outcome:?}"
+                        );
+                    } else {
+                        assert_eq!(outcome.unwrap().len(), 2, "{listed:?}");
+                    }
                 }
             }
         }
