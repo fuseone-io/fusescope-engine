@@ -29,6 +29,8 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
+regex = { workspace = true }
+roaring = { workspace = true }
 fs-schema = { path = "../fs-schema" }
 fs-catalog = { path = "../fs-catalog" }
 fs-ingest = { path = "../fs-ingest" }

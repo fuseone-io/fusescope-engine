@@ -29,7 +29,8 @@ use fs_catalog::{
 };
 use fs_ingest::flush;
 use fs_query::actions::{
-    METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, TRACE_LOOKUP, TraceLookup,
+    METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, METRICS_LABEL_NAMES,
+    METRICS_LABEL_VALUES, METRICS_SELECT, TRACE_LOOKUP, TraceLookup,
 };
 use fs_query::flight::FlightSql;
 use fs_query::querier::{MAX_PREPARED_TTL, PREPARED_PLAN_OVERHEAD};
@@ -1634,6 +1635,116 @@ async fn the_deadline_covers_planning_on_every_entry_point() {
 }
 
 /// `metadata.services` lists the tenant's services from the catalog, within
+/// The metric actions over Flight: one IPC stream of their schema, a bad
+/// body `INVALID_ARGUMENT`, a select that cannot hear an ingester
+/// `UNAVAILABLE`, and all three listed.
+#[tokio::test]
+async fn metric_actions_answer_over_flight_with_their_codes() {
+    let Some(f) = fixture().await else { return };
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let past = serde_json::json!({
+        "matchers": [{"name": "__name__", "type": "=", "value": "cpu"}],
+        "start_unix_milli": 0, "end_unix_milli": 1000,
+    });
+    let batches = action(&mut client, METRICS_SELECT, &past.to_string())
+        .await
+        .unwrap();
+    let names: Vec<String> = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, ["labels", "timestamps", "values"]);
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let batches = action(&mut client, METRICS_LABEL_NAMES, &past.to_string())
+        .await
+        .unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "name");
+    let mut values = past.clone();
+    values["label"] = serde_json::json!("host");
+    let batches = action(&mut client, METRICS_LABEL_VALUES, &values.to_string())
+        .await
+        .unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "value");
+
+    for (kind, bad) in [
+        (
+            METRICS_SELECT,
+            r#"{"start_unix_milli": 2, "end_unix_milli": 1}"#.to_owned(),
+        ),
+        (
+            METRICS_SELECT,
+            r#"{"start_unix_milli": 1, "end_unix_milli": 2, "lookback": 1}"#.to_owned(),
+        ),
+        (
+            METRICS_SELECT,
+            serde_json::json!({
+                "matchers": [{"name": "a", "type": "=~", "value": "("}],
+                "start_unix_milli": 1, "end_unix_milli": 2,
+            })
+            .to_string(),
+        ),
+        (METRICS_LABEL_VALUES, past.to_string()),
+        (METRICS_LABEL_NAMES, values.to_string()),
+    ] {
+        let err = action(&mut client, kind, &bad).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{kind} {bad}: {err}");
+    }
+
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = silent.local_addr().unwrap().to_string();
+    drop(silent);
+    f.db.catalog
+        .heartbeat("ingester-gone", &address)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let recent = serde_json::json!({"start_unix_milli": now - 1000, "end_unix_milli": now});
+    let err = action(&mut client, METRICS_SELECT, &recent.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err}");
+    action(&mut client, METRICS_LABEL_NAMES, &recent.to_string())
+        .await
+        .expect("a listing answers in part");
+
+    let mut raw = FlightServiceClient::new(
+        Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let listed: Vec<arrow_flight::ActionType> = raw
+        .list_actions(Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .try_collect()
+        .await
+        .unwrap();
+    for kind in [METRICS_SELECT, METRICS_LABEL_VALUES, METRICS_LABEL_NAMES] {
+        assert!(
+            listed.iter().any(|a| a.r#type == kind),
+            "{kind}: {listed:?}"
+        );
+    }
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
 /// a range at file granularity, and never another tenant's.
 #[tokio::test]
 async fn metadata_services_action_lists_the_services_of_the_tenant() {

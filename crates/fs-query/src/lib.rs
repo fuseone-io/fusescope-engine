@@ -17,6 +17,7 @@ pub mod flight;
 pub mod has_token;
 pub mod hot;
 pub mod metric_index;
+pub mod metric_select;
 pub mod prune;
 pub mod querier;
 pub mod session;
@@ -76,6 +77,29 @@ pub enum QueryError {
     /// Unknown tenant.
     #[error("unknown tenant")]
     UnknownTenant,
+    /// A metric series holds more than one identity in the window: rows
+    /// of one hour that disagree, or hours that differ.
+    #[error("series {name} {fingerprint:016x} has more than one identity in the window")]
+    Ambiguous {
+        /// The metric's name.
+        name: String,
+        /// The series' fingerprint.
+        fingerprint: u64,
+    },
+    /// Live ingesters that did not answer an action that needs them all.
+    #[error("ingesters did not answer: {}", .0.join(", "))]
+    HotUnavailable(Vec<String>),
+    /// A select resolved more series than its limit.
+    #[error("selector matched more than {0} series")]
+    TooManySeries(usize),
+    /// A metric file this engine does not read.
+    #[error("metric file {path} is not readable: {source}")]
+    MetricFile {
+        /// The file.
+        path: String,
+        /// What the check refused.
+        source: fs_schema::SchemaError,
+    },
     /// An action body that does not describe a valid request.
     #[error("invalid action: {0}")]
     InvalidAction(String),

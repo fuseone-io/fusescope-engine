@@ -24,6 +24,13 @@
 //! `metadata.keys`: `{"signal": "traces", "prefix": "http.", "limit": n}`;
 //! the rows of the `attribute_keys` table, or of `log_attribute_keys` for
 //! `"logs"`, whose key starts with `prefix`, most frequent first.
+//!
+//! `metrics.select`, `metrics.label_values` and `metrics.label_names`
+//! read metric series as the Prometheus querier of the Go backend does;
+//! their bodies and answers are in
+//! [`metric_select`](crate::metric_select) and `DESIGN.md` §8. Times are
+//! Unix milliseconds, both bounds inclusive and required. A select whose
+//! hot window is partial fails `UNAVAILABLE` instead.
 
 use fs_schema::attribute_keys::KeyTable;
 use serde::de::DeserializeOwned;
@@ -39,6 +46,12 @@ pub const METADATA_SERVICES: &str = "metadata.services";
 pub const METADATA_OPERATIONS: &str = "metadata.operations";
 /// Action type of the attribute key listing.
 pub const METADATA_KEYS: &str = "metadata.keys";
+/// Action type of a metric selector's series and samples.
+pub const METRICS_SELECT: &str = "metrics.select";
+/// Action type of the values of one label of a selector's series.
+pub const METRICS_LABEL_VALUES: &str = "metrics.label_values";
+/// Action type of the label names of a selector's series.
+pub const METRICS_LABEL_NAMES: &str = "metrics.label_names";
 /// Rows a listing answers at most when its body names no `limit`.
 pub const DEFAULT_LIST_LIMIT: usize = 1000;
 

@@ -50,6 +50,10 @@ pub struct SignalTable {
     )>,
     trace_index: Option<Arc<crate::trace_index::TraceIndexCache>>,
     text_index: Option<(Arc<dyn FileIndex>, Arc<QueryStats>)>,
+    /// For samples: the source order is a column.
+    source_order: bool,
+    /// An ingester that does not answer fails the scan.
+    hot_required: bool,
 }
 
 /// The files a scan opens and what the text index made of them.
@@ -113,7 +117,25 @@ impl SignalTable {
             hot: None,
             trace_index: None,
             text_index: None,
+            source_order: false,
+            hot_required: false,
         }
+    }
+
+    /// Shows the samples' source order, for a reader that deduplicates
+    /// them; no session table does.
+    #[must_use]
+    pub fn with_source_order(mut self) -> Self {
+        self.source_order = self.table == Some(MetricTable::Samples);
+        self
+    }
+
+    /// Fails the scan with [`QueryError::HotUnavailable`] when an ingester
+    /// does not answer, instead of noting it in the warnings.
+    #[must_use]
+    pub fn requiring_hot_window(mut self) -> Self {
+        self.hot_required = true;
+        self
     }
 
     /// Consults `trace_id` sidecars when the filters pin trace ids. Only
@@ -230,10 +252,13 @@ impl SignalTable {
     }
 
     /// The schema the table shows: its signal's, for metrics its table's,
-    /// without the samples' source order, which no query sees.
+    /// without the samples' source order unless it was asked for.
     fn table_schema(&self) -> arrow::datatypes::SchemaRef {
         match self.table {
             Some(MetricTable::Series) => fs_schema::metrics::series_schema_v1(),
+            Some(MetricTable::Samples) if self.source_order => {
+                fs_schema::metrics::samples_schema_v1()
+            }
             Some(MetricTable::Samples) => {
                 let full = fs_schema::metrics::samples_schema_v1();
                 let shown: Vec<usize> = (0..full.fields().len())
@@ -333,6 +358,9 @@ impl TableProvider for SignalTable {
                     )
                     .await
                     .map_err(|e| external(e.into()))?;
+                if self.hot_required && !result.unavailable.is_empty() {
+                    return Err(external(QueryError::HotUnavailable(result.unavailable)));
+                }
                 for ingester in &result.unavailable {
                     warnings.push(format!(
                         "ingester {ingester} did not answer; recent rows may be missing"

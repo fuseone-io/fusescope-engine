@@ -9,6 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::functions::expr_fn::starts_with;
@@ -142,6 +143,12 @@ pub struct QueryStats {
     pub trace_index_misses: std::sync::atomic::AtomicU64,
     /// Files a trace lookup skipped because their sidecar lacked the trace.
     pub trace_index_pruned: std::sync::atomic::AtomicU64,
+    /// `metrics.select` actions run.
+    pub metric_selects: std::sync::atomic::AtomicU64,
+    /// Selects refused because a series held more than one identity.
+    pub metric_ambiguous: std::sync::atomic::AtomicU64,
+    /// Series files a metric action left unread by their postings.
+    pub metric_index_pruned: std::sync::atomic::AtomicU64,
     /// Postings sidecars fetched from the bucket.
     pub metric_index_fetches: std::sync::atomic::AtomicU64,
     /// Series files read without postings: none, unusable or no room.
@@ -193,6 +200,15 @@ pub struct QueryLimits {
     /// selectors. Zero disables them; clamped to
     /// [`MetricIndexCache::MAX_BYTES`](crate::metric_index::MetricIndexCache::MAX_BYTES).
     pub metric_index_cache_bytes: usize,
+    /// Most series a `metrics.select` resolves; clamped to
+    /// [`MAX_SERIES`](crate::metric_select::MAX_SERIES).
+    pub metrics_max_series: usize,
+    /// Most matchers a metric action carries; clamped to
+    /// [`MAX_MATCHERS`](crate::metric_select::MAX_MATCHERS).
+    pub metrics_max_matchers: usize,
+    /// Most bytes of regex a metric action's matchers carry together;
+    /// clamped to [`MAX_REGEX_BYTES`](crate::metric_select::MAX_REGEX_BYTES).
+    pub metrics_max_regex_bytes: usize,
     /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
     /// oldest is dropped and its ticket plans again.
     pub prepared_plans: usize,
@@ -216,6 +232,9 @@ impl Default for QueryLimits {
             trace_index_cache_bytes: 256 * 1024 * 1024,
             text_index_cache_bytes: 256 * 1024 * 1024,
             metric_index_cache_bytes: 64 * 1024 * 1024,
+            metrics_max_series: 100_000,
+            metrics_max_matchers: 64,
+            metrics_max_regex_bytes: 64 * 1024,
             prepared_plans: 1024,
             prepared_bytes: 64 * 1024 * 1024,
             prepared_ttl: Duration::from_secs(60),
@@ -250,6 +269,7 @@ pub struct Querier {
     trace_index: Arc<crate::trace_index::TraceIndexCache>,
     text_index: Arc<dyn crate::file_index::FileIndex>,
     metric_index: Arc<crate::metric_index::MetricIndexCache>,
+    store: Arc<dyn ObjectStore>,
     runtime: Arc<RuntimeEnv>,
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
@@ -309,8 +329,11 @@ impl Querier {
             .with_stats(Arc::clone(&stats)),
         );
         let text_index = Arc::new(
-            crate::text_index::TextIndexCache::new(store, limits.text_index_cache_bytes)
-                .with_stats(Arc::clone(&stats)),
+            crate::text_index::TextIndexCache::new(
+                Arc::clone(&store),
+                limits.text_index_cache_bytes,
+            )
+            .with_stats(Arc::clone(&stats)),
         );
         let hot = Arc::new(
             crate::hot::HotWindow::new(catalog.clone(), limits.hot_window)
@@ -332,6 +355,7 @@ impl Querier {
             trace_index,
             text_index,
             metric_index,
+            store,
             runtime,
             store_url,
             limits,
@@ -408,6 +432,15 @@ impl Querier {
         &self,
         tenant: TenantId,
     ) -> Result<(SessionContext, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings, _) = self.budgeted_session(tenant).await?;
+        Ok((ctx, warnings))
+    }
+
+    /// [`Querier::session`] and the tenant's byte budget.
+    async fn budgeted_session(
+        &self,
+        tenant: TenantId,
+    ) -> Result<(SessionContext, Arc<QueryWarnings>, u64), QueryError> {
         let budget = self
             .catalog
             .tenant(tenant)
@@ -432,7 +465,89 @@ impl Querier {
             self.limits.batch_size,
             Arc::clone(&self.verified),
         )?;
-        Ok((ctx, warnings))
+        Ok((ctx, warnings, budget))
+    }
+
+    /// The series of `query`'s selector for `tenant` with their samples,
+    /// as one batch of [`select_schema`](crate::metric_select::select_schema).
+    /// Every live ingester must answer: a partial answer would read as
+    /// absent series.
+    ///
+    /// # Errors
+    /// Unknown tenant, invalid matchers, an ingester that does not
+    /// answer, an ambiguous series, a limit, or a read failure.
+    pub async fn metrics_select(
+        &self,
+        tenant: TenantId,
+        query: &crate::metric_select::SelectQuery,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings, budget) = self.budgeted_session(tenant).await?;
+        self.stats
+            .metric_selects
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reservation =
+            MemoryConsumer::new("metrics.select").register(&ctx.runtime_env().memory_pool);
+        let samples = crate::signal_table::SignalTable::metrics(
+            fs_ingest::hot::MetricTable::Samples,
+            tenant,
+            Arc::clone(&self.cache),
+            self.store_url.clone(),
+            budget,
+        )
+        .with_source_order()
+        .with_hot_window(Arc::clone(&self.hot), Arc::clone(&warnings))
+        .requiring_hot_window();
+        let frame = ctx.read_table(Arc::new(samples))?;
+        let batch = self
+            .metric_context(tenant, budget)
+            .select(frame, query, &mut reservation)
+            .await?;
+        Ok((held_batch(batch, reservation), warnings))
+    }
+
+    /// The label values, or names, of `query`'s series for `tenant`, as
+    /// one batch of one `value` or `name` column; ingesters that do not
+    /// answer are reported as warnings.
+    ///
+    /// # Errors
+    /// Unknown tenant, invalid matchers, a limit, or a read failure.
+    pub async fn metrics_labels(
+        &self,
+        tenant: TenantId,
+        query: &crate::metric_select::LabelQuery,
+    ) -> Result<(SendableRecordBatchStream, Arc<QueryWarnings>), QueryError> {
+        let (ctx, warnings, budget) = self.budgeted_session(tenant).await?;
+        self.stats
+            .metadata_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reservation =
+            MemoryConsumer::new("metrics.labels").register(&ctx.runtime_env().memory_pool);
+        let batch = self
+            .metric_context(tenant, budget)
+            .labels(query, &warnings, &mut reservation)
+            .await?;
+        Ok((held_batch(batch, reservation), warnings))
+    }
+
+    fn metric_context(&self, tenant: TenantId, budget: u64) -> crate::metric_select::Context<'_> {
+        crate::metric_select::Context {
+            tenant,
+            cache: &self.cache,
+            hot: &self.hot,
+            store: &self.store,
+            postings: &self.metric_index,
+            stats: &self.stats,
+            limits: crate::metric_select::MetricLimits {
+                max_series: self.limits.metrics_max_series,
+                max_rows: self.limits.max_rows,
+                matchers: crate::metric_select::MatcherLimits {
+                    max_matchers: self.limits.metrics_max_matchers,
+                    max_regex_bytes: self.limits.metrics_max_regex_bytes,
+                },
+            }
+            .clamped(),
+            budget,
+        }
     }
 
     /// The spans of one trace for `tenant`, in `timestamp` order, within
@@ -923,6 +1038,18 @@ fn admit(services: &mut BTreeSet<String>, service: &str, limit: usize) -> Result
     }
     services.insert(service.to_owned());
     Ok(())
+}
+
+/// A stream of `batch` that keeps `reservation` until it is dropped.
+fn held_batch(batch: RecordBatch, reservation: MemoryReservation) -> SendableRecordBatchStream {
+    let schema = batch.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures_util::stream::iter(vec![Ok(batch)]).map(move |batch| {
+            let _held = &reservation;
+            batch
+        }),
+    ))
 }
 
 fn one_batch(batch: RecordBatch) -> SendableRecordBatchStream {

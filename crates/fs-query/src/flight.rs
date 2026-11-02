@@ -32,11 +32,13 @@ use tracing::{info, warn};
 
 use crate::QueryError;
 use crate::actions::{
-    KeysLookup, METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, OperationsLookup,
-    ServicesLookup, TRACE_LOOKUP, TraceLookup,
+    KeysLookup, METADATA_KEYS, METADATA_OPERATIONS, METADATA_SERVICES, METRICS_LABEL_NAMES,
+    METRICS_LABEL_VALUES, METRICS_SELECT, OperationsLookup, ServicesLookup, TRACE_LOOKUP,
+    TraceLookup,
 };
 use crate::audit::Audit;
 use crate::auth::{Authenticator, Caller, QueryAuth, encode_ticket, redeem_ticket};
+use crate::metric_select::{LabelLookup, SelectLookup};
 use crate::querier::{Querier, QueryLimits, QueryWarnings};
 
 /// Response header set when the result may be incomplete, with the reasons.
@@ -154,6 +156,29 @@ impl FlightSql {
                     .and_then(|lookup| lookup.query())
                     .map_err(invalid)?;
                 within(deadline, limits, self.querier.metadata_keys(tenant, &query)).await
+            }
+            METRICS_SELECT => {
+                let query = SelectLookup::parse(&action.body)
+                    .and_then(|lookup| lookup.query())
+                    .map_err(invalid)?;
+                within(
+                    deadline,
+                    limits,
+                    self.querier.metrics_select(tenant, &query),
+                )
+                .await
+            }
+            METRICS_LABEL_VALUES | METRICS_LABEL_NAMES => {
+                let values = action.r#type == METRICS_LABEL_VALUES;
+                let query = LabelLookup::parse(&action.body)
+                    .and_then(|lookup| lookup.query(values))
+                    .map_err(invalid)?;
+                within(
+                    deadline,
+                    limits,
+                    self.querier.metrics_labels(tenant, &query),
+                )
+                .await
             }
             other => Err(Status::unimplemented(format!("unknown action {other:?}"))),
         }
@@ -276,15 +301,20 @@ fn status_of(error: &QueryError) -> Status {
     match error {
         QueryError::NotAllowed(_) => Status::permission_denied(error.to_string()),
         QueryError::InvalidAction(_) => Status::invalid_argument(error.to_string()),
-        QueryError::OverBudget { .. } | QueryError::TooManyRows(_) => {
-            Status::resource_exhausted(error.to_string())
-        }
+        QueryError::OverBudget { .. }
+        | QueryError::TooManyRows(_)
+        | QueryError::TooManySeries(_) => Status::resource_exhausted(error.to_string()),
+        QueryError::Ambiguous { .. } => Status::failed_precondition(error.to_string()),
+        QueryError::HotUnavailable(_) => Status::unavailable(error.to_string()),
         QueryError::Timeout(_) => Status::deadline_exceeded(error.to_string()),
         QueryError::UnknownTenant => Status::unauthenticated(error.to_string()),
         QueryError::DataFusion(e) => match e {
             datafusion::error::DataFusionError::External(inner) => inner
                 .downcast_ref::<QueryError>()
                 .map_or_else(|| Status::internal(e.to_string()), status_of),
+            datafusion::error::DataFusionError::ResourcesExhausted(_) => {
+                Status::resource_exhausted(e.to_string())
+            }
             datafusion::error::DataFusionError::Plan(_)
             | datafusion::error::DataFusionError::SQL(_, _)
             | datafusion::error::DataFusionError::SchemaError(_, _) => {
@@ -437,6 +467,18 @@ impl FlightSqlService for FlightSql {
                 METADATA_KEYS,
                 "Rows of the attribute_keys table; body {signal, prefix?, limit?}",
             ),
+            listed(
+                METRICS_SELECT,
+                "Series of a selector with their samples, one row a labelset; body {matchers, start_unix_milli, end_unix_milli, temporalities?, last_per_step?}",
+            ),
+            listed(
+                METRICS_LABEL_VALUES,
+                "Values of one label of a selector's series; body {label, matchers, start_unix_milli, end_unix_milli, limit?}",
+            ),
+            listed(
+                METRICS_LABEL_NAMES,
+                "Label names of a selector's series; body {matchers, start_unix_milli, end_unix_milli, limit?}",
+            ),
         ])
     }
 
@@ -448,6 +490,39 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn metric_errors_map_to_their_codes() {
+        let cases = [
+            (
+                QueryError::Ambiguous {
+                    name: "cpu".into(),
+                    fingerprint: 7,
+                },
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                QueryError::HotUnavailable(vec!["a".into()]),
+                tonic::Code::Unavailable,
+            ),
+            (QueryError::TooManySeries(1), tonic::Code::ResourceExhausted),
+            (
+                QueryError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(
+                    "pool".into(),
+                )),
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                QueryError::DataFusion(datafusion::error::DataFusionError::External(Box::new(
+                    QueryError::HotUnavailable(vec!["b".into()]),
+                ))),
+                tonic::Code::Unavailable,
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(status_of(&error).code(), code, "{error}");
+        }
+    }
 
     fn batch_stream(
         batches: Vec<RecordBatch>,

@@ -203,10 +203,10 @@ async fn check_rows(
 
 /// Fetches byte ranges of one object of `size` bytes for the Parquet
 /// readers.
-struct Footer {
-    store: Arc<dyn ObjectStore>,
-    path: Path,
-    size: u64,
+pub(crate) struct Footer {
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) path: Path,
+    pub(crate) size: u64,
 }
 
 impl AsyncFileReader for Footer {
