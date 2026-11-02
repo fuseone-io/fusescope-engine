@@ -275,13 +275,42 @@ pub async fn scan_with(
     scan_charged(address, request, timeout, tls, Arc::new(|_| true)).await
 }
 
+/// Bytes one array holds besides its buffers.
+const ARRAY_BYTES: usize = 128;
+
+/// What `batch` keeps alive: each distinct allocation its buffers share,
+/// once, at its capacity, and every array of it, children included.
+pub fn held_bytes(batch: &RecordBatch) -> usize {
+    held_bytes_of(batch.columns())
+}
+
+/// [`held_bytes`] of `columns`.
+pub fn held_bytes_of(columns: &[arrow::array::ArrayRef]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0usize;
+    let mut pending: Vec<arrow::array::ArrayData> =
+        columns.iter().map(arrow::array::Array::to_data).collect();
+    while let Some(data) = pending.pop() {
+        bytes += ARRAY_BYTES;
+        let nulls = data.nulls().map(|n| n.inner().inner().clone());
+        for buffer in data.buffers().iter().chain(nulls.iter()) {
+            if seen.insert(buffer.data_ptr().as_ptr().addr()) {
+                bytes += buffer.capacity();
+            }
+        }
+        pending.extend(data.child_data().iter().cloned());
+    }
+    bytes
+}
+
 /// What a hot scan charges each message to; `false` refuses it.
 pub type Charge = Arc<dyn Fn(usize) -> bool + Send + Sync>;
 
 /// [`scan_with`], each message of the answer charged to `charge` before it
-/// is decoded: twice its bytes, the message and the arrays decoded from
-/// it. A charge refused ends the scan, so no more than one message beyond
-/// what `charge` admitted is ever held.
+/// is decoded, and each batch decoded from it, at [`held_bytes`], before it
+/// is kept. A charge refused ends the scan, so no more than one message
+/// and the batch decoded from it beyond what `charge` admitted are ever
+/// held.
 ///
 /// # Errors
 /// As [`scan_with`], and [`IngestError::HotScanBudget`] when `charge`
@@ -326,7 +355,7 @@ pub async fn scan_charged(
         let stream = response.into_inner().map(move |message| {
             let message = message.map_err(|status| FlightError::Tonic(Box::new(status)))?;
             let bytes = message.data_body.len() + message.data_header.len();
-            if charged(bytes.saturating_mul(2)) {
+            if charged(bytes) {
                 Ok(message)
             } else {
                 refusing.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -338,7 +367,12 @@ pub async fn scan_charged(
         let mut batches = Vec::new();
         loop {
             match stream.try_next().await {
-                Ok(Some(batch)) => batches.push(batch),
+                Ok(Some(batch)) if charge(held_bytes(&batch)) => batches.push(batch),
+                Ok(Some(_)) => {
+                    return Err(IngestError::HotScanBudget {
+                        ingester: address.to_owned(),
+                    });
+                }
                 Ok(None) => break,
                 Err(_) if refused.load(std::sync::atomic::Ordering::Relaxed) => {
                     return Err(IngestError::HotScanBudget {

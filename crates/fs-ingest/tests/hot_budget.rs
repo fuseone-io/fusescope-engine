@@ -203,3 +203,37 @@ async fn a_hot_answer_past_its_budget_stops_before_it_is_read() {
         "{read} bytes of {total} crossed before the budget of {budget} stopped the scan"
     );
 }
+
+#[tokio::test]
+async fn a_decoded_batch_is_charged_before_it_is_kept() {
+    let messages = messages().await;
+    let wire: std::collections::HashSet<usize> = messages
+        .iter()
+        .map(|m| m.data_body.len() + m.data_header.len())
+        .collect();
+    let (address, _) = serve(messages).await;
+    let timeout = Duration::from_secs(30);
+
+    // Every message as it arrives is admitted; what it decodes into is not.
+    let admit_wire = Arc::new(move |bytes: usize| wire.contains(&bytes));
+    let err = scan_charged(&address, &request(), timeout, None, admit_wire)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IngestError::HotScanBudget { .. }), "{err}");
+
+    let charged = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&charged);
+    let all = Arc::new(move |bytes: usize| {
+        counted.fetch_add(bytes, Ordering::SeqCst);
+        true
+    });
+    let answer = scan_charged(&address, &request(), timeout, None, all)
+        .await
+        .unwrap();
+    let held: usize = answer.batches.iter().map(fs_ingest::hot::held_bytes).sum();
+    assert!(
+        charged.load(Ordering::SeqCst) >= held,
+        "charged {} for batches holding {held}",
+        charged.load(Ordering::SeqCst)
+    );
+}
