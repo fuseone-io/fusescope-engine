@@ -31,7 +31,7 @@ use arrow_flight::{
 };
 use fs_catalog::{FileId, TenantId};
 use fs_schema::spans::col;
-use futures_util::{Stream, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, Streaming};
@@ -272,6 +272,28 @@ pub async fn scan_with(
     timeout: Duration,
     tls: Option<&fs_auth::ClientTls>,
 ) -> Result<HotScanResponse, IngestError> {
+    scan_charged(address, request, timeout, tls, Arc::new(|_| true)).await
+}
+
+/// What a hot scan charges each message to; `false` refuses it.
+pub type Charge = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+
+/// [`scan_with`], each message of the answer charged to `charge` before it
+/// is decoded: twice its bytes, the message and the arrays decoded from
+/// it. A charge refused ends the scan, so no more than one message beyond
+/// what `charge` admitted is ever held.
+///
+/// # Errors
+/// As [`scan_with`], and [`IngestError::HotScanBudget`] when `charge`
+/// refuses a message.
+pub async fn scan_charged(
+    address: &str,
+    request: &HotScanRequest,
+    timeout: Duration,
+    tls: Option<&fs_auth::ClientTls>,
+    charge: Charge,
+) -> Result<HotScanResponse, IngestError> {
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fail = |reason: String| IngestError::HotScan {
         ingester: address.to_owned(),
         reason,
@@ -300,14 +322,31 @@ pub async fn scan_with(
                     .collect()
             })
             .unwrap_or_default();
-        let stream = response
-            .into_inner()
-            .map_err(|status| FlightError::Tonic(Box::new(status)));
+        let (charged, refusing) = (Arc::clone(&charge), Arc::clone(&refused));
+        let stream = response.into_inner().map(move |message| {
+            let message = message.map_err(|status| FlightError::Tonic(Box::new(status)))?;
+            let bytes = message.data_body.len() + message.data_header.len();
+            if charged(bytes.saturating_mul(2)) {
+                Ok(message)
+            } else {
+                refusing.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(FlightError::ProtocolError("past the memory budget".into()))
+            }
+        });
         let mut stream =
             arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream);
         let mut batches = Vec::new();
-        while let Some(batch) = stream.try_next().await.map_err(|e| fail(e.to_string()))? {
-            batches.push(batch);
+        loop {
+            match stream.try_next().await {
+                Ok(Some(batch)) => batches.push(batch),
+                Ok(None) => break,
+                Err(_) if refused.load(std::sync::atomic::Ordering::Relaxed) => {
+                    return Err(IngestError::HotScanBudget {
+                        ingester: address.to_owned(),
+                    });
+                }
+                Err(e) => return Err(fail(e.to_string())),
+            }
         }
         Ok(HotScanResponse {
             batches,

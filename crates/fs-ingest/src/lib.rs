@@ -128,6 +128,12 @@ pub enum IngestError {
         /// Why.
         reason: String,
     },
+    /// A hot-window answer grew past the budget its scan was given.
+    #[error("hot scan {ingester}: answer past the memory budget")]
+    HotScanBudget {
+        /// Ingester address.
+        ingester: String,
+    },
     /// A blocking task panicked or was cancelled.
     #[error("task: {0}")]
     Join(#[from] tokio::task::JoinError),
