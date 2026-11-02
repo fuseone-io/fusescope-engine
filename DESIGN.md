@@ -1453,11 +1453,16 @@ the answer at the capacity of its arrays, is reserved in the session's
 memory pool before it is held; a refused reservation is
 `RESOURCE_EXHAUSTED` (`fusescope_query_metric_selects_total`). The hot
 window's answers, series and samples alike, are charged message by
-message as they arrive, at twice a message's bytes for the message and
-the arrays decoded from it, before it is decoded: an answer past the pool
-stops with no more than one message of each ingester, at most the
-client's 4 MiB message limit, beyond what the pool admitted, and fails
-the select as resources exhausted, never as partial.
+message as they arrive, a message's bytes before it is decoded and what
+the batch decoded from it keeps alive (each allocation its buffers share,
+once, at its capacity, and every array) before the batch is kept; a
+batch brought back to the table's types is charged for the columns it
+casts before it is kept. An answer past the pool stops with no more than
+one message of each ingester, at most the client's 4 MiB message limit,
+and the batch made from it beyond what the pool admitted, and fails the
+select as resources exhausted, never as partial. A row selection from
+postings is reserved at four selectors a run, twice, for the copy the
+reader splits off one row group at a time.
 `metrics.label_values` takes `{"label": l, "matchers": [...],
 "start_unix_milli": n, "end_unix_milli": n, "limit": n}` and answers
 `value: Utf8`, the distinct non-empty values of the label over the rows
