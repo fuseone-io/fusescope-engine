@@ -277,9 +277,13 @@ impl Merge {
                 .ok_or(CompactError::Merge("a head lost"))?;
             let bytes = std::mem::take(&mut cursor.head_bytes);
             self.load_series(i, budget).await?;
-            if kept.iter_mut().any(|k| k.absorb(&mut row).is_some()) {
+            // The row kept takes the description it prefers and grows by
+            // what the row dropped shrinks by: what is held moves, only what
+            // is dropped now is freed.
+            if let Some(grown) = kept.iter_mut().find_map(|k| k.absorb(&mut row)) {
+                self.group_bytes = self.group_bytes.saturating_add_signed(grown);
+                budget.give(Part::Inputs, bytes.saturating_add_signed(-grown));
                 drop(row);
-                budget.give(Part::Inputs, bytes);
             } else {
                 self.group_bytes += bytes;
                 kept.push(row);
@@ -465,6 +469,10 @@ mod tests {
     use crate::metric::budget::MIN_METRIC_PASS_BYTES;
 
     fn request(hosts: &[&str]) -> ExportMetricsServiceRequest {
+        described(hosts, "")
+    }
+
+    fn described(hosts: &[&str], description: &str) -> ExportMetricsServiceRequest {
         let wide = "w".repeat(1024);
         let data_points = hosts
             .iter()
@@ -486,6 +494,7 @@ mod tests {
                 scope_metrics: vec![ScopeMetrics {
                     metrics: vec![Metric {
                         name: "cpu".into(),
+                        description: description.into(),
                         data: Some(Data::Gauge(Gauge { data_points })),
                         ..Metric::default()
                     }],
@@ -576,5 +585,70 @@ mod tests {
         merge.end_group(&mut budget);
         assert_eq!(budget.held(Part::Inputs), second + sizing);
         assert!(budget.peak() >= first + second);
+    }
+
+    /// One set of `request`, its two files written under `name`, opened.
+    async fn set(
+        store: &Arc<dyn ObjectStore>,
+        name: &str,
+        request: &ExportMetricsServiceRequest,
+    ) -> (read::Input, (read::Input, u32), bool) {
+        let (limits, metrics) = (Limits::default(), MetricLimits::default());
+        let checked = preflight(request, &limits, &metrics).unwrap();
+        let source = Source {
+            instance: [1; 16],
+            segment: 1,
+            offset: 1,
+        };
+        let rows = convert(request, &limits, &metrics, &checked, source).unwrap();
+        let series = series_batch(&rows.series, rows.series.len()).unwrap();
+        let open = |path: String, size: i64, schema| {
+            let store = Arc::clone(store);
+            async move {
+                let (input, layout) = read::Input::bounded(store, (&path, size), &schema, &[])
+                    .await
+                    .unwrap();
+                input.with_chunks(layout.plan(usize::MAX, 1024))
+            }
+        };
+        let (samples_path, series_path) =
+            (format!("{name}.s.parquet"), format!("{name}.r.parquet"));
+        let samples_size = put(store, &samples_path, &rows.samples).await;
+        let series_size = put(store, &series_path, &series).await;
+        (
+            open(
+                samples_path,
+                samples_size,
+                fs_schema::metrics::samples_schema_v1(),
+            )
+            .await,
+            (open(series_path, series_size, series_schema_v2()).await, 2),
+            true,
+        )
+    }
+
+    /// Of one series in two inputs, the row kept takes the longer
+    /// description of the one dropped: what the key holds is the row
+    /// kept, as it is after.
+    #[tokio::test]
+    async fn the_key_holds_its_row_as_it_grows_by_a_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let inputs = vec![
+            set(&store, "short", &described(&["a"], "")).await,
+            set(&store, "long", &described(&["a"], &"d".repeat(4096))).await,
+        ];
+        let mut budget = Budget::new(MIN_METRIC_PASS_BYTES);
+        let mut merge = Merge::open(inputs, &mut budget).await.unwrap();
+        let key = merge.next_key().unwrap().unwrap();
+        let (kept, _) = merge.take_series(&key, &mut budget).await.unwrap();
+        let [row] = kept.as_slice() else {
+            panic!("one row: {kept:?}");
+        };
+        assert_eq!(row.description.len(), 4096, "the longer description");
+        assert_eq!(budget.held(Part::Inputs), row.bytes());
+        merge.end_group(&mut budget);
+        assert_eq!(budget.held(Part::Inputs), 0);
     }
 }
