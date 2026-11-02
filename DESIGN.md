@@ -506,7 +506,7 @@ apart, then the series' name, type, unit, temporality, monotonicity and
 `le` or `quantile`: series whose labels match only because one level
 shadows another stay apart, and two declarations of one identity that
 differ in type, unit, temporality or monotonicity become two series under
-the same labels, which `metrics.select` refuses rather than merge. A
+the same labels, which `metrics.select` merges as the Go backend does. A
 series is its name, fingerprint, type, temporality, monotonicity, unit,
 labels and their levels; every merge, in a request, a buffer, a flush and
 a compaction, joins two rows of one name, fingerprint and hour only when
@@ -541,7 +541,7 @@ compactor** at every level. They are never the source of truth.
 | `.idx` sidecar | xor filter per column + min/max of promoted columns | file pruning without opening the footer | Tempo |
 | `index/trace_id/*.tix` | sorted table trace_id → file list, per hour | open two or three files for a trace instead of thousands | Tempo |
 | `logs/index/ngram/*.ngb` | trigram and token bloom over body, per row group of each log file | `LIKE`, `ILIKE`, `contains`, `has_token` | ClickHouse ngrambf_v1 |
-| `index/postings/*.pst` | roaring bitmaps, label=value → fingerprints, per hour | PromQL matcher resolution | Prometheus TSDB |
+| `metrics/index/postings/*.pst` | roaring bitmaps, label=value → rows of one series file | PromQL matcher resolution | Prometheus TSDB |
 | Tantivy (when measured, [ADR 0009](docs/adr/0009-text-bloom-per-row-group-tantivy-by-measure.md)) | inverted index per L1/L2 file | full-text search with ranking and phrases | Quickwit |
 
 Every sidecar carries a header with version, length and an xxh3 checksum. A
@@ -559,7 +559,13 @@ every row below the row count, and any failure scans the file. The
 compactor builds it as it writes the series file, each insertion admitted
 under the pass's budget before it allocates; past its share of the budget,
 or for a file of more than `u32::MAX` rows, the file is published without
-postings. `metrics.select` reads them (M3 step 3).
+postings. The metric actions (section 8.1) read only the rows a file's
+postings allow for the matchers that require a label, and skip a file
+they allow none of; decoded postings stay within
+`query.metric_index_cache_bytes` (64 MiB, at most 1 GiB, 0 disables) under
+the lease rule of the trace sidecar, `Postings::decode_cost` measuring
+what the decoder keeps and its scratch from the frame, without
+allocating, before a byte is decoded.
 
 The `trace_id` sidecar (`fs-index::trace_index`, format version 1) is a
 sorted table of `(trace_id, file)` pairs over a list of file paths. The flush
@@ -1338,7 +1344,8 @@ by the engine: `attr_string(attributes, 'http.method')`, `attr_number(...)`,
 |---|---|---|---|
 | `trace.lookup` | tenant, trace_id, optional range | spans of the trace | trace detail view |
 | `metrics.select` | tenant, label matchers, range, optional step | series with samples | Prometheus `storage.Queryable` in Go |
-| `metrics.label_values` | tenant, label, matchers | values | autocomplete |
+| `metrics.label_values` | tenant, label, matchers, range | values | autocomplete |
+| `metrics.label_names` | tenant, matchers, range | label names | autocomplete |
 | `metadata.keys` | tenant, signal, prefix | attribute keys with type | query builder |
 | `catalog.estimate` | tenant, SQL | bytes, files, row groups after pruning | `TelemetryStore.Estimate` |
 | `catalog.explain` | tenant, SQL | logical and physical plan | `TelemetryStore.Plan` and `Indexes` |
@@ -1382,6 +1389,78 @@ rows of `log_attribute_keys`, also a SQL table, and any other signal is
 (`fusescope_query_metadata_lookups_total`). An unknown action is
 `UNIMPLEMENTED`, a malformed body or a field the action does not know
 `INVALID_ARGUMENT`.
+
+The metric actions read as the Go backend's Prometheus querier
+(`clickhouseprometheusv2`) reads ClickHouse. Times are Unix milliseconds,
+both bounds required and inclusive, `start ≤ end`; series rows of the
+hours from the hour of `start` through `end` count.
+`metrics.select` takes `{"matchers": [{"name": n, "type": t, "value":
+v}], "start_unix_milli": n, "end_unix_milli": n, "temporalities": [...],
+"last_per_step": {"first_eval_unix_milli": n, "step_ms": n}}`:
+
+- **Matchers.** `type` is `=`, `!=`, `=~` or `!~`; `__name__` is the
+  metric's name. An absent label is `""` for every type. A regex is
+  anchored as `\A(?:…)\z` and compiled by `regex` 1.13.1 within 1 MiB of
+  program and 1 MiB of lazy DFA, both reserved in the memory pool first.
+  At most `query.metrics_max_matchers` (64, at most 1024) and
+  `query.metrics_max_regex_bytes` of patterns together (64 KiB, at most
+  1 MiB); past them, or a regex that does not compile,
+  `INVALID_ARGUMENT`. `temporalities` defaults to `Cumulative` and
+  `Unspecified`.
+- **Resolution.** First the candidate keys, name and fingerprint, of the
+  rows of the window that pass every matcher, a series file with usable
+  postings reading only the rows its label-requiring matchers allow, those
+  of `=` or `=~` that refuse `""`; with none, every row is read. Then
+  every row of those keys in the window, in every file and the hot window,
+  whether it passes or not, files with postings read by the rows of the
+  candidates' names, since postings do not index the fingerprint. A key
+  must hold one identity in each hour and the same in every hour, a
+  legacy level agreeing with any; otherwise the select is
+  `FAILED_PRECONDITION` naming the key
+  (`fusescope_query_metric_ambiguous_total`). The matchers then apply to
+  each key's identity. More than `query.metrics_max_series` keys (100 000,
+  at most 1 000 000) is `RESOURCE_EXHAUSTED` before a sample is read.
+- **Samples.** Read through the samples table with the source order,
+  sorted by name, fingerprint, time and source order descending: one
+  sample a key and time, the greatest source order winning, flagged ones
+  (`flags & 1`) the stale marker `0x7ff0000000000002`. With
+  `last_per_step`, `step_ms > 0`, each key keeps the last sample of each
+  bucket, the bucket of a sample at `t` being `0` when `t ≤ first_eval`
+  and `(t − first_eval − 1).div_euclid(step) + 1` otherwise, the Go
+  backend's `if(t <= first_eval, 0, intDiv(t - first_eval - 1, step) + 1)`
+  for the non-negative dividend it always has. Bucket 0 holds every
+  sample up to `first_eval`, bucket `i` those in
+  `(first_eval + (i − 1)·step, first_eval + i·step]`, negative times
+  alike; an instant query sends `first_eval = end`, one bucket. A window
+  whose `end − first_eval` overflows is `INVALID_ARGUMENT`. More than
+  `query.max_rows` samples after dedupe and reduction is
+  `RESOURCE_EXHAUSTED`, counted as they are read and again as labelsets
+  merge.
+- **Answer.** One row a labelset, sorted by labelset as Prometheus
+  compares them: `labels Map(Utf8, Utf8)` sorted by key, `__name__`
+  included and empty values left out, `timestamps List<Int64>` and
+  `values List<Float64>` of equal lengths in time order, nothing
+  nullable. Keys of equal labelsets merge in name and fingerprint order,
+  the first holding a time keeping it, as `sortAndMerge` does; a series
+  without samples is not answered.
+- **Partial.** A live ingester that does not answer, or answers rows of
+  another schema, fails the select with `UNAVAILABLE`: a partial answer
+  would read as absent series and fire alerts.
+
+Everything a select holds, candidate keys, rows, the hot window's
+batches, samples, merged series and the answer, is reserved in the
+session's memory pool before it is held; a refused reservation is
+`RESOURCE_EXHAUSTED` (`fusescope_query_metric_selects_total`).
+`metrics.label_values` takes `{"label": l, "matchers": [...],
+"start_unix_milli": n, "end_unix_milli": n, "limit": n}` and answers
+`value: Utf8`, the distinct non-empty values of the label over the rows
+of the window that pass the matchers, of the default temporalities, as
+Go's `DISTINCT` does; `metrics.label_names` takes the same without
+`label` and answers `name: Utf8`, the keys of non-empty values. Both are
+sorted and truncated to the first `limit` (1000, at most
+`query.max_rows`), as the Go backend's `LIMIT` truncates, and keep
+`x-fusescope-partial`, which the Go client turns into warning
+annotations.
 
 ### 8.2 Changes in Go
 

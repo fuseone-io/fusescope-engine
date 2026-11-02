@@ -173,11 +173,14 @@ bodies are stored and counted in `fusescope_ingest_log_bodies_truncated_total`.
 | `UNAUTHENTICATED` | `missing bearer token`, `unknown or revoked token`, a JWT reason, `unknown or deleted tenant` | the caller's token | in `jwt` mode, the backend's signing key and clock |
 | `PERMISSION_DENIED` | `ticket does not belong to this tenant`, `… issued to another subject`, `… not issued for a tenant token` | a ticket used by another caller, or an old ticket in `jwt` mode | the backend's ticket handling |
 | `PERMISSION_DENIED` | `only SELECT statements are allowed: …` | a statement that would write | the query |
-| `RESOURCE_EXHAUSTED` | `query would scan N bytes, over the budget of M`, `result exceeded N rows` | the scan budget or the row cap | narrow the query |
+| `RESOURCE_EXHAUSTED` | `query would scan N bytes, over the budget of M`, `result exceeded N rows` | the scan budget or the row cap; for `metrics.select` the samples answered | narrow the query |
+| `RESOURCE_EXHAUSTED` | `selector matched more than N series`, `Resources exhausted: …` | `query.metrics_max_series`, or the memory pool (`query.memory_bytes`) | narrow the selector |
+| `FAILED_PRECONDITION` | `series NAME FP has more than one identity in the window` | a key written under two identities (`fusescope_query_metric_ambiguous_total`) | escalate with the name and fingerprint; a window that leaves out the colliding hours answers |
 | `DEADLINE_EXCEEDED` | `query exceeded …` | `query.timeout_secs` | narrow the query |
 | `INVALID_ARGUMENT` | `bad ticket`, `invalid action: …`, a planning error | malformed input | the caller |
 | `UNIMPLEMENTED` | `unknown action "…"` | a `DoAction` type this engine does not serve | the backend calls an action of a newer engine, or a typo |
 | `UNAVAILABLE` | `token lookup failed: …`, `tenant lookup failed: …` | the catalog did not answer | catalog health |
+| `UNAVAILABLE` | `ingesters did not answer: …` | `metrics.select` needs every live ingester's hot window | the named ingesters; a stopped one leaves the list once its heartbeat is stale |
 
 A result carrying the `x-fusescope-partial` header is complete for what it
 read but missed something, named in the header, such as an ingester whose
@@ -231,6 +234,13 @@ points are counted by reason in
 `fusescope_ingest_metric_points_rejected_total`; a rising
 `exponential_histogram` means a sender needs explicit buckets until M3
 step 4.
+
+The metric actions read postings within `query.metric_index_cache_bytes`;
+a rising `fusescope_query_metric_index_misses_total` beside a flat
+`fusescope_query_metric_index_pruned_total` means selectors read series
+files whole: postings missing (L0, or abandoned by the compactor) or no
+room in the cache. Roll out queriers before turning on a Go backend that
+calls them; an older querier answers `UNIMPLEMENTED`.
 
 L2 compaction (`compactor.compact_l2`) is off by default. Roll out
 queriers first, then compactors with it off, then turn it on, and watch

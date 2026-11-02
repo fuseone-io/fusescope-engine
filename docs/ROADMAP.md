@@ -325,9 +325,28 @@ C5 landed after C6.
   and the accounting pass with `compact_metrics` off
   (`crates/fs-compactor/tests/metrics.rs`, among them
   `a_duplicate_across_l0_l1_and_l2_keeps_the_largest_source_order`); the
-  SQL table `metadata` and `usage_1h` of format v2. Next: step 3,
-  `metrics.select` joining on name and fingerprint, deduplicating
-  fragments and failing closed on a key of two identities.
+  SQL table `metadata` and `usage_1h` of format v2.
+- Step 3, `metrics.select`, `metrics.label_values` and
+  `metrics.label_names` (design revision 2 and the reviewer's contract
+  details). Done: `Postings::decode_cost`, equal to what the decoder
+  keeps by a counting allocator, and the postings cache
+  `query.metric_index_cache_bytes` on the sidecar lease rule; matchers
+  with an absent label empty and regexes anchored and reserved
+  (`regex` 1.13.1); candidates by postings, every row of a candidate key
+  read back and a key of two identities failing closed
+  (`an_identity_hidden_in_another_file_fails_the_select`); samples
+  deduplicated across L0, L1, L2 and the hot window
+  (`fragments_of_every_level_answer_once_the_last_written_winning`,
+  `the_hot_window_and_files_answer_together`); step buckets against the
+  Go formula (`step_buckets_match_the_go_backend`,
+  `last_per_step_is_the_raw_answer_reduced`); labelsets merged as
+  `sortAndMerge`; the series cap before samples, the sample cap and the
+  pool (`the_limits_refuse_before_the_work`); `UNAVAILABLE` on a partial
+  hot window, listings partial instead
+  (`an_ingester_that_does_not_answer_fails_a_select_but_not_a_listing`);
+  `query.metrics_max_series`, `metrics_max_matchers` and
+  `metrics_max_regex_bytes`. Next: `flightprometheus` in the Go backend,
+  then step 4, exponential histograms.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
 - `metrics.select` typed action; PromQL stays in Go ([ADR 0002](adr/0002-promql-stays-in-go.md)) through `flightprometheus`.
