@@ -150,7 +150,10 @@ columns the Go backend reads (`time_series_v4`, `samples_v4`), and
 `fusescope-collector-server/docs/spec/clickhouse-metrics.md` and its
 `observed/0.145.0` rows (Apache-2.0).
 
-A data point becomes one or more series, each with one sample.
+A data point becomes one or more series, each with one sample. These
+rules are mapping version 1 (`fs_schema::metrics::MAPPING_VERSION`), which
+each metric WAL record names; any change to the rows a request converts
+into takes a new version.
 
 | OTLP | Series | type | temporality | is_monotonic | unit | Source |
 |---|---|---|---|---|---|---|

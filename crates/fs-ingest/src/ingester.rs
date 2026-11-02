@@ -57,6 +57,7 @@ use crate::buffer::{
     Bound, Buffers, ConfirmAttempt, MetricPair, Reservation, Snapshot, Stream, TenantBuffer,
 };
 use crate::config::IngestConfig;
+use crate::metric_record::{MetricConversion, MetricPayloadError};
 use crate::ratelimit::RateLimiter;
 use crate::record::{FileLayout, FlushIntent, RecordSignal, RowSignal, WalRecord};
 use crate::server::{LogsReceiver, MetricsReceiver, TraceReceiver};
@@ -1531,28 +1532,7 @@ fn replay(
                         });
                     }
                     RecordSignal::Metrics => {
-                        let Ok(message) = ExportMetricsServiceRequest::decode(record.payload)
-                        else {
-                            out.damaged += 1;
-                            continue;
-                        };
-                        // The request was accepted: its own bounds held then,
-                        // so only the bounds of each point apply again.
-                        let replayed = MetricLimits {
-                            max_points: usize::MAX,
-                            max_samples: usize::MAX,
-                            ..metrics
-                        };
-                        let source = metric_source(instance, entry.position);
-                        let rows = convert_metrics(&message, &limits, &replayed, source)?;
-                        if rows.samples.num_rows() > 0 {
-                            out.rows.push(ReplayedRows {
-                                stream: Stream::metrics(record.tenant),
-                                position: entry.position,
-                                batch: rows.samples,
-                                series: rows.series,
-                            });
-                        }
+                        replay_metric(&record, &entry, instance, (limits, metrics), &mut out)?;
                     }
                     // An intent this engine cannot read was written by a newer
                     // one. Skipping it would send its rows back to live and
@@ -1796,6 +1776,66 @@ pub(crate) fn metric_source(instance: Uuid, position: Position) -> Source {
 ///
 /// # Errors
 /// A request over its bounds, or an Arrow failure.
+/// Converts a metric `record` read at `entry` into `out`'s rows, under the
+/// limits the record carries; a record of [`crate::record::VERSION`]
+/// carries the request alone and converts under `limits` and `metrics`.
+/// A damaged payload is counted and skipped.
+///
+/// # Errors
+/// A record under rules this engine does not convert by: skipping it would
+/// lose rows acknowledged, so the replay stops. Or an Arrow failure.
+fn replay_metric(
+    record: &WalRecord,
+    entry: &fs_wal::Entry,
+    instance: Uuid,
+    (limits, metrics): (fs_schema::limits::Limits, MetricLimits),
+    out: &mut Replayed,
+) -> Result<(), IngestError> {
+    let (conversion, request) = if record.version == crate::record::VERSION_METRIC_RECORD {
+        match MetricConversion::split(&record.payload) {
+            Ok((conversion, request)) => (Some(conversion), request),
+            Err(MetricPayloadError::Damaged) => {
+                out.damaged += 1;
+                return Ok(());
+            }
+            Err(MetricPayloadError::Mapping(mapping)) => {
+                return Err(IngestError::Record(format!(
+                    "metric record at {:?} is of mapping version {mapping}, which this engine does not convert; it was written by a newer one",
+                    entry.position
+                )));
+            }
+        }
+    } else {
+        (None, &record.payload[..])
+    };
+    let Ok(message) = ExportMetricsServiceRequest::decode(request) else {
+        out.damaged += 1;
+        return Ok(());
+    };
+    // The request was accepted: its own bounds held then, so only the
+    // bounds of each point apply again, as the record says they were.
+    let replayed = MetricLimits {
+        max_points: usize::MAX,
+        max_samples: usize::MAX,
+        ..metrics
+    };
+    let (limits, replayed) = match conversion {
+        Some(conversion) => conversion.apply(&limits, &replayed),
+        None => (limits, replayed),
+    };
+    let source = metric_source(instance, entry.position);
+    let rows = convert_metrics(&message, &limits, &replayed, source)?;
+    if rows.samples.num_rows() > 0 {
+        out.rows.push(ReplayedRows {
+            stream: Stream::metrics(record.tenant),
+            position: entry.position,
+            batch: rows.samples,
+            series: rows.series,
+        });
+    }
+    Ok(())
+}
+
 fn convert_metrics(
     message: &ExportMetricsServiceRequest,
     limits: &fs_schema::limits::Limits,

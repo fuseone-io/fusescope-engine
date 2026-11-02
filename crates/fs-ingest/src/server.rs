@@ -208,11 +208,15 @@ impl MetricsService for MetricsReceiver {
         let shared = &self.shared;
         let tenant = shared.auth.authenticate(request.metadata()).await?;
         let message = request.into_inner();
-        let payload = Bytes::from(message.encode_to_vec());
+        let conversion = crate::metric_record::MetricConversion::current(
+            &shared.config.limits,
+            &shared.config.metrics,
+        );
+        let payload = conversion.payload(&message.encode_to_vec());
         let now = Instant::now();
         check_rate(shared, tenant, payload.len(), now)?;
         let record = WalRecord {
-            version: crate::record::VERSION,
+            version: crate::record::VERSION_METRIC_RECORD,
             tenant,
             signal: RecordSignal::Metrics,
             payload,
@@ -220,7 +224,7 @@ impl MetricsService for MetricsReceiver {
         let task_shared = Arc::clone(shared);
         let outcome = run_ingest(shared, async move {
             task_shared
-                .ingest_metrics(tenant, &message, record.encode(), now)
+                .ingest_metrics(tenant, &message, conversion, record.encode(), now)
                 .await
         })
         .await?;

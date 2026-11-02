@@ -23,6 +23,7 @@ pub mod hours;
 pub mod ingester;
 pub mod metric_flush;
 mod metric_ingest;
+pub mod metric_record;
 pub mod ratelimit;
 pub mod record;
 pub mod series;

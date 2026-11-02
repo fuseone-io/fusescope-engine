@@ -29,9 +29,10 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use opentelemetry_proto::tonic::metrics::v1::summary_data_point::ValueAtQuantile;
 use opentelemetry_proto::tonic::metrics::v1::{
     ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
-    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Summary, SummaryDataPoint,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -435,6 +436,194 @@ async fn a_crash_before_the_intent_replays_the_metric_rows() {
     assert_eq!(db.files(tenant, Signal::MetricSeries).await.len(), 1);
     assert_eq!(db.sets().await.len(), 2);
     h.stop().await;
+    db.finish().await;
+}
+
+/// A copy of `from` in a new directory.
+fn copy_dir(from: &std::path::Path) -> tempfile::TempDir {
+    let to = tempfile::tempdir().unwrap();
+    for file in walkdir(from) {
+        let target = to.path().join(file.strip_prefix(from).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(&file, &target).unwrap();
+    }
+    std::fs::create_dir_all(to.path().join("bucket")).unwrap();
+    to
+}
+
+/// Points each conversion limit bears on: a histogram of two bounds, a
+/// summary of two quantiles, a long key, a long value and seven labels.
+fn bounded_request() -> ExportMetricsServiceRequest {
+    let attributes = vec![
+        kv("host", "h0"),
+        kv("a_rather_long_key", "x"),
+        kv("value", "a rather long value"),
+    ];
+    let summary = SummaryDataPoint {
+        attributes: attributes.clone(),
+        time_unix_nano: T0,
+        count: 4,
+        sum: 8.0,
+        quantile_values: vec![
+            ValueAtQuantile {
+                quantile: 0.5,
+                value: 1.0,
+            },
+            ValueAtQuantile {
+                quantile: 0.9,
+                value: 3.0,
+            },
+        ],
+        ..SummaryDataPoint::default()
+    };
+    let mut request = metrics(1, 0);
+    let scope = &mut request.resource_metrics[0].scope_metrics[0];
+    for metric in &mut scope.metrics {
+        match &mut metric.data {
+            Some(Data::Gauge(g)) => g.data_points[0].attributes.clone_from(&attributes),
+            Some(Data::Histogram(h)) => {
+                let point = &mut h.data_points[0];
+                point.attributes.clone_from(&attributes);
+                point.explicit_bounds = vec![1.0, 5.0];
+                point.bucket_counts = vec![1, 1, 1];
+            }
+            _ => {}
+        }
+    }
+    scope.metrics.push(Metric {
+        name: "rpc".into(),
+        data: Some(Data::Summary(Summary {
+            data_points: vec![summary],
+        })),
+        ..Metric::default()
+    });
+    request
+}
+
+/// Records logged, then a crash before their intent: whatever conversion
+/// limit the restart is configured with, the replay converts each record
+/// under the limits it was accepted with, into the same files, byte for
+/// byte, under the same ids.
+#[tokio::test]
+async fn a_replay_converts_under_the_limits_its_records_were_accepted_with() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, token) = db.tenant().await;
+    let h = start(&db.catalog, tempfile::tempdir().unwrap(), test_config()).await;
+    let (rejected, _) = h.export(bounded_request(), &token).await;
+    assert_eq!(rejected, 2, "the exponential histogram only");
+    let logged = h.crash().await;
+    let with = |change: fn(&mut IngestConfig)| {
+        let mut config = test_config();
+        change(&mut config);
+        config
+    };
+    let restarts = [
+        ("unchanged", test_config()),
+        (
+            "max_histogram_buckets",
+            with(|c| c.metrics.max_histogram_buckets = 1),
+        ),
+        (
+            "max_summary_quantiles",
+            with(|c| c.metrics.max_summary_quantiles = 1),
+        ),
+        (
+            "max_series_labels",
+            with(|c| c.metrics.max_series_labels = 6),
+        ),
+        ("max_key_bytes", with(|c| c.limits.max_key_bytes = 4)),
+        ("max_value_bytes", with(|c| c.limits.max_value_bytes = 4)),
+    ];
+    let mut first: Option<Vec<(String, [u8; 32])>> = None;
+    for (change, config) in restarts {
+        let h = start(&db.catalog, copy_dir(logged.path()), config).await;
+        h.ingester.flush_all().await;
+        let written: Vec<(String, [u8; 32])> = walkdir(&h.bucket())
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .map(|p| {
+                (
+                    p.strip_prefix(h.bucket()).unwrap().display().to_string(),
+                    sha256_of(p),
+                )
+            })
+            .collect();
+        assert_eq!(written.len(), 2, "{change}: one set");
+        assert_eq!(
+            db.files(tenant, Signal::MetricSamples).await.len(),
+            1,
+            "{change}"
+        );
+        assert_eq!(
+            db.files(tenant, Signal::MetricSeries).await.len(),
+            1,
+            "{change}"
+        );
+        match &first {
+            None => first = Some(written),
+            Some(first) => assert_eq!(&written, first, "{change}"),
+        }
+        h.stop().await;
+    }
+    db.finish().await;
+}
+
+/// A WAL of one metric record written as `record` makes.
+fn wal_with(record: &fs_ingest::record::WalRecord) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    wal.append(&record.encode()).unwrap();
+    wal.sync().unwrap();
+    dir
+}
+
+/// A metric record of version 1 carries the request alone and replays
+/// under the engine's limits; one of a mapping version this engine does
+/// not convert stops the start rather than lose its rows.
+#[tokio::test]
+async fn an_older_record_replays_and_one_of_an_unknown_mapping_stops_the_start() {
+    use fs_ingest::metric_record::MetricConversion;
+    use fs_ingest::record::{RecordSignal, VERSION, VERSION_METRIC_RECORD, WalRecord};
+    use prost::Message as _;
+
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let (tenant, _) = db.tenant().await;
+    let request = metrics(3, 0).encode_to_vec();
+    let older = WalRecord {
+        version: VERSION,
+        tenant,
+        signal: RecordSignal::Metrics,
+        payload: request.clone().into(),
+    };
+    let h = start(&db.catalog, wal_with(&older), test_config()).await;
+    h.ingester.flush_all().await;
+    let samples = db.files(tenant, Signal::MetricSamples).await;
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].row_count, 3 + 4, "the gauges and the histogram");
+    h.stop().await;
+
+    let config = test_config();
+    let mut conversion = MetricConversion::current(&config.limits, &config.metrics);
+    conversion.mapping = fs_schema::metrics::MAPPING_VERSION + 1;
+    let newer = WalRecord {
+        version: VERSION_METRIC_RECORD,
+        tenant,
+        signal: RecordSignal::Metrics,
+        payload: conversion.payload(&request),
+    };
+    let dir = wal_with(&newer);
+    std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
+    let wal = Wal::open(WalConfig::new(dir.path().join("wal"))).unwrap();
+    let err = match Ingester::new(config, db.catalog.clone(), store, Path::from(""), wal) {
+        Ok(_) => panic!("a record of an unknown mapping must stop the start"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("mapping version 2"), "{err}");
     db.finish().await;
 }
 

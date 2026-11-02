@@ -24,6 +24,12 @@ pub const VERSION_SIGNAL_INTENT: u8 = 3;
 /// the set of two files, samples and series, its rows go to. A reader
 /// without metrics meets it and fails.
 pub const VERSION_METRIC_INTENT: u8 = 4;
+/// Record format version of a metric record whose payload carries, ahead
+/// of the request, the mapping version and the limits it was converted
+/// under ([`crate::metric_record`]). A reader of the previous version
+/// meets it and fails; a metric record of [`VERSION`] carries the request
+/// alone and converts under the engine's limits.
+pub const VERSION_METRIC_RECORD: u8 = 5;
 
 /// Bytes of the seed at the head of a [`RecordSignal::Logs`] payload.
 pub const LOG_SEED_BYTES: usize = 16;
@@ -54,9 +60,10 @@ pub enum RecordSignal {
     /// seed names the request for the ids of its rows, so a replay gives
     /// them the ids the live conversion did.
     Logs = 3,
-    /// An `ExportMetricsServiceRequest`. Its samples take their source
-    /// order from the record's position, so a replay converts it as the
-    /// live request was.
+    /// An `ExportMetricsServiceRequest`, after what it was converted under
+    /// at [`VERSION_METRIC_RECORD`]. Its samples take their source order
+    /// from the record's position, so a replay converts it as the live
+    /// request was.
     Metrics = 4,
 }
 
@@ -437,6 +444,7 @@ impl WalRecord {
             VERSION_HOUR_INTENT,
             VERSION_SIGNAL_INTENT,
             VERSION_METRIC_INTENT,
+            VERSION_METRIC_RECORD,
         ]
         .contains(&version)
         {
@@ -446,7 +454,14 @@ impl WalRecord {
         }
         let signal = RecordSignal::from_byte(header.get(1).copied().unwrap_or(0))
             .ok_or_else(|| IngestError::Record("unknown signal".into()))?;
-        if version != VERSION && signal != RecordSignal::FlushIntent {
+        if version == VERSION_METRIC_RECORD && signal != RecordSignal::Metrics {
+            return Err(IngestError::Record(format!(
+                "version {version} is for metric records only"
+            )));
+        }
+        if ![VERSION, VERSION_METRIC_RECORD].contains(&version)
+            && signal != RecordSignal::FlushIntent
+        {
             return Err(IngestError::Record(format!(
                 "version {version} is for flush intents only"
             )));
@@ -863,6 +878,22 @@ mod tests {
         let bytes = record.encode();
         assert_eq!(bytes.get(1), Some(&4));
         assert_eq!(WalRecord::decode(&bytes).unwrap(), record);
+        let carrying = WalRecord {
+            version: VERSION_METRIC_RECORD,
+            ..record.clone()
+        };
+        assert_eq!(WalRecord::decode(&carrying.encode()).unwrap(), carrying);
+        for signal in [
+            RecordSignal::Traces,
+            RecordSignal::Logs,
+            RecordSignal::FlushIntent,
+        ] {
+            let other = WalRecord {
+                signal,
+                ..carrying.clone()
+            };
+            assert!(WalRecord::decode(&other.encode()).is_err(), "{signal:?}");
+        }
 
         let intent = metric_intent();
         let record = intent.to_record();

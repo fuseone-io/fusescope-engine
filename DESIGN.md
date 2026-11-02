@@ -166,7 +166,14 @@ arriving meanwhile:
   ingester of the previous version fails on. Span intents keep versions 1
   and 2, so a rollback is safe while no log record is in the log.
 - Metrics share the WAL, the gate and the checkpoint too. A metric record
-  has record code 4 and carries the request as received. What either walk
+  has record code 4 and, at record version 5, carries the mapping version
+  and the limits its conversion applied (`max_key_bytes`,
+  `max_value_bytes`, `max_histogram_buckets`, `max_summary_quantiles`,
+  `max_series_labels`) ahead of the request as received: a replay converts
+  under those, so a restart with other limits writes the same rows under
+  the same ids, and a mapping version the engine does not convert stops
+  it. A metric record of version 1 carries the request alone and converts
+  under the engine's limits. What either walk
   of a request holds at once, its levels, labels, names and rendering, is
   bounded from the request's sizes without allocating and held as scratch
   before the preflight, which validates and counts every point before any

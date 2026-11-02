@@ -16,7 +16,10 @@ use std::time::Instant;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, TimeZone, Utc};
 use fs_catalog::{CatalogError, FileId, FileSetId, MetricRole, NewFile, TenantId};
-use fs_schema::metrics::{Rejections, Source, convert, preflight, walk_bound, with_source};
+use fs_schema::limits::Limits;
+use fs_schema::metrics::{
+    MetricLimits, Rejections, Source, convert, preflight, walk_bound, with_source,
+};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use tracing::{info, warn};
 
@@ -27,6 +30,7 @@ use crate::ingester::{
     Converted, Shared, StageTiming, metric_source, nanos, take_injected, too_large,
 };
 use crate::metric_flush::{metric_path, prepare_samples, prepare_series};
+use crate::metric_record::MetricConversion;
 use crate::record::{FileLayout, FlushIntent, MetricFile, MetricIntent, RowSignal};
 
 /// What a metric flush wrote: the samples file, the samples and series as
@@ -39,8 +43,9 @@ impl Shared {
     async fn hold_walk(
         &self,
         message: &ExportMetricsServiceRequest,
-    ) -> Result<crate::buffer::Scratch, IngestError> {
-        let bound = walk_bound(message, &self.config.limits, &self.config.metrics);
+        (limits, metrics): (&Limits, &MetricLimits),
+    ) -> Result<Scratch, IngestError> {
+        let bound = walk_bound(message, limits, metrics);
         self.buffers
             .lock()
             .await
@@ -50,9 +55,10 @@ impl Shared {
             ))
     }
 
-    /// Counts `message`, admits what converting it holds, converts it, logs
-    /// `record` and adds the samples and series to the tenant's metric
-    /// buffer. A request with no sample is answered without the log.
+    /// Counts `message`, admits what converting it holds, converts it under
+    /// `conversion`, the one `record` carries, logs `record` and adds the
+    /// samples and series to the tenant's metric buffer. A request with no
+    /// sample is answered without the log.
     ///
     /// # Errors
     /// A request over a request-wide bound or spanning too many hours, a
@@ -61,6 +67,7 @@ impl Shared {
         &self,
         tenant: TenantId,
         message: &ExportMetricsServiceRequest,
+        conversion: MetricConversion,
         record: Vec<u8>,
         now: Instant,
     ) -> Result<Converted, IngestError> {
@@ -69,10 +76,10 @@ impl Shared {
             .acquire()
             .await
             .map_err(|_| IngestError::Backpressure("conversions closed"))?;
-        let metrics = &self.config.metrics;
-        let walk = self.hold_walk(message).await?;
-        let checked =
-            preflight(message, &self.config.limits, metrics).map_err(|e| too_large(e, metrics))?;
+        let (limits, metrics) = conversion.apply(&self.config.limits, &self.config.metrics);
+        let (limits, metrics) = (&limits, &metrics);
+        let walk = self.hold_walk(message, (limits, metrics)).await?;
+        let checked = preflight(message, limits, metrics).map_err(|e| too_large(e, metrics))?;
         let rejected = checked.rejected;
         let accepted = checked
             .points
@@ -123,7 +130,7 @@ impl Shared {
             segment: 0,
             offset: 0,
         };
-        let rows = convert(message, &self.config.limits, metrics, &checked, unknown)?;
+        let rows = convert(message, limits, metrics, &checked, unknown)?;
         drop(walk);
         drop(slot);
         let samples_rows = rows.samples.num_rows();

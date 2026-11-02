@@ -20,6 +20,11 @@ pub use schema::{
     SAMPLES_SCHEMA_VERSION, SERIES_SCHEMA_VERSION, col, samples_schema_v1, series_schema_v1,
 };
 
+/// Version of the rules a request converts by: `MAPPING.md` ("Metrics"),
+/// the canonical text, fingerprint version 1 and the schemas of version 1.
+/// Any change to the rows a request converts into takes a new version.
+pub const MAPPING_VERSION: u8 = 1;
+
 /// Bytes of a sample's source order: the WAL instance, segment and offset
 /// of its record and its ordinal in the request.
 pub const SOURCE_ORDER_BYTES: usize = 36;
