@@ -108,6 +108,13 @@ pub struct CompactionConfig {
     /// hour of them; log L1 files and `log_attribute_keys` tables already
     /// written are read, rebuilt, swept and purged all the same.
     pub compact_logs: bool,
+    /// Also compact metric sets, L0 to L1 and, with `compact_l2`, L1 to
+    /// L2. Off, metric sets are only accounted, their usage and metadata
+    /// published, and left at L0.
+    pub compact_metrics: bool,
+    /// The one budget of a metric pass, every part of it within; clamped
+    /// within 16 MiB and 8 GiB.
+    pub metric_pass_bytes: usize,
     /// Make this many swaps fail artificially after the outputs are
     /// uploaded. Zero in production; tests use it to crash before the swap.
     pub inject_swap_failures: u32,
@@ -180,6 +187,23 @@ pub struct CompactorStats {
     pub service_graph: AtomicU64,
     /// Completed passes whose span count crossed the graph cap.
     pub service_graph_skipped: AtomicU64,
+    /// Metric L0 to L1 passes that swapped sets in.
+    pub metric_passes: AtomicU64,
+    /// Metric L1 to L2 passes that swapped sets in.
+    pub metric_l2_passes: AtomicU64,
+    /// Metric accounting passes that committed.
+    pub metric_accounted: AtomicU64,
+    /// Most bytes one metric pass held, every part of its budget together.
+    pub metric_peak_bytes: AtomicU64,
+    /// Units passed over because their oldest set cannot be read within
+    /// the pass's budget.
+    pub metric_over_budget: AtomicU64,
+    /// Keys of metric series, name, fingerprint and hour, written holding
+    /// more than one identity, once a file.
+    pub metric_collisions: AtomicU64,
+    /// Series files published without postings, past their budget or
+    /// their rows.
+    pub postings_abandoned: AtomicU64,
 }
 
 impl CountsOrphans for CompactorStats {
@@ -848,6 +872,8 @@ mod tests {
             inject_swap_failures: 0,
             inject_put_failure_at: None,
             inject_put_hold: None,
+            compact_metrics: false,
+            metric_pass_bytes: crate::metric::DEFAULT_METRIC_PASS_BYTES,
         };
         bound_passes(&mut config);
         assert_eq!(config.l1_passes_per_tick, MAX_L1_PASSES_PER_TICK);

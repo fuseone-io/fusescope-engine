@@ -232,6 +232,8 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
+        compact_metrics: false,
+        metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
     }
 }
 
@@ -1209,6 +1211,8 @@ async fn a_cancelled_pass_counts_the_orphans_it_created() {
         CompactionConfig {
             l1_target_bytes: 1,
             inject_put_hold: Some((1, Duration::from_secs(30))),
+            compact_metrics: false,
+            metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
             ..config(4)
         },
     ));

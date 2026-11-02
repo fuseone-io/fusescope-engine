@@ -44,8 +44,8 @@ const TRACE_FINISH_COPIES: usize = 3;
 
 /// Bytes of each buffer an output is written into: a sixty-fourth of
 /// its memory budget, within these.
-const MIN_CHUNK_BYTES: usize = 64 << 10;
-const MAX_CHUNK_BYTES: usize = 4 << 20;
+pub(crate) const MIN_CHUNK_BYTES: usize = 64 << 10;
+pub(crate) const MAX_CHUNK_BYTES: usize = 4 << 20;
 
 /// Bytes one data page holds in the page indexes until the footer: its
 /// location and unencoded size, its minimum and maximum truncated to 64
@@ -62,11 +62,11 @@ const CHUNK_META_BYTES: usize = 1024;
 
 /// Bytes of the footer whatever its row groups: the schema and the
 /// key-value metadata, the Arrow schema among them.
-const FOOTER_FIXED_BYTES: usize = 64 << 10;
+pub(crate) const FOOTER_FIXED_BYTES: usize = 64 << 10;
 
 /// Copies of the indexes and footer at once as an output finishes: the
 /// indexes held, the footer encoded, and the metadata built from them.
-const FOOTER_COPIES: usize = 3;
+pub(crate) const FOOTER_COPIES: usize = 3;
 
 /// An output's bytes in buffers of one size, so growing never copies
 /// what is written, as a doubling buffer would.
@@ -98,7 +98,7 @@ impl std::io::Write for Chunks {
 }
 
 impl Chunks {
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         Self {
             done: Vec::new(),
             current: Vec::new(),
@@ -114,7 +114,7 @@ impl Chunks {
     }
 
     /// The bytes, their length and their SHA-256.
-    fn finish(mut self) -> (PutPayload, usize, [u8; 32]) {
+    pub(crate) fn finish(mut self) -> (PutPayload, usize, [u8; 32]) {
         use sha2::Digest;
         if !self.current.is_empty() {
             self.done
@@ -134,7 +134,7 @@ impl Chunks {
 
 /// What the page indexes and footer of `groups` hold, by their page
 /// counts.
-fn index_bytes(groups: &[parquet::file::metadata::RowGroupMetaData]) -> usize {
+pub(crate) fn index_bytes(groups: &[parquet::file::metadata::RowGroupMetaData]) -> usize {
     use parquet::basic::PageType;
     groups
         .iter()
@@ -164,7 +164,7 @@ fn index_bytes(groups: &[parquet::file::metadata::RowGroupMetaData]) -> usize {
 }
 
 /// What writing a row group adds besides its rows, for one writer.
-struct RowGroupCost {
+pub(crate) struct RowGroupCost {
     /// The bloom filters of a row group, sized as the Parquet split-block
     /// filter sizes them for each column's distinct values and
     /// false-positive rate, before folding.
@@ -183,7 +183,7 @@ impl RowGroupCost {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    fn new(
+    pub(crate) fn new(
         schema: &SchemaRef,
         properties: &parquet::file::properties::WriterProperties,
     ) -> Result<Self, CompactError> {
@@ -220,7 +220,7 @@ impl RowGroupCost {
     /// closes past the page size or row limit, so a column has at most
     /// those pages, one at a dictionary fallback and its last; a value
     /// encodes to no more than its payload and a four-byte index.
-    fn of(&self, rows: usize, payload: usize) -> usize {
+    pub(crate) fn of(&self, rows: usize, payload: usize) -> usize {
         let encoded = payload.saturating_add(rows.saturating_mul(4 * self.leaves));
         let pages = (encoded / self.page_bytes)
             .saturating_add(self.leaves.saturating_mul(rows / self.page_rows + 2));

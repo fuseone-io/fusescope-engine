@@ -1147,6 +1147,59 @@ than spans or logs, an hour not whole, or keys not strictly ascending by
 written, fails the read rather than reaching a sum; a key listed twice is
 one out of order.
 
+### 7.5 Metric sets
+
+Metric files are compacted as sets, samples and series together, with
+`compactor.compact_metrics` (off by default). A pass takes, from one
+repeatable-read snapshot (`metric_inputs`), the L0 sets of the oldest cold
+hour, both files of each ended and confirmed more than the close delay
+ago, into L1 under `metrics/{samples|series}/l1/dt=…/hr=…`; with
+`compact_l2`, the L1 sets of a closed day with no L0 metric file left,
+beside L2 sets or not, into L2 under `metrics/{samples|series}/l2/dt=…`,
+zstd 7. A set found in part, or whose files disagree on their accounting,
+fails the pass closed. The two files of every set are merged in step by
+`(metric_name, fingerprint, hour)`: the series rows of a key merge as a
+request merges them, two identities both kept and counted
+(`fusescope_compaction_metric_collisions_total`), and its samples keep,
+of one fingerprint and millisecond, the largest `_source_order`. A set of
+outputs closes when a file nears its share of the budget or its target
+size, so the samples of a key may span sets of one pass, or of passes,
+each holding the key's series row: an identical series row in two sets is
+valid, and the next level, or the reader, deduplicates.
+
+Every byte a pass holds is admitted against one budget,
+`compactor.metric_pass_bytes` (512 MiB, clamped within 16 MiB and 8 GiB by
+the compactor itself), split in sixteenths: inputs four (each file's
+metadata and costliest row in one half, its chunks, planned from the page
+index, in the other), the samples file four, the series file two, its
+postings two, metadata two, usage one, the row groups being gathered and
+the key's series rows one. A part's allocation is admitted before it is
+made; a unit whose oldest set cannot be read within the inputs' share is
+passed over and counted (`fusescope_compaction_metric_over_budget_total`).
+The highest total a pass held is `fusescope_compaction_metric_peak_bytes`.
+
+Each output set uploads its samples, then its series, then the postings
+of its series file, create-once; a pass of L0 sets not accounted then
+uploads its contributions: `metric_metadata` (signal 18), the labels of
+the series over the times of the samples of those inputs, one row a key,
+attribute, level, type and value, and `usage_1h` of format v2, every
+sample of those inputs, duplicates included, by the series' service. One
+fenced transaction quarantines the input sets, publishes the output sets
+and the contributions (`swap_file_sets_fenced`); a crash or refusal before
+it leaves the inputs visible and every object put an orphan. With
+`compact_metrics` off, an accounting pass reads the L0 sets of a cold hour
+not accounted, publishes their contributions and marks both files of each
+accounted in one fenced transaction (`account_file_sets_fenced`), the sets
+left at L0, so retention, which waits for a metric set's accounting, is
+never held. A set accounted is never counted again; L2 counts nothing.
+The SQL table `metadata` aggregates the contributions by
+`(metric_name, attr_name, attr_type, attr_datatype, attr_string_value)`,
+the least first and greatest last reported.
+
+The rollout is queriers first, then compactors with `compact_metrics` off,
+then ingesters of mapping 2, then `compact_metrics` on; once a metric set
+of L1 is published the binary is not rolled back.
+
 ### 7.4 Orphan sweep
 
 A crash between an upload and its registration, a compaction that did not

@@ -117,6 +117,12 @@ pub fn derived_columns(signal: UsageSignal) -> Vec<&'static str> {
     out
 }
 
+/// The usage logical bytes of a metric sample of `name`: its name, time,
+/// value and flags, as [`row_bytes`] counts a row of the samples schema.
+pub fn sample_bytes(name: &str) -> u64 {
+    (name.len() as u64).saturating_add(8 + 8 + 4)
+}
+
 /// The usage logical bytes of every row of `batch`, rows of `signal`.
 ///
 /// # Errors
@@ -455,6 +461,40 @@ impl UsageCounts {
             self.add(hour, name, 1, size)?;
         }
         Ok(None)
+    }
+
+    /// Counts `rows` samples of `bytes` together in the hour starting at
+    /// `hour`, in nanoseconds, of `service`, within `budget` bytes, as
+    /// [`Self::absorb_from`] counts rows: before a new pair would take the
+    /// counts past it, the counts so far are handed back, `self` starts
+    /// from none, and the samples are counted in it.
+    ///
+    /// # Errors
+    /// Counts of another signal than samples, or an overflow.
+    pub fn add_samples(
+        &mut self,
+        (hour, service): (i64, Option<&str>),
+        rows: u64,
+        bytes: u64,
+        budget: usize,
+    ) -> Result<Option<UsageCounts>, SchemaError> {
+        if self.signal != UsageSignal::Samples {
+            return Err(SchemaError::Layout("usage counts of another signal"));
+        }
+        let known = self
+            .hours
+            .get_mut(&hour)
+            .and_then(|h| h.get_mut(service))
+            .is_some();
+        let mut full = None;
+        if !known {
+            let cost = Self::entry_bytes(service.unwrap_or_default());
+            if !self.is_empty() && self.bytes.saturating_add(cost) > budget {
+                full = Some(std::mem::replace(self, Self::new(self.signal)));
+            }
+        }
+        self.add(hour, service, rows, bytes)?;
+        Ok(full)
     }
 
     /// Adds `rows` and `bytes` to `(hour, service)`.

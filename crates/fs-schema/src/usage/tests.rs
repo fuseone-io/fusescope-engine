@@ -422,3 +422,27 @@ fn metric_samples_are_admitted_in_format_v2_only() {
     );
     assert!(check_schema(&schema_v2()).is_ok());
 }
+
+/// One sample at a time counts as a batch of them does, its bytes by
+/// [`sample_bytes`], and a full count is handed back before a new pair.
+#[test]
+fn samples_counted_by_group_match_the_batch() {
+    let ms = 1_792_678_623_000i64;
+    let batch = samples(&["cpu", "memory"], ms);
+    let bytes = row_bytes(&batch, UsageSignal::Samples).unwrap();
+    assert_eq!(bytes, [sample_bytes("cpu"), sample_bytes("memory")]);
+    let hour = ms.div_euclid(3_600_000) * 3_600_000_000_000;
+    let mut counts = UsageCounts::new(UsageSignal::Samples);
+    let first = counts.add_samples((hour, Some("api")), 2, 2 * bytes[0], usize::MAX);
+    assert!(first.unwrap().is_none());
+    let budget = counts.estimated_bytes();
+    let full = counts.add_samples((hour, None), 1, bytes[1], budget);
+    let full = full.unwrap().unwrap();
+    assert_eq!(
+        full.of_hour(hour).collect::<Vec<_>>(),
+        [(Some("api"), 2, 46)]
+    );
+    assert_eq!(counts.of_hour(hour).collect::<Vec<_>>(), [(None, 1, 26)]);
+    let spans = UsageCounts::new(UsageSignal::Spans).add_samples((hour, None), 1, 1, 0);
+    assert!(spans.is_err());
+}

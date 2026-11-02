@@ -219,6 +219,14 @@ A metric flush writes two files of one set, samples and series; a set
 found registered or visible in part stops the flush, or fails the
 tenant's metric queries, with `file set … is registered in part`, which no
 crash leaves: keep both objects and escalate. Refused
+Metric sets are compacted with `compactor.compact_metrics` (off by default):
+roll out queriers, then compactors with it off, then ingesters, then turn it
+on, and do not roll back once an L1 metric set exists. Off, the compactor
+still accounts metric sets, publishing their usage and metadata, which
+retention waits for. An hour of metric sets whose oldest set cannot be read
+within `compactor.metric_pass_bytes` is passed over
+(`fusescope_compaction_metric_over_budget_total`) and, not accounted, keeps
+retention from it: raise the budget. Refused
 points are counted by reason in
 `fusescope_ingest_metric_points_rejected_total`; a rising
 `exponential_histogram` means a sender needs explicit buckets until M3

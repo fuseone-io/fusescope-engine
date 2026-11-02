@@ -45,7 +45,7 @@ pub fn converts(mapping: u8) -> bool {
 pub const SOURCE_ORDER_BYTES: usize = 36;
 
 /// [`SOURCE_ORDER_BYTES`] as Arrow sizes a fixed-size binary.
-const SOURCE_ORDER_WIDTH: i32 = 36;
+pub const SOURCE_ORDER_WIDTH: i32 = 36;
 
 /// The kind of series, as the Go backend reads `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

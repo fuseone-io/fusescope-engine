@@ -235,6 +235,8 @@ fn config() -> CompactionConfig {
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
+        compact_metrics: false,
+        metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
     }
 }
 
@@ -698,7 +700,7 @@ async fn a_tick_runs_an_l2_pass_behind_an_l1_backlog() {
         TickPasses {
             l1: 1,
             l2: 1,
-            accounted: 0
+            ..TickPasses::default()
         }
     );
     assert!(spans(&f).await.iter().any(|x| x.level == Level::L2));

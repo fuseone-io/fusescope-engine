@@ -622,6 +622,8 @@ fn no_compaction() -> fs_compactor::CompactionConfig {
         inject_swap_failures: 0,
         inject_put_failure_at: None,
         inject_put_hold: None,
+        compact_metrics: false,
+        metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
     }
 }
 

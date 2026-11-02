@@ -322,6 +322,8 @@ fn compactor(f: &Fixture) -> Compactor {
             inject_swap_failures: 0,
             inject_put_failure_at: None,
             inject_put_hold: None,
+            compact_metrics: false,
+            metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
         },
         Arc::new(CompactorStats::default()),
     )
@@ -1101,6 +1103,8 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
                 inject_swap_failures: 0,
                 inject_put_failure_at: None,
                 inject_put_hold: None,
+                compact_metrics: false,
+                metric_pass_bytes: fs_compactor::DEFAULT_METRIC_PASS_BYTES,
             },
             orphan_interval: Duration::from_secs(3600),
             sweep: fs_compactor::SweepConfig {

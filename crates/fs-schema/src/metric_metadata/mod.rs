@@ -74,6 +74,15 @@ impl MetadataCounts {
         self.bytes
     }
 
+    /// The least first and greatest last time listed, `None` without an
+    /// entry.
+    pub fn times(&self) -> Option<(i64, i64)> {
+        self.entries
+            .values()
+            .copied()
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    }
+
     /// Entries held.
     pub fn len(&self) -> usize {
         self.entries.len()

@@ -122,6 +122,20 @@ pub fn metric_writer_properties(row_group_rows: usize) -> Result<WriterPropertie
     .build())
 }
 
+/// [`metric_writer_properties`] at [`L2_ZSTD_LEVEL`].
+///
+/// # Errors
+/// A zstd level the library refuses.
+pub fn metric_l2_writer_properties(row_group_rows: usize) -> Result<WriterProperties, SchemaError> {
+    Ok(with_blooms(
+        base_properties(row_group_rows)?
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(L2_ZSTD_LEVEL)?)),
+        &METRIC_BLOOM_COLUMNS,
+        row_group_rows,
+    )
+    .build())
+}
+
 /// [`writer_properties`] or [`log_writer_properties`] at
 /// [`L2_ZSTD_LEVEL`], for `logs` or span rows.
 ///

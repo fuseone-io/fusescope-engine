@@ -27,6 +27,7 @@ mod kway;
 mod l2;
 pub mod lease;
 pub mod merge;
+mod metric;
 mod objects;
 pub mod orphans;
 pub mod output;
@@ -37,6 +38,9 @@ mod usage;
 
 pub use compact::{CompactionConfig, Compactor, CompactorStats};
 pub use lease::Leadership;
+pub use metric::{
+    DEFAULT_METRIC_PASS_BYTES, MAX_METRIC_PASS_BYTES, MIN_METRIC_PASS_BYTES, MetricPassed,
+};
 pub use orphans::{OrphanStats, SweepConfig, Sweeper};
 pub use retention::{Rebuild, Retention, RetentionConfig, RetentionStats};
 pub use usage::Accounted;
@@ -273,6 +277,12 @@ pub struct TickPasses {
     pub l2: usize,
     /// Accounting passes.
     pub accounted: usize,
+    /// Metric L0 to L1 passes.
+    pub metric_l1: usize,
+    /// Metric L1 to L2 passes.
+    pub metric_l2: usize,
+    /// Metric accounting passes.
+    pub metric_accounted: usize,
 }
 
 /// One compaction tick: up to `l1_passes_per_tick` L0 to L1 passes, then,
@@ -319,7 +329,51 @@ pub async fn compaction_tick(
             }
         }
     }
+    metric_tick(compactor, &fence, &mut ran).await;
     ran
+}
+
+/// The metric passes of a tick: as many L0 to L1 passes as L1 passes,
+/// then L2 passes, or, with metric compaction off, accounting passes.
+async fn metric_tick(
+    compactor: &Compactor,
+    fence: &impl Fn() -> Option<LeaseFence>,
+    ran: &mut TickPasses,
+) {
+    let config = compactor.config();
+    for _ in 0..config.l1_passes_per_tick {
+        let Some(f) = fence() else { return };
+        match compactor.compact_metrics_once(&f).await {
+            Ok(Some(_)) => ran.metric_l1 += 1,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "metric compaction pass failed");
+                break;
+            }
+        }
+    }
+    for _ in 0..config.l2_passes_per_tick.max(1) {
+        let Some(f) = fence() else { return };
+        match compactor.merge_metrics_once(&f).await {
+            Ok(Some(_)) => ran.metric_l2 += 1,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "metric L2 pass failed");
+                break;
+            }
+        }
+    }
+    for _ in 0..PASSES_PER_TICK {
+        let Some(f) = fence() else { return };
+        match compactor.account_metrics_once(&f).await {
+            Ok(Some(_)) => ran.metric_accounted += 1,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(role = "compactor", error = %e, "metric accounting pass failed");
+                break;
+            }
+        }
+    }
 }
 
 /// Expiry passes until nothing is beyond its cut, then stale tables
