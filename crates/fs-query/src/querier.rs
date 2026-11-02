@@ -142,6 +142,10 @@ pub struct QueryStats {
     pub trace_index_misses: std::sync::atomic::AtomicU64,
     /// Files a trace lookup skipped because their sidecar lacked the trace.
     pub trace_index_pruned: std::sync::atomic::AtomicU64,
+    /// Postings sidecars fetched from the bucket.
+    pub metric_index_fetches: std::sync::atomic::AtomicU64,
+    /// Series files read without postings: none, unusable or no room.
+    pub metric_index_misses: std::sync::atomic::AtomicU64,
     /// Text sidecars fetched from the bucket.
     pub text_index_fetches: std::sync::atomic::AtomicU64,
     /// Files a body search read whole for want of a usable text sidecar.
@@ -185,6 +189,10 @@ pub struct QueryLimits {
     /// Text sidecars, their bytes and descriptors, kept in memory for body
     /// searches of log files. Zero disables them.
     pub text_index_cache_bytes: usize,
+    /// Decoded postings of metric series files kept in memory for metric
+    /// selectors. Zero disables them; clamped to
+    /// [`MetricIndexCache::MAX_BYTES`](crate::metric_index::MetricIndexCache::MAX_BYTES).
+    pub metric_index_cache_bytes: usize,
     /// Most plans kept between `GetFlightInfo` and `DoGet`; beyond it the
     /// oldest is dropped and its ticket plans again.
     pub prepared_plans: usize,
@@ -207,6 +215,7 @@ impl Default for QueryLimits {
             hot_window: crate::hot::HotWindowConfig::default(),
             trace_index_cache_bytes: 256 * 1024 * 1024,
             text_index_cache_bytes: 256 * 1024 * 1024,
+            metric_index_cache_bytes: 64 * 1024 * 1024,
             prepared_plans: 1024,
             prepared_bytes: 64 * 1024 * 1024,
             prepared_ttl: Duration::from_secs(60),
@@ -240,6 +249,7 @@ pub struct Querier {
     hot: Arc<crate::hot::HotWindow>,
     trace_index: Arc<crate::trace_index::TraceIndexCache>,
     text_index: Arc<dyn crate::file_index::FileIndex>,
+    metric_index: Arc<crate::metric_index::MetricIndexCache>,
     runtime: Arc<RuntimeEnv>,
     store_url: ObjectStoreUrl,
     limits: QueryLimits,
@@ -291,6 +301,13 @@ impl Querier {
             )
             .with_stats(Arc::clone(&stats)),
         );
+        let metric_index = Arc::new(
+            crate::metric_index::MetricIndexCache::new(
+                Arc::clone(&store),
+                limits.metric_index_cache_bytes,
+            )
+            .with_stats(Arc::clone(&stats)),
+        );
         let text_index = Arc::new(
             crate::text_index::TextIndexCache::new(store, limits.text_index_cache_bytes)
                 .with_stats(Arc::clone(&stats)),
@@ -305,6 +322,7 @@ impl Querier {
             hot_window = limits.hot_window.enabled,
             trace_index_cache_bytes = limits.trace_index_cache_bytes,
             text_index_cache_bytes = limits.text_index_cache_bytes,
+            metric_index_cache_bytes = limits.metric_index_cache_bytes,
             "querier ready"
         );
         Ok(Self {
@@ -313,6 +331,7 @@ impl Querier {
             hot,
             trace_index,
             text_index,
+            metric_index,
             runtime,
             store_url,
             limits,
@@ -332,6 +351,11 @@ impl Querier {
     /// The sidecar cache trace lookups consult.
     pub fn trace_index(&self) -> Arc<crate::trace_index::TraceIndexCache> {
         Arc::clone(&self.trace_index)
+    }
+
+    /// The postings cache metric selectors consult.
+    pub fn metric_index(&self) -> Arc<crate::metric_index::MetricIndexCache> {
+        Arc::clone(&self.metric_index)
     }
 
     /// Consults `index` instead of the text sidecars for body searches;

@@ -16,6 +16,7 @@ pub mod files;
 pub mod flight;
 pub mod has_token;
 pub mod hot;
+pub mod metric_index;
 pub mod prune;
 pub mod querier;
 pub mod session;
