@@ -12,6 +12,7 @@ mod catalog;
 mod compaction;
 mod file_set;
 mod lease;
+mod metric_sets;
 mod orphans;
 mod retention;
 mod token;
@@ -22,6 +23,7 @@ mod watch;
 pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
 pub use compaction::CompactionInputs;
 pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
+pub use metric_sets::{MetricInputs, MetricPass, MetricSet};
 pub use orphans::{Doom, OrphanClaim};
 pub use retention::{ExpiredFiles, RebuildInput, StaleKey, StaleTable};
 pub use token::{

@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 
 use crate::CatalogError;
 use crate::catalog::{Catalog, Confirm, insert_file};
-use crate::types::{FileId, FileRecord, FileSetId, MetricRole, NewFile};
+use crate::types::{FileId, FileRecord, FileSetId, Level, MetricRole, NewFile};
 
 impl Catalog {
     /// Registers `files`, the samples then the series file of one tenant
@@ -65,9 +65,9 @@ impl Catalog {
     }
 }
 
-/// `files` are a samples then a series file of one tenant, both within one
-/// hour, under distinct ids.
-fn check_pair(set: FileSetId, files: &[NewFile; 2]) -> Result<(), CatalogError> {
+/// `files` are a samples then a series file of one tenant and level, both
+/// within one hour, or one day at L2, under distinct ids.
+pub(crate) fn check_pair(set: FileSetId, files: &[NewFile; 2]) -> Result<(), CatalogError> {
     let invalid = |reason| Err(CatalogError::InvalidFileSet { set: set.0, reason });
     let [samples, series] = files;
     if samples.signal != MetricRole::Samples.signal()
@@ -81,14 +81,33 @@ fn check_pair(set: FileSetId, files: &[NewFile; 2]) -> Result<(), CatalogError> 
     if samples.id == series.id {
         return invalid("one id for both files");
     }
-    let hour = hour_of(samples.range.start);
-    let end = hour + Duration::hours(1);
+    if samples.level != series.level {
+        return invalid("files of two levels");
+    }
+    let (start, span, beyond) = if samples.level == Level::L2 {
+        (
+            day_of(samples.range.start),
+            Duration::days(1),
+            "files beyond one day",
+        )
+    } else {
+        (
+            hour_of(samples.range.start),
+            Duration::hours(1),
+            "files beyond one hour",
+        )
+    };
+    let end = start + span;
     let within =
-        |f: &NewFile| f.range.start >= hour && f.range.end < end && f.range.start <= f.range.end;
+        |f: &NewFile| f.range.start >= start && f.range.end < end && f.range.start <= f.range.end;
     if !within(samples) || !within(series) {
-        return invalid("files beyond one hour");
+        return invalid(beyond);
     }
     Ok(())
+}
+
+fn day_of(at: DateTime<Utc>) -> DateTime<Utc> {
+    hour_of(at).with_hour(0).unwrap_or(at)
 }
 
 fn hour_of(at: DateTime<Utc>) -> DateTime<Utc> {

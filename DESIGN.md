@@ -1134,7 +1134,9 @@ once. A signal whose compaction is off, logs without `compact_logs`, is
 counted by an accounting pass instead: the same cold-hour rule, its L0
 inputs read and left in place, the contribution published and the inputs
 marked `true` in one fenced transaction. Retention never expires a file
-still `false`; the contribution files expire by the rule of their hour.
+still `false`; the contribution files expire by the rule of their hour. For a metric file `true` means its set's usage and metadata are
+published; both files of a set turn `true` together, and a set whose files
+disagree fails every pass and listing closed.
 The SQL table `usage_1h` sums every contribution, one row per
 `(signal, service_name, hour)`: `signal` `UInt8`, `service_name` nullable,
 `hour` a whole UTC hour, `rows` and `bytes` `UInt64`. A contribution is

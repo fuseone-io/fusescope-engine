@@ -259,6 +259,8 @@ pub enum Signal {
     Rollup30m,
     /// Derived: attribute keys of log rows.
     LogAttributeKeys,
+    /// Derived: the labels, values and types of metric series.
+    MetricMetadata,
 }
 
 impl Signal {
@@ -277,6 +279,7 @@ impl Signal {
             Signal::Rollup5m => 15,
             Signal::Rollup30m => 16,
             Signal::LogAttributeKeys => 17,
+            Signal::MetricMetadata => 18,
         }
     }
 
@@ -298,6 +301,7 @@ impl Signal {
             15 => Signal::Rollup5m,
             16 => Signal::Rollup30m,
             17 => Signal::LogAttributeKeys,
+            18 => Signal::MetricMetadata,
             other => {
                 return Err(CatalogError::InvalidValue {
                     column: "signal",
@@ -322,6 +326,7 @@ impl Signal {
             Signal::Rollup5m => "metrics/derived/rollup_5m",
             Signal::Rollup30m => "metrics/derived/rollup_30m",
             Signal::LogAttributeKeys => "derived/log_attribute_keys",
+            Signal::MetricMetadata => "metrics/derived/metric_metadata",
         }
     }
 }

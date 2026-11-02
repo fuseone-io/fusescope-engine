@@ -59,9 +59,10 @@ pub struct RebuildInput {
 const CUTOFF: &str = "date_bin('1 day', now(), timestamptz '1970-01-01 00:00:00+00') \
                       - make_interval(days => t.retention_days)";
 
-/// A file retention may expire: spans and logs only once their usage was
-/// counted (`usage_accounted`).
-const COUNTED: &str = "(f.usage_accounted or f.signal not in (1, 2))";
+/// A file retention may expire: spans, logs and metric files only once
+/// their usage was counted (`usage_accounted`), for metric files their
+/// metadata too.
+const COUNTED: &str = "(f.usage_accounted or f.signal not in (1, 2, 3, 4))";
 
 impl Catalog {
     /// Quarantines, under `fence`, up to `limit` visible files of `signal`
@@ -111,7 +112,7 @@ impl Catalog {
             "with picked as (
                  select id, file_set from engine_file
                  where tenant_id = $2 and signal = $3 and state = $4 and ts_max < $5
-                   and (usage_accounted or signal not in (1, 2))
+                   and (usage_accounted or signal not in (1, 2, 3, 4))
                  order by ts_max, id
                  limit $6
              )
