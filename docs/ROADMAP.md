@@ -279,6 +279,19 @@ C5 landed after C6.
 
 ## M3 · metrics (phase 3)
 
+- Step 1, ingest and read of samples and series (design revision 3). Done:
+  schemas v1, fingerprint v1 and the clean-room mapping (`fs_schema::metrics`,
+  pinned); file sets (migration 0019) registered and confirmed as one, a
+  file without its partner never visible nor left behind by retention
+  (`crates/fs-catalog/tests/file_set.rs`); WAL record 4 and intent v4 with
+  derived set and file ids, `_source_order` so a duplicate keeps the same
+  winner in any merge, limits reserved before conversion, the pair's
+  supersede and crash boundaries (`crates/fs-ingest/tests/metrics.rs`);
+  `samples` and `time_series` SQL tables over sets and the hot window
+  (`crates/fs-query/tests/metrics.rs`); `ingest.max_metric_*`,
+  `max_histogram_buckets`, `max_summary_quantiles`, `max_series_labels`
+  and rejection counters by reason. Next: step 2, metric compaction with
+  the duplicate kept across L0, L1 and L2.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
 - `metrics.select` typed action; PromQL stays in Go ([ADR 0002](adr/0002-promql-stays-in-go.md)) through `flightprometheus`.

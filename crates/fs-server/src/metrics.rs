@@ -942,7 +942,7 @@ async fn respond(
     stream.shutdown().await
 }
 
-/// Rows each signal buffered and dropped.
+/// Rows and points each signal buffered and dropped.
 fn render_ingest_rows(out: &mut String, i: &fs_ingest::IngestStats) {
     counter(
         out,
@@ -973,6 +973,30 @@ fn render_ingest_rows(out: &mut String, i: &fs_ingest::IngestStats) {
         "fusescope_ingest_log_bodies_truncated_total",
         "Log bodies truncated to the body limit",
         i.bodies_truncated.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_ingest_metric_points_total",
+        "Metric data points accepted",
+        i.metric_points.load(Ordering::Relaxed),
+    );
+    counter(
+        out,
+        "fusescope_ingest_metric_samples_total",
+        "Metric samples buffered, buckets and quantiles included",
+        i.metric_samples.load(Ordering::Relaxed),
+    );
+    let rejected: Vec<(&str, u64)> = fs_schema::metrics::Rejection::ALL
+        .iter()
+        .zip(&i.metric_points_rejected)
+        .map(|(reason, count)| (reason.as_str(), count.load(Ordering::Relaxed)))
+        .collect();
+    labelled_counter(
+        out,
+        "fusescope_ingest_metric_points_rejected_total",
+        "Metric data points refused, by reason",
+        "reason",
+        &rejected,
     );
 }
 
@@ -1052,6 +1076,9 @@ mod tests {
         ingest.logs.fetch_add(7, Ordering::Relaxed);
         ingest.logs_rejected.fetch_add(2, Ordering::Relaxed);
         ingest.bodies_truncated.fetch_add(1, Ordering::Relaxed);
+        ingest.metric_points.fetch_add(4, Ordering::Relaxed);
+        ingest.metric_samples.fetch_add(9, Ordering::Relaxed);
+        ingest.metric_points_rejected[0].fetch_add(6, Ordering::Relaxed);
         metrics.register_ingest(ingest, Arc::new(|| 42));
         let page = metrics.render();
         assert!(
@@ -1062,6 +1089,10 @@ mod tests {
             "fusescope_ingest_logs_total 7\n",
             "fusescope_ingest_logs_rejected_total 2\n",
             "fusescope_ingest_log_bodies_truncated_total 1\n",
+            "fusescope_ingest_metric_points_total 4\n",
+            "fusescope_ingest_metric_samples_total 9\n",
+            "fusescope_ingest_metric_points_rejected_total{reason=\"exponential_histogram\"} 6\n",
+            "fusescope_ingest_metric_points_rejected_total{reason=\"stale_histogram\"} 0\n",
         ] {
             assert!(page.contains(line), "{line}{page}");
         }

@@ -112,6 +112,10 @@ impl Default for MetricLimits {
 }
 
 impl MetricLimits {
+    /// The least `max_series_labels`: the generated labels every series
+    /// carries and one more.
+    pub const MIN_SERIES_LABELS: usize = identity::ALWAYS_GENERATED + 1;
+
     /// The limits with `max_samples` within `1..=u32::MAX` and every other
     /// bound at least 1, whatever the caller validated.
     #[must_use]
@@ -122,7 +126,7 @@ impl MetricLimits {
             max_samples: self.max_samples.clamp(1, max_ordinal),
             max_histogram_buckets: self.max_histogram_buckets.max(1),
             max_summary_quantiles: self.max_summary_quantiles.max(1),
-            max_series_labels: self.max_series_labels.max(identity::ALWAYS_GENERATED + 1),
+            max_series_labels: self.max_series_labels.max(Self::MIN_SERIES_LABELS),
         }
     }
 }

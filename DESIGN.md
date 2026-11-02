@@ -481,6 +481,13 @@ shadows another stay apart, and two declarations of one identity that
 differ in type, unit, temporality or monotonicity become two series under
 the same labels, which `metrics.select` refuses rather than merge.
 Exponential histograms are refused point by point until M3 step 4.
+A request is bounded before conversion by `ingest.max_metric_points_per_request`
+(100 000), `max_metric_samples_per_request` (1 000 000, at most
+`u32::MAX`), `max_histogram_buckets` (160), `max_summary_quantiles` (64)
+and `max_series_labels` (320); a request past the first two is refused
+whole, a point past the others is refused, reported in the partial
+success and counted in
+`fusescope_ingest_metric_points_rejected_total{reason}`.
 
 A request converts in two passes over one traversal: a preflight validates
 every point and counts samples, series and bytes without keeping any, and

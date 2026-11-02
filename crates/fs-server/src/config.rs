@@ -354,6 +354,23 @@ pub struct IngestSection {
     /// Milliseconds a request waits for a WAL queue slot.
     #[serde(default = "default_wal_queue_wait_ms")]
     pub wal_queue_wait_ms: u64,
+    /// Refuse a metrics request carrying more data points than this.
+    #[serde(default = "default_max_metric_points")]
+    pub max_metric_points_per_request: usize,
+    /// Refuse a metrics request expanding into more samples than this,
+    /// buckets and quantiles included; at most `u32::MAX`.
+    #[serde(default = "default_max_metric_samples")]
+    pub max_metric_samples_per_request: u64,
+    /// Refuse a histogram point with more explicit bounds than this.
+    #[serde(default = "default_max_histogram_buckets")]
+    pub max_histogram_buckets: usize,
+    /// Refuse a summary point with more quantiles than this.
+    #[serde(default = "default_max_summary_quantiles")]
+    pub max_summary_quantiles: usize,
+    /// Refuse a point whose series has more labels than this, generated
+    /// ones included; at least 6.
+    #[serde(default = "default_max_series_labels")]
+    pub max_series_labels: usize,
 }
 
 impl Default for IngestSection {
@@ -393,8 +410,33 @@ impl Default for IngestSection {
             wal_queue_records: default_wal_queue_records(),
             wal_queue_bytes: default_wal_queue_bytes(),
             wal_queue_wait_ms: default_wal_queue_wait_ms(),
+            max_metric_points_per_request: default_max_metric_points(),
+            max_metric_samples_per_request: default_max_metric_samples(),
+            max_histogram_buckets: default_max_histogram_buckets(),
+            max_summary_quantiles: default_max_summary_quantiles(),
+            max_series_labels: default_max_series_labels(),
         }
     }
+}
+
+fn default_max_metric_points() -> usize {
+    fs_schema::metrics::MetricLimits::default().max_points
+}
+
+fn default_max_metric_samples() -> u64 {
+    u64::try_from(fs_schema::metrics::MetricLimits::default().max_samples).unwrap_or(u64::MAX)
+}
+
+fn default_max_histogram_buckets() -> usize {
+    fs_schema::metrics::MetricLimits::default().max_histogram_buckets
+}
+
+fn default_max_summary_quantiles() -> usize {
+    fs_schema::metrics::MetricLimits::default().max_summary_quantiles
+}
+
+fn default_max_series_labels() -> usize {
+    fs_schema::metrics::MetricLimits::default().max_series_labels
 }
 
 fn default_wal_batch_records() -> usize {
@@ -495,8 +537,22 @@ impl IngestSection {
                 max_inflight_bytes: self.wal_queue_bytes,
                 queue_wait: std::time::Duration::from_millis(self.wal_queue_wait_ms),
             },
+            metrics: self.metric_limits(),
             ..fs_ingest::IngestConfig::default()
         })
+    }
+
+    /// The metric conversion bounds; out-of-range values are refused by
+    /// validation and clamped here.
+    fn metric_limits(&self) -> fs_schema::metrics::MetricLimits {
+        fs_schema::metrics::MetricLimits {
+            max_points: self.max_metric_points_per_request,
+            max_samples: usize::try_from(self.max_metric_samples_per_request).unwrap_or(usize::MAX),
+            max_histogram_buckets: self.max_histogram_buckets,
+            max_summary_quantiles: self.max_summary_quantiles,
+            max_series_labels: self.max_series_labels,
+        }
+        .clamped()
     }
 }
 
@@ -1418,6 +1474,26 @@ impl Config {
             );
         }
         self.ingest.text_index_limits()?;
+        self.validate_metric_limits()
+    }
+
+    fn validate_metric_limits(&self) -> Result<(), ServerError> {
+        let ingest = &self.ingest;
+        if !(1..=u64::from(u32::MAX)).contains(&ingest.max_metric_samples_per_request) {
+            return Err(ServerError::InvalidConfig(
+                "ingest.max_metric_samples_per_request must be between 1 and 4294967295".into(),
+            ));
+        }
+        if ingest.max_metric_points_per_request == 0
+            || ingest.max_histogram_buckets == 0
+            || ingest.max_summary_quantiles == 0
+            || ingest.max_series_labels < fs_schema::metrics::MetricLimits::MIN_SERIES_LABELS
+        {
+            return Err(ServerError::InvalidConfig(format!(
+                "ingest.max_metric_points_per_request, max_histogram_buckets and max_summary_quantiles must be positive and ingest.max_series_labels at least {}",
+                fs_schema::metrics::MetricLimits::MIN_SERIES_LABELS
+            )));
+        }
         Ok(())
     }
 
@@ -1967,6 +2043,50 @@ mod tests {
             let config =
                 Config::parse(&format!("{MINIMAL}[ingest]\ntoken_cache_secs = {secs}\n")).unwrap();
             assert_eq!(config.validate(&secrets).is_ok(), ok, "{secs}");
+        }
+    }
+
+    #[test]
+    fn metric_limits_are_configured_and_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let keys = "[ingest]\nmax_metric_points_per_request = 7\nmax_metric_samples_per_request = 70\nmax_histogram_buckets = 8\nmax_summary_quantiles = 9\nmax_series_labels = 40\n";
+        let config = Config::parse(&format!("{MINIMAL}{keys}")).unwrap();
+        config.validate(&secrets).unwrap();
+        let metrics = config.ingest.to_ingest_config().unwrap().metrics;
+        assert_eq!(
+            (
+                metrics.max_points,
+                metrics.max_samples,
+                metrics.max_histogram_buckets,
+                metrics.max_summary_quantiles,
+                metrics.max_series_labels
+            ),
+            (7, 70, 8, 9, 40)
+        );
+        let defaults = Config::parse(MINIMAL)
+            .unwrap()
+            .ingest
+            .to_ingest_config()
+            .unwrap();
+        assert_eq!(
+            defaults.metrics,
+            fs_schema::metrics::MetricLimits::default()
+        );
+        let above = u64::from(u32::MAX) + 1;
+        for (key, value, ok) in [
+            ("max_metric_samples_per_request", u64::from(u32::MAX), true),
+            ("max_metric_samples_per_request", above, false),
+            ("max_metric_samples_per_request", 0, false),
+            ("max_metric_points_per_request", 0, false),
+            ("max_histogram_buckets", 0, false),
+            ("max_summary_quantiles", 0, false),
+            ("max_series_labels", 1, false),
+        ] {
+            let config = Config::parse(&format!("{MINIMAL}[ingest]\n{key} = {value}\n")).unwrap();
+            assert_eq!(config.validate(&secrets).is_ok(), ok, "{key} = {value}");
         }
     }
 

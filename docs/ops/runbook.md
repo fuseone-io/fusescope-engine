@@ -208,7 +208,11 @@ first, then queriers, and before a rollback flush and checkpoint every
 ingester (stop it cleanly) so no metric record or intent is left in a WAL.
 A metric flush writes two files of one set, samples and series; a set
 found registered in part stops the flush with `file set … is registered in
-part`, which no crash leaves: keep both objects and escalate.
+part`, which no crash leaves: keep both objects and escalate. Refused
+points are counted by reason in
+`fusescope_ingest_metric_points_rejected_total`; a rising
+`exponential_histogram` means a sender needs explicit buckets until M3
+step 4.
 
 L2 compaction (`compactor.compact_l2`) is off by default. Roll out
 queriers first, then compactors with it off, then turn it on, and watch
