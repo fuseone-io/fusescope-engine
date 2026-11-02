@@ -139,6 +139,8 @@ impl SampleCursor {
 /// One series file being read, a row decoded at a time.
 struct SeriesCursor {
     input: read::Input,
+    /// Its series schema version, read off its footer.
+    version: u32,
     batch: Option<RecordBatch>,
     row: usize,
     head: Option<SeriesRow>,
@@ -157,12 +159,13 @@ pub(crate) struct Merge {
 }
 
 impl Merge {
-    /// The merge of `inputs`, `(samples, series, uncounted)` of each set.
+    /// The merge of `inputs`, `(samples, (series, its version), uncounted)`
+    /// of each set.
     ///
     /// # Errors
     /// A store or Parquet failure reading the first batches.
     pub(crate) async fn open(
-        inputs: Vec<(read::Input, read::Input, bool)>,
+        inputs: Vec<(read::Input, (read::Input, u32), bool)>,
     ) -> Result<Self, CompactError> {
         let mut merge = Self {
             samples: Vec::with_capacity(inputs.len()),
@@ -171,7 +174,7 @@ impl Merge {
             uncounted: 0,
             uncounted_times: (i64::MAX, i64::MIN),
         };
-        for (samples, series, uncounted) in inputs {
+        for (samples, (series, version), uncounted) in inputs {
             merge.samples.push(SampleCursor {
                 input: samples,
                 current: None,
@@ -180,6 +183,7 @@ impl Merge {
             });
             merge.series.push(SeriesCursor {
                 input: series,
+                version,
                 batch: None,
                 row: 0,
                 head: None,
@@ -385,7 +389,7 @@ impl Merge {
                 cursor.head = None;
                 return Ok(());
             };
-            let schema = if batch.num_columns() == series_schema_v2().fields().len() {
+            let schema = if cursor.version == 2 {
                 series_schema_v2()
             } else {
                 series_schema_v1()

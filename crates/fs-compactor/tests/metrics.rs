@@ -32,7 +32,7 @@ use fs_schema::metrics::{
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore as _, ObjectStoreExt, PutPayload};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -1020,4 +1020,80 @@ async fn identities_of_one_key_stay_apart_and_names_never_merge() {
     );
     assert!(samples.iter().all(|s| s.1 == fingerprint));
     f.db.finish().await;
+}
+
+/// `batch` under `schema`'s fields and a `fusescope.schema_version` of
+/// `version`, written as Parquet at `path`.
+async fn put_as_version(f: &Fixture, path: &str, batch: &RecordBatch, version: &str) {
+    let mut metadata = batch.schema().metadata().clone();
+    metadata.insert("fusescope.schema_version".into(), version.into());
+    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        batch.schema().fields().clone(),
+        metadata,
+    ));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec()).unwrap();
+    let properties = fs_schema::parquet::metric_writer_properties(4).unwrap();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = writer.into_inner().unwrap();
+    f.store
+        .put(&Path::from(path), PutPayload::from(bytes))
+        .await
+        .unwrap();
+}
+
+/// A set one of whose files carries a version this engine does not read,
+/// though laid out as one it does, fails the pass before anything is
+/// written: its inputs stay visible, no output is put.
+#[tokio::test]
+async fn a_metric_file_of_a_version_this_engine_does_not_read_fails_the_pass() {
+    for (role, version) in [(Signal::MetricSeries, "3"), (Signal::MetricSamples, "2")] {
+        let Some(f) = fixture().await else {
+            return;
+        };
+        let set = l0_set(&f, &gauge("cpu", &[("a", 1, 1.0)]), (source(1, 1), 2, 5)).await;
+        let file = visible(&f, role).await.remove(0);
+        let rows = batches(&f, &file.path).await;
+        f.store
+            .delete(&Path::from(file.path.as_str()))
+            .await
+            .unwrap();
+        put_as_version(&f, &file.path, &rows[0], version).await;
+        sqlx::query("update engine_file set size_bytes = $2 where id = $1")
+            .bind(file.id)
+            .bind(
+                i64::try_from(
+                    f.store
+                        .head(&Path::from(file.path.as_str()))
+                        .await
+                        .unwrap()
+                        .size,
+                )
+                .unwrap(),
+            )
+            .execute(f.db.catalog.pool())
+            .await
+            .unwrap();
+        let me = fence(&f).await;
+        let err = compactor(&f, config())
+            .compact_metrics_once(&me)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not read"), "{role:?}: {err}");
+        assert_eq!(sets_of(&f, Level::L1).await.len(), 0);
+        assert!(
+            f.store
+                .list_with_delimiter(Some(&Path::from(format!(
+                    "t/{}/metrics/samples/l1",
+                    f.tenant.0
+                ))))
+                .await
+                .map_or(true, |l| l.objects.is_empty()
+                    && l.common_prefixes.is_empty()),
+            "{role:?}: nothing put"
+        );
+        assert_eq!(visible(&f, Signal::MetricSamples).await.len(), 1, "{set:?}");
+        f.db.finish().await;
+    }
 }

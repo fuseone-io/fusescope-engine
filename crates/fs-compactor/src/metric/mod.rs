@@ -29,7 +29,9 @@ use fs_catalog::{
     TenantId, TimeRange,
 };
 use fs_schema::metric_metadata::MetadataCounts;
-use fs_schema::metrics::{SeriesRow, samples_schema_v1, series_schema_v2};
+use fs_schema::metrics::{
+    SeriesRow, check_samples_schema, samples_schema_v1, series_schema_v2, series_schema_version,
+};
 use fs_schema::usage::{UsageCounts, UsageSignal, sample_bytes};
 use object_store::PutPayload;
 use tracing::{info, warn};
@@ -58,6 +60,9 @@ pub struct MetricPassed {
     /// Contributions it published, metadata and usage.
     pub derived: usize,
 }
+
+/// A set opened: its samples file, and its series file with its version.
+type Opened = (MetricSet, read::Input, (read::Input, u32));
 
 /// The service a series row names, by its `service.name` label.
 fn service_of(row: &SeriesRow) -> Option<&str> {
@@ -163,7 +168,7 @@ impl Compactor {
         &self,
         candidate: &MetricInputs,
         budget: &mut Budget,
-    ) -> Result<Option<Vec<(MetricSet, read::Input, read::Input)>>, CompactError> {
+    ) -> Result<Option<Vec<Opened>>, CompactError> {
         let share = budget.share(Part::Inputs);
         let mut opened = Vec::new();
         let (mut metadata, mut floors, mut bytes) = (0usize, 0usize, 0u64);
@@ -191,6 +196,15 @@ impl Compactor {
                 &[],
             )
             .await?;
+            // A file of a version this engine does not read fails the pass
+            // before any chunk is planned or anything written.
+            let footer = |input: &read::Input| {
+                input
+                    .file_schema()
+                    .ok_or(CompactError::Merge("a metric file read unbounded"))
+            };
+            check_samples_schema(footer(&samples)?.as_ref())?;
+            let version = series_schema_version(footer(&series)?.as_ref())?;
             let more = samples_layout.metadata_bytes + series_layout.metadata_bytes;
             let floor = 2 * (samples_layout.floor + series_layout.floor);
             if metadata + floors + more + floor > share / 2 {
@@ -202,7 +216,7 @@ impl Compactor {
             opened.push((
                 set.clone(),
                 (samples, samples_layout),
-                (series, series_layout),
+                (series, series_layout, version),
             ));
         }
         if opened.is_empty() {
@@ -215,17 +229,17 @@ impl Compactor {
         let chunk = (share / 2) / (2 * files);
         let held: usize = opened
             .iter()
-            .map(|(_, (_, sl), (_, rl))| 2 * (chunk.max(sl.floor) + chunk.max(rl.floor)))
+            .map(|(_, (_, sl), (_, rl, _))| 2 * (chunk.max(sl.floor) + chunk.max(rl.floor)))
             .sum();
         budget.take(Part::Inputs, metadata + held)?;
         let rows = self.config.row_group_rows.max(1);
         Ok(Some(
             opened
                 .into_iter()
-                .map(|(set, (samples, sl), (series, rl))| {
+                .map(|(set, (samples, sl), (series, rl, version))| {
                     let samples = samples.with_chunks(sl.plan(chunk.max(sl.floor), rows));
                     let series = series.with_chunks(rl.plan(chunk.max(rl.floor), rows));
-                    (set, samples, series)
+                    (set, samples, (series, version))
                 })
                 .collect(),
         ))
@@ -235,7 +249,7 @@ impl Compactor {
         &self,
         pass: MetricPass,
         candidate: &MetricInputs,
-        inputs: Vec<(MetricSet, read::Input, read::Input)>,
+        inputs: Vec<Opened>,
         mut budget: Budget,
         fence: &LeaseFence,
     ) -> Result<MetricPassed, CompactError> {

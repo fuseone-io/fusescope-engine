@@ -438,6 +438,15 @@ impl Input {
         Ok((input, layout))
     }
 
+    /// The schema the file's footer carries, its metadata included; `None`
+    /// for an unbounded read.
+    pub(crate) fn file_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+        match self {
+            Self::Planned { metadata, .. } => Some(Arc::clone(metadata.schema())),
+            Self::Rows(_) => None,
+        }
+    }
+
     /// Reads the file in `chunks`, planned from its layout.
     pub(crate) fn with_chunks(mut self, planned: VecDeque<Chunk>) -> Self {
         if let Self::Planned { chunks, .. } = &mut self {

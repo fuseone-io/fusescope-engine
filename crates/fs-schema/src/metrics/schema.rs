@@ -122,3 +122,47 @@ fn with_metadata(fields: Vec<Field>, signal: &str, version: u32) -> Schema {
     ];
     Schema::new_with_metadata(fields, metadata.into_iter().collect())
 }
+
+/// Refuses a schema other than samples version 1: another signal or
+/// version, or other columns, whatever their layout.
+///
+/// # Errors
+/// As above.
+pub fn check_samples_schema(found: &Schema) -> Result<(), crate::SchemaError> {
+    let expected = samples_schema_v1();
+    if signal_and_version(found) != Some(("metric_samples", "1"))
+        || found.fields() != expected.fields()
+    {
+        return Err(crate::SchemaError::Layout(
+            "metrics: a samples file of a version this engine does not read",
+        ));
+    }
+    Ok(())
+}
+
+/// The version of a series schema, 1 or 2, its columns exactly those of
+/// the version it names.
+///
+/// # Errors
+/// Another signal or version, or other columns.
+pub fn series_schema_version(found: &Schema) -> Result<u32, crate::SchemaError> {
+    let other =
+        crate::SchemaError::Layout("metrics: a series file of a version this engine does not read");
+    let (version, expected) = match signal_and_version(found) {
+        Some(("metric_series", "1")) => (1, series_schema_v1()),
+        Some(("metric_series", "2")) => (2, series_schema_v2()),
+        _ => return Err(other),
+    };
+    if found.fields() != expected.fields() {
+        return Err(other);
+    }
+    Ok(version)
+}
+
+fn signal_and_version(schema: &Schema) -> Option<(&str, &str)> {
+    let metadata = schema.metadata();
+    Some((
+        metadata.get("fusescope.signal")?.as_str(),
+        metadata.get("fusescope.schema_version")?.as_str(),
+    ))
+}

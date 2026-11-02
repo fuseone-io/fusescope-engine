@@ -25,8 +25,8 @@ pub use rows::{
     MetricRows, SeriesRow, dedupe_series, series_batch, series_batch_of, series_rows, with_source,
 };
 pub use schema::{
-    SAMPLES_SCHEMA_VERSION, SERIES_SCHEMA_VERSION, col, samples_schema_v1, series_schema_v1,
-    series_schema_v2,
+    SAMPLES_SCHEMA_VERSION, SERIES_SCHEMA_VERSION, check_samples_schema, col, samples_schema_v1,
+    series_schema_v1, series_schema_v2, series_schema_version,
 };
 
 /// Version of the rules a request converts by: `MAPPING.md` ("Metrics"),
