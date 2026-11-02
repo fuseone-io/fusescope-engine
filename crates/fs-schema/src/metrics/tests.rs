@@ -586,6 +586,42 @@ fn the_traversal_holds_no_more_than_its_bound_found_before_it() {
     }
 }
 
+/// Limits at the top of their range clamp to their ceilings: a walk under
+/// them computes nothing past its type.
+#[test]
+fn limits_at_their_maximum_clamp_to_their_ceilings() {
+    let widest = MetricLimits {
+        max_points: usize::MAX,
+        max_samples: usize::MAX,
+        max_histogram_buckets: usize::MAX,
+        max_summary_quantiles: usize::MAX,
+        max_series_labels: usize::MAX,
+    };
+    let clamped = widest.clamped();
+    assert_eq!(
+        clamped.max_histogram_buckets,
+        MetricLimits::MAX_HISTOGRAM_BUCKETS
+    );
+    assert_eq!(
+        clamped.max_summary_quantiles,
+        MetricLimits::MAX_SUMMARY_QUANTILES
+    );
+    assert_eq!(clamped.max_series_labels, MetricLimits::MAX_SERIES_LABELS);
+    let req = request(
+        vec![kv("service.name", "api")],
+        vec![],
+        vec![histogram("h", bounded(vec![1.0], vec![1, 1]))],
+    );
+    let limits = Limits {
+        max_key_bytes: usize::MAX,
+        max_value_bytes: usize::MAX,
+        ..Limits::default()
+    };
+    assert!(walk_bound(&req, &limits, &widest) > 0);
+    let checked = preflight(&req, &limits, &widest).unwrap();
+    convert(&req, &limits, &widest, &checked, SOURCE).unwrap();
+}
+
 #[test]
 fn requests_past_their_point_or_sample_cap_are_refused_whole() {
     let points = |n: usize| {

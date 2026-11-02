@@ -247,7 +247,7 @@ fn metric_bound(
                 let buckets = p
                     .bucket_counts
                     .len()
-                    .clamp(1, metrics.max_histogram_buckets + 1)
+                    .clamp(1, metrics.max_histogram_buckets.saturating_add(1))
                     .saturating_mul(std::mem::size_of::<u64>());
                 let extra = names.saturating_add(buckets).saturating_add(GENERATED_TEXT);
                 point(&p.attributes, extra)

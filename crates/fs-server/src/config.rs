@@ -361,14 +361,15 @@ pub struct IngestSection {
     /// buckets and quantiles included; at most `u32::MAX`.
     #[serde(default = "default_max_metric_samples")]
     pub max_metric_samples_per_request: u64,
-    /// Refuse a histogram point with more explicit bounds than this.
+    /// Refuse a histogram point with more explicit bounds than this; at
+    /// most 4096.
     #[serde(default = "default_max_histogram_buckets")]
     pub max_histogram_buckets: usize,
-    /// Refuse a summary point with more quantiles than this.
+    /// Refuse a summary point with more quantiles than this; at most 4096.
     #[serde(default = "default_max_summary_quantiles")]
     pub max_summary_quantiles: usize,
     /// Refuse a point whose series has more labels than this, generated
-    /// ones included; at least 6.
+    /// ones included; between 6 and 4096.
     #[serde(default = "default_max_series_labels")]
     pub max_series_labels: usize,
 }
@@ -1478,6 +1479,7 @@ impl Config {
     }
 
     fn validate_metric_limits(&self) -> Result<(), ServerError> {
+        type M = fs_schema::metrics::MetricLimits;
         let ingest = &self.ingest;
         if !(1..=u64::from(u32::MAX)).contains(&ingest.max_metric_samples_per_request) {
             return Err(ServerError::InvalidConfig(
@@ -1485,13 +1487,16 @@ impl Config {
             ));
         }
         if ingest.max_metric_points_per_request == 0
-            || ingest.max_histogram_buckets == 0
-            || ingest.max_summary_quantiles == 0
-            || ingest.max_series_labels < fs_schema::metrics::MetricLimits::MIN_SERIES_LABELS
+            || !(1..=M::MAX_HISTOGRAM_BUCKETS).contains(&ingest.max_histogram_buckets)
+            || !(1..=M::MAX_SUMMARY_QUANTILES).contains(&ingest.max_summary_quantiles)
+            || !(M::MIN_SERIES_LABELS..=M::MAX_SERIES_LABELS).contains(&ingest.max_series_labels)
         {
             return Err(ServerError::InvalidConfig(format!(
-                "ingest.max_metric_points_per_request, max_histogram_buckets and max_summary_quantiles must be positive and ingest.max_series_labels at least {}",
-                fs_schema::metrics::MetricLimits::MIN_SERIES_LABELS
+                "ingest.max_metric_points_per_request must be positive, ingest.max_histogram_buckets between 1 and {}, ingest.max_summary_quantiles between 1 and {}, ingest.max_series_labels between {} and {}",
+                M::MAX_HISTOGRAM_BUCKETS,
+                M::MAX_SUMMARY_QUANTILES,
+                M::MIN_SERIES_LABELS,
+                M::MAX_SERIES_LABELS
             )));
         }
         Ok(())
@@ -2084,6 +2089,17 @@ mod tests {
             ("max_histogram_buckets", 0, false),
             ("max_summary_quantiles", 0, false),
             ("max_series_labels", 1, false),
+            ("max_histogram_buckets", 4096, true),
+            ("max_histogram_buckets", 4097, false),
+            ("max_summary_quantiles", 4096, true),
+            ("max_summary_quantiles", 4097, false),
+            ("max_series_labels", 4096, true),
+            ("max_series_labels", 4097, false),
+            (
+                "max_histogram_buckets",
+                u64::try_from(i64::MAX).unwrap(),
+                false,
+            ),
         ] {
             let config = Config::parse(&format!("{MINIMAL}[ingest]\n{key} = {value}\n")).unwrap();
             assert_eq!(config.validate(&secrets).is_ok(), ok, "{key} = {value}");

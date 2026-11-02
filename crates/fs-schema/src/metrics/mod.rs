@@ -120,18 +120,31 @@ impl MetricLimits {
     /// The least `max_series_labels`: the generated labels every series
     /// carries and one more.
     pub const MIN_SERIES_LABELS: usize = identity::ALWAYS_GENERATED + 1;
+    /// The most `max_histogram_buckets` takes.
+    pub const MAX_HISTOGRAM_BUCKETS: usize = 4096;
+    /// The most `max_summary_quantiles` takes.
+    pub const MAX_SUMMARY_QUANTILES: usize = 4096;
+    /// The most `max_series_labels` takes.
+    pub const MAX_SERIES_LABELS: usize = 4096;
 
-    /// The limits with `max_samples` within `1..=u32::MAX` and every other
-    /// bound at least 1, whatever the caller validated.
+    /// The limits with `max_samples` within `1..=u32::MAX`, every other
+    /// bound at least 1 and the per-point ones at most their ceilings,
+    /// whatever the caller validated.
     #[must_use]
     pub fn clamped(self) -> Self {
         let max_ordinal = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
         Self {
             max_points: self.max_points.max(1),
             max_samples: self.max_samples.clamp(1, max_ordinal),
-            max_histogram_buckets: self.max_histogram_buckets.max(1),
-            max_summary_quantiles: self.max_summary_quantiles.max(1),
-            max_series_labels: self.max_series_labels.max(Self::MIN_SERIES_LABELS),
+            max_histogram_buckets: self
+                .max_histogram_buckets
+                .clamp(1, Self::MAX_HISTOGRAM_BUCKETS),
+            max_summary_quantiles: self
+                .max_summary_quantiles
+                .clamp(1, Self::MAX_SUMMARY_QUANTILES),
+            max_series_labels: self
+                .max_series_labels
+                .clamp(Self::MIN_SERIES_LABELS, Self::MAX_SERIES_LABELS),
         }
     }
 }
