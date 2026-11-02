@@ -8,6 +8,7 @@
 
 mod frame;
 pub mod layout;
+pub mod postings;
 pub mod text_index;
 pub mod trace_index;
 
@@ -16,11 +17,13 @@ pub use text_index::{TextIndex, TextIndexBuilder, TextIndexLimits};
 pub use trace_index::{TraceIndex, owners_of_sidecar, sidecar_path};
 
 /// Every sidecar a file at `parquet` has: the `trace_id` sidecar of a span
-/// file, the text sidecar of a log file, none for anything else.
+/// file, the text sidecar of a log file, the postings of a series file of
+/// L1 or L2, none for anything else.
 pub fn sidecar_paths(parquet: &str) -> impl Iterator<Item = String> {
     trace_index::sidecar_path(parquet)
         .into_iter()
         .chain(text_index::sidecar_path(parquet))
+        .chain(postings::sidecar_path(parquet))
 }
 
 /// Crate version, exposed for diagnostics and the `--version` flag.
@@ -53,6 +56,9 @@ pub enum IndexError {
     /// More files or entries than the format can count.
     #[error("sidecar too large: {0}")]
     TooLarge(&'static str),
+    /// The sidecar was built for another file, or another version of it.
+    #[error("sidecar bound to another file: {0}")]
+    NotBound(&'static str),
 }
 
 #[cfg(test)]

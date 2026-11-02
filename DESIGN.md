@@ -547,6 +547,20 @@ compactor** at every level. They are never the source of truth.
 Every sidecar carries a header with version, length and an xxh3 checksum. A
 corrupt or missing sidecar degrades to a file scan, never to an error.
 
+The postings sidecar (`fs-index::postings`, format version 1) belongs to one
+series file of L1 or L2, at `metrics/index/postings/dt=…[/hr=…]/{id}.pst`:
+for each label key and value of its series, sorted as bytes, a roaring
+bitmap (`roaring` 0.11.3, the portable serialization every implementation
+reads) of the rows holding it. Its body names the series file's path,
+SHA-256, schema version and row count, so postings beside any other object
+are refused; a decoder checks every count and length against the bytes
+left before it allocates, strict order, no duplicate, no empty bitmap, and
+every row below the row count, and any failure scans the file. The
+compactor builds it as it writes the series file, each insertion admitted
+under the pass's budget before it allocates; past its share of the budget,
+or for a file of more than `u32::MAX` rows, the file is published without
+postings. `metrics.select` reads them (M3 step 3).
+
 The `trace_id` sidecar (`fs-index::trace_index`, format version 1) is a
 sorted table of `(trace_id, file)` pairs over a list of file paths. The flush
 writes one per L0 file, derived from the trace sets of its row groups, after
