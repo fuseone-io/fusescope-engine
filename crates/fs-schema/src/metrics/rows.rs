@@ -85,14 +85,14 @@ impl SeriesRow {
             .then(self.unix_milli.cmp(&other.unix_milli))
     }
 
-    /// Takes `other`, a row of the same series and hour: its description
-    /// when it is preferred. Returns how many bytes this row grew by,
-    /// negative when it shrank.
-    pub fn absorb(&mut self, other: Self) -> isize {
+    /// Takes from `other`, a row of the same series and hour, its
+    /// description when it is preferred, `other` keeping this one's.
+    /// Returns how many bytes this row grew by, negative when it shrank.
+    pub fn absorb(&mut self, other: &mut Self) -> isize {
         if preferred(&other.description, &self.description) {
             let signed = |n: usize| isize::try_from(n).unwrap_or(isize::MAX);
             let grown = signed(other.description.len()) - signed(self.description.len());
-            self.description = other.description;
+            std::mem::swap(&mut self.description, &mut other.description);
             grown
         } else {
             0

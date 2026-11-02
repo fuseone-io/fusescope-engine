@@ -84,16 +84,16 @@ impl Shared {
         // What converting holds only while it runs, the merge of its series
         // into the buffer's included, is held as scratch under the cap; the
         // rows that stay are admitted with the margin of their flush.
-        let transient = {
-            let buffers = self.buffers.lock().await;
-            let bytes = checked
-                .transient_bound()
-                .saturating_add(buffers.series_merge_peak(stream, checked.series));
-            buffers
+        let (transient, incoming) = {
+            let mut buffers = self.buffers.lock().await;
+            let (merge, incoming) = buffers.series_merge_peak(stream, checked.series);
+            let bytes = checked.transient_bound().saturating_add(merge);
+            let held = buffers
                 .try_hold_scratch(bytes, self.config.max_memory_bytes)
                 .ok_or(IngestError::Capacity(
                     "ingester memory full, hot-window retention pending",
-                ))?
+                ))?;
+            (held, incoming)
         };
         let reservation = self
             .admit(stream, checked.rows_bound(), checked.samples, &hours)
@@ -121,6 +121,7 @@ impl Shared {
                 .push_metric(samples, rows.series, hours, tracked.position, now);
             drop(reservation);
             drop(transient);
+            drop(incoming);
             drop(tracked);
             let live = buffers.get_mut(stream);
             (

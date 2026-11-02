@@ -175,7 +175,9 @@ arriving meanwhile:
   position under the gate, before the push; a replay converts with the
   position directly, into the same bytes. A metric buffer keeps its samples
   as other buffers keep rows and its series in two sorted runs merged as
-  requests arrive, one row a fingerprint and hour. A metric cut writes,
+  requests arrive, one row a fingerprint and hour; each merge allocates
+  one run of exactly its rows, and its scratch counts the series of
+  requests not pushed yet and of flushes that may come back. A metric cut writes,
   per hour, a set of two files, samples and series, under an intent of
   record version 4 naming the set and both files, whose ids derive from
   the rows' first position, the hour and the role. The samples file is

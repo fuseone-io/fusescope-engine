@@ -734,6 +734,20 @@ pub struct Reservation {
     reserved_hours: Arc<StdMutex<ReservedHours>>,
 }
 
+/// Series rows of one request counted as on their way into a buffer until
+/// dropped; see [`Buffers::series_merge_peak`].
+#[derive(Debug)]
+pub struct IncomingSeries {
+    rows: usize,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for IncomingSeries {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.rows, Ordering::Relaxed);
+    }
+}
+
 /// Hours of requests admitted but not yet pushed, counted per tenant so a
 /// cap on the hours a tenant holds sees them while they travel.
 type ReservedHours = HashMap<Stream, HashMap<DateTime<Utc>, usize>>;
@@ -859,6 +873,9 @@ pub struct Buffers {
     unconfirmed: HashMap<FileId, Unconfirmed>,
     reserved: HashMap<Stream, Arc<AtomicUsize>>,
     reserved_hours: Arc<StdMutex<ReservedHours>>,
+    /// Series rows of requests that reserved their merge and have not
+    /// pushed yet.
+    series_incoming: HashMap<Stream, Arc<AtomicUsize>>,
     /// Tenants refused a request for the hours they hold: due for a cut
     /// whatever their rows, bytes and age, until one takes them.
     pressed: HashSet<Stream>,
@@ -1420,13 +1437,34 @@ impl Buffers {
     }
 
     /// Most bytes merging `incoming` series rows into the live series of
-    /// `tenant` holds beyond them and the series already held.
-    pub fn series_merge_peak(&self, tenant: Stream, incoming: usize) -> usize {
-        self.tenants
+    /// `tenant` allocates beyond them and the series already held, counting
+    /// the rows that may join those first: of requests that asked before
+    /// and have not pushed, and of flushes a failed attempt gives back. The
+    /// guard counts `incoming` among the former until it is dropped, after
+    /// the push.
+    pub fn series_merge_peak(
+        &mut self,
+        tenant: Stream,
+        incoming: usize,
+    ) -> (usize, IncomingSeries) {
+        let pending = self.series_incoming.entry(tenant).or_default();
+        let others = pending.fetch_add(incoming, Ordering::Relaxed);
+        let guard = IncomingSeries {
+            rows: incoming,
+            pending: Arc::clone(pending),
+        };
+        let flushing: usize = self
+            .flushing
             .get(&tenant)
-            .map_or(SeriesSet::default().merge_peak(incoming), |b| {
-                b.series.merge_peak(incoming)
-            })
+            .map_or(0, |list| list.iter().map(|f| f.buffer.series.len()).sum());
+        let joining = incoming.saturating_add(others).saturating_add(flushing);
+        let peak = self
+            .tenants
+            .get(&tenant)
+            .map_or(SeriesSet::default().merge_peak(joining), |b| {
+                b.series.merge_peak(joining)
+            });
+        (peak, guard)
     }
 
     /// The hours the live rows of `tenant` fall in, in order.
@@ -1873,6 +1911,24 @@ mod tests {
 
     fn at(offset: u64) -> Position {
         Position { segment: 1, offset }
+    }
+
+    /// A request's merge counts the series rows of the requests that asked
+    /// before it and have not pushed: any of them may merge first.
+    #[test]
+    fn a_series_merge_counts_the_rows_of_requests_on_their_way() {
+        let mut buffers = Buffers::default();
+        let tenant = Stream::metrics(TenantId::new());
+        let alone = SeriesSet::default().merge_peak(10);
+        let (first, first_guard) = buffers.series_merge_peak(tenant, 10);
+        assert_eq!(first, alone);
+        let (second, second_guard) = buffers.series_merge_peak(tenant, 10);
+        assert_eq!(second, SeriesSet::default().merge_peak(20));
+        let (other, _) = buffers.series_merge_peak(Stream::metrics(TenantId::new()), 10);
+        assert_eq!(other, alone, "another tenant's requests merge elsewhere");
+        drop(first_guard);
+        drop(second_guard);
+        assert_eq!(buffers.series_merge_peak(tenant, 10).0, alone);
     }
 
     /// 2026-10-22T14:00:00Z.
