@@ -290,8 +290,18 @@ C5 landed after C6.
   `samples` and `time_series` SQL tables over sets and the hot window
   (`crates/fs-query/tests/metrics.rs`); `ingest.max_metric_*`,
   `max_histogram_buckets`, `max_summary_quantiles`, `max_series_labels`
-  and rejection counters by reason. Next: step 2, metric compaction with
-  the duplicate kept across L0, L1 and L2.
+  and rejection counters by reason. Review round 1: metric records of
+  WAL version 5 carry the mapping version and the limits they converted
+  under, so a replay writes the same bytes whatever a restart configures
+  (`a_replay_converts_under_the_limits_its_records_were_accepted_with`);
+  the walk's scratch is bounded without allocating and held before the
+  preflight (`the_traversal_holds_no_more_than_its_bound_found_before_it`);
+  a file visible without its partner fails the listing and the query
+  (`a_metric_file_is_refused_without_its_partner_and_expires_with_it`); a
+  series merge allocates one exact run, its peak counting requests on
+  their way (`adding_allocates_one_exact_run_within_the_merge_peak`).
+  Next: step 2, metric compaction with the duplicate kept across L0, L1
+  and L2.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
 - `metrics.select` typed action; PromQL stays in Go ([ADR 0002](adr/0002-promql-stays-in-go.md)) through `flightprometheus`.
