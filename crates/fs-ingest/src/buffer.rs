@@ -734,17 +734,36 @@ pub struct Reservation {
     reserved_hours: Arc<StdMutex<ReservedHours>>,
 }
 
-/// Series rows of one request counted as on their way into a buffer until
-/// dropped; see [`Buffers::series_merge_peak`].
-#[derive(Debug)]
-pub struct IncomingSeries {
-    rows: usize,
-    pending: Arc<AtomicUsize>,
+/// The series merges of one tenant's requests on their way into its
+/// buffer: their rows, and one lease that covers the merge of any of them.
+#[derive(Debug, Default)]
+struct MergeLease {
+    pending: usize,
+    bytes: u64,
 }
 
-impl Drop for IncomingSeries {
+/// One request's part of its tenant's merge lease, until dropped after
+/// its push; see [`Buffers::hold_series_merge`].
+#[derive(Debug)]
+pub struct SeriesMerge {
+    tenant: Stream,
+    rows: usize,
+    leases: Arc<StdMutex<HashMap<Stream, MergeLease>>>,
+    total: Arc<AtomicU64>,
+}
+
+impl Drop for SeriesMerge {
     fn drop(&mut self) {
-        self.pending.fetch_sub(self.rows, Ordering::Relaxed);
+        let Ok(mut leases) = self.leases.lock() else {
+            return;
+        };
+        if let Some(lease) = leases.get_mut(&self.tenant) {
+            lease.pending = lease.pending.saturating_sub(self.rows);
+            if lease.pending == 0 {
+                self.total.fetch_sub(lease.bytes, Ordering::Relaxed);
+                leases.remove(&self.tenant);
+            }
+        }
     }
 }
 
@@ -873,9 +892,8 @@ pub struct Buffers {
     unconfirmed: HashMap<FileId, Unconfirmed>,
     reserved: HashMap<Stream, Arc<AtomicUsize>>,
     reserved_hours: Arc<StdMutex<ReservedHours>>,
-    /// Series rows of requests that reserved their merge and have not
-    /// pushed yet.
-    series_incoming: HashMap<Stream, Arc<AtomicUsize>>,
+    /// Each tenant's merge lease while requests are on their way.
+    series_merges: Arc<StdMutex<HashMap<Stream, MergeLease>>>,
     /// Tenants refused a request for the hours they hold: due for a cut
     /// whatever their rows, bytes and age, until one takes them.
     pressed: HashSet<Stream>,
@@ -1436,35 +1454,50 @@ impl Buffers {
         }
     }
 
-    /// Most bytes merging `incoming` series rows into the live series of
-    /// `tenant` allocates beyond them and the series already held, counting
-    /// the rows that may join those first: of requests that asked before
-    /// and have not pushed, and of flushes a failed attempt gives back. The
-    /// guard counts `incoming` among the former until it is dropped, after
-    /// the push.
-    pub fn series_merge_peak(
-        &mut self,
+    /// Holds under `cap` the merge of `incoming` series rows into the live
+    /// series of `tenant`, as part of one lease of the tenant's that covers
+    /// the merge of any request on its way, whichever merges first: every
+    /// row the live series hold, may get back from a flush, or may take
+    /// from those requests, and `incoming`. The lease only grows while a
+    /// request is on its way, and is given back when none is. `None` past
+    /// `cap`, nothing held.
+    pub fn hold_series_merge(
+        &self,
         tenant: Stream,
         incoming: usize,
-    ) -> (usize, IncomingSeries) {
-        let pending = self.series_incoming.entry(tenant).or_default();
-        let others = pending.fetch_add(incoming, Ordering::Relaxed);
-        let guard = IncomingSeries {
-            rows: incoming,
-            pending: Arc::clone(pending),
-        };
+        cap: usize,
+    ) -> Option<SeriesMerge> {
         let flushing: usize = self
             .flushing
             .get(&tenant)
             .map_or(0, |list| list.iter().map(|f| f.buffer.series.len()).sum());
-        let joining = incoming.saturating_add(others).saturating_add(flushing);
-        let peak = self
+        let mut leases = self.series_merges.lock().ok()?;
+        let lease = leases.get(&tenant);
+        let (pending, bytes) = lease.map_or((0, 0), |l| (l.pending, l.bytes));
+        let joining = flushing.saturating_add(pending).saturating_add(incoming);
+        let target = self
             .tenants
             .get(&tenant)
             .map_or(SeriesSet::default().merge_peak(joining), |b| {
                 b.series.merge_peak(joining)
             });
-        (peak, guard)
+        let target = u64::try_from(target).unwrap_or(u64::MAX);
+        let grown = usize::try_from(target.saturating_sub(bytes)).unwrap_or(usize::MAX);
+        let held = self.total_bytes() + self.reserved_total() + self.scratch_total();
+        if held.saturating_add(grown) > cap {
+            return None;
+        }
+        self.scratch_total
+            .fetch_add(target.saturating_sub(bytes), Ordering::Relaxed);
+        let lease = leases.entry(tenant).or_default();
+        lease.pending = pending.saturating_add(incoming);
+        lease.bytes = bytes.max(target);
+        Some(SeriesMerge {
+            tenant,
+            rows: incoming,
+            leases: Arc::clone(&self.series_merges),
+            total: Arc::clone(&self.scratch_total),
+        })
     }
 
     /// The hours the live rows of `tenant` fall in, in order.
@@ -1913,22 +1946,51 @@ mod tests {
         Position { segment: 1, offset }
     }
 
-    /// A request's merge counts the series rows of the requests that asked
-    /// before it and have not pushed: any of them may merge first.
+    fn series_row(fingerprint: u64) -> SeriesRow {
+        SeriesRow {
+            fingerprint,
+            unix_milli: 0,
+            name: "m".into(),
+            kind: fs_schema::metrics::MetricType::Gauge,
+            temporality: fs_schema::metrics::Temporality::Unspecified,
+            monotonic: false,
+            unit: "".into(),
+            description: "".into(),
+            labels: Vec::new().into(),
+        }
+    }
+
+    /// Of two requests, the one that reserved first may merge last, after
+    /// the other's series joined the buffer: the tenant's merge lease
+    /// covers it, and is given back once no request is on its way.
     #[test]
-    fn a_series_merge_counts_the_rows_of_requests_on_their_way() {
+    fn the_merge_lease_covers_a_request_that_merges_after_a_later_one() {
         let mut buffers = Buffers::default();
         let tenant = Stream::metrics(TenantId::new());
-        let alone = SeriesSet::default().merge_peak(10);
-        let (first, first_guard) = buffers.series_merge_peak(tenant, 10);
-        assert_eq!(first, alone);
-        let (second, second_guard) = buffers.series_merge_peak(tenant, 10);
-        assert_eq!(second, SeriesSet::default().merge_peak(20));
-        let (other, _) = buffers.series_merge_peak(Stream::metrics(TenantId::new()), 10);
-        assert_eq!(other, alone, "another tenant's requests merge elsewhere");
-        drop(first_guard);
-        drop(second_guard);
-        assert_eq!(buffers.series_merge_peak(tenant, 10).0, alone);
+        let first = buffers.hold_series_merge(tenant, 10, usize::MAX).unwrap();
+        let second = buffers.hold_series_merge(tenant, 500, usize::MAX).unwrap();
+        buffers
+            .get_mut(tenant)
+            .add_series((0..500).map(series_row).collect());
+        drop(second);
+        let peak = buffers.get_mut(tenant).series.merge_peak(10);
+        assert!(
+            buffers.scratch_total() >= peak,
+            "{} held, {peak} merged",
+            buffers.scratch_total()
+        );
+        let other = buffers
+            .hold_series_merge(Stream::metrics(TenantId::new()), 10, usize::MAX)
+            .unwrap();
+        assert!(buffers.scratch_total() >= peak + SeriesSet::default().merge_peak(10));
+        drop(other);
+        drop(first);
+        assert_eq!(buffers.scratch_total(), 0);
+        assert!(
+            buffers.hold_series_merge(tenant, 10, 1).is_none(),
+            "past the cap"
+        );
+        assert_eq!(buffers.scratch_total(), 0);
     }
 
     /// 2026-10-22T14:00:00Z.

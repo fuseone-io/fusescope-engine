@@ -109,18 +109,19 @@ impl Shared {
         // into the buffer's included, is held as scratch under the cap; the
         // rows that stay are admitted with the margin of their flush.
         let (transient, incoming) = {
-            let mut buffers = self.buffers.lock().await;
-            let (merge, incoming) = buffers.series_merge_peak(stream, checked.series);
-            let bytes = checked
-                .transient_bound()
-                .saturating_sub(checked.scratch)
-                .saturating_add(merge);
+            let buffers = self.buffers.lock().await;
+            let full =
+                || IngestError::Capacity("ingester memory full, hot-window retention pending");
             let held = buffers
-                .try_hold_scratch(bytes, self.config.max_memory_bytes)
-                .ok_or(IngestError::Capacity(
-                    "ingester memory full, hot-window retention pending",
-                ))?;
-            (held, incoming)
+                .try_hold_scratch(
+                    checked.transient_bound().saturating_sub(checked.scratch),
+                    self.config.max_memory_bytes,
+                )
+                .ok_or_else(full)?;
+            let merge = buffers
+                .hold_series_merge(stream, checked.series, self.config.max_memory_bytes)
+                .ok_or_else(full)?;
+            (held, merge)
         };
         let reservation = self
             .admit(stream, checked.rows_bound(), checked.samples, &hours)
