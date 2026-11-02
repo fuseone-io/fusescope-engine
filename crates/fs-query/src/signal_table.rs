@@ -523,6 +523,11 @@ fn coerce_charged(
     schema: &arrow::datatypes::SchemaRef,
     charge: Option<&crate::hot::Charge>,
 ) -> DfResult<Vec<arrow::record_batch::RecordBatch>> {
+    if let Some(charge) = charge {
+        if !charge(std::mem::size_of_val(batches)) {
+            return Err(hot_exhausted(&[]));
+        }
+    }
     let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
         let coerced = coerce_to_schema(batch, schema)?;
@@ -534,7 +539,9 @@ fn coerce_charged(
                 .filter(|(made, given)| made.data_type() != given.data_type())
                 .map(|(made, _)| Arc::clone(made))
                 .collect();
-            if !cast.is_empty() && !charge(fs_ingest::hot::held_bytes_of(&cast)) {
+            let made = fs_ingest::hot::batch_bytes(coerced.num_columns())
+                + fs_ingest::hot::held_bytes_of(&cast);
+            if !cast.is_empty() && !charge(made) {
                 return Err(hot_exhausted(&[]));
             }
         }
@@ -571,6 +578,7 @@ fn coerce_to_schema(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use std::sync::Mutex;
 
@@ -579,6 +587,32 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
+
+    /// What `array` keeps alive, measured: it and its children at their
+    /// size with their `Arc`, and each distinct allocation of their buffers
+    /// at its capacity.
+    fn kept_by(array: &arrow::array::ArrayRef) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0;
+        let mut pending = vec![Arc::clone(array)];
+        while let Some(array) = pending.pop() {
+            bytes += std::mem::size_of_val(array.as_ref()) + 2 * std::mem::size_of::<usize>();
+            let data = array.to_data();
+            let nulls = data.nulls().map(|n| n.inner().inner().clone());
+            for buffer in data.buffers().iter().chain(nulls.iter()) {
+                if seen.insert(buffer.data_ptr().as_ptr().addr()) {
+                    bytes += buffer.capacity();
+                }
+            }
+            pending.extend(
+                data.child_data()
+                    .iter()
+                    .cloned()
+                    .map(arrow::array::make_array),
+            );
+        }
+        bytes
+    }
 
     #[test]
     fn each_coerced_batch_is_charged_before_it_is_kept() {
@@ -616,13 +650,13 @@ mod tests {
         });
         let coerced = coerce_charged(&batches, &declared, Some(&charge)).unwrap();
         let charges = charges.lock().unwrap().clone();
-        assert_eq!(charges.len(), 2, "one charge a batch made");
-        for (made, charged) in coerced.iter().zip(&charges) {
-            let cast = [Arc::clone(made.column(0))];
-            assert!(
-                *charged >= fs_ingest::hot::held_bytes_of(&cast),
-                "{charged}"
-            );
+        assert_eq!(charges.len(), 3, "the list, then one charge a batch made");
+        assert!(charges[0] >= coerced.capacity() * std::mem::size_of::<RecordBatch>());
+        for (made, charged) in coerced.iter().zip(&charges[1..]) {
+            let kept = std::mem::size_of::<RecordBatch>()
+                + made.num_columns() * std::mem::size_of::<arrow::array::ArrayRef>()
+                + kept_by(made.column(0));
+            assert!(*charged >= kept, "charged {charged} for {kept}");
         }
         let refuse: crate::hot::Charge = Arc::new(|_| false);
         assert!(matches!(
