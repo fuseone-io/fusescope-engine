@@ -60,6 +60,14 @@ impl Narrow {
         }
     }
 
+    /// Whether postings can narrow a file's rows.
+    fn uses_postings(&self) -> bool {
+        match self {
+            Self::Matchers(matchers) => matchers.iter().any(Matcher::requires_label),
+            Self::Names(_) => true,
+        }
+    }
+
     fn tests_names(&self) -> bool {
         match self {
             Self::Matchers(matchers) => matchers.iter().any(|m| &*m.name == NAME_LABEL),
@@ -198,7 +206,7 @@ impl Sources<'_> {
         let total = usize::try_from(builder.metadata().file_metadata().num_rows()).unwrap_or(0);
         let mut builder = builder.with_batch_size(BATCH_ROWS);
         let mut selected = 0;
-        if file.level != Level::L0 {
+        if file.level != Level::L0 && narrow.uses_postings() {
             if let Some(postings) = self.postings.postings(file, version).await {
                 if let Some(rows) = narrow.rows(&postings, reservation)? {
                     if rows.is_empty() {

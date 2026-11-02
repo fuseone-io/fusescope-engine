@@ -799,6 +799,20 @@ async fn postings_change_what_is_read_not_the_answer() {
             pruned,
             "{what}"
         );
+        let unnarrowed = querier(&db, dir.path(), QueryLimits::default());
+        let names = json!({"matchers": [m("host", "!=", "z")], "start_unix_milli": T0, "end_unix_milli": T0 + HOUR - 1});
+        assert_eq!(
+            labels(&unnarrowed, tenant, names, false).await.0,
+            ["__name__", "host"]
+        );
+        assert_eq!(
+            unnarrowed
+                .stats()
+                .metric_index_fetches
+                .load(Ordering::Relaxed),
+            0,
+            "{what}: no matcher narrows by postings, none is fetched"
+        );
         let disabled = querier(
             &db,
             dir.path(),
