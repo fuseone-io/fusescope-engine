@@ -26,7 +26,8 @@ backends on the same data.
 
 Concretely:
 
-1. The collector exports OTLP to the engine ingesters ([ADR 0006](adr/0006-collector-exports-otlp.md)).
+1. The collector, [`fusescope-collector-server`](https://github.com/fuseone-io/fusescope-collector-server),
+   exports OTLP to the engine ingesters ([ADR 0006](adr/0006-collector-exports-otlp.md)).
 2. The engine ingests, flushes, compacts L0 to L1 and serves the hot window
    for one or more tenants, surviving restarts without loss or duplicates.
 3. The Go backend talks to the engine over Flight SQL through
@@ -41,6 +42,39 @@ Concretely:
 
 Everything before item 3 is engine work in this repository. Items 3 to 5
 need the Go backend and the collector too.
+
+## The collector
+
+`fuseone-io/fusescope-collector-server` (Apache-2.0) is FuseScope's own
+distribution of the OpenTelemetry Collector, built from upstream components,
+and replaces the AGPL `fusescope-otel-collector`, which stays in production
+until the new one's phase 6. The clean-room rule on the AGPL repository does
+not change. Its phases are in its `DESIGN.md` §9; these are the ones this
+roadmap depends on:
+
+| Collector phase | Issue | State (2026-11-04) | Needed by |
+|---|---|---|---|
+| 1 to 3 · traces, logs and metrics into ClickHouse | [#2](https://github.com/fuseone-io/fusescope-collector-server/issues/2), [#3](https://github.com/fuseone-io/fusescope-collector-server/issues/3), [#4](https://github.com/fuseone-io/fusescope-collector-server/issues/4) | done | the ClickHouse side of dual-write (D1) |
+| 4 · APM metrics, ordinary OTLP metrics derived from spans | [#5](https://github.com/fuseone-io/fusescope-collector-server/issues/5) | open | M3 parity of the pages that read span metrics |
+| 6 · shadow and cutover, the AGPL collector retired | [#7](https://github.com/fuseone-io/fusescope-collector-server/issues/7) | shadow running on the demo | M4 |
+| 7 · gateway to engine, dual-write, load benchmark | [#8](https://github.com/fuseone-io/fusescope-collector-server/issues/8) | open; `config/gateway-engine.yaml` writes to the engine alone | D1, so M1 |
+| 8 · new installations without the AGPL collector | [#9](https://github.com/fuseone-io/fusescope-collector-server/issues/9) | open | M4 |
+
+Log pipelines, span mapping, LLM pricing, tail sampling and the RUM and
+ingestion-key ingress run in the collector before any exporter, so they need
+no work here.
+
+Open between the two repositories:
+
+- **Order of D1.** The collector places phase 7 after its cutover, phase 6,
+  whose exit is 30 days in production. M1 needs dual-write before that, so
+  either phase 7 moves ahead of phase 6 or M1 waits for it.
+- **ClickHouse after M4.** Collector [ADR 0003](https://github.com/fuseone-io/fusescope-collector-server/blob/main/docs/adr/0003-clickhouse-and-engine.md)
+  makes ClickHouse a supported product output, not a bridge, while M4 removes
+  `clickhousetelemetrystore`. One of the two has to change.
+- **OTel-Arrow.** The collector's `DESIGN.md` §4 waits for Arrow ingest in the
+  engine, which no item here schedules. Until one does, the wire is OTLP with
+  `zstd`.
 
 ## Where we are
 
@@ -116,12 +150,12 @@ retention holds about 570 bytes per span.
 
 ### Group D · Go backend and collector
 
-Work in `fuseone-io/fusescope` and `fuseone-io/fusescope-otel-collector`,
+Work in `fuseone-io/fusescope` and `fuseone-io/fusescope-collector-server`,
 tracked here so the order stays visible.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| D1 | Collector: OTLP exporter to the engine next to the ClickHouse exporter, dual-write by configuration | both backends receive the same data during the comparison | collector config test; spans arrive in both | S | todo |
+| D1 | Collector: OTLP exporter to the engine next to `fusescope_clickhouse`, dual-write by configuration, one `fst_` token per tenant, over TLS (E4) | both backends receive the same data during the comparison | collector [#8](https://github.com/fuseone-io/fusescope-collector-server/issues/8): config test; spans arrive in both | S | todo: the engine-only `config/gateway-engine.yaml` exists; no dual-write configuration, and its order is open (see The collector) |
 | D2 | Go: `telemetrystore` interface with `Query` and `Do`, `flighttelemetrystore` with mTLS and tenant token, `telemetrystore.provider` flag | the backend needs a second provider before any view can switch | Go unit tests with a Flight test server; integration against `fusescope-engine --role all` | L | todo |
 | D3 | Go: DataFusion dialect for the trace statement builders, tested against the same cases as the ClickHouse dialect | the trace views build SQL through these builders | builder tests pass for both dialects | L | todo |
 | D4 | Go: trace views on the Flight provider (trace by id, span list, services, latency, top operations) | the M1 user-facing check | end-to-end test in the backend repository | M | todo |
@@ -134,6 +168,7 @@ tracked here so the order stays visible.
 | E1 | mTLS on Flight SQL and the internal hot-window Flight, OS trust store, certificate reload | DESIGN.md section 10.4; staging is a shared network | handshake tests with a bad client certificate refused | M | done: `fs-auth` loads and validates the identity and client CAs (`tonic` `tls-ring` and `tls-native-roots`, `tokio-rustls` for the listener), serves both Flights through a listener that hands each new connection the config current at accept time and reloads the files every `tls.reload_interval_secs` keeping the last good config on failure (`a_reload_serves_new_connections_and_leaves_open_ones`, `a_failed_reload_keeps_the_last_good_config_and_marks_it_stale`, `silent_and_excess_connections_are_dropped_within_the_limits`, `the_hot_window_over_mtls_admits_only_certified_queriers`, `with_tls_on_each_flight_admits_only_its_own_clients`); clients trust the system store only; `/readyz` shows `tls=`, metrics `fusescope_tls_*`; review round 1: Flight SQL and the hot window take disjoint client CA bundles (`tls.public_client_ca`, `tls.hot_client_ca`), refused when they share a CA, so a backend certificate never opens the hot window (`the_public_and_hot_listeners_admit_disjoint_clients`, `with_tls_on_each_flight_admits_only_its_own_clients`), and `tls.max_handshakes` is bounded at 65536 in the server and clamped in `fs-auth` (`max_handshakes_is_clamped_to_its_bounds`, `a_listener_with_an_unbounded_handshake_limit_still_serves`); round 2: the bundles are compared as trust domains, every client CA a self-signed root (checked by its own signature through the rustls provider) and no public key in both, so a CA reissued under the same key, renamed, an intermediate or a self-issued lookalike is refused (`a_ca_reissued_under_the_same_key_is_the_same_trust_domain`, `invalid_mismatched_or_overlapping_files_refuse_the_load`), and the rotation tests go B, B+B2, B2 on Flight SQL and A, A+A2, A2 on the hot window without moving a CA between listeners; refusing an expired certificate at start is required before staging; test certificates in `crates/fs-auth/tests/fixtures` with their generator; the OTLP listener stays out |
 | E2 | Tenant JWT from the Go backend to the querier, bound to the session and the ticket | the query token today is a static bearer; the backend acts for many tenants | token test: a ticket from one tenant is refused by another | M | done: `fs_auth::JwtVerifier` checks compact JWS `EdDSA` tokens against a reloaded Ed25519 JWK set through the rustls provider, no new crate (`every_refusal_has_its_reason`, `a_key_rotation_overlaps_without_a_restart`); `auth.mode = "jwt"` takes only those tokens, checks the tenant alive in the catalog and binds the ticket (`FST2`) to tenant and subject (`tenant_jwts_bind_the_ticket_to_tenant_and_subject`, `in_jwt_mode_the_querier_takes_only_backend_tokens`); `token` mode and its ticket are unchanged; one `fusescope::audit` event per execution (`the_outcome_follows_how_the_stream_ends`); test keys in `crates/fs-auth/tests/fixtures`; review round 1: `jwt` requires `[tls]` on (`jwt_mode_requires_tls`, the server test runs over mTLS with the backend certificate), refused tokens and tickets are audited with `refused`, an unreachable catalog or a deadline with `failed` (`the_outcome_follows_how_the_stream_ends`), and client strings escaped, and the key set refuses private material and any `key_ops` but `verify`; the Go signer lives in `fuseone-io/fusescope` |
 | E3 | Token rotation and revocation in `admin`, cached tokens expire within the TTL | operations | catalog and cache tests | S | done: no migration, `revoked_at` in the future is a scheduled end; tokens are named by the first 8 bytes of their hash (`TenantToken::id`), `Catalog::revoke_token_by_id` and `rotate_token` work in one transaction and refuse an ambiguous id, `resolve_token_until` tells a cache how long a token has left on the catalog's clock (`tokens_are_revoked_and_rotated_by_their_id`, `an_ambiguous_token_id_changes_nothing`); a revocation or rotation reaches an ingester within `ingest.token_cache_secs`, an answer cached after a rotation never outliving its end (`revoked_and_rotated_tokens_stop_within_the_cache_ttl`), invalidation on change left for a migration; `admin token list`, `revoke` and `rotate [overlap-secs]` with `fusescope::audit` events (`admin_rotates_and_revokes_tokens_by_id`) |
+| E4 | mTLS on the OTLP listener of the ingesters, under `[tls]`, with the reload and handshake limits of E1 | `config/gateway-engine.yaml` connects with TLS 1.3 and a client certificate, and the listener serves plain text, so D1 cannot connect; a bearer token crosses it in the clear | handshake tests: plain text and a bad client certificate refused, the collector's certificate admitted; a CA of its own, apart from the Flight bundles | M | todo; the listener stayed out of E1 |
 
 ### Group F · operations for staging
 
@@ -151,7 +186,7 @@ tracked here so the order stays visible.
 A1 → B1 → B2 → A2 → A3 → B3 → C1 → C2 → B5 → B4 → B6 → B7 → A4 → A5 →
 A6 → C3 → C4 → C6 → E1 → E2 → E3 → F1 → F2 → F3 → F4 → F5 → F6, with D1 to D5 in
 parallel in the other repositories once B4 and B6 define the actions.
-C5 landed after C6.
+C5 landed after C6. E4 comes before D1.
 
 ## M2 · logs and compactor (phase 2)
 
@@ -346,19 +381,24 @@ C5 landed after C6.
   (`an_ingester_that_does_not_answer_fails_a_select_but_not_a_listing`);
   `query.metrics_max_series`, `metrics_max_matchers` and
   `metrics_max_regex_bytes`. Next: `flightprometheus` in the Go backend,
-  then step 4, exponential histograms.
+  then step 4, exponential histograms; the collector's ClickHouse exporter
+  writes none, so the comparison with ClickHouse does not wait for step 4.
 - Series and samples schemas, fingerprints, postings sidecars
   (roaring bitmaps per hour).
 - `metrics.select` typed action; PromQL stays in Go ([ADR 0002](adr/0002-promql-stays-in-go.md)) through `flightprometheus`.
 - Rollups `rollup_5m` and `rollup_30m` from the compactor; per-tenant
   cardinality limit.
-- Exit: alerts and dashboards match ClickHouse in shadow for two weeks.
+- Exit: alerts and dashboards match ClickHouse in shadow for two weeks, the
+  span metrics of collector phase 4 included.
 
 ## M4 · cutover (phase 4)
 
 - History migration from ClickHouse through Parquet export into L2.
 - Iceberg export of L2 ([ADR 0001](adr/0001-own-catalog-iceberg-export.md)).
-- Remove `clickhousetelemetrystore`; ClickHouse shutdown.
+- Remove `clickhousetelemetrystore`; ClickHouse shutdown. Open against
+  collector ADR 0003 (see The collector).
+- Collector phases 6 and 8 done: no installation depends on the AGPL
+  collector.
 - Exit: production without ClickHouse for 30 days.
 
 ## Cadence
