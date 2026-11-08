@@ -4539,6 +4539,7 @@ fn tls_in(
         key: dir.join("tls.key"),
         public_client_ca: dir.join("public-ca.crt"),
         hot_client_ca: dir.join("hot-ca.crt"),
+        ingest_client_ca: None,
     };
     std::fs::copy(tls_fixture(cert), &files.cert).unwrap();
     std::fs::copy(tls_fixture(key), &files.key).unwrap();

@@ -1602,8 +1602,11 @@ surface and is handled as follows:
 
 ### 10.3 Ingest
 
-- mTLS between collector and ingester, or a per-tenant bearer token where the
-  collector runs on the customer side.
+- mTLS between collector and ingester under `[tls]` (section 10.4), and a
+  per-tenant bearer token on every request whatever the transport: the
+  certificate admits the collector, the token names the tenant. A
+  collector on the customer side, with no certificate of ours, is not
+  served yet. `ingest.anonymous_tenant` is refused with `[tls]` on.
 - Tokens, ingest or query, are random `fst_` secrets stored as their sha256
   and shown once. An operator names one by its id, the first 8 bytes of
   that hash in hex, never by the secret: `admin token list` shows ids,
@@ -1649,20 +1652,22 @@ surface and is handled as follows:
   (log body, tenant-listed attributes), with a key per tenant. parquet-rs
   supports it.
 - Catalog Postgres with TLS and one user per role, minimal `GRANT`s.
-- mTLS on the Flight SQL listener and the internal hot-window Flight, under
-  `[tls]`. A process has one identity, `tls.cert` and `tls.key`, that it
+- mTLS on the Flight SQL listener, the internal hot-window Flight and the
+  OTLP ingest listener, under `[tls]`. A process has one identity, `tls.cert` and `tls.key`, that it
   serves with and presents as a client, so its certificate carries both the
   `serverAuth` and the `clientAuth` extended key usages. Each listener has
   its own bundle of client CAs: Flight SQL admits clients of
-  `tls.public_client_ca`, the backend's, and the hot window clients of
-  `tls.hot_client_ca`, the queriers'. The two are separate trust domains,
+  `tls.public_client_ca`, the backend's, the hot window clients of
+  `tls.hot_client_ca`, the queriers', and OTLP ingest clients of
+  `tls.ingest_client_ca`, the collectors', which a process running an
+  ingester must name. The three are separate trust domains,
   because the hot window trusts the tenant in its ticket: a backend
   certificate that opened it would read any tenant without a bearer token
-  or a JWT. A certificate verifies under whatever CA holds the key that
+  or a JWT, and a collector certificate opens neither Flight. A certificate verifies under whatever CA holds the key that
   signed it, whatever that CA's serial, validity or name, so every client
   CA must be a self-signed root, never an intermediate or a
   cross-certificate that could descend from a root of the other bundle,
-  and no public key may appear in both bundles; both are refused at start
+  and no public key may appear in two bundles; both are refused at start
   and at reload. A listener refuses a client without a
   certificate from its bundle before any request is read. Clients verify
   the server against the operating system's trust store only, so a private
@@ -1680,12 +1685,13 @@ surface and is handled as follows:
   start stop the start. Handshakes run off the accept loop, each within
   `tls.handshake_timeout_secs` (10) and at most `tls.max_handshakes` (1024,
   never above 65536, clamped inside `fs-auth` as well) at a time per
-  listener. `[tls]` is off by default for development, where the start
+  listener, and `fusescope_tls_handshake_failures_total` and
+  `fusescope_tls_handshakes_refused_total` count per listener
+  (`listener="public|hot|ingest"`). `[tls]` is off by default for development, where the start
   warns, and half a section, on without its four files or off with files
   named, is refused; staging and production turn it on. Required before
   staging: refusing at start, and reporting, a certificate already expired
-  or not yet valid, which today loads and fails every handshake. The OTLP
-  listener of section 10.3 is not covered yet.
+  or not yet valid, which today loads and fails every handshake.
 
 ### 10.5 Supply chain and code
 

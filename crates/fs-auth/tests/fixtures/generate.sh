@@ -2,7 +2,8 @@
 # Regenerates the TLS test fixtures. Valid for a century so the tests
 # never age; never used outside tests.
 #
-# ca-a, ca-a2, ca-b, ca-b2   independent self-signed roots
+# ca-a, ca-a2, ca-b, ca-b2, ca-c
+#                            independent self-signed roots
 # ca-a-reissued              ca-a's subject and key, another serial
 # ca-a-renamed               ca-a's key under another subject
 # ca-a-intermediate          a CA signed by ca-a, not self-signed
@@ -55,6 +56,7 @@ root ca-a-renamed ca-a ca-a-renamed
 root ca-a2
 root ca-b
 root ca-b2
+root ca-c
 issue ca-a-intermediate ca-a "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
 lookalike ca-a-lookalike ca-a
 leaf server-a ca-a DNS:localhost serverAuth,clientAuth
@@ -63,7 +65,8 @@ leaf client-a ca-a DNS:client.test clientAuth
 leaf client-a2 ca-a2 DNS:client.test clientAuth
 leaf client-b ca-b DNS:client.test clientAuth
 leaf client-b2 ca-b2 DNS:client.test clientAuth
-rm -f ca-a.key ca-a2.key ca-b.key ca-b2.key ca-a-intermediate.key
+leaf client-c ca-c DNS:client.test clientAuth
+rm -f ca-a.key ca-a2.key ca-b.key ca-b2.key ca-c.key ca-a-intermediate.key
 
 jwk() {
     x=$(openssl pkey -in "jwt-$1.key" -pubout -outform DER | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')

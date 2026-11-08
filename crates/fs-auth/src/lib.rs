@@ -1,11 +1,12 @@
-//! mTLS for the engine's Flight listeners and their clients.
+//! mTLS for the engine's Flight and OTLP listeners and their clients.
 //!
 //! A process with TLS on has one identity, a certificate and its key, that
-//! it serves with and presents as a client, and two disjoint bundles of
-//! client CAs: the public Flight SQL listener admits clients of one, the
-//! backend's, and the internal hot-window listener clients of the other,
-//! the queriers'. Every client CA is a self-signed root and no key is in
-//! both bundles, so a certificate that opens one never opens the other.
+//! it serves with and presents as a client, and disjoint bundles of client
+//! CAs, one per listener: the public Flight SQL listener admits the
+//! backend's, the internal hot-window listener the queriers' and the OTLP
+//! ingest listener, on an ingester, the collectors'. Every client CA is a
+//! self-signed root and no key is in two bundles, so a certificate that
+//! opens one listener never opens another.
 //! Listeners require a client certificate; clients trust only the operating
 //! system's store for the server's. The files are read again every reload
 //! interval: a change
@@ -31,7 +32,7 @@ pub use jwt::{
     Claims, JwtError, JwtRules, JwtVerifier, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES, TENANT_CLAIM,
 };
 pub use load::{TlsError, TlsFiles};
-pub use reload::{MAX_HANDSHAKES, Reload, Tls, TlsLimits, TlsStats};
+pub use reload::{Listener, ListenerStats, MAX_HANDSHAKES, Reload, Tls, TlsLimits, TlsStats};
 
 /// Crate version, exposed for diagnostics and the `--version` flag.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

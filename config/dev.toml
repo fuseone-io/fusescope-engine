@@ -35,7 +35,7 @@ flush_interval_secs = 10       # short for development; production default is 30
 # wal_queue_records = 4096
 # wal_queue_bytes = 67108864
 # wal_queue_wait_ms = 2000
-# anonymous_tenant = "<uuid>"   # development only: accept unauthenticated OTLP as this tenant
+# anonymous_tenant = "<uuid>"   # development only, refused with [tls] on: accept unauthenticated OTLP as this tenant
 
 [query]
 memory_bytes = 1073741824   # 1 GiB for development
@@ -90,13 +90,14 @@ rebuild_max_bytes = 2147483648
 rebuilds_per_tick = 64
 rebuild_backoff_secs = 3600
 
-# mTLS of the Flight listeners and their clients; off for development only.
+# mTLS of the Flight and OTLP listeners and their clients; off for development only.
 [tls]
 enabled = false
 # cert = "/etc/fusescope/tls/tls.crt"
 # key = "/etc/fusescope/tls/tls.key"
 # public_client_ca = "/etc/fusescope/tls/backend-ca.crt"
 # hot_client_ca = "/etc/fusescope/tls/querier-ca.crt"
+# ingest_client_ca = "/etc/fusescope/tls/collector-ca.crt"   # required where an ingester runs
 # reload_interval_secs = 60
 
 # How Flight SQL clients authenticate: "token" (catalog query tokens) for

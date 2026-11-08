@@ -1492,6 +1492,12 @@ impl Config {
                 "auth.mode = \"jwt\" requires tls.enabled: a bearer JWT never crosses the network in plain text".into(),
             ));
         }
+        if self.tls.enabled && self.ingest.anonymous_tenant.is_some() {
+            return Err(ServerError::InvalidConfig(
+                "ingest.anonymous_tenant is for development and cannot be set with tls.enabled"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2295,6 +2301,13 @@ mod tests {
             .validate(&secrets)
             .unwrap();
         Config::parse(MINIMAL).unwrap().validate(&secrets).unwrap();
+        let anonymous = "[ingest]\nanonymous_tenant = \"00000000-0000-0000-0000-000000000001\"\n";
+        let err = Config::parse(&format!("{MINIMAL}{tls}{anonymous}"))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ingest.anonymous_tenant"), "{err}");
     }
 
     #[test]

@@ -51,13 +51,14 @@ orphan_interval_secs = 3600
 orphan_ttl_secs = 3600
 retention_interval_secs = 15
 
-# mTLS of the Flight listeners and their clients; off for development only.
+# mTLS of the Flight and OTLP listeners and their clients; off for development only.
 [tls]
 enabled = false
 # cert = "/etc/fusescope/tls/tls.crt"
 # key = "/etc/fusescope/tls/tls.key"
 # public_client_ca = "/etc/fusescope/tls/backend-ca.crt"
 # hot_client_ca = "/etc/fusescope/tls/querier-ca.crt"
+# ingest_client_ca = "/etc/fusescope/tls/collector-ca.crt"   # required where an ingester runs
 # reload_interval_secs = 60
 
 # How Flight SQL clients authenticate: "token" (catalog query tokens) for

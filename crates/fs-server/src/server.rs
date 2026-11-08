@@ -42,11 +42,11 @@ pub async fn bootstrap(
     config.validate(secrets)?;
     let tls = if let Some(files) = config.tls.files() {
         let tls = fs_auth::Tls::load(files, config.tls.limits())?;
-        info!(cert = %config.tls.cert, public_client_ca = %config.tls.public_client_ca, hot_client_ca = %config.tls.hot_client_ca, "tls loaded; the flight listeners require client certificates");
+        info!(cert = %config.tls.cert, public_client_ca = %config.tls.public_client_ca, hot_client_ca = %config.tls.hot_client_ca, ingest_client_ca = %config.tls.ingest_client_ca, "tls loaded; the listeners require client certificates");
         Some(tls)
     } else {
         warn!(
-            "tls is off: the flight listeners accept plain text; turn [tls] on outside development"
+            "tls is off: the flight and otlp listeners accept plain text; turn [tls] on outside development"
         );
         None
     };
@@ -285,6 +285,9 @@ pub async fn run_with(
     shutdown: watch::Receiver<bool>,
     ingest_override: Option<fs_ingest::IngestConfig>,
 ) -> Result<(), ServerError> {
+    config
+        .tls
+        .validate_ingester(role.expand().contains(&Role::Ingester))?;
     let write_probe = role != Role::Querier;
     let mut ctx = bootstrap(config, &secrets, node_id, write_probe).await?;
     ctx.ingest_override = ingest_override;

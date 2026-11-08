@@ -29,6 +29,41 @@ pub struct TlsLimits {
     pub max_handshakes: usize,
 }
 
+/// A TLS listener of the process, each with its own client CA bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listener {
+    /// Flight SQL, for the backend.
+    Public,
+    /// The internal hot window, for the queriers.
+    Hot,
+    /// OTLP ingest, for the collectors.
+    Ingest,
+}
+
+impl Listener {
+    /// Every listener, in the order metrics list them.
+    pub const ALL: [Listener; 3] = [Listener::Public, Listener::Hot, Listener::Ingest];
+
+    /// Lowercase name, the `listener` label of its metrics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Listener::Public => "public",
+            Listener::Hot => "hot",
+            Listener::Ingest => "ingest",
+        }
+    }
+}
+
+/// Handshake counters of one listener.
+#[derive(Debug, Default)]
+pub struct ListenerStats {
+    /// Handshakes that failed or timed out, a refused client certificate
+    /// included.
+    pub handshake_failures: AtomicU64,
+    /// Connections closed because `max_handshakes` were in progress.
+    pub handshakes_refused: AtomicU64,
+}
+
 /// Counters of the TLS listeners and the reload.
 #[derive(Debug, Default)]
 pub struct TlsStats {
@@ -36,14 +71,21 @@ pub struct TlsStats {
     pub reloads: AtomicU64,
     /// Reloads that failed; the last good config stays.
     pub reload_failures: AtomicU64,
-    /// Handshakes that failed or timed out, a refused client certificate
-    /// included.
-    pub handshake_failures: AtomicU64,
-    /// Connections closed because `max_handshakes` were in progress.
-    pub handshakes_refused: AtomicU64,
     /// The last reload failed: new connections get an older config than
     /// the files describe.
     pub stale: AtomicBool,
+    listeners: [ListenerStats; 3],
+}
+
+impl TlsStats {
+    /// The handshake counters of `listener`.
+    pub fn listener(&self, listener: Listener) -> &ListenerStats {
+        match listener {
+            Listener::Public => &self.listeners[0],
+            Listener::Hot => &self.listeners[1],
+            Listener::Ingest => &self.listeners[2],
+        }
+    }
 }
 
 /// Outcome of a successful [`Tls::reload`].
@@ -62,6 +104,7 @@ pub struct Tls {
     limits: TlsLimits,
     public: watch::Sender<Arc<ServerConfig>>,
     hot: watch::Sender<Arc<ServerConfig>>,
+    ingest: Option<watch::Sender<Arc<ServerConfig>>>,
     identity: watch::Sender<Identity>,
     seen: Mutex<Pems>,
     stats: Arc<TlsStats>,
@@ -82,8 +125,8 @@ impl Tls {
     ///
     /// # Errors
     /// A file is unreadable or empty, a certificate or CA does not parse,
-    /// the key does not match the certificate, or the two client CA
-    /// bundles share a CA.
+    /// the key does not match the certificate, or two client CA bundles
+    /// share a CA.
     pub fn load(files: TlsFiles, mut limits: TlsLimits) -> Result<Arc<Self>, TlsError> {
         limits.max_handshakes = limits.max_handshakes.clamp(1, MAX_HANDSHAKES);
         let pems = Pems::read(&files)?;
@@ -93,6 +136,7 @@ impl Tls {
             limits,
             public: watch::Sender::new(loaded.public),
             hot: watch::Sender::new(loaded.hot),
+            ingest: loaded.ingest.map(watch::Sender::new),
             identity: watch::Sender::new(loaded.identity),
             seen: Mutex::new(pems),
             stats: Arc::new(TlsStats::default()),
@@ -102,17 +146,30 @@ impl Tls {
     /// The public Flight SQL listener's side: clients from
     /// `public_client_ca` only, followed across reloads.
     pub fn public_server(&self) -> ServerTls {
-        ServerTls::new(
-            self.public.subscribe(),
-            Arc::clone(&self.stats),
-            self.limits,
-        )
+        self.server(&self.public, Listener::Public)
     }
 
     /// The internal hot-window listener's side: clients from
     /// `hot_client_ca` only, followed across reloads.
     pub fn hot_server(&self) -> ServerTls {
-        ServerTls::new(self.hot.subscribe(), Arc::clone(&self.stats), self.limits)
+        self.server(&self.hot, Listener::Hot)
+    }
+
+    /// The OTLP ingest listener's side: clients from `ingest_client_ca`
+    /// only, followed across reloads; `None` without that bundle.
+    pub fn ingest_server(&self) -> Option<ServerTls> {
+        self.ingest
+            .as_ref()
+            .map(|ingest| self.server(ingest, Listener::Ingest))
+    }
+
+    fn server(&self, config: &watch::Sender<Arc<ServerConfig>>, listener: Listener) -> ServerTls {
+        ServerTls::new(
+            config.subscribe(),
+            Arc::clone(&self.stats),
+            listener,
+            self.limits,
+        )
     }
 
     /// The limits in force, after clamping.
@@ -166,6 +223,9 @@ impl Tls {
         let loaded = loaded?;
         self.public.send_replace(loaded.public);
         self.hot.send_replace(loaded.hot);
+        if let (Some(ingest), Some(config)) = (&self.ingest, loaded.ingest) {
+            ingest.send_replace(config);
+        }
         self.identity.send_replace(loaded.identity);
         Ok(Reload::Reloaded)
     }

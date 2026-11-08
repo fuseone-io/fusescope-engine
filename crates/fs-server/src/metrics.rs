@@ -922,7 +922,13 @@ fn histogram(out: &mut String, name: &str, help: &str, h: &fs_ingest::histogram:
     );
 }
 
-fn labelled_counter(out: &mut String, name: &str, help: &str, label: &str, values: &[(&str, u64)]) {
+pub(crate) fn labelled_counter(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: &[(&str, u64)],
+) {
     let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} counter");
     for (value, count) in values {
         let _ = writeln!(out, "{name}{{{label}=\"{value}\"}} {count}");

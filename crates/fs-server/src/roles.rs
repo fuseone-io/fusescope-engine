@@ -83,6 +83,12 @@ pub async fn ingester(
     )?;
     if let Some(tls) = &ctx.tls {
         ingester = ingester.with_hot_tls(tls.hot_server());
+        let otlp = tls.ingest_server().ok_or_else(|| {
+            ServerError::InvalidConfig(
+                "tls.enabled requires tls.ingest_client_ca where an ingester runs".into(),
+            )
+        })?;
+        ingester = ingester.with_otlp_tls(otlp);
     }
     let ingester = Arc::new(ingester);
     let wal_probe = Arc::clone(&ingester);

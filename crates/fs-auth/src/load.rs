@@ -25,6 +25,10 @@ pub struct TlsFiles {
     /// queriers'. It shares no CA with `public_client_ca`, so a certificate
     /// that opens one listener never opens the other.
     pub hot_client_ca: PathBuf,
+    /// CAs a client of the OTLP ingest listener must chain to: the
+    /// collectors'. It shares no CA with the other two; a process without
+    /// it serves no ingest listener over TLS.
+    pub ingest_client_ca: Option<PathBuf>,
 }
 
 /// Why TLS could not be loaded or a connection set up.
@@ -57,13 +61,14 @@ pub enum TlsError {
     },
 }
 
-/// The contents of the three files, read at one moment.
+/// The contents of the files, read at one moment.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Pems {
     cert: Vec<u8>,
     key: Vec<u8>,
     public_client_ca: Vec<u8>,
     hot_client_ca: Vec<u8>,
+    ingest_client_ca: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for Pems {
@@ -73,6 +78,10 @@ impl fmt::Debug for Pems {
             .field("key", &"***")
             .field("public_client_ca", &self.public_client_ca.len())
             .field("hot_client_ca", &self.hot_client_ca.len())
+            .field(
+                "ingest_client_ca",
+                &self.ingest_client_ca.as_ref().map(Vec::len),
+            )
             .finish()
     }
 }
@@ -84,6 +93,7 @@ impl Pems {
             key: read(&files.key)?,
             public_client_ca: read(&files.public_client_ca)?,
             hot_client_ca: read(&files.hot_client_ca)?,
+            ingest_client_ca: files.ingest_client_ca.as_deref().map(read).transpose()?,
         })
     }
 }
@@ -93,33 +103,44 @@ impl Pems {
 pub(crate) struct Loaded {
     pub(crate) public: Arc<ServerConfig>,
     pub(crate) hot: Arc<ServerConfig>,
+    pub(crate) ingest: Option<Arc<ServerConfig>>,
     pub(crate) identity: Identity,
 }
 
 /// Builds every side from `pems`, refusing a certificate or CA that does
 /// not parse, a key that does not match the certificate, an empty file, a
-/// client CA that is not a self-signed root, or two client CA bundles that
-/// share a CA key.
+/// client CA that is not a self-signed root, or any two client CA bundles
+/// that share a CA key.
 pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let chain = certificates(&pems.cert, &files.cert)?;
     let key = PrivateKeyDer::from_pem_slice(&pems.key)
         .map_err(|e| invalid(&files.key, format!("no private key: {e}")))?;
-    let public_cas = certificates(&pems.public_client_ca, &files.public_client_ca)?;
-    let hot_cas = certificates(&pems.hot_client_ca, &files.hot_client_ca)?;
-    let public_keys = crate::anchors::root_keys(&public_cas, &provider)
-        .map_err(|reason| invalid(&files.public_client_ca, reason))?;
-    let hot_keys = crate::anchors::root_keys(&hot_cas, &provider)
-        .map_err(|reason| invalid(&files.hot_client_ca, reason))?;
-    if public_keys.iter().any(|key| hot_keys.contains(key)) {
-        return Err(invalid(
-            &files.hot_client_ca,
-            format!(
-                "shares a CA key with {}: a backend certificate would open the hot window",
-                files.public_client_ca.display()
-            ),
-        ));
-    }
+    let (public_cas, public_keys) =
+        bundle(&pems.public_client_ca, &files.public_client_ca, &provider)?;
+    let (hot_cas, hot_keys) = bundle(&pems.hot_client_ca, &files.hot_client_ca, &provider)?;
+    disjoint(
+        (&hot_keys, &files.hot_client_ca),
+        (&public_keys, &files.public_client_ca),
+        "a backend certificate would open the hot window",
+    )?;
+    let ingest = match (&pems.ingest_client_ca, &files.ingest_client_ca) {
+        (Some(pem), Some(path)) => {
+            let (cas, keys) = bundle(pem, path, &provider)?;
+            disjoint(
+                (&keys, path),
+                (&public_keys, &files.public_client_ca),
+                "a collector certificate would open Flight SQL",
+            )?;
+            disjoint(
+                (&keys, path),
+                (&hot_keys, &files.hot_client_ca),
+                "a collector certificate would open the hot window",
+            )?;
+            Some((cas, path))
+        }
+        _ => None,
+    };
     let pair = |e: rustls::Error| {
         invalid(
             &files.cert,
@@ -146,6 +167,7 @@ pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     };
     let public = server(public_cas, &files.public_client_ca)?;
     let hot = server(hot_cas, &files.hot_client_ca)?;
+    let ingest = ingest.map(|(cas, path)| server(cas, path)).transpose()?;
     ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(pair)?
@@ -155,8 +177,35 @@ pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     Ok(Loaded {
         public,
         hot,
+        ingest,
         identity: Identity::from_pem(&pems.cert, &pems.key),
     })
+}
+
+/// A client CA bundle and the keys of its roots.
+fn bundle(
+    pem: &[u8],
+    path: &Path,
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<(Vec<CertificateDer<'static>>, Vec<Vec<u8>>), TlsError> {
+    let cas = certificates(pem, path)?;
+    let keys = crate::anchors::root_keys(&cas, provider).map_err(|reason| invalid(path, reason))?;
+    Ok((cas, keys))
+}
+
+/// Refuses `bundle` when it shares a CA key with `other`, naming `bundle`.
+fn disjoint(
+    (keys, path): (&[Vec<u8>], &Path),
+    (other_keys, other): (&[Vec<u8>], &Path),
+    consequence: &str,
+) -> Result<(), TlsError> {
+    if keys.iter().any(|key| other_keys.contains(key)) {
+        return Err(invalid(
+            path,
+            format!("shares a CA key with {}: {consequence}", other.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn certificates(pem: &[u8], path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {

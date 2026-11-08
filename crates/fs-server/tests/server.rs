@@ -743,6 +743,7 @@ fn tls_on(cfg: &mut Config, cert: &str, key: &str) {
         key: tls_fixture(key).display().to_string(),
         public_client_ca: tls_fixture("ca-b.pem").display().to_string(),
         hot_client_ca: tls_fixture("ca-a.pem").display().to_string(),
+        ingest_client_ca: tls_fixture("ca-c.pem").display().to_string(),
         ..fs_server::tls::TlsSection::default()
     };
 }
@@ -755,6 +756,7 @@ fn certified(cert: &str, key: &str) -> fs_auth::ClientTls {
             key: tls_fixture(key),
             public_client_ca: tls_fixture("ca-b.pem"),
             hot_client_ca: tls_fixture("ca-a.pem"),
+            ingest_client_ca: None,
         },
         fs_server::tls::TlsSection::default().limits(),
     )
@@ -763,13 +765,14 @@ fn certified(cert: &str, key: &str) -> fs_auth::ClientTls {
     identity.client().trusting_only(&ca)
 }
 
-/// With `[tls]` on, the server refuses to start on files that do not load.
-/// On good files, in one process running every role, a backend
-/// certificate opens Flight SQL and not the hot window, a querier
-/// certificate the reverse, plain text opens neither, and readiness and
-/// the metrics report the TLS.
+/// With `[tls]` on, the server refuses to start on files that do not load
+/// and an ingester without a collector CA bundle. On good files, in one
+/// process running every role, a backend certificate opens Flight SQL
+/// alone, a querier certificate the hot window alone and a collector
+/// certificate OTLP alone, plain text opens none, and readiness and the
+/// metrics report the TLS.
 #[tokio::test]
-async fn with_tls_on_each_flight_admits_only_its_own_clients() {
+async fn with_tls_on_each_listener_admits_only_its_own_clients() {
     use fs_server::client;
     let Some(db) = TestDb::new().await else {
         return;
@@ -785,13 +788,23 @@ async fn with_tls_on_each_flight_admits_only_its_own_clients() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("server-a.pem"), "{err}");
+    let mut plain_otlp = config(dir.path());
+    tls_on(&mut plain_otlp, "server-a.pem", "server-a.key");
+    plain_otlp.tls.ingest_client_ca.clear();
+    let (_stop, never) = watch::channel(false);
+    let err = server::run(plain_otlp, secrets.clone(), Role::All, "n".into(), never)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("tls.ingest_client_ca"), "{err}");
 
     let port = free_port();
+    let otlp_port = free_port();
     let hot_port = free_port();
     let metrics_port = free_port();
     let mut cfg = config(dir.path());
     cfg.server.flight_addr = format!("127.0.0.1:{port}");
     cfg.server.metrics_addr = format!("127.0.0.1:{metrics_port}");
+    cfg.ingest.listen = format!("127.0.0.1:{otlp_port}");
     cfg.ingest.hot_listen = format!("127.0.0.1:{hot_port}");
     cfg.ingest.hot_advertise = format!("localhost:{hot_port}");
     tls_on(&mut cfg, "server-a.pem", "server-a.key");
@@ -862,11 +875,57 @@ async fn with_tls_on_each_flight_admits_only_its_own_clients() {
             .is_err()
     );
     assert!(fs_ingest::hot::scan(&hot, &scan, timeout).await.is_err());
-    let (_, body) = http_get(&metrics_addr, "/metrics").await;
+
+    let (ingest_token, _) = catalog
+        .create_token(tenant, "collector", fs_catalog::TokenScope::Ingest)
+        .await
+        .unwrap();
+    let otlp = format!("localhost:{otlp_port}");
+    let export = |tls: Option<fs_auth::ClientTls>| {
+        let (otlp, token) = (otlp.clone(), ingest_token.clone());
+        async move {
+            let channel = fs_auth::endpoint(&otlp, tls.as_ref())
+                .unwrap()
+                .connect()
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut request = tonic::Request::new(one_span("api"));
+            request.metadata_mut().insert(
+                "authorization",
+                tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+            );
+            TraceServiceClient::new(channel)
+                .export(request)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    };
+    let collector = certified("client-c.pem", "client-c.key");
+    export(Some(collector.clone())).await.unwrap();
+    assert!(export(None).await.is_err(), "plain text OTLP");
+    for client in [&backend, &querier] {
+        assert!(
+            export(Some(client.clone())).await.is_err(),
+            "{client:?} on OTLP"
+        );
+    }
     assert!(
-        !body.contains("fusescope_tls_handshake_failures_total 0\n"),
-        "the refused attempts failed their handshakes: {body}"
+        fs_ingest::hot::scan_with(&hot, &scan, timeout, Some(&collector))
+            .await
+            .is_err(),
+        "a collector certificate on the hot window"
     );
+
+    let (_, body) = http_get(&metrics_addr, "/metrics").await;
+    for listener in ["public", "hot", "ingest"] {
+        assert!(
+            !body.contains(&format!(
+                "fusescope_tls_handshake_failures_total{{listener=\"{listener}\"}} 0\n"
+            )),
+            "the refused attempts on {listener} failed their handshakes: {body}"
+        );
+    }
 
     tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)

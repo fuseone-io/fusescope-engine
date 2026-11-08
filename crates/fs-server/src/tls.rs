@@ -1,6 +1,7 @@
 //! The `[tls]` section: mTLS of the Flight SQL listener, the internal hot
-//! window listener and the clients of both. Off unless `enabled = true`;
-//! development keeps it off, staging and production turn it on.
+//! window listener, the OTLP ingest listener and the clients of the first
+//! two. Off unless `enabled = true`; development keeps it off, staging and
+//! production turn it on.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,7 @@ use crate::ServerError;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsSection {
-    /// Require mTLS on both Flight listeners and use it as a client.
+    /// Require mTLS on every listener and use it as a client.
     #[serde(default)]
     pub enabled: bool,
     /// PEM certificate chain, leaf first; served and presented as a client.
@@ -30,6 +31,10 @@ pub struct TlsSection {
     /// Shares no CA with `public_client_ca`.
     #[serde(default)]
     pub hot_client_ca: String,
+    /// PEM bundle of the CAs an OTLP client, a collector, must chain to.
+    /// Shares no CA with the other two; required where an ingester runs.
+    #[serde(default)]
+    pub ingest_client_ca: String,
     /// How often the three files are read again.
     #[serde(default = "default_reload_interval")]
     pub reload_interval_secs: u64,
@@ -49,6 +54,7 @@ impl Default for TlsSection {
             key: String::new(),
             public_client_ca: String::new(),
             hot_client_ca: String::new(),
+            ingest_client_ca: String::new(),
             reload_interval_secs: default_reload_interval(),
             handshake_timeout_secs: default_handshake_timeout(),
             max_handshakes: default_max_handshakes(),
@@ -76,6 +82,8 @@ impl TlsSection {
             key: PathBuf::from(&self.key),
             public_client_ca: PathBuf::from(&self.public_client_ca),
             hot_client_ca: PathBuf::from(&self.hot_client_ca),
+            ingest_client_ca: (!self.ingest_client_ca.is_empty())
+                .then(|| PathBuf::from(&self.ingest_client_ca)),
         })
     }
 
@@ -102,6 +110,11 @@ impl TlsSection {
             &self.hot_client_ca,
         ]
         .map(|p| !p.is_empty());
+        if !self.enabled && !self.ingest_client_ca.is_empty() {
+            return invalid(
+                "tls.ingest_client_ca is set but tls.enabled is false; enable it or remove it",
+            );
+        }
         if self.enabled && named.contains(&false) {
             return invalid(
                 "tls.enabled requires tls.cert, tls.key, tls.public_client_ca and tls.hot_client_ca",
@@ -115,6 +128,13 @@ impl TlsSection {
         if self.enabled && self.public_client_ca == self.hot_client_ca {
             return invalid("tls.public_client_ca and tls.hot_client_ca must be different bundles");
         }
+        if self.enabled
+            && [&self.public_client_ca, &self.hot_client_ca].contains(&&self.ingest_client_ca)
+        {
+            return invalid(
+                "tls.ingest_client_ca must be a bundle apart from tls.public_client_ca and tls.hot_client_ca",
+            );
+        }
         let day = 86_400;
         if !(1..=day).contains(&self.reload_interval_secs)
             || !(1..=day).contains(&self.handshake_timeout_secs)
@@ -123,6 +143,20 @@ impl TlsSection {
             return invalid(
                 "tls.reload_interval_secs and tls.handshake_timeout_secs must be between 1 and 86400 and tls.max_handshakes between 1 and 65536",
             );
+        }
+        Ok(())
+    }
+
+    /// Refuses an ingester whose OTLP listener would serve plain text while
+    /// `[tls]` is on.
+    ///
+    /// # Errors
+    /// `[tls]` is on, `ingests` and `ingest_client_ca` is not set.
+    pub fn validate_ingester(&self, ingests: bool) -> Result<(), ServerError> {
+        if self.enabled && ingests && self.ingest_client_ca.is_empty() {
+            return Err(ServerError::InvalidConfig(
+                "tls.enabled requires tls.ingest_client_ca where an ingester runs: its OTLP listener would serve plain text".into(),
+            ));
         }
         Ok(())
     }
@@ -142,19 +176,26 @@ pub(crate) fn render(out: &mut String, stats: &fs_auth::TlsStats) {
             "TLS reloads that failed and kept the last good config",
             load(&stats.reload_failures),
         ),
-        (
-            "fusescope_tls_handshake_failures_total",
-            "TLS handshakes that failed or timed out, refused client certificates included",
-            load(&stats.handshake_failures),
-        ),
-        (
-            "fusescope_tls_handshakes_refused_total",
-            "Connections closed because tls.max_handshakes were in progress",
-            load(&stats.handshakes_refused),
-        ),
     ] {
         crate::metrics::counter(out, name, help, value);
     }
+    let per_listener = |count: fn(&fs_auth::ListenerStats) -> &std::sync::atomic::AtomicU64| {
+        fs_auth::Listener::ALL.map(|l| (l.name(), load(count(stats.listener(l)))))
+    };
+    crate::metrics::labelled_counter(
+        out,
+        "fusescope_tls_handshake_failures_total",
+        "TLS handshakes that failed or timed out, refused client certificates included",
+        "listener",
+        &per_listener(|s| &s.handshake_failures),
+    );
+    crate::metrics::labelled_counter(
+        out,
+        "fusescope_tls_handshakes_refused_total",
+        "Connections closed because tls.max_handshakes were in progress",
+        "listener",
+        &per_listener(|s| &s.handshakes_refused),
+    );
     crate::metrics::gauge(
         out,
         "fusescope_tls_stale",
@@ -180,6 +221,21 @@ mod tests {
             "enabled = true\ncert = \"/tls/tls.crt\"\nkey = \"/tls/tls.key\"\npublic_client_ca = \"/tls/backend-ca.crt\"\nhot_client_ca = \"/tls/querier-ca.crt\"\n",
         );
         on.validate().unwrap();
+        assert!(on.files().unwrap().ingest_client_ca.is_none());
+        on.validate_ingester(false).unwrap();
+        let err = on.validate_ingester(true).unwrap_err().to_string();
+        assert!(err.contains("tls.ingest_client_ca"), "{err}");
+        let ingesting = TlsSection {
+            ingest_client_ca: "/tls/collector-ca.crt".into(),
+            ..on.clone()
+        };
+        ingesting.validate().unwrap();
+        ingesting.validate_ingester(true).unwrap();
+        assert_eq!(
+            ingesting.files().unwrap().ingest_client_ca,
+            Some(PathBuf::from("/tls/collector-ca.crt"))
+        );
+        off.validate_ingester(true).unwrap();
         assert_eq!(
             on.files().unwrap().hot_client_ca,
             PathBuf::from("/tls/querier-ca.crt")
@@ -211,6 +267,15 @@ mod tests {
             (
                 "enabled = true\ncert = \"a\"\nkey = \"b\"\npublic_client_ca = \"c\"\nhot_client_ca = \"c\"\n",
                 "different bundles",
+            ),
+            ("ingest_client_ca = \"e\"\n", "tls.enabled is false"),
+            (
+                "enabled = true\ncert = \"a\"\nkey = \"b\"\npublic_client_ca = \"c\"\nhot_client_ca = \"d\"\ningest_client_ca = \"d\"\n",
+                "a bundle apart",
+            ),
+            (
+                "enabled = true\ncert = \"a\"\nkey = \"b\"\npublic_client_ca = \"c\"\nhot_client_ca = \"d\"\ningest_client_ca = \"c\"\n",
+                "a bundle apart",
             ),
         ] {
             let err = section(bad).validate().unwrap_err().to_string();

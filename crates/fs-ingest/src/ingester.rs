@@ -1863,6 +1863,7 @@ fn convert_metrics(
 pub struct Ingester {
     shared: Arc<Shared>,
     hot_tls: Option<fs_auth::ServerTls>,
+    otlp_tls: Option<fs_auth::ServerTls>,
 }
 
 impl Ingester {
@@ -1870,6 +1871,13 @@ impl Ingester {
     #[must_use]
     pub fn with_hot_tls(mut self, tls: fs_auth::ServerTls) -> Self {
         self.hot_tls = Some(tls);
+        self
+    }
+
+    /// Serves OTLP over mTLS with `tls` instead of plain text.
+    #[must_use]
+    pub fn with_otlp_tls(mut self, tls: fs_auth::ServerTls) -> Self {
+        self.otlp_tls = Some(tls);
         self
     }
 
@@ -1960,6 +1968,7 @@ impl Ingester {
         Ok(Self {
             shared: Arc::new(shared),
             hot_tls: None,
+            otlp_tls: None,
         })
     }
 
@@ -2044,7 +2053,7 @@ impl Ingester {
             addr: "local_addr".into(),
             source,
         })?;
-        info!(%addr, "otlp grpc listening");
+        info!(%addr, tls = self.otlp_tls.is_some(), "otlp grpc listening");
         if let Some(tx) = bound {
             let _ = tx.send(addr);
         }
@@ -2056,16 +2065,13 @@ impl Ingester {
         let metrics = MetricsServiceServer::new(MetricsReceiver::new(self.shared.clone()))
             .max_decoding_message_size(self.shared.config.max_message_bytes);
         let mut server_shutdown = shutdown.clone();
-        let server = tonic::transport::Server::builder()
+        let router = tonic::transport::Server::builder()
             .add_service(service)
             .add_service(logs)
-            .add_service(metrics)
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async move {
-                    let _ = server_shutdown.changed().await;
-                },
-            );
+            .add_service(metrics);
+        let server = fs_auth::serve(router, listener, self.otlp_tls.as_ref(), async move {
+            let _ = server_shutdown.changed().await;
+        });
 
         let hot = crate::hot::serve(
             self.shared.clone(),

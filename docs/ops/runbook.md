@@ -137,7 +137,10 @@ objects are this deployment's.
   certificate is reissued, never by a direct switch. A rotation that does
   not load keeps the last good files and shows `tls=stale` or
   `jwt_keys=stale` on `/readyz` and in `fusescope_tls_stale` and
-  `fusescope_jwt_keys_stale`: fix the Secret or ConfigMap. A rotated
+  `fusescope_jwt_keys_stale`: fix the Secret or ConfigMap. The collectors'
+  CA, `tls.ingest_client_ca`, rotates the same way; the collector trusts
+  the CA that issued the ingesters' `tls.cert` (`ENGINE_CA_FILE` in
+  `config/gateway-engine.yaml`). A rotated
   environment Secret (catalog or bucket credentials) needs a rollout; see
   `rolloutTokens` in `docs/ops/helm.md`.
 
@@ -145,7 +148,12 @@ objects are this deployment's.
 
 ### OTLP ingest (gRPC status and message)
 
-The trace and logs services answer alike.
+The trace and logs services answer alike. With `[tls]` on, a collector
+whose certificate does not chain to `tls.ingest_client_ca`, or that speaks
+plain text, never reaches them: its exporter reports `UNAVAILABLE` with a
+handshake error, and the ingester counts
+`fusescope_tls_handshake_failures_total{listener="ingest"}`. A valid
+certificate does not replace the token.
 
 | Status | Message | Meaning | Action |
 |---|---|---|---|

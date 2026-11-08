@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use fs_auth::{MAX_HANDSHAKES, Reload, ServerTls, Tls, TlsError, TlsFiles, TlsLimits};
+use fs_auth::{Listener, MAX_HANDSHAKES, Reload, ServerTls, Tls, TlsError, TlsFiles, TlsLimits};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
@@ -47,7 +47,13 @@ fn files_in(dir: &Path, cert: &str, key: &str, public: &[&str], hot: &[&str]) ->
         key: dir.join("tls.key"),
         public_client_ca: dir.join("public-ca.crt"),
         hot_client_ca: dir.join("hot-ca.crt"),
+        ingest_client_ca: Some(dir.join("ingest-ca.crt")),
     };
+    std::fs::copy(
+        fixture("ca-c.pem"),
+        files.ingest_client_ca.as_ref().unwrap(),
+    )
+    .unwrap();
     install(&files, cert, key, public, hot);
     files
 }
@@ -67,13 +73,14 @@ fn bundle(names: &[&str]) -> Vec<u8> {
 }
 
 /// The backend's clients come from CA b, the queriers' from CA a, which
-/// also issued the process's own identity.
+/// also issued the process's own identity, and the collectors' from CA c.
 fn fixtures() -> TlsFiles {
     TlsFiles {
         cert: fixture("server-a.pem"),
         key: fixture("server-a.key"),
         public_client_ca: fixture("ca-b.pem"),
         hot_client_ca: fixture("ca-a.pem"),
+        ingest_client_ca: Some(fixture("ca-c.pem")),
     }
 }
 
@@ -81,6 +88,7 @@ const BACKEND: Option<(&str, &str)> = Some(("client-b.pem", "client-b.key"));
 const QUERIER: Option<(&str, &str)> = Some(("client-a.pem", "client-a.key"));
 const BACKEND2: Option<(&str, &str)> = Some(("client-b2.pem", "client-b2.key"));
 const QUERIER2: Option<(&str, &str)> = Some(("client-a2.pem", "client-a2.key"));
+const COLLECTOR: Option<(&str, &str)> = Some(("client-c.pem", "client-c.key"));
 
 /// Binds a listener whose accepted connections echo what they read.
 async fn echo_server(tls: &ServerTls) -> SocketAddr {
@@ -282,6 +290,34 @@ fn invalid_mismatched_or_overlapping_files_refuse_the_load() {
             },
             fixture("ca-a-lookalike.pem"),
         ),
+        (
+            TlsFiles {
+                ingest_client_ca: Some(fixture("ca-a.pem")),
+                ..good()
+            },
+            fixture("ca-a.pem"),
+        ),
+        (
+            TlsFiles {
+                ingest_client_ca: Some(fixture("ca-b.pem")),
+                ..good()
+            },
+            fixture("ca-b.pem"),
+        ),
+        (
+            TlsFiles {
+                ingest_client_ca: Some(fixture("ca-a-intermediate.pem")),
+                ..good()
+            },
+            fixture("ca-a-intermediate.pem"),
+        ),
+        (
+            TlsFiles {
+                ingest_client_ca: Some(missing.clone()),
+                ..good()
+            },
+            missing.clone(),
+        ),
     ];
     for (files, culprit) in cases {
         let err = Tls::load(files.clone(), limits()).unwrap_err();
@@ -327,13 +363,30 @@ async fn a_listener_with_an_unbounded_handshake_limit_still_serves() {
     assert!(accepted(addr, "ca-a.pem", QUERIER).await);
 }
 
-/// The decisive case: a backend certificate opens Flight SQL and not the
-/// hot window, a querier certificate the reverse.
+/// The decisive case: a backend certificate opens Flight SQL alone, a
+/// querier certificate the hot window alone and a collector certificate
+/// OTLP ingest alone.
 #[tokio::test]
-async fn the_public_and_hot_listeners_admit_disjoint_clients() {
+async fn the_public_hot_and_ingest_listeners_admit_disjoint_clients() {
     let tls = Tls::load(fixtures(), limits()).unwrap();
     let public = echo_server(&tls.public_server()).await;
     let hot = echo_server(&tls.hot_server()).await;
+    let ingest = echo_server(&tls.ingest_server().unwrap()).await;
+
+    assert!(accepted(ingest, "ca-a.pem", COLLECTOR).await);
+    for (client, why) in [(BACKEND, "the backend"), (QUERIER, "a querier")] {
+        assert!(
+            !accepted(ingest, "ca-a.pem", client).await,
+            "{why} on ingest"
+        );
+    }
+    for addr in [public, hot] {
+        assert!(!accepted(addr, "ca-a.pem", COLLECTOR).await, "a collector");
+    }
+    assert!(
+        !accepted(ingest, "ca-a.pem", None).await,
+        "no client certificate"
+    );
 
     assert!(accepted(public, "ca-a.pem", BACKEND).await);
     assert!(
@@ -363,7 +416,31 @@ async fn the_public_and_hot_listeners_admit_disjoint_clients() {
         "a server certificate the client does not trust"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(tls.stats().handshake_failures.load(Ordering::Relaxed) >= 6);
+    let stats = tls.stats();
+    let failures = |listener: Listener| {
+        stats
+            .listener(listener)
+            .handshake_failures
+            .load(Ordering::Relaxed)
+    };
+    assert_eq!(failures(Listener::Ingest), 3, "counted on its own listener");
+    assert_eq!(failures(Listener::Public), 3);
+    assert!(failures(Listener::Hot) >= 4);
+}
+
+#[tokio::test]
+async fn a_process_without_an_ingest_bundle_has_no_ingest_listener() {
+    let tls = Tls::load(
+        TlsFiles {
+            ingest_client_ca: None,
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap();
+    assert!(tls.ingest_server().is_none());
+    let hot = echo_server(&tls.hot_server()).await;
+    assert!(accepted(hot, "ca-a.pem", QUERIER).await);
 }
 
 /// A CA issued again under the same key is the same trust domain whatever
@@ -517,6 +594,17 @@ async fn a_failed_reload_keeps_the_last_good_config_and_marks_it_stale() {
         "the overlap never reached the hot window"
     );
     std::fs::copy(fixture("ca-b.pem"), &files.public_client_ca).unwrap();
+    let ingest_ca = files.ingest_client_ca.clone().unwrap();
+    std::fs::copy(fixture("ca-a.pem"), &ingest_ca).unwrap();
+    assert!(
+        tls.reload().is_err(),
+        "the ingest bundle shares a CA with the hot window's"
+    );
+    assert!(
+        accepted(addr, "ca-a.pem", QUERIER).await,
+        "a refused reload leaves the hot window as it was"
+    );
+    std::fs::copy(fixture("ca-c.pem"), &ingest_ca).unwrap();
     std::fs::copy(fixture("client-a.key"), &files.key).unwrap();
     assert!(
         tls.reload().is_err(),
@@ -524,7 +612,7 @@ async fn a_failed_reload_keeps_the_last_good_config_and_marks_it_stale() {
     );
     std::fs::remove_file(&files.key).unwrap();
     assert!(tls.reload().is_err(), "a key file that is gone");
-    assert_eq!(stats.reload_failures.load(Ordering::Relaxed), 4);
+    assert_eq!(stats.reload_failures.load(Ordering::Relaxed), 5);
     assert!(accepted(addr, "ca-a.pem", QUERIER).await);
 
     install(
@@ -598,12 +686,18 @@ async fn silent_and_excess_connections_are_dropped_within_the_limits() {
         .await
         .unwrap();
     assert!(matches!(closed, Ok(0) | Err(_)), "closed at once");
-    assert_eq!(stats.handshakes_refused.load(Ordering::Relaxed), 1);
+    let hot = stats.listener(Listener::Hot);
+    assert_eq!(hot.handshakes_refused.load(Ordering::Relaxed), 1);
     let closed = tokio::time::timeout(Duration::from_secs(2), silent.read(&mut buf))
         .await
         .unwrap();
     assert!(matches!(closed, Ok(0) | Err(_)), "closed at the timeout");
-    assert_eq!(stats.handshake_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(hot.handshake_failures.load(Ordering::Relaxed), 1);
+    for other in [Listener::Public, Listener::Ingest] {
+        let other = stats.listener(other);
+        assert_eq!(other.handshakes_refused.load(Ordering::Relaxed), 0);
+        assert_eq!(other.handshake_failures.load(Ordering::Relaxed), 0);
+    }
     assert!(
         accepted(addr, "ca-a.pem", QUERIER).await,
         "the permit came back"
