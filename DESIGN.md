@@ -29,7 +29,7 @@ aggregate by window, and text search over logs.
 ```mermaid
 flowchart LR
     subgraph edge[Collection]
-        COL[fusescope-otel-collector<br/>OTLP / OTel-Arrow exporter]
+        COL[fusescope-collector-server<br/>OTLP / OTel-Arrow exporter]
     end
 
     subgraph engine[fusescope-engine · one binary, roles]
@@ -404,7 +404,8 @@ not carried over.
 
 **Clean-room rule (ADR 0008).** The OTLP to schema mapping is specified from
 the OpenTelemetry protocol and semantic conventions and from observed data,
-never from the AGPL exporter code in the collector repository.
+never from the exporter code of the AGPL collector, `fusescope-otel-collector`,
+which `fusescope-collector-server` replaces (ADR 0010).
 
 ### Spans
 
@@ -1485,7 +1486,7 @@ annotations.
 | `pkg/prometheus/clickhouseprometheusv2` | Gains a sibling `flightprometheus` implementing `storage.Queryable` on top of `metrics.select`. The Prometheus PromQL engine stays in Go. |
 | `pkg/telemetrymetadata` | Reads the `attribute_keys` derived table through `metadata.keys`. |
 | `pkg/query-service/app/{logs,traces,metrics}/{v3,v4}` | Not ported. Legacy code that SigNoz itself is retiring in favor of querier v5. |
-| `fusescope-otel-collector` | Swaps the ClickHouse exporter for the standard OTLP exporter pointing at the ingesters. The schema stops living in the AGPL repository. |
+| `fusescope-collector-server` | Replaces the AGPL `fusescope-otel-collector` (ADR 0010). Exports standard OTLP to the ingesters next to its own ClickHouse exporter, both at once for dual-write. The engine schema lives in `fs-schema`. |
 
 A `telemetrystore.provider: clickhouse | flight` flag selects the
 implementation at runtime, allowing dual-write from the collector and result
@@ -1772,7 +1773,7 @@ decision, not inertia.
 | 1 · Traces | OTLP ingest, L0 flush, trace_id indexes, querier with Flight SQL and `trace.lookup`, `flighttelemetrystore` in Go, dual-write from the collector | trace targets in section 9.2 within the same order of magnitude as ClickHouse on the same data; identical results in a diff |
 | 2 · Logs and compactor | ngram bloom, hot window, L1/L2, trace and log derived tables, retention | logs view and service map served by the engine in staging for two weeks without regression |
 | 3 · Metrics | series and samples, postings, `metrics.select`, `flightprometheus`, rollups | PromQL alerts and dashboards match ClickHouse in shadow for two weeks |
-| 4 · Cutover | history migration via Parquet export, ClickHouse shutdown, removal of `clickhousetelemetrystore` | production without ClickHouse for 30 days |
+| 4 · Cutover | history migration via Parquet export, ClickHouse removed from FuseScope's production, Flight the default provider; `clickhousetelemetrystore` stays optional (ADR 0010) | production without ClickHouse for 30 days |
 
 ## 13. Risks
 
@@ -1798,3 +1799,4 @@ decision, not inertia.
 | 006 | Collector exports standard OTLP to the ingester | Keeping an adapted ClickHouse exporter: schema stays in the AGPL repository |
 | 007 | Logical schema compatible with the Go backend, physical encoding free | Byte-compatible ClickHouse schema: carries hex ids, JSON strings and camelCase aliases into Parquet |
 | 008 | Clean-room mapping from OTLP; AGPL exporter code is never read | Porting the exporter's mapping: AGPL contamination of an Apache-2.0 engine |
+| 010 | `fusescope-collector-server` is the collector; ClickHouse stays a supported product after the cutover | Removing `clickhousetelemetrystore` at the cutover: breaks installations that keep ClickHouse |

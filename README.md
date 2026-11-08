@@ -91,8 +91,9 @@ service and always runs them.
 
 ## Clean-room rule
 
-Parts of FuseScope's collector are AGPL-3.0. Nothing in this repository may be
-derived from that code. The OTLP mapping is specified from the OpenTelemetry
+FuseScope's earlier collector, `fusescope-otel-collector`, is AGPL-3.0. Nothing
+in this repository may be derived from that code, including its git history.
+The collector that replaces it, `fusescope-collector-server`, is Apache-2.0. The OTLP mapping is specified from the OpenTelemetry
 protocol, the semantic conventions and observed data. See
 [ADR 0008](docs/adr/0008-clean-room-from-otlp.md).
 

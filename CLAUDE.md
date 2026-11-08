@@ -10,7 +10,7 @@ are binding until superseded by a new ADR.
 |---|---|---|
 | `fuseone-io/fusescope-engine` (this) | Rust workspace: `crates/fs-*`, one binary `fusescope-engine` | Apache-2.0 |
 | `fuseone-io/fusescope` | Go backend, React frontend; talks to the engine over Flight SQL | MIT |
-| `fuseone-io/fusescope-otel-collector` | collector; exports plain OTLP to the engine | AGPL-3.0 |
+| `fuseone-io/fusescope-collector-server` | collector ([ADR 0010](docs/adr/0010-fusescope-collector-server.md)); exports plain OTLP to the engine, ClickHouse beside it | Apache-2.0 |
 
 These rules apply repo-wide. Topic rules live in [`.claude/rules/`](.claude/rules/)
 (comments, Rust, tests, pull requests). Everything committed is written in
@@ -27,7 +27,8 @@ English.
 - **Clean-room** ([ADR 0008](docs/adr/0008-clean-room-from-otlp.md)): the OTLP to
   schema mapping is specified from the OpenTelemetry protocol, the semantic
   conventions and observed data. Never open, copy, translate or summarise the
-  AGPL collector's exporter source, including from git history. Every mapping
+  source of the AGPL collector it replaces, `fusescope-otel-collector`, including
+  from git history. `fusescope-collector-server` is Apache-2.0 and may be read. Every mapping
   rule is written down with its source in
   [`crates/fs-schema/MAPPING.md`](crates/fs-schema/MAPPING.md). Say "clean-room"
   in the commit message when touching the mapping.

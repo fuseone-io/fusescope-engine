@@ -46,17 +46,19 @@ need the Go backend and the collector too.
 ## The collector
 
 `fuseone-io/fusescope-collector-server` (Apache-2.0) is FuseScope's own
-distribution of the OpenTelemetry Collector, built from upstream components,
-and replaces the AGPL `fusescope-otel-collector`, which stays in production
-until the new one's phase 6. The clean-room rule on the AGPL repository does
-not change. Its phases are in its `DESIGN.md` §9; these are the ones this
+distribution of the OpenTelemetry Collector, built from upstream components
+([ADR 0010](adr/0010-fusescope-collector-server.md)). It replaces the AGPL
+`fusescope-otel-collector`, the SigNoz fork, entirely: the demo's cutover is
+under way and goes forward only, with no return to the old collector. The
+clean-room rule on the AGPL repository, git history included, does not
+change. Its phases are in its `DESIGN.md` §9; these are the ones this
 roadmap depends on:
 
-| Collector phase | Issue | State (2026-11-04) | Needed by |
+| Collector phase | Issue | State (2026-11-08) | Needed by |
 |---|---|---|---|
 | 1 to 3 · traces, logs and metrics into ClickHouse | [#2](https://github.com/fuseone-io/fusescope-collector-server/issues/2), [#3](https://github.com/fuseone-io/fusescope-collector-server/issues/3), [#4](https://github.com/fuseone-io/fusescope-collector-server/issues/4) | done | the ClickHouse side of dual-write (D1) |
-| 4 · APM metrics, ordinary OTLP metrics derived from spans | [#5](https://github.com/fuseone-io/fusescope-collector-server/issues/5) | open | M3 parity of the pages that read span metrics |
-| 6 · shadow and cutover, the AGPL collector retired | [#7](https://github.com/fuseone-io/fusescope-collector-server/issues/7) | shadow running on the demo | M4 |
+| 4 · APM metrics, ordinary OTLP metrics derived from spans | [#5](https://github.com/fuseone-io/fusescope-collector-server/issues/5) | done | M3 parity of the pages that read span metrics |
+| 6 · shadow and cutover, the AGPL collector retired | [#7](https://github.com/fuseone-io/fusescope-collector-server/issues/7) | demo cutover in progress, forward only | M4 |
 | 7 · gateway to engine, dual-write, load benchmark | [#8](https://github.com/fuseone-io/fusescope-collector-server/issues/8) | open; `config/gateway-engine.yaml` writes to the engine alone | D1, so M1 |
 | 8 · new installations without the AGPL collector | [#9](https://github.com/fuseone-io/fusescope-collector-server/issues/9) | open | M4 |
 
@@ -64,17 +66,21 @@ Log pipelines, span mapping, LLM pricing, tail sampling and the RUM and
 ingestion-key ingress run in the collector before any exporter, so they need
 no work here.
 
-Open between the two repositories:
+Decided between the two repositories (2026-11-08):
 
-- **Order of D1.** The collector places phase 7 after its cutover, phase 6,
-  whose exit is 30 days in production. M1 needs dual-write before that, so
-  either phase 7 moves ahead of phase 6 or M1 waits for it.
-- **ClickHouse after M4.** Collector [ADR 0003](https://github.com/fuseone-io/fusescope-collector-server/blob/main/docs/adr/0003-clickhouse-and-engine.md)
-  makes ClickHouse a supported product output, not a bridge, while M4 removes
-  `clickhousetelemetrystore`. One of the two has to change.
-- **OTel-Arrow.** The collector's `DESIGN.md` §4 waits for Arrow ingest in the
-  engine, which no item here schedules. Until one does, the wire is OTLP with
-  `zstd`.
+- **Dependencies are partial, not a renumbering.** Dual-write is how M1 is
+  validated, so it does not wait for the collector's cutover: E4 → collector
+  phase 7 (mTLS, tokens and dual-write) → the M1 comparison. Phase 7's
+  dual-write lands while phase 6 runs; phase 6 goes on in parallel, and its
+  30 days in production are a requirement of M4, not of M1.
+- **ClickHouse stays a supported product after M4**, as collector
+  [ADR 0003](https://github.com/fuseone-io/fusescope-collector-server/blob/main/docs/adr/0003-clickhouse-and-engine.md)
+  says. M4 is the cutover of FuseScope's own production:
+  `clickhousetelemetrystore` stays an optional provider, and removing it takes
+  a deprecation ADR, an announced window and a migration path.
+- **OTel-Arrow** stays unscheduled. The collector's `DESIGN.md` §4 waits for
+  Arrow ingest in the engine; until an item here takes it, the wire is OTLP
+  with `zstd`.
 
 ## Where we are
 
@@ -155,7 +161,7 @@ tracked here so the order stays visible.
 
 | # | Item | Why | Exit test | Size | Status |
 |---|---|---|---|---|---|
-| D1 | Collector: OTLP exporter to the engine next to `fusescope_clickhouse`, dual-write by configuration, one `fst_` token per tenant, over TLS (E4) | both backends receive the same data during the comparison | collector [#8](https://github.com/fuseone-io/fusescope-collector-server/issues/8): config test; spans arrive in both | S | todo: the engine-only `config/gateway-engine.yaml` exists; no dual-write configuration, and its order is open (see The collector) |
+| D1 | Collector: OTLP exporter to the engine next to `fusescope_clickhouse`, dual-write by configuration, one `fst_` token per tenant, over TLS (E4) | both backends receive the same data during the comparison | collector [#8](https://github.com/fuseone-io/fusescope-collector-server/issues/8): config test; spans arrive in both | S | todo, after E4 and during collector phase 6: the engine-only `config/gateway-engine.yaml` exists; no dual-write configuration yet |
 | D2 | Go: `telemetrystore` interface with `Query` and `Do`, `flighttelemetrystore` with mTLS and tenant token, `telemetrystore.provider` flag | the backend needs a second provider before any view can switch | Go unit tests with a Flight test server; integration against `fusescope-engine --role all` | L | todo |
 | D3 | Go: DataFusion dialect for the trace statement builders, tested against the same cases as the ClickHouse dialect | the trace views build SQL through these builders | builder tests pass for both dialects | L | todo |
 | D4 | Go: trace views on the Flight provider (trace by id, span list, services, latency, top operations) | the M1 user-facing check | end-to-end test in the backend repository | M | todo |
@@ -186,7 +192,8 @@ tracked here so the order stays visible.
 A1 → B1 → B2 → A2 → A3 → B3 → C1 → C2 → B5 → B4 → B6 → B7 → A4 → A5 →
 A6 → C3 → C4 → C6 → E1 → E2 → E3 → F1 → F2 → F3 → F4 → F5 → F6, with D1 to D5 in
 parallel in the other repositories once B4 and B6 define the actions.
-C5 landed after C6. E4 comes before D1.
+C5 landed after C6. E4 comes before D1, which does not wait for the
+collector's cutover (see The collector).
 
 ## M2 · logs and compactor (phase 2)
 
@@ -395,11 +402,13 @@ C5 landed after C6. E4 comes before D1.
 
 - History migration from ClickHouse through Parquet export into L2.
 - Iceberg export of L2 ([ADR 0001](adr/0001-own-catalog-iceberg-export.md)).
-- Remove `clickhousetelemetrystore`; ClickHouse shutdown. Open against
-  collector ADR 0003 (see The collector).
-- Collector phases 6 and 8 done: no installation depends on the AGPL
-  collector.
-- Exit: production without ClickHouse for 30 days.
+- Remove ClickHouse, its credentials and its workloads from FuseScope's
+  production deployment, and make Flight the default provider.
+  `clickhousetelemetrystore` stays an optional supported provider
+  ([ADR 0010](adr/0010-fusescope-collector-server.md)).
+- Collector phases 6 and 8 done, phase 6 with its 30 days in production: no
+  installation depends on the AGPL collector.
+- Exit: FuseScope's production without ClickHouse for 30 days.
 
 ## Cadence
 
