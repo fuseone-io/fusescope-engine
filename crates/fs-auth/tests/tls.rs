@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use fs_auth::{Listener, MAX_HANDSHAKES, Reload, ServerTls, Tls, TlsError, TlsFiles, TlsLimits};
+use fs_auth::{MAX_HANDSHAKES, Reload, ServerTls, Tls, TlsError, TlsFiles, TlsLimits};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
@@ -416,16 +416,7 @@ async fn the_public_hot_and_ingest_listeners_admit_disjoint_clients() {
         "a server certificate the client does not trust"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let stats = tls.stats();
-    let failures = |listener: Listener| {
-        stats
-            .listener(listener)
-            .handshake_failures
-            .load(Ordering::Relaxed)
-    };
-    assert_eq!(failures(Listener::Ingest), 3, "counted on its own listener");
-    assert_eq!(failures(Listener::Public), 3);
-    assert!(failures(Listener::Hot) >= 4);
+    assert!(tls.stats().handshake_failures.load(Ordering::Relaxed) >= 10);
 }
 
 #[tokio::test]
@@ -686,18 +677,12 @@ async fn silent_and_excess_connections_are_dropped_within_the_limits() {
         .await
         .unwrap();
     assert!(matches!(closed, Ok(0) | Err(_)), "closed at once");
-    let hot = stats.listener(Listener::Hot);
-    assert_eq!(hot.handshakes_refused.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.handshakes_refused.load(Ordering::Relaxed), 1);
     let closed = tokio::time::timeout(Duration::from_secs(2), silent.read(&mut buf))
         .await
         .unwrap();
     assert!(matches!(closed, Ok(0) | Err(_)), "closed at the timeout");
-    assert_eq!(hot.handshake_failures.load(Ordering::Relaxed), 1);
-    for other in [Listener::Public, Listener::Ingest] {
-        let other = stats.listener(other);
-        assert_eq!(other.handshakes_refused.load(Ordering::Relaxed), 0);
-        assert_eq!(other.handshake_failures.load(Ordering::Relaxed), 0);
-    }
+    assert_eq!(stats.handshake_failures.load(Ordering::Relaxed), 1);
     assert!(
         accepted(addr, "ca-a.pem", QUERIER).await,
         "the permit came back"

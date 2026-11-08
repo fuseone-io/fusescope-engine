@@ -284,13 +284,7 @@ async fn otlp_over_mtls_admits_only_collectors_and_still_needs_a_token() {
         "nothing refused reached the receivers"
     );
     let ingest = tls.stats();
-    assert!(
-        ingest
-            .listener(fs_auth::Listener::Ingest)
-            .handshake_failures
-            .load(Ordering::Relaxed)
-            >= 2
-    );
+    assert!(ingest.handshake_failures.load(Ordering::Relaxed) >= 2);
     running.stop().await;
     db.finish().await;
 }
@@ -369,7 +363,6 @@ async fn the_otlp_listener_bounds_its_handshakes() {
         .unwrap();
     assert!(matches!(closed, Ok(0) | Err(_)), "closed at once");
     let ingest = tls.stats();
-    let ingest = ingest.listener(fs_auth::Listener::Ingest);
     assert_eq!(ingest.handshakes_refused.load(Ordering::Relaxed), 1);
     running.stop().await;
     db.finish().await;

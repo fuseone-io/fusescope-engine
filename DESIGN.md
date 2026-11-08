@@ -1685,9 +1685,7 @@ surface and is handled as follows:
   start stop the start. Handshakes run off the accept loop, each within
   `tls.handshake_timeout_secs` (10) and at most `tls.max_handshakes` (1024,
   never above 65536, clamped inside `fs-auth` as well) at a time per
-  listener, and `fusescope_tls_handshake_failures_total` and
-  `fusescope_tls_handshakes_refused_total` count per listener
-  (`listener="public|hot|ingest"`). `[tls]` is off by default for development, where the start
+  listener. `[tls]` is off by default for development, where the start
   warns, and half a section, on without its four files or off with files
   named, is refused; staging and production turn it on. Required before
   staging: refusing at start, and reporting, a certificate already expired

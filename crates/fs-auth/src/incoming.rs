@@ -15,7 +15,7 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::server::Router;
 use tracing::{debug, warn};
 
-use crate::reload::{Listener, TlsLimits, TlsStats};
+use crate::reload::{TlsLimits, TlsStats};
 
 /// Pause after a failed `accept`, such as running out of file descriptors,
 /// so the loop does not spin.
@@ -26,14 +26,12 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 pub struct ServerTls {
     config: watch::Receiver<Arc<ServerConfig>>,
     stats: Arc<TlsStats>,
-    listener: Listener,
     limits: TlsLimits,
 }
 
 impl std::fmt::Debug for ServerTls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerTls")
-            .field("listener", &self.listener)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
@@ -43,13 +41,11 @@ impl ServerTls {
     pub(crate) fn new(
         config: watch::Receiver<Arc<ServerConfig>>,
         stats: Arc<TlsStats>,
-        listener: Listener,
         limits: TlsLimits,
     ) -> Self {
         Self {
             config,
             stats,
-            listener,
             limits,
         }
     }
@@ -90,15 +86,13 @@ impl ServerTls {
             };
             let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                 self.stats
-                    .listener(self.listener)
                     .handshakes_refused
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(%peer, listener = self.listener.name(), "tls handshakes at their limit; connection closed");
+                debug!(%peer, "tls handshakes at their limit; connection closed");
                 continue;
             };
             let acceptor = TlsAcceptor::from(Arc::clone(&self.config.borrow()));
             let stats = Arc::clone(&self.stats);
-            let listener = self.listener;
             let timeout = self.limits.handshake_timeout;
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -108,18 +102,12 @@ impl ServerTls {
                         let _ = tx.send(Ok(stream)).await;
                     }
                     Ok(Err(e)) => {
-                        stats
-                            .listener(listener)
-                            .handshake_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        debug!(%peer, listener = listener.name(), error = %e, "tls handshake refused");
+                        stats.handshake_failures.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, error = %e, "tls handshake refused");
                     }
                     Err(_) => {
-                        stats
-                            .listener(listener)
-                            .handshake_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        debug!(%peer, listener = listener.name(), ?timeout, "tls handshake timed out");
+                        stats.handshake_failures.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, ?timeout, "tls handshake timed out");
                     }
                 }
             });

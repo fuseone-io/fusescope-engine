@@ -918,14 +918,10 @@ async fn with_tls_on_each_listener_admits_only_its_own_clients() {
     );
 
     let (_, body) = http_get(&metrics_addr, "/metrics").await;
-    for listener in ["public", "hot", "ingest"] {
-        assert!(
-            !body.contains(&format!(
-                "fusescope_tls_handshake_failures_total{{listener=\"{listener}\"}} 0\n"
-            )),
-            "the refused attempts on {listener} failed their handshakes: {body}"
-        );
-    }
+    assert!(
+        !body.contains("fusescope_tls_handshake_failures_total 0\n"),
+        "the refused attempts failed their handshakes: {body}"
+    );
 
     tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(10), server)

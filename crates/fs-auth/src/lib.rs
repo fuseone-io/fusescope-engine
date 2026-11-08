@@ -32,7 +32,7 @@ pub use jwt::{
     Claims, JwtError, JwtRules, JwtVerifier, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES, TENANT_CLAIM,
 };
 pub use load::{TlsError, TlsFiles};
-pub use reload::{Listener, ListenerStats, MAX_HANDSHAKES, Reload, Tls, TlsLimits, TlsStats};
+pub use reload::{MAX_HANDSHAKES, Reload, Tls, TlsLimits, TlsStats};
 
 /// Crate version, exposed for diagnostics and the `--version` flag.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -152,7 +152,8 @@ The trace and logs services answer alike. With `[tls]` on, a collector
 whose certificate does not chain to `tls.ingest_client_ca`, or that speaks
 plain text, never reaches them: its exporter reports `UNAVAILABLE` with a
 handshake error, and the ingester counts
-`fusescope_tls_handshake_failures_total{listener="ingest"}`. A valid
+`fusescope_tls_handshake_failures_total`, one counter for every listener of
+the process. A valid
 certificate does not replace the token.
 
 | Status | Message | Meaning | Action |

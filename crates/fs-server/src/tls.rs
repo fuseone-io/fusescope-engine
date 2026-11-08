@@ -176,26 +176,19 @@ pub(crate) fn render(out: &mut String, stats: &fs_auth::TlsStats) {
             "TLS reloads that failed and kept the last good config",
             load(&stats.reload_failures),
         ),
+        (
+            "fusescope_tls_handshake_failures_total",
+            "TLS handshakes that failed or timed out, refused client certificates included",
+            load(&stats.handshake_failures),
+        ),
+        (
+            "fusescope_tls_handshakes_refused_total",
+            "Connections closed because tls.max_handshakes were in progress",
+            load(&stats.handshakes_refused),
+        ),
     ] {
         crate::metrics::counter(out, name, help, value);
     }
-    let per_listener = |count: fn(&fs_auth::ListenerStats) -> &std::sync::atomic::AtomicU64| {
-        fs_auth::Listener::ALL.map(|l| (l.name(), load(count(stats.listener(l)))))
-    };
-    crate::metrics::labelled_counter(
-        out,
-        "fusescope_tls_handshake_failures_total",
-        "TLS handshakes that failed or timed out, refused client certificates included",
-        "listener",
-        &per_listener(|s| &s.handshake_failures),
-    );
-    crate::metrics::labelled_counter(
-        out,
-        "fusescope_tls_handshakes_refused_total",
-        "Connections closed because tls.max_handshakes were in progress",
-        "listener",
-        &per_listener(|s| &s.handshakes_refused),
-    );
     crate::metrics::gauge(
         out,
         "fusescope_tls_stale",
