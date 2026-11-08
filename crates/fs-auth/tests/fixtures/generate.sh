@@ -10,6 +10,9 @@
 # ca-a-lookalike             ca-a's subject on another key, signed by ca-a:
 #                            self-issued, not self-signed
 # server-a, server-a2        identities for localhost, issued by ca-a
+# server-expired             an identity of ca-d valid in 2000 only
+# server-future              an identity of ca-d valid from 2125
+# ca-expired                 a self-signed root valid in 2000 only
 # client-X                   a client identity issued by ca-X
 # jwt-X.key                  an Ed25519 signing key of the backend, kid X
 # jwks-a, jwks-ab, jwks-b    JWK sets of those keys, as the engine reads them
@@ -49,6 +52,18 @@ leaf() {
     issue "$1" "$2" "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=$4\nsubjectAltName=$3\n"
 }
 
+# A localhost identity of $2 valid from $3 to $4 only.
+dated() {
+    name=$1 issuer=$2
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "$name.key" -out "$name.csr" -subj "/CN=$name"
+    printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:localhost\n' > "$name.ext"
+    openssl x509 -req -in "$name.csr" -CA "$issuer.pem" -CAkey "$issuer.key" \
+        -set_serial "0x$(openssl rand -hex 8)" -out "$name.pem" \
+        -not_before "$3" -not_after "$4" -extfile "$name.ext"
+    rm "$name.csr" "$name.ext"
+}
+
 rm -f ./*.pem ./*.key ./*.json
 root ca-a
 root ca-a-reissued ca-a ca-a
@@ -66,7 +81,16 @@ leaf client-a2 ca-a2 DNS:client.test clientAuth
 leaf client-b ca-b DNS:client.test clientAuth
 leaf client-b2 ca-b2 DNS:client.test clientAuth
 leaf client-c ca-c DNS:client.test clientAuth
-rm -f ca-a.key ca-a2.key ca-b.key ca-b2.key ca-c.key ca-a-intermediate.key
+root ca-d
+dated server-expired ca-d 20000101000000Z 20001231000000Z
+dated server-future ca-d 21250101000000Z 22250101000000Z
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca-expired.key
+openssl req -x509 -new -key ca-expired.key -out ca-expired.pem \
+    -not_before 20000101000000Z -not_after 20001231000000Z \
+    -subj "/CN=fusescope test ca-expired" -set_serial "0x$(openssl rand -hex 8)" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign"
+rm -f ca-a.key ca-a2.key ca-b.key ca-b2.key ca-c.key ca-d.key ca-expired.key ca-a-intermediate.key
 
 jwk() {
     x=$(openssl pkey -in "jwt-$1.key" -pubout -outform DER | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')

@@ -10,6 +10,9 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
 use tonic::transport::Identity;
+use tracing::warn;
+
+use crate::validity::Validity;
 
 /// The PEM files of a process's TLS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,16 +112,39 @@ pub(crate) struct Loaded {
 
 /// Builds every side from `pems`, refusing a certificate or CA that does
 /// not parse, a key that does not match the certificate, an empty file, a
-/// client CA that is not a self-signed root, or any two client CA bundles
-/// that share a CA key.
+/// client CA that is not a self-signed root, any two client CA bundles
+/// that share a CA key, a certificate of the chain outside its validity,
+/// or a bundle none of whose CAs is within its validity.
 pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let now = now();
     let chain = certificates(&pems.cert, &files.cert)?;
+    for (n, cert) in chain.iter().enumerate() {
+        let validity = Validity::of(cert).ok_or_else(|| {
+            invalid(
+                &files.cert,
+                format!(
+                    "certificate {} of the chain has no readable validity",
+                    n + 1
+                ),
+            )
+        })?;
+        if let Some(refusal) = validity.refusal(now) {
+            return Err(invalid(
+                &files.cert,
+                format!("certificate {} of the chain {refusal}", n + 1),
+            ));
+        }
+    }
     let key = PrivateKeyDer::from_pem_slice(&pems.key)
         .map_err(|e| invalid(&files.key, format!("no private key: {e}")))?;
-    let (public_cas, public_keys) =
-        bundle(&pems.public_client_ca, &files.public_client_ca, &provider)?;
-    let (hot_cas, hot_keys) = bundle(&pems.hot_client_ca, &files.hot_client_ca, &provider)?;
+    let (public_cas, public_keys) = bundle(
+        &pems.public_client_ca,
+        &files.public_client_ca,
+        &provider,
+        now,
+    )?;
+    let (hot_cas, hot_keys) = bundle(&pems.hot_client_ca, &files.hot_client_ca, &provider, now)?;
     disjoint(
         (&hot_keys, &files.hot_client_ca),
         (&public_keys, &files.public_client_ca),
@@ -126,7 +152,7 @@ pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     )?;
     let ingest = match (&pems.ingest_client_ca, &files.ingest_client_ca) {
         (Some(pem), Some(path)) => {
-            let (cas, keys) = bundle(pem, path, &provider)?;
+            let (cas, keys) = bundle(pem, path, &provider, now)?;
             disjoint(
                 (&keys, path),
                 (&public_keys, &files.public_client_ca),
@@ -182,15 +208,49 @@ pub(crate) fn load(pems: &Pems, files: &TlsFiles) -> Result<Loaded, TlsError> {
     })
 }
 
-/// A client CA bundle and the keys of its roots.
+/// A client CA bundle and the keys of its roots. A CA outside its
+/// validity admits no one, so it is only reported unless every CA of the
+/// bundle is.
 fn bundle(
     pem: &[u8],
     path: &Path,
     provider: &rustls::crypto::CryptoProvider,
+    now: i64,
 ) -> Result<(Vec<CertificateDer<'static>>, Vec<Vec<u8>>), TlsError> {
     let cas = certificates(pem, path)?;
     let keys = crate::anchors::root_keys(&cas, provider).map_err(|reason| invalid(path, reason))?;
+    let mut refused = Vec::new();
+    for (n, ca) in cas.iter().enumerate() {
+        let validity = Validity::of(ca).ok_or_else(|| {
+            invalid(
+                path,
+                format!(
+                    "certificate {} of the bundle has no readable validity",
+                    n + 1
+                ),
+            )
+        })?;
+        if let Some(refusal) = validity.refusal(now) {
+            refused.push(format!("certificate {} {refusal}", n + 1));
+        }
+    }
+    if refused.len() == cas.len() {
+        return Err(invalid(
+            path,
+            format!("no CA of the bundle is valid now: {}", refused.join(", ")),
+        ));
+    }
+    for refusal in &refused {
+        warn!(path = %path.display(), "tls: a CA of the bundle admits no one: {refusal}");
+    }
     Ok((cas, keys))
+}
+
+/// Seconds since the Unix epoch on the system clock.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Refuses `bundle` when it shares a CA key with `other`, naming `bundle`.

@@ -765,8 +765,8 @@ fn certified(cert: &str, key: &str) -> fs_auth::ClientTls {
     identity.client().trusting_only(&ca)
 }
 
-/// With `[tls]` on, the server refuses to start on files that do not load
-/// and an ingester without a collector CA bundle. On good files, in one
+/// With `[tls]` on, the server refuses to start on files that do not load,
+/// an expired certificate and an ingester without a collector CA bundle. On good files, in one
 /// process running every role, a backend certificate opens Flight SQL
 /// alone, a querier certificate the hot window alone and a collector
 /// certificate OTLP alone, plain text opens none, and readiness and the
@@ -788,6 +788,16 @@ async fn with_tls_on_each_listener_admits_only_its_own_clients() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("server-a.pem"), "{err}");
+    let mut expired = config(dir.path());
+    tls_on(&mut expired, "server-expired.pem", "server-expired.key");
+    let err = server::check(expired, secrets.clone(), "checker".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("server-expired.pem") && err.contains("expired at 2000-12-31T00:00:00Z"),
+        "{err}"
+    );
     let mut plain_otlp = config(dir.path());
     tls_on(&mut plain_otlp, "server-a.pem", "server-a.key");
     plain_otlp.tls.ingest_client_ca.clear();

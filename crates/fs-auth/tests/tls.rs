@@ -318,6 +318,36 @@ fn invalid_mismatched_or_overlapping_files_refuse_the_load() {
             },
             missing.clone(),
         ),
+        (
+            TlsFiles {
+                cert: fixture("server-expired.pem"),
+                key: fixture("server-expired.key"),
+                ..good()
+            },
+            fixture("server-expired.pem"),
+        ),
+        (
+            TlsFiles {
+                cert: fixture("server-future.pem"),
+                key: fixture("server-future.key"),
+                ..good()
+            },
+            fixture("server-future.pem"),
+        ),
+        (
+            TlsFiles {
+                public_client_ca: fixture("ca-expired.pem"),
+                ..good()
+            },
+            fixture("ca-expired.pem"),
+        ),
+        (
+            TlsFiles {
+                ingest_client_ca: Some(fixture("ca-expired.pem")),
+                ..good()
+            },
+            fixture("ca-expired.pem"),
+        ),
     ];
     for (files, culprit) in cases {
         let err = Tls::load(files.clone(), limits()).unwrap_err();
@@ -327,6 +357,70 @@ fn invalid_mismatched_or_overlapping_files_refuse_the_load() {
         };
         assert_eq!(path, culprit, "{files:?}: {err}");
     }
+}
+
+#[test]
+fn a_certificate_outside_its_validity_names_the_dates() {
+    let expired = Tls::load(
+        TlsFiles {
+            cert: fixture("server-expired.pem"),
+            key: fixture("server-expired.key"),
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        expired.contains("expired at 2000-12-31T00:00:00Z"),
+        "{expired}"
+    );
+    let future = Tls::load(
+        TlsFiles {
+            cert: fixture("server-future.pem"),
+            key: fixture("server-future.key"),
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        future.contains("not valid before 2125-01-01T00:00:00Z"),
+        "{future}"
+    );
+    let bundle = Tls::load(
+        TlsFiles {
+            hot_client_ca: fixture("ca-expired.pem"),
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        bundle.contains("no CA of the bundle is valid now"),
+        "{bundle}"
+    );
+}
+
+/// An expired CA beside a valid one is a rotation left behind: it admits
+/// no one and fails no handshake, so the bundle still loads.
+#[tokio::test]
+async fn an_expired_ca_beside_a_valid_one_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let public = dir.path().join("public-ca.crt");
+    std::fs::write(&public, bundle(&["ca-expired.pem", "ca-b.pem"])).unwrap();
+    let tls = Tls::load(
+        TlsFiles {
+            public_client_ca: public,
+            ..fixtures()
+        },
+        limits(),
+    )
+    .unwrap();
+    let addr = echo_server(&tls.public_server()).await;
+    assert!(accepted(addr, "ca-a.pem", BACKEND).await);
 }
 
 #[test]
@@ -603,7 +697,15 @@ async fn a_failed_reload_keeps_the_last_good_config_and_marks_it_stale() {
     );
     std::fs::remove_file(&files.key).unwrap();
     assert!(tls.reload().is_err(), "a key file that is gone");
-    assert_eq!(stats.reload_failures.load(Ordering::Relaxed), 5);
+    install(
+        &files,
+        "server-expired.pem",
+        "server-expired.key",
+        &["ca-b.pem"],
+        &["ca-a.pem"],
+    );
+    assert!(tls.reload().is_err(), "an expired certificate");
+    assert_eq!(stats.reload_failures.load(Ordering::Relaxed), 6);
     assert!(accepted(addr, "ca-a.pem", QUERIER).await);
 
     install(

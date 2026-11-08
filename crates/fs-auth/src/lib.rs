@@ -24,6 +24,7 @@ mod jwks;
 mod jwt;
 mod load;
 mod reload;
+mod validity;
 
 pub use client::{ClientTls, endpoint, error_chain};
 pub use incoming::{ServerTls, serve};

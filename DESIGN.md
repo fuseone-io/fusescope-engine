@@ -1687,9 +1687,13 @@ surface and is handled as follows:
   never above 65536, clamped inside `fs-auth` as well) at a time per
   listener. `[tls]` is off by default for development, where the start
   warns, and half a section, on without its four files or off with files
-  named, is refused; staging and production turn it on. Required before
-  staging: refusing at start, and reporting, a certificate already expired
-  or not yet valid, which today loads and fails every handshake.
+  named, is refused; staging and production turn it on. A certificate of
+  `tls.cert` outside its validity, and a client CA bundle none of whose
+  CAs is within its validity, are refused at start and at reload with the
+  date passed, since either would fail every handshake; a CA outside its
+  validity beside a valid one, left from a rotation, only logs a warning.
+  A certificate that expires while loaded is not caught until the next
+  change of the files.
 
 ### 10.5 Supply chain and code
 

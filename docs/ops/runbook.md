@@ -280,6 +280,7 @@ domain (unknown signal, partial hour, duplicate key): find the file under
 |---|---|
 | `invalid config: …` | the configuration; `--validate` reproduces it without connecting |
 | `tls: …`, `jwt keys …` | a certificate, key, CA bundle or key set that does not load |
+| `tls: … certificate N of the chain expired at …` or `… is not valid before …`, `… no CA of the bundle is valid now: …` | the certificate or every CA of the bundle is outside its validity; reissue it, or check the node's clock |
 | `bucket prefix … belongs to catalog …` | another deployment's prefix |
 | `… holds objects but no catalog marker` | see the orphan collector above |
 | `wal: damage at segment … that recovery must not cut (…)` | damage recovery cannot prove unacknowledged, corrupt bytes or a read failure as the suffix says; keep the volume and escalate |

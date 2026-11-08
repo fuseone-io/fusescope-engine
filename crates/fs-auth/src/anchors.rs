@@ -23,6 +23,7 @@ struct Parts<'a> {
     signature_alg: &'a [u8],
     signature: &'a [u8],
     issuer: &'a [u8],
+    validity: &'a [u8],
     subject: &'a [u8],
     spki: &'a [u8],
     key_alg: &'a [u8],
@@ -55,6 +56,11 @@ pub(crate) fn root_keys(
         .collect()
 }
 
+/// The contents of the certificate's `Validity` sequence.
+pub(crate) fn validity(der: &[u8]) -> Option<&[u8]> {
+    parts(der).map(|parts| parts.validity)
+}
+
 fn self_signed(parts: &Parts<'_>, provider: &CryptoProvider) -> bool {
     provider
         .signature_verification_algorithms
@@ -85,7 +91,7 @@ fn parts(der: &[u8]) -> Option<Parts<'_>> {
     let (_, fields) = tlv(fields, INTEGER)?;
     let (_, fields) = tlv(fields, SEQUENCE)?;
     let (issuer, fields) = tlv(fields, SEQUENCE)?;
-    let (_, fields) = tlv(fields, SEQUENCE)?;
+    let (validity, fields) = tlv(fields, SEQUENCE)?;
     let (subject, fields) = tlv(fields, SEQUENCE)?;
     let (spki, _) = tlv(fields, SEQUENCE)?;
     let (key_alg, after_key_alg) = tlv(spki.value, SEQUENCE)?;
@@ -95,6 +101,7 @@ fn parts(der: &[u8]) -> Option<Parts<'_>> {
         signature_alg: signature_alg.value,
         signature: bits(signature.value)?,
         issuer: issuer.value,
+        validity: validity.value,
         subject: subject.value,
         spki: spki.whole,
         key_alg: key_alg.value,
@@ -110,13 +117,13 @@ fn bits(value: &[u8]) -> Option<&[u8]> {
     }
 }
 
-struct Tlv<'a> {
-    whole: &'a [u8],
-    value: &'a [u8],
+pub(crate) struct Tlv<'a> {
+    pub(crate) whole: &'a [u8],
+    pub(crate) value: &'a [u8],
 }
 
 /// The element of `tag` at the start of `input` and what follows it.
-fn tlv(input: &[u8], tag: u8) -> Option<(Tlv<'_>, &[u8])> {
+pub(crate) fn tlv(input: &[u8], tag: u8) -> Option<(Tlv<'_>, &[u8])> {
     let (&found, rest) = input.split_first()?;
     if found != tag {
         return None;
