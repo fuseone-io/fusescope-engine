@@ -1090,6 +1090,7 @@ async fn admin_rotates_and_revokes_tokens_by_id() {
     let admin = |action| server::admin(config(dir.path()), secrets.clone(), action);
     let tenant: uuid::Uuid = admin(AdminAction::CreateTenant {
         name: "acme".into(),
+        id: None,
     })
     .await
     .unwrap()[0]
@@ -1097,6 +1098,36 @@ async fn admin_rotates_and_revokes_tokens_by_id() {
         .unwrap()
         .parse()
         .unwrap();
+    let org: uuid::Uuid = "0190f3a1-7b2c-7d4e-9f00-112233445566".parse().unwrap();
+    let created = admin(AdminAction::CreateTenant {
+        name: "org".into(),
+        id: Some(org),
+    })
+    .await
+    .unwrap();
+    assert_eq!(created[0], format!("tenant_id={org}"));
+    let err = admin(AdminAction::CreateTenant {
+        name: "acme".into(),
+        id: Some(uuid::Uuid::now_v7()),
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("a tenant with name acme exists already"),
+        "{err}"
+    );
+    let err = admin(AdminAction::CreateTenant {
+        name: "another".into(),
+        id: Some(org),
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&format!("a tenant with id {org} exists already")),
+        "{err}"
+    );
     let field = |line: &str, key: &str| {
         line.split(' ')
             .find_map(|kv| kv.strip_prefix(&format!("{key}=")))

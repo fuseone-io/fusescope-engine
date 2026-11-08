@@ -123,6 +123,9 @@ objects are this deployment's.
 
 ## Tokens, TLS and JWT keys
 
+- **Create a tenant:** `admin tenant create <name> --id <org-id>` takes
+  the backend organisation's id, which is how the backend names the
+  tenant; an id or name already taken is refused naming which.
 - **Issue a token:** `admin token create <tenant-id> <name> [ingest|query]`
   prints the secret once.
 - **List:** `admin token list <tenant-id>` shows ids, names, scopes and

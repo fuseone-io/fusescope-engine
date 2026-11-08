@@ -1354,8 +1354,8 @@ by the engine: `attr_string(attributes, 'http.method')`, `attr_number(...)`,
 An action is authenticated like a statement; the tenant is the token's.
 Its body is JSON and its results are one Arrow IPC stream split in order
 across the `Result` bodies: concatenated, they are the stream, the schema
-in the first body, the end-of-stream marker in the last, which is how the
-Go `Do` hands back an `arrow.RecordReader`. The row cap, the timeout and
+in the first body, the end-of-stream marker in the last, which the Go
+`Do` decodes into the same `Rows` as `Query` (section 8.2). The row cap, the timeout and
 the `x-fusescope-partial` header apply as for `DoGet`; `ListActions` names
 the actions served. The timeout runs from the request's arrival, over
 authentication, planning and every wait for a batch, so a stalled catalog,
@@ -1481,14 +1481,16 @@ annotations.
 
 | Where | Change |
 |---|---|
-| `pkg/telemetrystore` | The interface stops exposing `ClickhouseDB() clickhouse.Conn`. It exposes `Query(ctx, stmt, args) (arrow.RecordReader, error)` and `Do(ctx, action, payload) (arrow.RecordReader, error)`. `flighttelemetrystore` is born next to `clickhousetelemetrystore`. |
+| `pkg/telemetrystore` | Gains `Query(ctx, stmt, args) (Rows, error)` and `Do(ctx, action, body) (Rows, error)`, `Rows` a neutral row reader exposing neither Arrow nor `clickhouse-go` types, which the querier's readers consume whatever the provider. `flighttelemetrystore` is born next to `clickhousetelemetrystore`: it converts Arrow inside, copying every value out before `Next` moves on, gives a nullable column's null as a nil pointer and fails on a null in a non-nullable one, never a silent zero, and closes the stream exactly once whatever ends it. `ClickhouseDB()` stays while callers migrate one item at a time; with `provider: flight` it is served by the existing ClickHouse block as a transitional fallback for unmigrated callers only, and `Query` and `Do` never fall back to it. The tenant is the backend organisation's id, passed explicitly with the call; the JWT subject is the user acting or an explicit service identity, never a default. |
 | `pkg/statementbuilder/*` | Gain a dialect. ClickHouse SQL generation is already encapsulated here; the DataFusion version is a second backend of the same builders, tested against the same cases. |
 | `pkg/prometheus/clickhouseprometheusv2` | Gains a sibling `flightprometheus` implementing `storage.Queryable` on top of `metrics.select`. The Prometheus PromQL engine stays in Go. |
 | `pkg/telemetrymetadata` | Reads the `attribute_keys` derived table through `metadata.keys`. |
 | `pkg/query-service/app/{logs,traces,metrics}/{v3,v4}` | Not ported. Legacy code that SigNoz itself is retiring in favor of querier v5. |
 | `fusescope-collector-server` | Replaces the AGPL `fusescope-otel-collector` (ADR 0010). Exports standard OTLP to the ingesters next to its own ClickHouse exporter, both at once for dual-write. The engine schema lives in `fs-schema`. |
 
-A `telemetrystore.provider: clickhouse | flight` flag selects the
+An engine tenant is created under the organisation's id
+(`admin tenant create <name> --id <org-id>`). A
+`telemetrystore.provider: clickhouse | flight` flag selects the
 implementation at runtime, allowing dual-write from the collector and result
 comparison during migration.
 

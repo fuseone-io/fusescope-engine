@@ -67,24 +67,52 @@ impl Catalog {
         Ok(row.0)
     }
 
-    /// Creates a tenant.
+    /// Creates a tenant under a fresh id.
     ///
     /// # Errors
     /// Duplicate name, or database failure.
     pub async fn create_tenant(&self, tenant: &NewTenant) -> Result<Tenant, CatalogError> {
+        self.create_tenant_with_id(TenantId::new(), tenant).await
+    }
+
+    /// Creates a tenant under `id`, such as the backend organisation it
+    /// serves.
+    ///
+    /// # Errors
+    /// [`CatalogError::TenantExists`] when the id or the name is taken, or
+    /// database failure.
+    pub async fn create_tenant_with_id(
+        &self,
+        id: TenantId,
+        tenant: &NewTenant,
+    ) -> Result<Tenant, CatalogError> {
         let row = sqlx::query_as::<_, Tenant>(
             "insert into engine_tenant (id, name, retention_days, max_keys_hour, bytes_budget, qps_limit)
              values ($1, $2, $3, $4, $5, $6)
              returning id, name, retention_days, max_keys_hour, bytes_budget, qps_limit, created_at, deleted_at",
         )
-        .bind(TenantId::new())
+        .bind(id)
         .bind(&tenant.name)
         .bind(tenant.retention_days)
         .bind(tenant.max_keys_hour)
         .bind(tenant.bytes_budget)
         .bind(tenant.qps_limit)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            let constraint = e.as_database_error().and_then(|d| d.constraint());
+            match constraint {
+                Some("engine_tenant_pkey") => CatalogError::TenantExists {
+                    field: "id",
+                    value: id.0.to_string(),
+                },
+                Some("engine_tenant_name_key") => CatalogError::TenantExists {
+                    field: "name",
+                    value: tenant.name.clone(),
+                },
+                _ => CatalogError::Database(e),
+            }
+        })?;
         Ok(row)
     }
 

@@ -204,7 +204,51 @@ async fn tenants_round_trip_and_names_are_unique() {
         .catalog
         .create_tenant(&NewTenant::with_defaults("acme"))
         .await;
-    assert!(matches!(dup, Err(CatalogError::Database(_))));
+    assert!(
+        matches!(dup, Err(CatalogError::TenantExists { field: "name", .. })),
+        "{dup:?}"
+    );
+    db.finish().await;
+}
+
+/// A tenant takes the id it is given, the backend's organisation id, and
+/// a second tenant under the same id or the same name is refused naming
+/// which one collided; neither collision writes anything.
+#[tokio::test]
+async fn a_tenant_created_with_an_id_keeps_it_and_collisions_are_named() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let id = TenantId(uuid::Uuid::parse_str("0190f3a1-7b2c-7d4e-9f00-112233445566").unwrap());
+    let created = db
+        .catalog
+        .create_tenant_with_id(id, &NewTenant::with_defaults("org-a"))
+        .await
+        .unwrap();
+    assert_eq!(created.id, id);
+    assert_eq!(db.catalog.tenant(id).await.unwrap().unwrap(), created);
+
+    let same_id = db
+        .catalog
+        .create_tenant_with_id(id, &NewTenant::with_defaults("org-b"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(same_id, CatalogError::TenantExists { field: "id", ref value } if value == &id.0.to_string()),
+        "{same_id:?}"
+    );
+    let other = TenantId(uuid::Uuid::parse_str("0190f3a1-7b2c-7d4e-9f00-665544332211").unwrap());
+    let same_name = db
+        .catalog
+        .create_tenant_with_id(other, &NewTenant::with_defaults("org-a"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(same_name, CatalogError::TenantExists { field: "name", ref value } if value == "org-a"),
+        "{same_name:?}"
+    );
+    assert!(db.catalog.tenant(other).await.unwrap().is_none());
+    assert_eq!(db.catalog.tenant(id).await.unwrap().unwrap().name, "org-a");
     db.finish().await;
 }
 

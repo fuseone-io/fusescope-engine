@@ -149,6 +149,9 @@ pub enum AdminAction {
     CreateTenant {
         /// Unique name.
         name: String,
+        /// The id to take, such as the backend organisation's; a fresh
+        /// one when absent.
+        id: Option<uuid::Uuid>,
     },
     /// Issue a token; the secret is printed once.
     CreateToken {
@@ -201,10 +204,16 @@ pub async fn admin(
             info!(target: "fusescope::audit", action = "catalog.migrate", "catalog");
             Ok(vec!["ok: catalog migrated".to_owned()])
         }
-        AdminAction::CreateTenant { name } => {
-            let tenant = catalog
-                .create_tenant(&fs_catalog::NewTenant::with_defaults(name))
-                .await?;
+        AdminAction::CreateTenant { name, id } => {
+            let new = fs_catalog::NewTenant::with_defaults(name);
+            let tenant = match id {
+                Some(id) => {
+                    catalog
+                        .create_tenant_with_id(fs_catalog::TenantId(id), &new)
+                        .await?
+                }
+                None => catalog.create_tenant(&new).await?,
+            };
             Ok(vec![
                 format!("tenant_id={}", tenant.id.0),
                 format!("name={}", tenant.name),

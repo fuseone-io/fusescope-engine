@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! fusescope-engine --config <file> [--role ingester|querier|compactor|all] [--check]
-//! fusescope-engine --config <file> admin tenant create <name>
+//! fusescope-engine --config <file> admin tenant create <name> [--id <uuid>]
 //! fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
 //! FS_QUERY_TOKEN=... fusescope-engine admin query <addr> <sql>
 //! FS_QUERY_TOKEN=... fusescope-engine admin action <addr> <type> [json]
@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: fusescope-engine --config <file> [--role <ingester|querier|compactor|all>] [--check | --validate] [--version]
        fusescope-engine --config <file> admin migrate
-       fusescope-engine --config <file> admin tenant create <name>
+       fusescope-engine --config <file> admin tenant create <name> [--id <uuid>]
        fusescope-engine --config <file> admin token create <tenant-id> <name> [ingest|query]
        fusescope-engine --config <file> admin token list <tenant-id>
        fusescope-engine --config <file> admin token revoke <token-id>
@@ -103,7 +103,20 @@ fn parse_admin(rest: &[String]) -> Result<Admin, String> {
         ["migrate"] => Ok(Admin::Catalog(AdminAction::Migrate)),
         ["tenant", "create", name] => Ok(Admin::Catalog(AdminAction::CreateTenant {
             name: (*name).to_owned(),
+            id: None,
         })),
+        ["tenant", "create", name, "--id", id] => {
+            let id: uuid::Uuid = id
+                .parse()
+                .map_err(|e| format!("tenant id {id:?}: {e}\n{USAGE}"))?;
+            if id.is_nil() {
+                return Err(format!("tenant id must not be the nil uuid\n{USAGE}"));
+            }
+            Ok(Admin::Catalog(AdminAction::CreateTenant {
+                name: (*name).to_owned(),
+                id: Some(id),
+            }))
+        }
         ["query", addr, sql] => Ok(Admin::Query {
             addr: (*addr).to_owned(),
             sql: (*sql).to_owned(),
@@ -371,6 +384,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_tenant_create_with_an_id() {
+        let org = "0190f3a1-7b2c-7d4e-9f00-112233445566";
+        let parsed = parse_args(args(&[
+            "--config", "x.toml", "admin", "tenant", "create", "acme", "--id", org,
+        ]))
+        .unwrap()
+        .ok()
+        .unwrap();
+        assert_eq!(
+            parsed.admin,
+            Some(Admin::Catalog(AdminAction::CreateTenant {
+                name: "acme".into(),
+                id: Some(org.parse().unwrap()),
+            }))
+        );
+        for (bad, why) in [
+            (vec!["--id", "00000000-0000-0000-0000-000000000000"], "nil"),
+            (vec!["--id", "not-a-uuid"], "tenant id"),
+            (vec!["--id"], "usage"),
+            (vec!["--name", org], "usage"),
+        ] {
+            let mut words = vec!["--config", "x.toml", "admin", "tenant", "create", "acme"];
+            words.extend(bad.iter());
+            let err = parse_args(args(&words)).unwrap_err();
+            assert!(err.contains(why), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
     fn parses_admin_commands() {
         let parsed = parse_args(args(&[
             "--config", "x.toml", "admin", "tenant", "create", "acme",
@@ -381,7 +423,8 @@ mod tests {
         assert_eq!(
             parsed.admin,
             Some(Admin::Catalog(AdminAction::CreateTenant {
-                name: "acme".into()
+                name: "acme".into(),
+                id: None,
             }))
         );
         let id = "00000000-0000-0000-0000-000000000001";

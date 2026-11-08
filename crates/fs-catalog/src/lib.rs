@@ -47,6 +47,14 @@ pub enum CatalogError {
     /// Database failure.
     #[error("database: {0}")]
     Database(#[from] sqlx::Error),
+    /// A tenant with this id or this name exists already.
+    #[error("a tenant with {field} {value} exists already")]
+    TenantExists {
+        /// `id` or `name`.
+        field: &'static str,
+        /// The value that collided.
+        value: String,
+    },
     /// Migration failure.
     #[error("migration: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
