@@ -1,0 +1,6 @@
+requests ok=137029 err=0 in 30.1s → 4552 req/s, 54629 spans/s
+latency p50=3.36ms p95=18.29ms p99=42.91ms
+flushes=15 rows/flush=96881 parquet/flush=5.0 MiB | per flush: concat=121ms sort=89ms encode=266ms upload=267ms register=3ms total=803ms | buffers at end: live=0 MiB flushing=156 MiB persisted=238 MiB
+row groups/flush=1.0 writer peak=47 MiB mean=42.0 MiB
+coalesces=252 batches/coalesce=524 42.6ms each p95<=100ms active at end=0 | hot scans=152 p95<=200ms | checkpoints=30 p95<=200ms
+json written to docs/benchmarks/2026-11-08-m1-benchmarks/load-1t-c32-q.json

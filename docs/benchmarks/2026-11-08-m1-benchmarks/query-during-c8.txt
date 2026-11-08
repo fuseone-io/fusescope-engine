@@ -1,0 +1,8 @@
+| query | rows | p50 | p95 | max |
+|---|---:|---:|---:|---:|
+| trace by id | 36 | 138.98ms | 158.98ms | 179.01ms |
+| span list, 1 service, 15 min, promoted attribute | 100 | 103.99ms | 159.00ms | 162.03ms |
+| p99 latency per service, 24 h | 20 | 211.71ms | 441.44ms | 664.69ms |
+| dashboard: rate and errors per service, last 5 min | 20 | 122.83ms | 171.79ms | 195.79ms |
+| top operations by p95, 1 h | 20 | 268.02ms | 367.38ms | 834.17ms |
+json written to docs/benchmarks/2026-11-08-m1-benchmarks/query-during-c8.json

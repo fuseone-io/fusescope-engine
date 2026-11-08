@@ -1,0 +1,485 @@
+# HELP fusescope_ingest_requests_total OTLP export requests accepted
+# TYPE fusescope_ingest_requests_total counter
+fusescope_ingest_requests_total 517615
+# HELP fusescope_ingest_spans_total Spans buffered
+# TYPE fusescope_ingest_spans_total counter
+fusescope_ingest_spans_total 6211380
+# HELP fusescope_ingest_spans_rejected_total Spans rejected for malformed ids
+# TYPE fusescope_ingest_spans_rejected_total counter
+fusescope_ingest_spans_rejected_total 0
+# HELP fusescope_ingest_logs_total Log records buffered
+# TYPE fusescope_ingest_logs_total counter
+fusescope_ingest_logs_total 0
+# HELP fusescope_ingest_logs_rejected_total Log records rejected for carrying no time
+# TYPE fusescope_ingest_logs_rejected_total counter
+fusescope_ingest_logs_rejected_total 0
+# HELP fusescope_ingest_log_bodies_truncated_total Log bodies truncated to the body limit
+# TYPE fusescope_ingest_log_bodies_truncated_total counter
+fusescope_ingest_log_bodies_truncated_total 0
+# HELP fusescope_ingest_metric_points_total Metric data points accepted
+# TYPE fusescope_ingest_metric_points_total counter
+fusescope_ingest_metric_points_total 0
+# HELP fusescope_ingest_metric_samples_total Metric samples buffered, buckets and quantiles included
+# TYPE fusescope_ingest_metric_samples_total counter
+fusescope_ingest_metric_samples_total 0
+# HELP fusescope_ingest_metric_series_collisions_total Keys of metric series, name, fingerprint and hour, found holding a second identity
+# TYPE fusescope_ingest_metric_series_collisions_total counter
+fusescope_ingest_metric_series_collisions_total 0
+# HELP fusescope_ingest_metric_points_rejected_total Metric data points refused, by reason
+# TYPE fusescope_ingest_metric_points_rejected_total counter
+fusescope_ingest_metric_points_rejected_total{reason="exponential_histogram"} 0
+fusescope_ingest_metric_points_rejected_total{reason="stale_histogram"} 0
+fusescope_ingest_metric_points_rejected_total{reason="malformed_histogram"} 0
+fusescope_ingest_metric_points_rejected_total{reason="malformed_summary"} 0
+fusescope_ingest_metric_points_rejected_total{reason="too_many_buckets"} 0
+fusescope_ingest_metric_points_rejected_total{reason="too_many_quantiles"} 0
+fusescope_ingest_metric_points_rejected_total{reason="too_many_labels"} 0
+fusescope_ingest_metric_points_rejected_total{reason="no_timestamp"} 0
+fusescope_ingest_metric_points_rejected_total{reason="no_value"} 0
+fusescope_ingest_metric_points_rejected_total{reason="no_name"} 0
+# HELP fusescope_ingest_rate_limited_total Requests refused by the throughput limiter
+# TYPE fusescope_ingest_rate_limited_total counter
+fusescope_ingest_rate_limited_total 0
+# HELP fusescope_ingest_over_capacity_total Requests refused because buffers or WAL were full
+# TYPE fusescope_ingest_over_capacity_total counter
+fusescope_ingest_over_capacity_total 0
+# HELP fusescope_hot_scan_batches_skipped_total Hot-window batches skipped by their trace set
+# TYPE fusescope_hot_scan_batches_skipped_total counter
+fusescope_hot_scan_batches_skipped_total 1841
+# HELP fusescope_hot_scan_seconds Hot-window snapshot latency, gate wait included
+# TYPE fusescope_hot_scan_seconds histogram
+fusescope_hot_scan_seconds_bucket{le="0.001"} 342
+fusescope_hot_scan_seconds_bucket{le="0.002"} 457
+fusescope_hot_scan_seconds_bucket{le="0.005"} 537
+fusescope_hot_scan_seconds_bucket{le="0.01"} 564
+fusescope_hot_scan_seconds_bucket{le="0.02"} 585
+fusescope_hot_scan_seconds_bucket{le="0.05"} 587
+fusescope_hot_scan_seconds_bucket{le="0.1"} 587
+fusescope_hot_scan_seconds_bucket{le="0.2"} 592
+fusescope_hot_scan_seconds_bucket{le="0.5"} 599
+fusescope_hot_scan_seconds_bucket{le="1"} 603
+fusescope_hot_scan_seconds_bucket{le="+Inf"} 603
+fusescope_hot_scan_seconds_sum 6.150129188
+fusescope_hot_scan_seconds_count 603
+# HELP fusescope_checkpoint_seconds WAL checkpoint latency, gate wait and I/O included
+# TYPE fusescope_checkpoint_seconds histogram
+fusescope_checkpoint_seconds_bucket{le="0.001"} 27
+fusescope_checkpoint_seconds_bucket{le="0.002"} 38
+fusescope_checkpoint_seconds_bucket{le="0.005"} 71
+fusescope_checkpoint_seconds_bucket{le="0.01"} 79
+fusescope_checkpoint_seconds_bucket{le="0.02"} 106
+fusescope_checkpoint_seconds_bucket{le="0.05"} 124
+fusescope_checkpoint_seconds_bucket{le="0.1"} 134
+fusescope_checkpoint_seconds_bucket{le="0.2"} 139
+fusescope_checkpoint_seconds_bucket{le="0.5"} 140
+fusescope_checkpoint_seconds_bucket{le="1"} 140
+fusescope_checkpoint_seconds_bucket{le="+Inf"} 140
+fusescope_checkpoint_seconds_sum 2.6884021000000002
+fusescope_checkpoint_seconds_count 140
+# HELP fusescope_ingest_files_flushed_total Parquet files written and registered
+# TYPE fusescope_ingest_files_flushed_total counter
+fusescope_ingest_files_flushed_total 70
+# HELP fusescope_ingest_flush_failures_total Flush attempts that failed
+# TYPE fusescope_ingest_flush_failures_total counter
+fusescope_ingest_flush_failures_total 0
+# HELP fusescope_ingest_flush_retries_total Flush retries after a failed attempt
+# TYPE fusescope_ingest_flush_retries_total counter
+fusescope_ingest_flush_retries_total 0
+# HELP fusescope_ingest_flushes_recovered_total Flushes resumed from an intent after a restart
+# TYPE fusescope_ingest_flushes_recovered_total counter
+fusescope_ingest_flushes_recovered_total 0
+# HELP fusescope_wal_records_total Records appended to the WAL
+# TYPE fusescope_wal_records_total counter
+fusescope_wal_records_total 517685
+# HELP fusescope_wal_batches_total Group-commit batches synced
+# TYPE fusescope_wal_batches_total counter
+fusescope_wal_batches_total 69641
+# HELP fusescope_wal_backpressure_total Appends refused because the writer queue was full
+# TYPE fusescope_wal_backpressure_total counter
+fusescope_wal_backpressure_total 0
+# HELP fusescope_wal_sync_seconds_total Seconds spent in fsync
+# TYPE fusescope_wal_sync_seconds_total counter
+fusescope_wal_sync_seconds_total 87.112008893
+# HELP fusescope_flush_attempts_total Flush attempts, successful or not
+# TYPE fusescope_flush_attempts_total counter
+fusescope_flush_attempts_total 70
+# HELP fusescope_flush_total Flushes completed
+# TYPE fusescope_flush_total counter
+fusescope_flush_total 70
+# HELP fusescope_flush_rows_total Rows written by flushes
+# TYPE fusescope_flush_rows_total counter
+fusescope_flush_rows_total 6211380
+# HELP fusescope_flush_parquet_bytes_total Parquet bytes written by flushes
+# TYPE fusescope_flush_parquet_bytes_total counter
+fusescope_flush_parquet_bytes_total 339612971
+# HELP fusescope_flush_concat_nanoseconds_total Nanoseconds sorting each input batch, completed flushes
+# TYPE fusescope_flush_concat_nanoseconds_total counter
+fusescope_flush_concat_nanoseconds_total 6847662997
+# HELP fusescope_flush_sort_nanoseconds_total Nanoseconds merging sorted inputs into row groups, completed flushes
+# TYPE fusescope_flush_sort_nanoseconds_total counter
+fusescope_flush_sort_nanoseconds_total 4318325548
+# HELP fusescope_flush_encode_nanoseconds_total Nanoseconds encoding Parquet
+# TYPE fusescope_flush_encode_nanoseconds_total counter
+fusescope_flush_encode_nanoseconds_total 14910787753
+# HELP fusescope_flush_upload_nanoseconds_total Nanoseconds uploading
+# TYPE fusescope_flush_upload_nanoseconds_total counter
+fusescope_flush_upload_nanoseconds_total 16570709870
+# HELP fusescope_flush_register_nanoseconds_total Nanoseconds registering in the catalog
+# TYPE fusescope_flush_register_nanoseconds_total counter
+fusescope_flush_register_nanoseconds_total 1632495106
+# HELP fusescope_flush_nanoseconds_total Nanoseconds from taking rows to checkpoint
+# TYPE fusescope_flush_nanoseconds_total counter
+fusescope_flush_nanoseconds_total 46876647401
+# HELP fusescope_coalesce_total Chunks built by merging request batches in log order.
+# TYPE fusescope_coalesce_total counter
+fusescope_coalesce_total 969
+# HELP fusescope_coalesce_batches_total Request batches merged into chunks.
+# TYPE fusescope_coalesce_batches_total counter
+fusescope_coalesce_batches_total 502792
+# HELP fusescope_coalesce_nanoseconds_total Time spent merging request batches.
+# TYPE fusescope_coalesce_nanoseconds_total counter
+fusescope_coalesce_nanoseconds_total 43113345338
+# HELP fusescope_buffer_live_bytes Bytes in live buffers
+# TYPE fusescope_buffer_live_bytes gauge
+fusescope_buffer_live_bytes 0
+# HELP fusescope_buffer_flushing_bytes Bytes bound to flushes in progress
+# TYPE fusescope_buffer_flushing_bytes gauge
+fusescope_buffer_flushing_bytes 0
+# HELP fusescope_buffer_persisted_bytes Bytes kept for the hot window after registration
+# TYPE fusescope_buffer_persisted_bytes gauge
+fusescope_buffer_persisted_bytes 0
+# HELP fusescope_buffer_scratch_bytes Working memory held by chunks being built
+# TYPE fusescope_buffer_scratch_bytes gauge
+fusescope_buffer_scratch_bytes 0
+# HELP fusescope_coalesce_active Chunks being built right now
+# TYPE fusescope_coalesce_active gauge
+fusescope_coalesce_active 0
+# HELP fusescope_flush_writer_peak_bytes Most bytes the Parquet writer held for one row group
+# TYPE fusescope_flush_writer_peak_bytes gauge
+fusescope_flush_writer_peak_bytes 64205108
+# HELP fusescope_flush_writer_bytes_total Sum over flushes of the writer's peak bytes
+# TYPE fusescope_flush_writer_bytes_total counter
+fusescope_flush_writer_bytes_total 3022137953
+# HELP fusescope_flush_row_groups_total Parquet row groups written
+# TYPE fusescope_flush_row_groups_total counter
+fusescope_flush_row_groups_total 70
+# HELP fusescope_flush_trace_index_bytes_total Bytes of trace_id sidecars created
+# TYPE fusescope_flush_trace_index_bytes_total counter
+fusescope_flush_trace_index_bytes_total 10363360
+# HELP fusescope_flush_text_index_bytes_total Bytes of text sidecars of log files created
+# TYPE fusescope_flush_text_index_bytes_total counter
+fusescope_flush_text_index_bytes_total 0
+# HELP fusescope_flush_superseded_total Flushes given a fresh id because the orphan sweep marked their path or the object at it held other bytes
+# TYPE fusescope_flush_superseded_total counter
+fusescope_flush_superseded_total 0
+# HELP fusescope_flush_replay_mismatch_total Retried flushes that met an object with other bytes at their path
+# TYPE fusescope_flush_replay_mismatch_total counter
+fusescope_flush_replay_mismatch_total 0
+# HELP fusescope_flush_confirm_failures_total Registration confirmations that failed and wait for a retry
+# TYPE fusescope_flush_confirm_failures_total counter
+fusescope_flush_confirm_failures_total 0
+# HELP fusescope_flush_unconfirmed Registered files whose confirmation has not landed
+# TYPE fusescope_flush_unconfirmed gauge
+fusescope_flush_unconfirmed 0
+# HELP fusescope_coalesce_seconds Time to build one chunk
+# TYPE fusescope_coalesce_seconds histogram
+fusescope_coalesce_seconds_bucket{le="0.001"} 0
+fusescope_coalesce_seconds_bucket{le="0.002"} 0
+fusescope_coalesce_seconds_bucket{le="0.005"} 0
+fusescope_coalesce_seconds_bucket{le="0.01"} 0
+fusescope_coalesce_seconds_bucket{le="0.02"} 49
+fusescope_coalesce_seconds_bucket{le="0.05"} 655
+fusescope_coalesce_seconds_bucket{le="0.1"} 955
+fusescope_coalesce_seconds_bucket{le="0.2"} 969
+fusescope_coalesce_seconds_bucket{le="0.5"} 969
+fusescope_coalesce_seconds_bucket{le="1"} 969
+fusescope_coalesce_seconds_bucket{le="+Inf"} 969
+fusescope_coalesce_seconds_sum 43.113440953
+fusescope_coalesce_seconds_count 969
+# HELP fusescope_query_statements_total Statements planned
+# TYPE fusescope_query_statements_total counter
+fusescope_query_statements_total 603
+# HELP fusescope_query_errors_total Statements refused or failed to plan
+# TYPE fusescope_query_errors_total counter
+fusescope_query_errors_total 0
+# HELP fusescope_query_rows_total Rows sent by Flight executions and in-process queries
+# TYPE fusescope_query_rows_total counter
+fusescope_query_rows_total 23523
+# HELP fusescope_query_hot_fanouts_total Hot-window fan-outs
+# TYPE fusescope_query_hot_fanouts_total counter
+fusescope_query_hot_fanouts_total 603
+# HELP fusescope_query_auth_refused_total Flight requests refused for a missing, unknown or invalid token
+# TYPE fusescope_query_auth_refused_total counter
+fusescope_query_auth_refused_total 0
+# HELP fusescope_query_hot_unavailable_total Ingesters that did not answer a fan-out
+# TYPE fusescope_query_hot_unavailable_total counter
+fusescope_query_hot_unavailable_total 0
+# HELP fusescope_query_trace_index_fetches_total trace_id sidecars fetched from the bucket
+# TYPE fusescope_query_trace_index_fetches_total counter
+fusescope_query_trace_index_fetches_total 52
+# HELP fusescope_query_trace_index_misses_total Sidecars missing, unreadable or unreachable; their files were scanned
+# TYPE fusescope_query_trace_index_misses_total counter
+fusescope_query_trace_index_misses_total 0
+# HELP fusescope_query_trace_index_pruned_total Files a trace lookup skipped because their sidecar lacked the trace
+# TYPE fusescope_query_trace_index_pruned_total counter
+fusescope_query_trace_index_pruned_total 3945
+# HELP fusescope_query_trace_lookups_total trace.lookup actions served
+# TYPE fusescope_query_trace_lookups_total counter
+fusescope_query_trace_lookups_total 0
+# HELP fusescope_query_metadata_lookups_total metadata.* and metrics.label_* actions served
+# TYPE fusescope_query_metadata_lookups_total counter
+fusescope_query_metadata_lookups_total 0
+# HELP fusescope_query_metric_selects_total metrics.select actions served
+# TYPE fusescope_query_metric_selects_total counter
+fusescope_query_metric_selects_total 0
+# HELP fusescope_query_metric_ambiguous_total Selects refused because a series held more than one identity
+# TYPE fusescope_query_metric_ambiguous_total counter
+fusescope_query_metric_ambiguous_total 0
+# HELP fusescope_query_metric_index_fetches_total Postings sidecars fetched from the bucket
+# TYPE fusescope_query_metric_index_fetches_total counter
+fusescope_query_metric_index_fetches_total 0
+# HELP fusescope_query_metric_index_misses_total Series files read without postings: none, unusable or no room
+# TYPE fusescope_query_metric_index_misses_total counter
+fusescope_query_metric_index_misses_total 0
+# HELP fusescope_query_metric_index_pruned_total Series files a metric action left unread by their postings
+# TYPE fusescope_query_metric_index_pruned_total counter
+fusescope_query_metric_index_pruned_total 0
+# HELP fusescope_query_plannings_total Times a statement went through the planner
+# TYPE fusescope_query_plannings_total counter
+fusescope_query_plannings_total 603
+# HELP fusescope_query_prepared_hits_total Tickets executed from their prepared plan
+# TYPE fusescope_query_prepared_hits_total counter
+fusescope_query_prepared_hits_total 603
+# HELP fusescope_query_prepared_misses_total Tickets whose prepared plan was gone and whose SQL was planned again
+# TYPE fusescope_query_prepared_misses_total counter
+fusescope_query_prepared_misses_total 0
+# HELP fusescope_query_prepared_plans Plans waiting for their DoGet
+# TYPE fusescope_query_prepared_plans gauge
+fusescope_query_prepared_plans 0
+# HELP fusescope_query_prepared_bytes Bytes the waiting plans are estimated to retain
+# TYPE fusescope_query_prepared_bytes gauge
+fusescope_query_prepared_bytes 0
+# HELP fusescope_query_seconds Flight executions of an authenticated caller, request to end of stream
+# TYPE fusescope_query_seconds histogram
+fusescope_query_seconds_bucket{le="0.005"} 0
+fusescope_query_seconds_bucket{le="0.01"} 1
+fusescope_query_seconds_bucket{le="0.025"} 1
+fusescope_query_seconds_bucket{le="0.05"} 20
+fusescope_query_seconds_bucket{le="0.1"} 198
+fusescope_query_seconds_bucket{le="0.25"} 570
+fusescope_query_seconds_bucket{le="0.5"} 597
+fusescope_query_seconds_bucket{le="1"} 602
+fusescope_query_seconds_bucket{le="2.5"} 602
+fusescope_query_seconds_bucket{le="5"} 603
+fusescope_query_seconds_bucket{le="10"} 603
+fusescope_query_seconds_bucket{le="30"} 603
+fusescope_query_seconds_bucket{le="60"} 603
+fusescope_query_seconds_bucket{le="120"} 603
+fusescope_query_seconds_bucket{le="300"} 603
+fusescope_query_seconds_bucket{le="+Inf"} 603
+fusescope_query_seconds_sum 89.724720776
+fusescope_query_seconds_count 603
+# HELP fusescope_query_text_index_fetches_total Text sidecars fetched from the bucket
+# TYPE fusescope_query_text_index_fetches_total counter
+fusescope_query_text_index_fetches_total 0
+# HELP fusescope_query_text_index_misses_total Files a body search read whole for want of a usable text sidecar
+# TYPE fusescope_query_text_index_misses_total counter
+fusescope_query_text_index_misses_total 0
+# HELP fusescope_query_text_searches_total Body searches the text index could prune whose scan reached its end
+# TYPE fusescope_query_text_searches_total counter
+fusescope_query_text_searches_total 0
+# HELP fusescope_query_text_files_total Files of those searches after the catalog, after the text index and with a matching row
+# TYPE fusescope_query_text_files_total counter
+fusescope_query_text_files_total{stage="catalog"} 0
+fusescope_query_text_files_total{stage="index"} 0
+fusescope_query_text_files_total{stage="matched"} 0
+# HELP fusescope_query_text_row_groups_total Row groups of those searches' files with a checked sidecar, after the catalog and after the text index
+# TYPE fusescope_query_text_row_groups_total counter
+fusescope_query_text_row_groups_total{stage="catalog"} 0
+fusescope_query_text_row_groups_total{stage="index"} 0
+# HELP fusescope_query_text_precision_ratio Per body search, files with a matching row over files the text index kept
+# TYPE fusescope_query_text_precision_ratio histogram
+fusescope_query_text_precision_ratio_bucket{le="0.05"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.1"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.2"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.3"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.4"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.5"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.6"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.7"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.8"} 0
+fusescope_query_text_precision_ratio_bucket{le="0.9"} 0
+fusescope_query_text_precision_ratio_bucket{le="1"} 0
+fusescope_query_text_precision_ratio_bucket{le="+Inf"} 0
+fusescope_query_text_precision_ratio_sum 0
+fusescope_query_text_precision_ratio_count 0
+# HELP fusescope_query_text_seconds Per body search, from planning its scan to the scan's end
+# TYPE fusescope_query_text_seconds histogram
+fusescope_query_text_seconds_bucket{le="0.005"} 0
+fusescope_query_text_seconds_bucket{le="0.01"} 0
+fusescope_query_text_seconds_bucket{le="0.025"} 0
+fusescope_query_text_seconds_bucket{le="0.05"} 0
+fusescope_query_text_seconds_bucket{le="0.1"} 0
+fusescope_query_text_seconds_bucket{le="0.25"} 0
+fusescope_query_text_seconds_bucket{le="0.5"} 0
+fusescope_query_text_seconds_bucket{le="1"} 0
+fusescope_query_text_seconds_bucket{le="2.5"} 0
+fusescope_query_text_seconds_bucket{le="5"} 0
+fusescope_query_text_seconds_bucket{le="10"} 0
+fusescope_query_text_seconds_bucket{le="30"} 0
+fusescope_query_text_seconds_bucket{le="60"} 0
+fusescope_query_text_seconds_bucket{le="120"} 0
+fusescope_query_text_seconds_bucket{le="300"} 0
+fusescope_query_text_seconds_bucket{le="+Inf"} 0
+fusescope_query_text_seconds_sum 0
+fusescope_query_text_seconds_count 0
+# HELP fusescope_compaction_passes_total Compaction passes that swapped outputs in
+# TYPE fusescope_compaction_passes_total counter
+fusescope_compaction_passes_total 0
+# HELP fusescope_compaction_inputs_total L0 files merged into L1 and L1 files merged into L2 by completed passes
+# TYPE fusescope_compaction_inputs_total counter
+fusescope_compaction_inputs_total 0
+# HELP fusescope_compaction_outputs_total L1 and L2 files published by completed passes
+# TYPE fusescope_compaction_outputs_total counter
+fusescope_compaction_outputs_total 0
+# HELP fusescope_compaction_rows_total Rows written by completed passes
+# TYPE fusescope_compaction_rows_total counter
+fusescope_compaction_rows_total 0
+# HELP fusescope_compaction_input_bytes_total Bytes of inputs merged by completed passes
+# TYPE fusescope_compaction_input_bytes_total counter
+fusescope_compaction_input_bytes_total 0
+# HELP fusescope_compaction_output_bytes_total Bytes of outputs published by completed passes
+# TYPE fusescope_compaction_output_bytes_total counter
+fusescope_compaction_output_bytes_total 0
+# HELP fusescope_compaction_conflicts_total Swaps refused because an input was no longer visible
+# TYPE fusescope_compaction_conflicts_total counter
+fusescope_compaction_conflicts_total 0
+# HELP fusescope_compaction_lease_lost_total Swaps refused because the lease had changed hands
+# TYPE fusescope_compaction_lease_lost_total counter
+fusescope_compaction_lease_lost_total 0
+# HELP fusescope_compaction_failures_total Passes that failed for any other reason
+# TYPE fusescope_compaction_failures_total counter
+fusescope_compaction_failures_total 0
+# HELP fusescope_compaction_orphaned_total Outputs uploaded by passes that did not publish them
+# TYPE fusescope_compaction_orphaned_total counter
+fusescope_compaction_orphaned_total 0
+# HELP fusescope_compaction_skipped_total Hours skipped because their two oldest files exceed the input cap
+# TYPE fusescope_compaction_skipped_total counter
+fusescope_compaction_skipped_total 0
+# HELP fusescope_compaction_derived_total attribute_keys tables rebuilt by completed passes
+# TYPE fusescope_compaction_derived_total counter
+fusescope_compaction_derived_total 0
+# HELP fusescope_compaction_derived_unreadable_total Passes aborted because the attribute_keys table before could not be read
+# TYPE fusescope_compaction_derived_unreadable_total counter
+fusescope_compaction_derived_unreadable_total 0
+# HELP fusescope_compaction_derived_keys_dropped_total Entries of attribute keys beyond the tenant's max_keys_hour not counted
+# TYPE fusescope_compaction_derived_keys_dropped_total counter
+fusescope_compaction_derived_keys_dropped_total 0
+# HELP fusescope_compaction_trace_summary_total trace_summary contribution files published
+# TYPE fusescope_compaction_trace_summary_total counter
+fusescope_compaction_trace_summary_total 0
+# HELP fusescope_compaction_trace_summary_skipped_total Completed passes whose trace count crossed the summary cap
+# TYPE fusescope_compaction_trace_summary_skipped_total counter
+fusescope_compaction_trace_summary_skipped_total 0
+# HELP fusescope_compaction_service_graph_total service_graph_1m contribution files published
+# TYPE fusescope_compaction_service_graph_total counter
+fusescope_compaction_service_graph_total 0
+# HELP fusescope_compaction_service_graph_skipped_total Completed passes whose span count crossed the graph cap
+# TYPE fusescope_compaction_service_graph_skipped_total counter
+fusescope_compaction_service_graph_skipped_total 0
+# HELP fusescope_compaction_metric_passes_total Metric L0 to L1 passes that swapped sets in
+# TYPE fusescope_compaction_metric_passes_total counter
+fusescope_compaction_metric_passes_total 0
+# HELP fusescope_compaction_metric_l2_passes_total Metric L1 to L2 passes that swapped sets in
+# TYPE fusescope_compaction_metric_l2_passes_total counter
+fusescope_compaction_metric_l2_passes_total 0
+# HELP fusescope_compaction_metric_accounted_total Metric accounting passes that committed
+# TYPE fusescope_compaction_metric_accounted_total counter
+fusescope_compaction_metric_accounted_total 0
+# HELP fusescope_compaction_metric_collisions_total Keys of metric series written holding more than one identity, once a file
+# TYPE fusescope_compaction_metric_collisions_total counter
+fusescope_compaction_metric_collisions_total 0
+# HELP fusescope_compaction_metric_over_budget_total Metric hours or days passed over, their oldest set past the pass budget
+# TYPE fusescope_compaction_metric_over_budget_total counter
+fusescope_compaction_metric_over_budget_total 0
+# HELP fusescope_compaction_postings_abandoned_total Metric series files published without postings
+# TYPE fusescope_compaction_postings_abandoned_total counter
+fusescope_compaction_postings_abandoned_total 0
+# HELP fusescope_compaction_metric_peak_bytes Most bytes one metric pass held, every part of its budget together
+# TYPE fusescope_compaction_metric_peak_bytes gauge
+fusescope_compaction_metric_peak_bytes 0
+# HELP fusescope_usage_files_accounted_total Files whose usage an accounting pass counted in place
+# TYPE fusescope_usage_files_accounted_total counter
+fusescope_usage_files_accounted_total 0
+# HELP fusescope_usage_contributions_total usage_1h contributions published by compaction and accounting passes
+# TYPE fusescope_usage_contributions_total counter
+fusescope_usage_contributions_total 0
+# HELP fusescope_compaction_l2_passes_total L1 to L2 passes that swapped outputs in
+# TYPE fusescope_compaction_l2_passes_total counter
+fusescope_compaction_l2_passes_total 0
+# HELP fusescope_compaction_sidecars_over_cap_total Span outputs published without a trace_id sidecar, their trace ids past the cap
+# TYPE fusescope_compaction_sidecars_over_cap_total counter
+fusescope_compaction_sidecars_over_cap_total 0
+# HELP fusescope_compaction_l2_over_budget_total Closed days passed over because their oldest L1 file cannot be read within l2_output_bytes
+# TYPE fusescope_compaction_l2_over_budget_total counter
+fusescope_compaction_l2_over_budget_total 0
+# HELP fusescope_compaction_l2_peak_bytes Most bytes one L2 pass held since start, inputs, row group and output together
+# TYPE fusescope_compaction_l2_peak_bytes gauge
+fusescope_compaction_l2_peak_bytes 0
+# HELP fusescope_usage_peak_bytes Most bytes of usage counts one pass held at once since start
+# TYPE fusescope_usage_peak_bytes gauge
+fusescope_usage_peak_bytes 0
+# HELP fusescope_orphan_sweeps_total Orphan sweeps completed
+# TYPE fusescope_orphan_sweeps_total counter
+fusescope_orphan_sweeps_total 1
+# HELP fusescope_orphan_listed_total Objects listed by completed sweeps
+# TYPE fusescope_orphan_listed_total counter
+fusescope_orphan_listed_total 0
+# HELP fusescope_orphan_seen_total Objects seen without a catalog row
+# TYPE fusescope_orphan_seen_total counter
+fusescope_orphan_seen_total 0
+# HELP fusescope_orphan_deleted_total Objects deleted after a TTL without a row
+# TYPE fusescope_orphan_deleted_total counter
+fusescope_orphan_deleted_total 0
+# HELP fusescope_orphan_forgotten_total Remembered orphans found with a row, or gone, before their TTL
+# TYPE fusescope_orphan_forgotten_total counter
+fusescope_orphan_forgotten_total 0
+# HELP fusescope_orphan_delete_failures_total Deletes that failed and wait their backoff
+# TYPE fusescope_orphan_delete_failures_total counter
+fusescope_orphan_delete_failures_total 0
+# HELP fusescope_retention_passes_total Retention passes that quarantined files beyond their tenant's cut
+# TYPE fusescope_retention_passes_total counter
+fusescope_retention_passes_total 0
+# HELP fusescope_retention_expired_total Files quarantined by retention
+# TYPE fusescope_retention_expired_total counter
+fusescope_retention_expired_total 0
+# HELP fusescope_retention_lease_lost_total Retention passes refused because the lease had changed hands
+# TYPE fusescope_retention_lease_lost_total counter
+fusescope_retention_lease_lost_total 0
+# HELP fusescope_retention_failures_total Retention passes that failed for any other reason
+# TYPE fusescope_retention_failures_total counter
+fusescope_retention_failures_total 0
+# HELP fusescope_retention_rebuilds_total attribute_keys tables rebuilt from the L1 files that remain, or removed
+# TYPE fusescope_retention_rebuilds_total counter
+fusescope_retention_rebuilds_total 0
+# HELP fusescope_retention_rebuild_skipped_total Tenants whose remaining L1 files exceed the rebuild cap, reported once
+# TYPE fusescope_retention_rebuild_skipped_total counter
+fusescope_retention_rebuild_skipped_total 0
+# HELP fusescope_retention_rebuild_lease_lost_total Rebuild swaps refused because the lease had changed hands
+# TYPE fusescope_retention_rebuild_lease_lost_total counter
+fusescope_retention_rebuild_lease_lost_total 0
+# HELP fusescope_retention_rebuild_conflicts_total Rebuild swaps refused because the table before was no longer visible
+# TYPE fusescope_retention_rebuild_conflicts_total counter
+fusescope_retention_rebuild_conflicts_total 0
+# HELP fusescope_retention_rebuild_failures_total Rebuilds that failed before or at the swap for any other reason
+# TYPE fusescope_retention_rebuild_failures_total counter
+fusescope_retention_rebuild_failures_total 0
+# HELP fusescope_retention_rebuild_orphaned_total Tables uploaded by rebuilds that did not publish them
+# TYPE fusescope_retention_rebuild_orphaned_total counter
+fusescope_retention_rebuild_orphaned_total 0
+# HELP fusescope_ingest_wal_bytes Bytes the write-ahead log holds on disk
+# TYPE fusescope_ingest_wal_bytes gauge
+fusescope_ingest_wal_bytes 49687862
+# HELP fusescope_uptime_seconds Seconds since the process started
+# TYPE fusescope_uptime_seconds gauge
+fusescope_uptime_seconds 291

@@ -1,0 +1,6 @@
+requests ok=39509 err=0 in 30.0s → 1316 req/s, 15790 spans/s
+latency p50=3.86ms p95=23.35ms p99=48.48ms
+flushes=16 rows/flush=84431 parquet/flush=4.4 MiB | per flush: concat=92ms sort=50ms encode=213ms upload=100ms register=20ms total=520ms | buffers at end: live=306 MiB flushing=0 MiB persisted=374 MiB
+row groups/flush=1.0 writer peak=48 MiB mean=38.8 MiB
+coalesces=299 batches/coalesce=514 61.2ms each p95<=100ms active at end=1 | hot scans=0 p95<=0ms | checkpoints=32 p95<=200ms
+json written to docs/benchmarks/2026-11-08-m1-benchmarks/load-4t-c8-t1.json

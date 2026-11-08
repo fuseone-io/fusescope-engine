@@ -1,0 +1,112 @@
+# Development configuration for the services in compose.yaml.
+# Secrets never live in this file: FS_CATALOG_URL, FS_BUCKET_ACCESS_KEY and
+# FS_BUCKET_SECRET_KEY come from the environment (see the Makefile).
+
+[server]
+role = "all"
+node_id = "bench-0"
+flight_addr = "0.0.0.0:8815"   # Arrow Flight SQL for the Go backend
+metrics_addr = "0.0.0.0:9464"  # Prometheus text exposition
+
+[catalog]
+max_connections = 8
+migrate = true
+
+[bucket]
+kind = "s3"
+name = "fusescope"
+prefix = "bench-20261108"
+endpoint = "http://localhost:9100"
+region = "us-east-1"
+allow_http = true          # development only; production endpoints are https
+
+[wal]
+dir = "./data/bench-20261108/wal"
+
+[ingest]
+listen = "0.0.0.0:4317"
+hot_listen = "0.0.0.0:8816"    # internal: queriers read unflushed rows here
+hot_advertise = "127.0.0.1:8816"
+flush_interval_secs = 10       # short for development; production default is 30
+# WAL group commit: batch limits, and the queue limits that turn into RESOURCE_EXHAUSTED
+# wal_batch_records = 1024
+# wal_batch_bytes = 16777216
+# wal_linger_ms = 0
+# wal_queue_records = 4096
+# wal_queue_bytes = 67108864
+# wal_queue_wait_ms = 2000
+# anonymous_tenant = "<uuid>"   # development only, refused with [tls] on: accept unauthenticated OTLP as this tenant
+
+[query]
+memory_bytes = 1073741824   # 1 GiB for development
+timeout_secs = 60
+max_rows = 1000000
+spill_dir = "./data/bench-20261108/spill"
+# Decoded trace_id sidecars kept for trace lookups; 0 opens every overlapping file.
+trace_index_cache_bytes = 268435456
+# Text sidecars kept for body searches of log files; 0 reads every file the catalog keeps.
+text_index_cache_bytes = 268435456
+# Postings of metric series files kept for selectors, at most 1 GiB; 0 reads every series file.
+metric_index_cache_bytes = 67108864
+# Bounds of metrics.select and metrics.label_*.
+metrics_max_series = 100000
+metrics_max_matchers = 64
+metrics_max_regex_bytes = 65536
+
+[compactor]
+purge_interval_secs = 60
+# One compactor per deployment holds this lease; another takes over this long after a crash.
+lease_ttl_secs = 30
+# L0 to L1 compaction: closed hours only, up to 16 inputs or 2 GiB per pass, 512 MiB outputs.
+compaction_interval_secs = 60
+hour_close_delay_secs = 900
+l1_target_bytes = 536870912
+max_inputs_per_pass = 16
+max_input_bytes = 2147483648
+# Whole-pass derived tables are skipped, never partial, above either their
+# row cap or conservative resident-byte cap; the two byte caps total <= 1 GiB.
+trace_summary_max_traces = 4000000
+trace_summary_max_bytes = 268435456
+service_graph_max_spans = 4000000
+service_graph_max_bytes = 268435456
+compact_logs = true
+# Objects without a catalog row are deleted once seen that way for orphan_ttl_secs.
+orphan_interval_secs = 3600
+orphan_ttl_secs = 3600
+sweep_objects_per_pass = 100000
+sweep_deletes_per_pass = 10000
+sweep_delete_backoff_secs = 600
+quarantine_ttl_secs = 3600
+# Files beyond a tenant's retention_days leave the catalog, up to 1000 per pass, and their
+# objects follow at the purge; the tenant's attribute_keys table is then rebuilt from the L1
+# files that remain, reading up to 256 GiB of them and holding at most 2 GiB by the worst case
+# the ingest limits allow.
+retention_interval_secs = 3600
+retention_files_per_pass = 1000
+rebuild_max_input_bytes = 274877906944
+rebuild_max_bytes = 2147483648
+# At most 64 rebuilds per tick (256 at most); a tenant whose rebuild failed waits an hour,
+# times its failures so far, before the next try.
+rebuilds_per_tick = 64
+rebuild_backoff_secs = 3600
+
+# mTLS of the Flight and OTLP listeners and their clients; off for development only.
+[tls]
+enabled = false
+# cert = "/etc/fusescope/tls/tls.crt"
+# key = "/etc/fusescope/tls/tls.key"
+# public_client_ca = "/etc/fusescope/tls/backend-ca.crt"
+# hot_client_ca = "/etc/fusescope/tls/querier-ca.crt"
+# ingest_client_ca = "/etc/fusescope/tls/collector-ca.crt"   # required where an ingester runs
+# reload_interval_secs = 60
+
+# How Flight SQL clients authenticate: "token" (catalog query tokens) for
+# development, "jwt" (the backend's tenant JWTs only) for staging.
+[auth]
+mode = "token"
+# jwt_keys = "/etc/fusescope/jwt/jwks.json"
+# jwt_issuer = "fusescope-backend"
+
+[log]
+level = "info"
+format = "text"

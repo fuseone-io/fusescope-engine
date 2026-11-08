@@ -1,0 +1,8 @@
+| query | rows | p50 | p95 | max |
+|---|---:|---:|---:|---:|
+| trace by id | 48 | 139.09ms | 147.13ms | 318.79ms |
+| span list, 1 service, 15 min, promoted attribute | 100 | 155.78ms | 168.27ms | 4.72s |
+| p99 latency per service, 24 h | 20 | 217.99ms | 225.41ms | 232.00ms |
+| dashboard: rate and errors per service, last 5 min | 20 | 144.73ms | 148.94ms | 186.38ms |
+| top operations by p95, 1 h | 20 | 245.73ms | 257.46ms | 260.08ms |
+json written to docs/benchmarks/2026-11-08-m1-benchmarks/query-rest.json

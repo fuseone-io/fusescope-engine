@@ -1,0 +1,14 @@
+requests=5000 spans=60000 protobuf=20 MiB arrow=92 MiB parquet=3 MiB (ratio arrow/parquet 28.2x)
+
+| stage | total | ns/span | MiB/s | spans/s |
+|---|---:|---:|---:|---:|
+| protobuf encode | 56.21ms | 937 | 357.9 | 1067499 |
+| wal append+sync (per request) | 3.59s | 59760 | 5.6 | 16734 |
+| wal group commit (64 senders) | 145.78ms | 2430 | 138.0 | 411582 |
+| otlp -> arrow | 395.07ms | 6584 | 233.6 | 151873 |
+| concat + sort | 157.95ms | 2632 | 584.3 | 379873 |
+| parquet encode | 104.21ms | 1737 | 31.5 | 575740 |
+| upload | 1.10ms | 18 | 2969.9 | 54357821 |
+| hot-window filter+project | 105.23ms | 1754 | 877.0 | 570192 |
+| hot-window rows kept | 0µs | 0 | 0.0 | 0 |
+json written to docs/benchmarks/2026-11-08-m1-benchmarks/stages.json

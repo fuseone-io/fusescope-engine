@@ -1,0 +1,40 @@
+{
+  "requests_ok": 137029,
+  "requests_err": 0,
+  "spans_ok": 1644348,
+  "seconds": 30.100363075,
+  "rps": 4552.4035593381295,
+  "spans_per_sec": 54628.84271205755,
+  "p50_ms": 3.362823,
+  "p95_ms": 18.293806999999997,
+  "p99_ms": 42.908003,
+  "errors": [],
+  "flush": {
+    "flushes": 15,
+    "rows_per_flush": 96880.8,
+    "parquet_mib_per_flush": 5.012318293253581,
+    "concat_ms": 120.92993106666667,
+    "sort_ms": 89.22204426666667,
+    "encode_ms": 265.7941116,
+    "upload_ms": 267.247029,
+    "register_ms": 2.6982557999999996,
+    "total_ms": 802.6970043333333,
+    "buffer_bytes": [
+      626023,
+      164193674,
+      250110266
+    ],
+    "coalesces": 252,
+    "batches_per_coalesce": 523.7380952380952,
+    "coalesce_ms": 42.55725613095238,
+    "coalesce_p95_ms": 100.0,
+    "coalesce_active": 0,
+    "writer_peak_bytes": 49964047,
+    "writer_mean_bytes": 44090127.266666666,
+    "row_groups_per_flush": 1.0,
+    "hot_scans": 152,
+    "hot_scan_p95_ms": 200.0,
+    "checkpoints": 30,
+    "checkpoint_p95_ms": 200.0
+  }
+}
