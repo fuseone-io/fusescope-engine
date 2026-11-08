@@ -1,6 +1,6 @@
 # 0006 · Collector exports standard OTLP to the engine
 
-- Status: accepted
+- Status: accepted, amended by [0010](0010-fusescope-collector-server.md)
 - Date: 2026-10-24
 
 ## Context
