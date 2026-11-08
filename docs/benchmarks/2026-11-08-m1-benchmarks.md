@@ -114,8 +114,10 @@ retune the flush lease, not done here.
 queries in the retention run. Those ran on disk B and two weeks of code
 earlier; this one ran on disk A with other containers on the host. The
 per-request fsync on disk A measures as in the baseline (0.72 ms against
-0.69 ms) and the group-commit stage is not the bound. A run on disk B at
-54bd761 tells the disk from the code.
+0.69 ms) and the group-commit stage is not the bound. Recorded as
+inconclusive, not as a confirmed regression: the load runs alone are to be
+repeated on disk B at 54bd761 with the same `bench.toml`, without the other
+containers if possible, to tell the disk from the code.
 
 **Against DESIGN.md section 9.2** the query p95s are inside their targets
 (trace by id 198 ms of 300, span list 345 ms of 500, p99 per service 450 ms
