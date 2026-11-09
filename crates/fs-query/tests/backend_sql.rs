@@ -221,6 +221,24 @@ const COUNTS: &[(&str, i64)] = &[
         "TestEngineFilterMatrix/parent_span_id_NOT_IN_['00f067aa0ba902b7',_'00f067aa0ba902b8']",
         3,
     ),
+    ("TestEngineFilterMatrix/parent_span_id_NOT_LIKE_'00f0%'", 3),
+    ("TestEngineFilterMatrix/parent_span_id_NOT_ILIKE_'00F0%'", 3),
+    (
+        "TestEngineFilterMatrix/parent_span_id_NOT_CONTAINS_'aa0b'",
+        3,
+    ),
+    (
+        "TestEngineFilterMatrix/parent_span_id_NOT_REGEXP_'^00f0'",
+        3,
+    ),
+    (
+        "TestEngineFilterMatrix/parent_span_id_NOT_BETWEEN_'00f067aa0ba902b7'_AND_'00f067aa0ba902b8'",
+        3,
+    ),
+    (
+        "TestEngineFilterMatrix/parent_span_id_<_'00f067aa0ba902b7'",
+        1,
+    ),
     ("TestEngineFilterMatrix/parent_span_id_NOT_EXISTS", 1),
     ("TestEngineFilterMatrix/parent_span_id_EXISTS", 2),
 ];
