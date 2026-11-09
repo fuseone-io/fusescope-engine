@@ -1348,9 +1348,15 @@ budget on its own is not kept), oldest dropped first, on a second `DoGet`
 of the same ticket, or on another querier than the one that prepared it.
 `fusescope_query_prepared_plans` and `fusescope_query_prepared_bytes` show
 what waits. Dialect: DataFusion, close to PostgreSQL. Functions registered
-by the engine: `attr_string(attributes, 'http.method')`, `attr_number(...)`,
-`attr_bool(...)`, `has_attr(...)`, `has_token(body, 'token')` (section 5),
-`time_bucket(interval, ts)`, `quantile_tdigest(col, 0.99)`.
+by the engine: `has_token(body, 'token')` (section 5) and
+`quantile_tdigest(digest, 0.99)` over service-graph digests. The Go dialect
+uses the built-in functions for the rest: `attributes_string['k']` for a map
+key, `date_bin` for time buckets, `approx_percentile_cont ... WITHIN GROUP`
+for quantiles of raw values, `encode`/`decode(..., 'hex')` for ids. Every
+statement the Go trace builders render is planned and run by
+`crates/fs-query/tests/backend_sql.rs` from a copy written by
+`scripts/backend-sql-fixture.py`, which records the backend commit, the
+format version and the SHA-256 of the cases.
 
 **Typed DoAction** for hot paths where SQL only gets in the way:
 
