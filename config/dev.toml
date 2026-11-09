@@ -41,6 +41,7 @@ flush_interval_secs = 10       # short for development; production default is 30
 memory_bytes = 1073741824   # 1 GiB for development
 timeout_secs = 60
 max_rows = 1000000
+lookup_max_span_ids = 10000
 spill_dir = "./data/spill"
 # Decoded trace_id sidecars kept for trace lookups; 0 opens every overlapping file.
 trace_index_cache_bytes = 268435456

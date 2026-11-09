@@ -1319,6 +1319,146 @@ fn timestamps(batches: &[RecordBatch]) -> Vec<i64> {
         .collect()
 }
 
+/// A lookup past `max_rows` fails `RESOURCE_EXHAUSTED` with the stable
+/// `TOO_MANY_ROWS` reason, the one a client tells it from a budget by.
+#[tokio::test]
+async fn a_lookup_past_the_row_cap_carries_its_reason() {
+    let Some(mut f) = fixture().await else { return };
+    f.querier = Querier::new(
+        f.db.catalog.clone(),
+        Arc::new(LocalFileSystem::new_with_prefix(f.dir.path().join("bucket")).unwrap()),
+        None,
+        QueryLimits {
+            max_rows: 2,
+            timeout: Duration::from_secs(30),
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let err = lookup(
+        &mut client,
+        &serde_json::json!({"trace_id": "02".repeat(16)}).to_string(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted);
+    assert_eq!(
+        fs_query::error_info::reason_of(&err).as_deref(),
+        Some(fs_query::error_info::TOO_MANY_ROWS)
+    );
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
+/// `trace.lookup` answers the tree skeleton under `minimal` and only the
+/// spans named under `span_ids`; a body without them answers as before.
+#[tokio::test]
+async fn trace_lookup_projects_minimal_and_narrows_to_span_ids() {
+    let Some(f) = fixture().await else { return };
+    let (token, _) =
+        f.db.catalog
+            .create_token(f.tenant, "backend", TokenScope::Query)
+            .await
+            .unwrap();
+    let (addr, shutdown, server) = serve_flight(&f).await;
+    let mut client = sql_client(addr, &token).await;
+    let trace = "02".repeat(16);
+
+    let full = lookup(
+        &mut client,
+        &serde_json::json!({"trace_id": trace}).to_string(),
+    )
+    .await
+    .unwrap();
+    let explicit = lookup(
+        &mut client,
+        &serde_json::json!({"trace_id": trace, "projection": "full"}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(full[0].schema(), explicit[0].schema());
+    assert!(full[0].schema().fields().len() > 7);
+
+    let minimal = lookup(
+        &mut client,
+        &serde_json::json!({"trace_id": trace, "projection": "minimal"}).to_string(),
+    )
+    .await
+    .unwrap();
+    let columns: Vec<String> = minimal[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    assert_eq!(
+        columns,
+        [
+            "span_id",
+            "parent_span_id",
+            "timestamp",
+            "duration_nano",
+            "has_error",
+            "service_name",
+            "name"
+        ]
+    );
+    assert_eq!(minimal.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+
+    let narrowed = lookup(
+        &mut client,
+        &serde_json::json!({
+            "trace_id": trace,
+            "projection": "minimal",
+            "span_ids": ["0101010101010101", "0303030303030303", "0909090909090909"],
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    let mut kept: Vec<Vec<u8>> = narrowed
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch.column(0).as_fixed_size_binary().clone();
+            (0..batch.num_rows()).map(move |row| ids.value(row).to_vec())
+        })
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [vec![1u8; 8], vec![3u8; 8]],
+        "only the named spans of the trace"
+    );
+
+    for bad in [
+        serde_json::json!({"trace_id": trace, "span_ids": []}),
+        serde_json::json!({"trace_id": trace, "span_ids": ["01"]}),
+        serde_json::json!({"trace_id": trace, "projection": "narrow"}),
+    ] {
+        let err = lookup(&mut client, &bad.to_string()).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{bad}");
+    }
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.db.finish().await;
+}
+
 /// `trace.lookup` answers with the spans of one trace, in timestamp order,
 /// as one Arrow IPC stream split across the result bodies; an optional
 /// range narrows it with inclusive bounds; the tenant sees only its own
@@ -1340,6 +1480,8 @@ async fn trace_lookup_action_returns_the_spans_of_one_trace() {
         trace_id: trace.clone(),
         start_unix_nano: None,
         end_unix_nano: None,
+        projection: None,
+        span_ids: None,
     })
     .unwrap();
     let batches = lookup(&mut client, &body).await.unwrap();

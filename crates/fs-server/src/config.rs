@@ -686,6 +686,9 @@ pub struct QuerySection {
     /// Maximum rows returned per query.
     #[serde(default = "default_query_max_rows")]
     pub max_rows: usize,
+    /// Most span ids one `trace.lookup` may name.
+    #[serde(default = "default_lookup_max_span_ids")]
+    pub lookup_max_span_ids: usize,
     /// Directory for spill files. Unset disables spilling.
     pub spill_dir: Option<PathBuf>,
     /// Decoded `trace_id` sidecars kept in memory for trace lookups. Zero
@@ -730,6 +733,7 @@ impl Default for QuerySection {
             memory_bytes: default_query_memory(),
             timeout_secs: default_query_timeout(),
             max_rows: default_query_max_rows(),
+            lookup_max_span_ids: default_lookup_max_span_ids(),
             spill_dir: None,
             trace_index_cache_bytes: default_trace_index_cache_bytes(),
             text_index_cache_bytes: default_text_index_cache_bytes(),
@@ -751,6 +755,7 @@ impl QuerySection {
             memory_bytes: self.memory_bytes,
             timeout: std::time::Duration::from_secs(self.timeout_secs),
             max_rows: self.max_rows,
+            lookup_max_span_ids: self.lookup_max_span_ids,
             trace_index_cache_bytes: self.trace_index_cache_bytes,
             text_index_cache_bytes: self.text_index_cache_bytes,
             metric_index_cache_bytes: self.metric_index_cache_bytes,
@@ -807,6 +812,10 @@ fn default_query_memory() -> usize {
 
 fn default_query_timeout() -> u64 {
     60
+}
+
+fn default_lookup_max_span_ids() -> usize {
+    fs_query::querier::DEFAULT_LOOKUP_MAX_SPAN_IDS
 }
 
 fn default_query_max_rows() -> usize {
@@ -1700,11 +1709,12 @@ impl Config {
         self.validate_server()?;
         self.validate_access()?;
         if self.query.max_rows == 0
+            || self.query.lookup_max_span_ids == 0
             || !(1..=fs_query::querier::MAX_TIMEOUT_SECS).contains(&self.query.timeout_secs)
             || self.query.memory_bytes < 64 * 1024 * 1024
         {
             return invalid(
-                "query.max_rows must be positive, query.timeout_secs between 1 and 300, and query.memory_bytes at least 64 MiB",
+                "query.max_rows and query.lookup_max_span_ids must be positive, query.timeout_secs between 1 and 300, and query.memory_bytes at least 64 MiB",
             );
         }
         if self.query.prepared_plans == 0
@@ -2529,6 +2539,26 @@ mod tests {
         )
         .unwrap();
         assert!(on.compactor.to_compactor(4).compaction.compact_logs);
+    }
+
+    #[test]
+    fn lookup_max_span_ids_defaults_and_must_be_positive() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let config = Config::parse(MINIMAL).unwrap();
+        assert_eq!(
+            config.query.to_limits().lookup_max_span_ids,
+            fs_query::querier::DEFAULT_LOOKUP_MAX_SPAN_IDS
+        );
+        let set = Config::parse(&format!("{MINIMAL}\n[query]\nlookup_max_span_ids = 7\n")).unwrap();
+        assert_eq!(set.query.to_limits().lookup_max_span_ids, 7);
+        let err = Config::parse(&format!("{MINIMAL}\n[query]\nlookup_max_span_ids = 0\n"))
+            .unwrap()
+            .validate(&secrets)
+            .unwrap_err();
+        assert!(err.to_string().contains("lookup_max_span_ids"), "{err}");
     }
 
     #[test]

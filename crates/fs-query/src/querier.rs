@@ -25,7 +25,7 @@ use object_store::ObjectStore;
 use tracing::info;
 
 use crate::QueryError;
-use crate::actions::{KeysQuery, OperationsQuery, ServicesQuery, TraceQuery};
+use crate::actions::{KeysQuery, OperationsQuery, Projection, ServicesQuery, TraceQuery};
 use crate::files::FileCache;
 use crate::prune::Pruning;
 use crate::session::{SPANS_TABLE, plan_read_only, tenant_session};
@@ -53,6 +53,20 @@ impl QueryWarnings {
             .unwrap_or_default()
     }
 }
+
+/// The columns of a `minimal` trace lookup, in answer order.
+const MINIMAL_LOOKUP_COLUMNS: &[&str] = &[
+    span_col::SPAN_ID,
+    span_col::PARENT_SPAN_ID,
+    span_col::TIMESTAMP,
+    span_col::DURATION_NANO,
+    span_col::HAS_ERROR,
+    span_col::SERVICE_NAME,
+    span_col::NAME,
+];
+
+/// Default of [`QueryLimits::lookup_max_span_ids`].
+pub const DEFAULT_LOOKUP_MAX_SPAN_IDS: usize = 10_000;
 
 /// Longest query timeout a deployment may configure, seconds: the largest
 /// latency bucket, so no execution outlives the buckets.
@@ -186,6 +200,9 @@ pub struct QueryLimits {
     pub timeout: Duration,
     /// Maximum rows returned per query.
     pub max_rows: usize,
+    /// Most span ids one `trace.lookup` may name, checked before any is
+    /// decoded or planned.
+    pub lookup_max_span_ids: usize,
     /// Rows per output batch.
     pub batch_size: usize,
     /// Hot-window fan-out settings.
@@ -227,6 +244,7 @@ impl Default for QueryLimits {
             memory_bytes: 2 * 1024 * 1024 * 1024,
             timeout: Duration::from_secs(60),
             max_rows: 1_000_000,
+            lookup_max_span_ids: DEFAULT_LOOKUP_MAX_SPAN_IDS,
             batch_size: 8192,
             hot_window: crate::hot::HotWindowConfig::default(),
             trace_index_cache_bytes: 256 * 1024 * 1024,
@@ -581,7 +599,17 @@ impl Querier {
         if let Some(end) = query.end_ns {
             frame = frame.filter(col(span_col::TIMESTAMP).lt_eq(timestamp(end)))?;
         }
-        let frame = frame.sort(vec![col(span_col::TIMESTAMP).sort(true, false)])?;
+        if let Some(ids) = &query.span_ids {
+            let ids = ids
+                .iter()
+                .map(|id| lit(ScalarValue::FixedSizeBinary(8, Some(id.to_vec()))))
+                .collect();
+            frame = frame.filter(col(span_col::SPAN_ID).in_list(ids, false))?;
+        }
+        let mut frame = frame.sort(vec![col(span_col::TIMESTAMP).sort(true, false)])?;
+        if query.projection == Projection::Minimal {
+            frame = frame.select_columns(MINIMAL_LOOKUP_COLUMNS)?;
+        }
         let stream = frame.execute_stream().await?;
         Ok((stream, warnings))
     }

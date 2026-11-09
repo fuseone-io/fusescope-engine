@@ -10,8 +10,13 @@
 //! epoch, and optional.
 //!
 //! `trace.lookup`: `{"trace_id": "<32 hex digits>", "start_unix_nano": n,
-//! "end_unix_nano": n}`; the spans of that trace ordered by `timestamp`,
-//! every column of the spans table.
+//! "end_unix_nano": n, "projection": "full" | "minimal", "span_ids":
+//! ["<16 hex digits>", ...]}`; the spans of that trace ordered by
+//! `timestamp`. `full`, the default, is every column of the spans table;
+//! `minimal` is the tree skeleton: `span_id`, `parent_span_id`,
+//! `timestamp`, `duration_nano`, `has_error`, `service_name` and `name`.
+//! `span_ids`, when given, keeps only those spans: at least one and at
+//! most `query.lookup_max_span_ids`, counted before any is decoded.
 //!
 //! `metadata.services`: `{"start_unix_nano": n, "end_unix_nano": n,
 //! "limit": n}`; the distinct `service_name` of the tenant's spans,
@@ -76,10 +81,26 @@ pub struct TraceLookup {
     /// Inclusive upper bound on `timestamp`, nanoseconds since the epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_unix_nano: Option<u64>,
+    /// The columns answered; [`Projection::Full`] when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Projection>,
+    /// The spans kept, as 16 hex digits each; every span when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_ids: Option<Vec<String>>,
+}
+
+/// The columns a trace lookup answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Projection {
+    /// Every column of the spans table.
+    Full,
+    /// The columns a trace tree is built from.
+    Minimal,
 }
 
 /// A trace lookup with its fields decoded and checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceQuery {
     /// The trace id.
     pub trace_id: [u8; 16],
@@ -87,6 +108,10 @@ pub struct TraceQuery {
     pub start_ns: Option<i64>,
     /// Inclusive upper bound on `timestamp`, nanoseconds since the epoch.
     pub end_ns: Option<i64>,
+    /// The columns answered.
+    pub projection: Projection,
+    /// The spans kept; every span when `None`.
+    pub span_ids: Option<Vec<[u8; 8]>>,
 }
 
 impl TraceLookup {
@@ -99,19 +124,46 @@ impl TraceLookup {
         parse(body)
     }
 
-    /// Decodes the trace id and checks the range.
+    /// Decodes the ids and checks the range; `max_span_ids` bounds the
+    /// spans named, counted before any is decoded.
     ///
     /// # Errors
-    /// A trace id that is not 32 hex digits, a bound beyond `i64`, or a
-    /// start after the end.
-    pub fn query(&self) -> Result<TraceQuery, QueryError> {
+    /// A trace id that is not 32 hex digits, a bound beyond `i64`, a start
+    /// after the end, or span ids that are none, more than
+    /// `max_span_ids`, or not 16 hex digits each.
+    pub fn query(&self, max_span_ids: usize) -> Result<TraceQuery, QueryError> {
         let trace_id = decode_hex_16(&self.trace_id)
             .ok_or_else(|| QueryError::InvalidAction("trace_id must be 32 hex digits".into()))?;
         let range = range_of(self.start_unix_nano, self.end_unix_nano)?;
+        let span_ids = match &self.span_ids {
+            None => None,
+            Some(ids) if ids.is_empty() => {
+                return Err(QueryError::InvalidAction(
+                    "span_ids names no span; leave it out for every span".into(),
+                ));
+            }
+            Some(ids) if ids.len() > max_span_ids => {
+                return Err(QueryError::InvalidAction(format!(
+                    "span_ids names {} spans, at most {max_span_ids}",
+                    ids.len()
+                )));
+            }
+            Some(ids) => Some(
+                ids.iter()
+                    .map(|id| {
+                        decode_hex_8(id).ok_or_else(|| {
+                            QueryError::InvalidAction("a span id must be 16 hex digits".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
         Ok(TraceQuery {
             trace_id,
             start_ns: range.start_ns,
             end_ns: range.end_ns,
+            projection: self.projection.unwrap_or(Projection::Full),
+            span_ids,
         })
     }
 }
@@ -318,11 +370,19 @@ fn limit_of(limit: Option<usize>) -> Result<usize, QueryError> {
 }
 
 fn decode_hex_16(text: &str) -> Option<[u8; 16]> {
+    decode_hex(text)
+}
+
+fn decode_hex_8(text: &str) -> Option<[u8; 8]> {
+    decode_hex(text)
+}
+
+fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let digits = text.as_bytes();
-    if digits.len() != 32 {
+    if digits.len() != 2 * N {
         return None;
     }
-    let mut out = [0u8; 16];
+    let mut out = [0u8; N];
     for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
         let hi = (*pair.first()? as char).to_digit(16)?;
         let lo = (*pair.get(1)? as char).to_digit(16)?;
@@ -341,14 +401,14 @@ mod tests {
             br#"{"trace_id":"000102030405060708090a0b0c0d0e0F","start_unix_nano":5,"end_unix_nano":9}"#,
         )
         .unwrap();
-        let query = lookup.query().unwrap();
+        let query = lookup.query(10).unwrap();
         assert_eq!(query.trace_id[0..3], [0, 1, 2]);
         assert_eq!(query.trace_id[15], 15);
         assert_eq!((query.start_ns, query.end_ns), (Some(5), Some(9)));
 
         let open =
             TraceLookup::parse(br#"{"trace_id":"00000000000000000000000000000000"}"#).unwrap();
-        assert_eq!(open.query().unwrap().start_ns, None);
+        assert_eq!(open.query(10).unwrap().start_ns, None);
 
         for bad in [
             &br#"{"trace_id":"0102"}"#[..],
@@ -356,7 +416,7 @@ mod tests {
             br#"{"trace_id":"00000000000000000000000000000000","start_unix_nano":2,"end_unix_nano":1}"#,
             br#"{"trace_id":"00000000000000000000000000000000","end_unix_nano":18446744073709551615}"#,
         ] {
-            let err = TraceLookup::parse(bad).unwrap().query().unwrap_err();
+            let err = TraceLookup::parse(bad).unwrap().query(10).unwrap_err();
             assert!(matches!(err, QueryError::InvalidAction(_)), "{err}");
         }
         for bad in [
@@ -368,6 +428,76 @@ mod tests {
                 QueryError::InvalidAction(_)
             ));
         }
+    }
+
+    const TRACE: &str = "000102030405060708090a0b0c0d0e0f";
+
+    #[test]
+    fn a_lookup_projects_full_unless_asked_for_minimal() {
+        let full = TraceLookup::parse(format!(r#"{{"trace_id":"{TRACE}"}}"#).as_bytes())
+            .unwrap()
+            .query(10)
+            .unwrap();
+        assert_eq!(full.projection, Projection::Full);
+        assert_eq!(full.span_ids, None);
+        for (body, want) in [
+            (r#""projection":"full""#, Projection::Full),
+            (r#""projection":"minimal""#, Projection::Minimal),
+        ] {
+            let lookup =
+                TraceLookup::parse(format!(r#"{{"trace_id":"{TRACE}",{body}}}"#).as_bytes())
+                    .unwrap();
+            assert_eq!(lookup.query(10).unwrap().projection, want);
+        }
+        let other = format!(r#"{{"trace_id":"{TRACE}","projection":"columns"}}"#);
+        assert!(matches!(
+            TraceLookup::parse(other.as_bytes()).unwrap_err(),
+            QueryError::InvalidAction(_)
+        ));
+    }
+
+    #[test]
+    fn a_lookup_narrows_to_span_ids_within_their_bound() {
+        let body = format!(
+            r#"{{"trace_id":"{TRACE}","span_ids":["00f067aa0ba902b7","00F067AA0BA902B8"]}}"#
+        );
+        let query = TraceLookup::parse(body.as_bytes())
+            .unwrap()
+            .query(2)
+            .unwrap();
+        assert_eq!(
+            query.span_ids,
+            Some(vec![
+                [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7],
+                [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb8]
+            ])
+        );
+        for (ids, max) in [
+            ("[]", 2),
+            (r#"["00f067aa0ba902"]"#, 2),
+            (r#"["zzf067aa0ba902b7"]"#, 2),
+            (
+                r#"["00f067aa0ba902b7","00f067aa0ba902b8","00f067aa0ba902b9"]"#,
+                2,
+            ),
+        ] {
+            let body = format!(r#"{{"trace_id":"{TRACE}","span_ids":{ids}}}"#);
+            let err = TraceLookup::parse(body.as_bytes())
+                .unwrap()
+                .query(max)
+                .unwrap_err();
+            assert!(matches!(err, QueryError::InvalidAction(_)), "{ids}: {err}");
+        }
+    }
+
+    #[test]
+    fn too_many_span_ids_are_refused_before_any_is_decoded() {
+        let body = format!(r#"{{"trace_id":"{TRACE}","span_ids":["not hex","nor this"]}}"#);
+        let err = TraceLookup::parse(body.as_bytes())
+            .unwrap()
+            .query(1)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 1"), "{err}");
     }
 
     #[test]

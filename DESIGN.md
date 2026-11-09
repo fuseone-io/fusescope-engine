@@ -1362,7 +1362,7 @@ format version and the SHA-256 of the cases.
 
 | Action | Input | Output | Used by |
 |---|---|---|---|
-| `trace.lookup` | tenant, trace_id, optional range | spans of the trace | trace detail view |
+| `trace.lookup` | tenant, trace_id, optional range, projection and span ids | spans of the trace | trace detail view |
 | `metrics.select` | tenant, label matchers, range, optional step | series with samples | Prometheus `storage.Queryable` in Go |
 | `metrics.label_values` | tenant, label, matchers, range | values | autocomplete |
 | `metrics.label_names` | tenant, matchers, range | label names | autocomplete |
@@ -1381,12 +1381,24 @@ authentication, planning and every wait for a batch, so a stalled catalog,
 a stalled store or a slow plan ends in `DEADLINE_EXCEEDED` too, and a
 limit met while the stream is already flowing reaches the client with its
 own code. `trace.lookup` takes
-`{"trace_id": "<32 hex digits>", "start_unix_nano": n, "end_unix_nano": n}`,
-the bounds optional and inclusive, any other field refused, and answers
-every column of the spans table for that trace in
-`timestamp` order; it goes through the spans table like SQL would, so the
-`trace_id` sidecars, the hot window and the byte budget apply, without
-parsing or planning SQL (`fusescope_query_trace_lookups_total`).
+`{"trace_id": "<32 hex digits>", "start_unix_nano": n, "end_unix_nano": n,
+"projection": "full" | "minimal", "span_ids": ["<16 hex digits>", ...]}`,
+every field but `trace_id` optional, the bounds inclusive, any other field
+refused, and answers the spans of that trace in `timestamp` order: every
+column of the spans table under `full`, the default, and the tree skeleton
+under `minimal` (`span_id`, `parent_span_id`, `timestamp`,
+`duration_nano`, `has_error`, `service_name`, `name`). `span_ids` keeps
+only the spans named: at least one and at most `query.lookup_max_span_ids`
+(10 000), counted before any is decoded or a plan is made, so a waterfall
+reads the skeleton of a large trace and then the full rows of one window
+only. It goes through the spans table like SQL would, so the `trace_id`
+sidecars, the hot window and the byte budget apply, without parsing or
+planning SQL (`fusescope_query_trace_lookups_total`). A query whose answer
+passes `query.max_rows` fails `RESOURCE_EXHAUSTED` with a
+`google.rpc.ErrorInfo` of reason `TOO_MANY_ROWS` and domain
+`fusescope-engine` in its status details, the stable discriminator a
+client reads; other `RESOURCE_EXHAUSTED` failures, such as the byte
+budget, carry none.
 `metadata.services` takes `{"start_unix_nano": n, "end_unix_nano": n,
 "limit": n}` and answers the distinct `service_name` of the tenant, sorted,
 from the catalog alone: the services of every file overlapping the range,

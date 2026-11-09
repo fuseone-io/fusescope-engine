@@ -125,7 +125,7 @@ impl FlightSql {
         match action.r#type.as_str() {
             TRACE_LOOKUP => {
                 let query = TraceLookup::parse(&action.body)
-                    .and_then(|lookup| lookup.query())
+                    .and_then(|lookup| lookup.query(limits.lookup_max_span_ids))
                     .map_err(invalid)?;
                 within(deadline, limits, self.querier.trace_lookup(tenant, query)).await
             }
@@ -301,9 +301,14 @@ fn status_of(error: &QueryError) -> Status {
     match error {
         QueryError::NotAllowed(_) => Status::permission_denied(error.to_string()),
         QueryError::InvalidAction(_) => Status::invalid_argument(error.to_string()),
-        QueryError::OverBudget { .. }
-        | QueryError::TooManyRows(_)
-        | QueryError::TooManySeries(_) => Status::resource_exhausted(error.to_string()),
+        QueryError::TooManyRows(_) => crate::error_info::with_reason(
+            tonic::Code::ResourceExhausted,
+            error.to_string(),
+            crate::error_info::TOO_MANY_ROWS,
+        ),
+        QueryError::OverBudget { .. } | QueryError::TooManySeries(_) => {
+            Status::resource_exhausted(error.to_string())
+        }
         QueryError::Ambiguous { .. } => Status::failed_precondition(error.to_string()),
         QueryError::HotUnavailable(_) => Status::unavailable(error.to_string()),
         QueryError::Timeout(_) => Status::deadline_exceeded(error.to_string()),
@@ -453,7 +458,7 @@ impl FlightSqlService for FlightSql {
         Some(vec![
             listed(
                 TRACE_LOOKUP,
-                "Spans of one trace in timestamp order; body {trace_id: hex, start_unix_nano?, end_unix_nano?}",
+                "Spans of one trace in timestamp order; body {trace_id: hex, start_unix_nano?, end_unix_nano?, projection?: full|minimal, span_ids?: [hex]}",
             ),
             listed(
                 METADATA_SERVICES,
@@ -490,6 +495,27 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn only_too_many_rows_carries_its_reason() {
+        let status = status_of(&QueryError::TooManyRows(10));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            crate::error_info::reason_of(&status).as_deref(),
+            Some(crate::error_info::TOO_MANY_ROWS)
+        );
+        for other in [
+            QueryError::OverBudget {
+                bytes: 2,
+                budget: 1,
+            },
+            QueryError::TooManySeries(3),
+        ] {
+            let status = status_of(&other);
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{other}");
+            assert_eq!(crate::error_info::reason_of(&status), None, "{other}");
+        }
+    }
 
     /// One header value per reason, so a reason holding "; " stays whole, and none without one.
     #[test]
