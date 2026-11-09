@@ -106,6 +106,13 @@ attributes above; they do not derive from an exporter implementation.
 | graph count/error_count | one call, and one error when the measured child or inferred client/producer has error status | OTLP status; product service-map contract |
 | graph digest | latency of that same measured span, in nanoseconds | OTLP span start and end |
 
+| top_level_operations row | one per `(service_name, name)` of a span with no parent, or whose parent is remote (`is_remote = "true"`); a span without a service, with a local parent (`"false"`) or whose remoteness is unknown (`""`) does not count | OTLP empty `parent_span_id` means root; `SpanFlags` bits 0x100 and 0x200 for the parent context's `is_remote` |
+| top_level_operations.last_seen | greatest span `timestamp` of the pair in the pass | OTLP span start |
+
+Top-level membership needs only the span itself: no parent lookup, so a
+parent that is absent, in another hour or in another pass changes nothing,
+and nothing is inferred when the flags do not say.
+
 A direct edge takes precedence over inference. The parent map is keyed by
 both trace and span id, because span ids are only unique within a trace.
 Pairs split across compaction passes or UTC hours do not form an edge.

@@ -24,6 +24,7 @@ use fs_schema::attribute_keys::KeyStats;
 use fs_schema::logs::log_schema_v1;
 use fs_schema::service_graph::ServiceGraphBuilder;
 use fs_schema::spans::span_schema_v1;
+use fs_schema::top_level_operations::TopLevelOperations;
 use fs_schema::trace_summary::TraceSummaries;
 use fs_schema::usage::{UsageCounts, UsageRows, UsageSignal};
 use object_store::ObjectStore;
@@ -80,6 +81,10 @@ pub struct MergeConfig {
     pub text_index: fs_index::TextIndexLimits,
     /// Conservative byte budget for the service-graph builder.
     pub service_graph_max_bytes: usize,
+    /// Most distinct operations retained for the pass's top-level operations.
+    pub top_level_operations_max_operations: usize,
+    /// Conservative byte budget for the top-level operations builder.
+    pub top_level_operations_max_bytes: usize,
     /// Bytes the usage counts may hold; past them a full count is set
     /// aside, handed out as its own contribution.
     pub usage_max_bytes: usize,
@@ -103,6 +108,7 @@ pub struct Merger {
     hour_ns: i64,
     summaries: TraceSummaries,
     graph: ServiceGraphBuilder,
+    top_level: TopLevelOperations,
     /// The output being written, between steps.
     current: Option<OutputBuilder>,
     /// Most bytes the inputs, the row group and the output held together.
@@ -176,6 +182,7 @@ impl Merger {
             hour_ns,
             summaries: TraceSummaries::default(),
             graph: ServiceGraphBuilder::default(),
+            top_level: TopLevelOperations::default(),
             current: None,
             peak: 0,
             picks: None,
@@ -210,6 +217,11 @@ impl Merger {
     /// The pass's trace summaries, including which cap skipped them.
     pub fn take_trace_summaries(&mut self) -> TraceSummaries {
         std::mem::take(&mut self.summaries)
+    }
+
+    /// The pass's top-level operations, including which cap skipped them.
+    pub fn take_top_level_operations(&mut self) -> TopLevelOperations {
+        std::mem::take(&mut self.top_level)
     }
 
     /// The pass's service graph builder, including which cap skipped it.
@@ -352,6 +364,11 @@ impl Merger {
                 self.config.service_graph_max_spans,
                 self.config.service_graph_max_bytes,
             )?;
+            self.top_level.absorb(
+                group,
+                self.config.top_level_operations_max_operations,
+                self.config.top_level_operations_max_bytes,
+            )?;
         }
         Ok(())
     }
@@ -426,6 +443,22 @@ pub fn attribute_keys_path(
 /// Path of a per-pass trace summary contribution.
 pub fn trace_summary_path(root: &Path, tenant: TenantId, hour: DateTime<Utc>, id: FileId) -> Path {
     partitioned_path(root, tenant, Signal::TraceSummary.path_name(), hour, id)
+}
+
+/// Path of a per-pass top-level operations contribution.
+pub fn top_level_operations_path(
+    root: &Path,
+    tenant: TenantId,
+    hour: DateTime<Utc>,
+    id: FileId,
+) -> Path {
+    partitioned_path(
+        root,
+        tenant,
+        Signal::TopLevelOperations.path_name(),
+        hour,
+        id,
+    )
 }
 
 /// Path of a per-pass service graph contribution.

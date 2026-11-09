@@ -307,6 +307,8 @@ fn compactor(f: &Fixture) -> Compactor {
             trace_summary_max_bytes: 256 << 20,
             service_graph_max_spans: 4_000_000,
             service_graph_max_bytes: 256 << 20,
+            top_level_operations_max_operations: 1_000_000,
+            top_level_operations_max_bytes: 256 << 20,
             row_group_rows: 4,
             compact_logs: false,
             text_index: fs_index::TextIndexLimits::DEFAULT,
@@ -406,6 +408,7 @@ async fn retention_expires_span_log_and_per_pass_derived_files_with_the_same_day
         Signal::Logs,
         Signal::TraceSummary,
         Signal::ServiceGraph1m,
+        Signal::TopLevelOperations,
     ];
     for signal in signals {
         let id = FileId::new();
@@ -654,6 +657,9 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
     let summary = r.expire_once(&fence).await.unwrap().unwrap();
     assert_eq!(summary.files.len(), 1);
     assert_eq!(summary.files[0].signal, Signal::TraceSummary);
+    let operations = r.expire_once(&fence).await.unwrap().unwrap();
+    assert_eq!(operations.files.len(), 1);
+    assert_eq!(operations.files[0].signal, Signal::TopLevelOperations);
     assert!(r.expire_once(&fence).await.unwrap().is_none());
     assert_eq!(
         tables(&f).await[0].id,
@@ -770,6 +776,11 @@ async fn the_attribute_keys_table_is_rebuilt_from_the_l1_files_that_remain() {
         r.expire_once(&fence).await.unwrap().unwrap().tenant_id,
         other,
         "the per-pass trace summary expires with the same day"
+    );
+    assert_eq!(
+        r.expire_once(&fence).await.unwrap().unwrap().tenant_id,
+        other,
+        "and so do its top-level operations"
     );
     assert!(r.expire_once(&fence).await.unwrap().is_none());
     std::fs::write(f.dir.path().join(&others_table[0].path), b"not parquet").unwrap();
@@ -1088,6 +1099,8 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
                 trace_summary_max_bytes: 256 << 20,
                 service_graph_max_spans: 4_000_000,
                 service_graph_max_bytes: 256 << 20,
+                top_level_operations_max_operations: 1_000_000,
+                top_level_operations_max_bytes: 256 << 20,
                 row_group_rows: 4,
                 compact_logs: false,
                 text_index: fs_index::TextIndexLimits::DEFAULT,
@@ -1154,8 +1167,8 @@ async fn the_loop_expires_and_rebuilds_while_it_holds_the_lease() {
     );
     assert_eq!(
         stats.retention.expired.load(Ordering::Relaxed),
-        4,
-        "two expired L1 files and their trace summaries"
+        6,
+        "two expired L1 files, their trace summaries and their top-level operations"
     );
     assert_eq!(visible(&f).await.len(), 1, "the L1 of the hour kept");
     std::fs::write(f.dir.path().join(&kept.path), good).unwrap();

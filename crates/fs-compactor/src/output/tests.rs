@@ -84,6 +84,8 @@ fn config(output_bytes: usize) -> MergeConfig {
         service_graph_max_spans: 0,
         text_index: fs_index::TextIndexLimits::DEFAULT,
         service_graph_max_bytes: 0,
+        top_level_operations_max_operations: 0,
+        top_level_operations_max_bytes: 0,
         usage_max_bytes: 1 << 20,
     }
 }

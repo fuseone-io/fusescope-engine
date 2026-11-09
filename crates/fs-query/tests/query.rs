@@ -814,7 +814,7 @@ mod sandbox {
             )
             .await
             .unwrap();
-        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 10]);
+        assert_eq!(strings(&tables, "table_catalog"), ["fusescope"; 11]);
         assert_eq!(
             strings(&tables, "table_name"),
             [
@@ -826,6 +826,7 @@ mod sandbox {
                 "service_graph_1m",
                 "spans",
                 "time_series",
+                "top_level_operations",
                 "trace_summary",
                 "usage_1h"
             ]

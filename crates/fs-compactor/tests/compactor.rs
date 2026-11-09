@@ -607,6 +607,8 @@ fn no_compaction() -> fs_compactor::CompactionConfig {
         trace_summary_max_bytes: 256 << 20,
         service_graph_max_spans: 4_000_000,
         service_graph_max_bytes: 256 << 20,
+        top_level_operations_max_operations: 1_000_000,
+        top_level_operations_max_bytes: 256 << 20,
         row_group_rows: 1024,
         compact_logs: false,
         text_index: fs_index::TextIndexLimits::DEFAULT,

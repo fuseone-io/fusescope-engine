@@ -398,6 +398,7 @@ impl Metrics {
             return;
         };
         render_compaction(out, &stats.compaction);
+        render_trace_derived(out, &stats.compaction);
         render_metric_compaction(out, &stats.compaction);
         render_usage(out, &stats.compaction);
         render_orphans(out, &stats.orphans);
@@ -696,6 +697,44 @@ fn render_metric_compaction(out: &mut String, c: &fs_compactor::CompactorStats) 
     );
 }
 
+fn render_trace_derived(out: &mut String, c: &fs_compactor::CompactorStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    for (name, help, value) in [
+        (
+            "fusescope_compaction_trace_summary_total",
+            "trace_summary contribution files published",
+            load(&c.trace_summary),
+        ),
+        (
+            "fusescope_compaction_trace_summary_skipped_total",
+            "Completed passes whose trace count crossed the summary cap",
+            load(&c.trace_summary_skipped),
+        ),
+        (
+            "fusescope_compaction_service_graph_total",
+            "service_graph_1m contribution files published",
+            load(&c.service_graph),
+        ),
+        (
+            "fusescope_compaction_service_graph_skipped_total",
+            "Completed passes whose span count crossed the graph cap",
+            load(&c.service_graph_skipped),
+        ),
+        (
+            "fusescope_compaction_top_level_operations_total",
+            "top_level_operations contribution files published",
+            load(&c.top_level_operations),
+        ),
+        (
+            "fusescope_compaction_top_level_operations_skipped_total",
+            "Completed passes whose operations crossed the top-level cap",
+            load(&c.top_level_operations_skipped),
+        ),
+    ] {
+        counter(out, name, help, value);
+    }
+}
+
 fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
     let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
     for (name, help, value) in [
@@ -768,26 +807,6 @@ fn render_compaction(out: &mut String, c: &fs_compactor::CompactorStats) {
             "fusescope_compaction_derived_keys_dropped_total",
             "Entries of attribute keys beyond the tenant's max_keys_hour not counted",
             load(&c.derived_keys_dropped),
-        ),
-        (
-            "fusescope_compaction_trace_summary_total",
-            "trace_summary contribution files published",
-            load(&c.trace_summary),
-        ),
-        (
-            "fusescope_compaction_trace_summary_skipped_total",
-            "Completed passes whose trace count crossed the summary cap",
-            load(&c.trace_summary_skipped),
-        ),
-        (
-            "fusescope_compaction_service_graph_total",
-            "service_graph_1m contribution files published",
-            load(&c.service_graph),
-        ),
-        (
-            "fusescope_compaction_service_graph_skipped_total",
-            "Completed passes whose span count crossed the graph cap",
-            load(&c.service_graph_skipped),
         ),
     ] {
         counter(out, name, help, value);
@@ -1239,6 +1258,10 @@ mod tests {
             .compaction
             .service_graph_skipped
             .fetch_add(9, Ordering::Relaxed);
+        compactor
+            .compaction
+            .top_level_operations_skipped
+            .fetch_add(4, Ordering::Relaxed);
         compactor.orphans.deleted.fetch_add(6, Ordering::Relaxed);
         compactor.retention.expired.fetch_add(5, Ordering::Relaxed);
         compactor
@@ -1269,6 +1292,10 @@ mod tests {
         );
         assert!(
             page.contains("fusescope_compaction_derived_keys_dropped_total 7\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_compaction_top_level_operations_skipped_total 4\n"),
             "{page}"
         );
         assert!(

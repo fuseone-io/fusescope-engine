@@ -358,6 +358,8 @@ fn config() -> CompactionConfig {
         trace_summary_max_bytes: 1 << 20,
         service_graph_max_spans: 1000,
         service_graph_max_bytes: 1 << 20,
+        top_level_operations_max_operations: 1_000_000,
+        top_level_operations_max_bytes: 256 << 20,
         row_group_rows: 4,
         usage_max_bytes: 64 << 20,
         compact_l2: true,

@@ -1815,6 +1815,15 @@
           }
         },
         {
+          "refId": "E",
+          "expr": "sum(rate(fusescope_compaction_top_level_operations_skipped_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "top_level_operations over cap/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
           "refId": "C",
           "expr": "sum(rate(fusescope_compaction_derived_keys_dropped_total{instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "attribute keys dropped/s",

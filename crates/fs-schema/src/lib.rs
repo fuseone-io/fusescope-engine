@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod parquet;
 pub mod service_graph;
 pub mod spans;
+pub mod top_level_operations;
 pub mod trace_summary;
 pub mod usage;
 

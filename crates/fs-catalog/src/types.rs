@@ -261,6 +261,8 @@ pub enum Signal {
     LogAttributeKeys,
     /// Derived: the labels, values and types of metric series.
     MetricMetadata,
+    /// Derived: operations seen on a root span or one with a remote parent.
+    TopLevelOperations,
 }
 
 impl Signal {
@@ -280,6 +282,7 @@ impl Signal {
             Signal::Rollup30m => 16,
             Signal::LogAttributeKeys => 17,
             Signal::MetricMetadata => 18,
+            Signal::TopLevelOperations => 19,
         }
     }
 
@@ -302,6 +305,7 @@ impl Signal {
             16 => Signal::Rollup30m,
             17 => Signal::LogAttributeKeys,
             18 => Signal::MetricMetadata,
+            19 => Signal::TopLevelOperations,
             other => {
                 return Err(CatalogError::InvalidValue {
                     column: "signal",
@@ -327,6 +331,7 @@ impl Signal {
             Signal::Rollup30m => "metrics/derived/rollup_30m",
             Signal::LogAttributeKeys => "derived/log_attribute_keys",
             Signal::MetricMetadata => "metrics/derived/metric_metadata",
+            Signal::TopLevelOperations => "traces/derived/top_level_operations",
         }
     }
 }
@@ -650,9 +655,12 @@ mod tests {
             Signal::Rollup5m,
             Signal::Rollup30m,
             Signal::LogAttributeKeys,
+            Signal::MetricMetadata,
+            Signal::TopLevelOperations,
         ] {
             assert_eq!(Signal::from_code(s.code()).unwrap(), s);
         }
+        assert_eq!(Signal::TopLevelOperations.code(), 19);
         assert!(Signal::from_code(99).is_err());
     }
 

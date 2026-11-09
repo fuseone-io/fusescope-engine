@@ -11,7 +11,9 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::CompactError;
-use crate::merge::{attribute_keys_path, service_graph_path, trace_summary_path};
+use crate::merge::{
+    attribute_keys_path, service_graph_path, top_level_operations_path, trace_summary_path,
+};
 
 /// The table of keys of the rows of `data`, and the catalog signal of its
 /// files; `None` for a signal whose keys are not listed.
@@ -165,6 +167,52 @@ pub(crate) fn service_graph_file(
             path: path.to_string(),
             size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
             row_count: i64::try_from(graph.len()).unwrap_or(i64::MAX),
+            range: TimeRange {
+                start: Utc.timestamp_nanos(first),
+                end: Utc.timestamp_nanos(last),
+            },
+            services,
+            summary: None,
+            content_sha256: Some(crate::objects::sha256(&bytes)),
+            usage_accounted: true,
+        },
+        bytes,
+    )))
+}
+
+/// One pass's top-level operations with their catalog row; the range is
+/// the pass's span starts, so the file expires with its spans.
+///
+/// # Errors
+/// Encoding failure.
+pub(crate) fn top_level_operations_file(
+    root: &Path,
+    tenant: TenantId,
+    hour: DateTime<Utc>,
+    rows: &fs_schema::top_level_operations::TopLevelOperations,
+) -> Result<Option<(NewFile, Bytes)>, CompactError> {
+    let Some((first, last)) = rows.range() else {
+        return Ok(None);
+    };
+    let bytes = Bytes::from(fs_schema::top_level_operations::encode(rows)?);
+    let id = FileId::new();
+    let path = top_level_operations_path(root, tenant, hour, id);
+    let services = rows
+        .iter()
+        .map(|(service, _, _)| service.to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some((
+        NewFile {
+            id,
+            origin: id,
+            tenant_id: tenant,
+            signal: Signal::TopLevelOperations,
+            level: Level::L1,
+            path: path.to_string(),
+            size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            row_count: i64::try_from(rows.len()).unwrap_or(i64::MAX),
             range: TimeRange {
                 start: Utc.timestamp_nanos(first),
                 end: Utc.timestamp_nanos(last),

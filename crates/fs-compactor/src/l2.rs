@@ -223,6 +223,8 @@ impl Compactor {
             trace_summary_max_bytes: 0,
             service_graph_max_spans: 0,
             service_graph_max_bytes: 0,
+            top_level_operations_max_operations: 0,
+            top_level_operations_max_bytes: 0,
             usage_max_bytes: self.config.usage_max_bytes,
             text_index: self.config.text_index,
         }

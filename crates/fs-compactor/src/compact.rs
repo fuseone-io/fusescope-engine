@@ -51,6 +51,9 @@ pub const MAX_SERVICES_PER_FILE: usize = 1_000_000;
 /// Most bytes a pass's usage counts hold.
 pub const MAX_USAGE_BYTES: usize = 1 << 30;
 
+/// Ceiling of `top_level_operations_max_bytes`.
+pub const MAX_TOP_LEVEL_BYTES: usize = 1 << 30;
+
 /// Least `l2_output_bytes` the server configures: below it no L1 file of
 /// wide rows fits. The compactor itself takes any budget, an input it
 /// cannot read within one passed over.
@@ -77,6 +80,11 @@ pub struct CompactionConfig {
     pub service_graph_max_spans: usize,
     /// Conservative bytes retained to build one pass's service graph.
     pub service_graph_max_bytes: usize,
+    /// Most distinct operations retained to build one pass's top-level
+    /// operations.
+    pub top_level_operations_max_operations: usize,
+    /// Conservative bytes retained to build one pass's top-level operations.
+    pub top_level_operations_max_bytes: usize,
     /// Rows per output row group.
     pub row_group_rows: usize,
     /// Also merge closed days of L1 files into L2. Off, no L2 pass runs;
@@ -187,6 +195,10 @@ pub struct CompactorStats {
     pub service_graph: AtomicU64,
     /// Completed passes whose span count crossed the graph cap.
     pub service_graph_skipped: AtomicU64,
+    /// `top_level_operations` contribution files published.
+    pub top_level_operations: AtomicU64,
+    /// Completed passes whose operations crossed the top-level cap.
+    pub top_level_operations_skipped: AtomicU64,
     /// Metric L0 to L1 passes that swapped sets in.
     pub metric_passes: AtomicU64,
     /// Metric L1 to L2 passes that swapped sets in.
@@ -217,6 +229,7 @@ struct DerivedContributions {
     keys: KeyStats,
     summaries: TraceSummaries,
     service_graph: ServiceGraphBuilder,
+    top_level: fs_schema::top_level_operations::TopLevelOperations,
     usage: Option<fs_schema::usage::UsageCounts>,
 }
 
@@ -255,9 +268,11 @@ struct PublishedDerived {
     keys: Option<NewFile>,
     summaries: Option<NewFile>,
     service_graph: Option<NewFile>,
+    top_level: Option<NewFile>,
     usage: Vec<NewFile>,
     summary_skipped: Option<DerivedLimit>,
     service_graph_skipped: Option<DerivedLimit>,
+    top_level_skipped: Option<DerivedLimit>,
 }
 
 /// The compaction side of the compactor.
@@ -458,22 +473,7 @@ impl Compactor {
             signal,
             hour,
             &owned,
-            MergeConfig {
-                level: Level::L1,
-                row_group_rows: self.config.row_group_rows,
-                read_batch_rows: self.config.row_group_rows,
-                target_bytes: self.config.l1_target_bytes,
-                output_bytes: usize::MAX,
-                max_trace_index_bytes: self.config.max_trace_index_bytes,
-                max_services_per_file: self.config.max_services_per_file,
-                max_new_keys,
-                trace_summary_max_traces: self.config.trace_summary_max_traces,
-                trace_summary_max_bytes: self.config.trace_summary_max_bytes,
-                service_graph_max_spans: self.config.service_graph_max_spans,
-                service_graph_max_bytes: self.config.service_graph_max_bytes,
-                usage_max_bytes: self.config.usage_max_bytes,
-                text_index: self.config.text_index,
-            },
+            self.l1_merge_config(max_new_keys),
             table_before,
         )
         .await?;
@@ -509,6 +509,7 @@ impl Compactor {
             keys: merger.take_keys(),
             summaries: merger.take_trace_summaries(),
             service_graph: merger.take_service_graph(),
+            top_level: merger.take_top_level_operations(),
             usage: merger.take_usage(),
         };
         drop(merger);
@@ -533,9 +534,31 @@ impl Compactor {
             derived = derived.keys.is_some(),
             trace_summary = derived.summaries.is_some(),
             service_graph = derived.service_graph.is_some(),
+            top_level_operations = derived.top_level.is_some(),
             "compacted"
         );
         Ok(compaction)
+    }
+
+    fn l1_merge_config(&self, max_new_keys: usize) -> MergeConfig {
+        MergeConfig {
+            level: Level::L1,
+            row_group_rows: self.config.row_group_rows,
+            read_batch_rows: self.config.row_group_rows,
+            target_bytes: self.config.l1_target_bytes,
+            output_bytes: usize::MAX,
+            max_trace_index_bytes: self.config.max_trace_index_bytes,
+            max_services_per_file: self.config.max_services_per_file,
+            max_new_keys,
+            trace_summary_max_traces: self.config.trace_summary_max_traces,
+            trace_summary_max_bytes: self.config.trace_summary_max_bytes,
+            service_graph_max_spans: self.config.service_graph_max_spans,
+            service_graph_max_bytes: self.config.service_graph_max_bytes,
+            top_level_operations_max_operations: self.config.top_level_operations_max_operations,
+            top_level_operations_max_bytes: self.config.top_level_operations_max_bytes,
+            usage_max_bytes: self.config.usage_max_bytes,
+            text_index: self.config.text_index,
+        }
     }
 
     /// The tenant's table of keys of the pass's signal before this pass,
@@ -613,6 +636,7 @@ impl Compactor {
             keys,
             summaries,
             service_graph,
+            top_level,
             usage,
         } = contributions;
         let root = self.root.clone();
@@ -643,6 +667,17 @@ impl Compactor {
         })
         .await??;
         let service_graph = self.publish_prepared(service_graph, guard, puts).await?;
+        let top_level_skipped = top_level.limit_exceeded().map(Into::into);
+        let top_level = if top_level_skipped.is_none() {
+            let root = self.root.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::derived::top_level_operations_file(&root, tenant, hour, &top_level)
+            })
+            .await??
+        } else {
+            None
+        };
+        let top_level = self.publish_prepared(top_level, guard, puts).await?;
         let usage = match usage {
             Some(counts) => {
                 let root = self.root.clone();
@@ -662,9 +697,11 @@ impl Compactor {
             keys,
             summaries,
             service_graph,
+            top_level,
             usage,
             summary_skipped,
             service_graph_skipped,
+            top_level_skipped,
         })
     }
 
@@ -695,6 +732,16 @@ impl Compactor {
                 .service_graph_skipped
                 .fetch_add(1, Ordering::Relaxed);
             self.report_derived_over_cap(tenant, hour, "service_graph_1m", limit);
+        }
+        if published.top_level.is_some() {
+            self.stats
+                .top_level_operations
+                .fetch_add(1, Ordering::Relaxed);
+        } else if let Some(limit) = published.top_level_skipped {
+            self.stats
+                .top_level_operations_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            self.report_derived_over_cap(tenant, hour, "top_level_operations", limit);
         }
     }
 
@@ -762,6 +809,7 @@ impl Compactor {
             .chain(derived.keys.clone())
             .chain(derived.summaries.clone())
             .chain(derived.service_graph.clone())
+            .chain(derived.top_level.clone())
             .chain(derived.usage.iter().cloned())
             .collect();
         Ok(self
@@ -834,6 +882,10 @@ fn bound_passes(config: &mut CompactionConfig) {
     config.max_trace_index_bytes = config.max_trace_index_bytes.min(MAX_TRACE_INDEX_BYTES);
     config.max_services_per_file = config.max_services_per_file.min(MAX_SERVICES_PER_FILE);
     config.usage_max_bytes = config.usage_max_bytes.min(MAX_USAGE_BYTES);
+    config.top_level_operations_max_bytes = config.top_level_operations_max_bytes.clamp(
+        fs_schema::top_level_operations::OPERATION_ENTRY_BYTES,
+        MAX_TOP_LEVEL_BYTES,
+    );
 }
 
 /// An output already in the bucket, waiting for the swap.
@@ -857,6 +909,8 @@ mod tests {
             trace_summary_max_bytes: 1 << 20,
             service_graph_max_spans: 1,
             service_graph_max_bytes: 1 << 20,
+            top_level_operations_max_operations: 1,
+            top_level_operations_max_bytes: usize::MAX,
             row_group_rows: 4,
             usage_max_bytes: usize::MAX,
             compact_l2: true,

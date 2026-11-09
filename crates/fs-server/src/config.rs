@@ -858,6 +858,12 @@ pub struct CompactorConfig {
     /// Conservative bytes retained for one pass's `service_graph_1m` builder.
     #[serde(default = "default_service_graph_max_bytes")]
     pub service_graph_max_bytes: usize,
+    /// Most distinct operations retained for one pass's `top_level_operations`.
+    #[serde(default = "default_top_level_operations_max_operations")]
+    pub top_level_operations_max_operations: usize,
+    /// Conservative bytes retained for one pass's `top_level_operations` builder.
+    #[serde(default = "default_top_level_operations_max_bytes")]
+    pub top_level_operations_max_bytes: usize,
     /// Also compact log L0 files into log L1 files with their
     /// `log_attribute_keys`. Off by default: a binary from before logs
     /// compaction cannot read a catalog that holds `log_attribute_keys`,
@@ -974,6 +980,8 @@ impl Default for CompactorConfig {
             trace_summary_max_bytes: default_trace_summary_max_bytes(),
             service_graph_max_spans: default_service_graph_max_spans(),
             service_graph_max_bytes: default_service_graph_max_bytes(),
+            top_level_operations_max_operations: default_top_level_operations_max_operations(),
+            top_level_operations_max_bytes: default_top_level_operations_max_bytes(),
             compact_logs: false,
             compact_metrics: false,
             metric_pass_bytes: default_metric_pass_bytes(),
@@ -1038,6 +1046,8 @@ impl CompactorConfig {
                 trace_summary_max_bytes: self.trace_summary_max_bytes,
                 service_graph_max_spans: self.service_graph_max_spans,
                 service_graph_max_bytes: self.service_graph_max_bytes,
+                top_level_operations_max_operations: self.top_level_operations_max_operations,
+                top_level_operations_max_bytes: self.top_level_operations_max_bytes,
                 row_group_rows,
                 text_index: self.text_index_limits().unwrap_or_default(),
                 usage_max_bytes: self.usage_max_bytes,
@@ -1162,6 +1172,14 @@ fn default_service_graph_max_spans() -> usize {
 
 fn default_service_graph_max_bytes() -> usize {
     256 * 1024 * 1024
+}
+
+fn default_top_level_operations_max_operations() -> usize {
+    1_000_000
+}
+
+fn default_top_level_operations_max_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_purge_interval() -> u64 {
@@ -1403,6 +1421,10 @@ impl Config {
             || self.compactor.service_graph_max_spans == 0
             || self.compactor.trace_summary_max_bytes < fs_schema::trace_summary::TRACE_ENTRY_BYTES
             || self.compactor.service_graph_max_bytes < fs_schema::service_graph::SPAN_ENTRY_BYTES
+            || self.compactor.top_level_operations_max_operations == 0
+            || !(fs_schema::top_level_operations::OPERATION_ENTRY_BYTES
+                ..=fs_compactor::compact::MAX_TOP_LEVEL_BYTES)
+                .contains(&self.compactor.top_level_operations_max_bytes)
             || derived_bytes
                 .is_none_or(|bytes| bytes > fs_compactor::compact::MAX_DERIVED_BUILDER_BYTES)
         {
@@ -2521,7 +2543,18 @@ mod tests {
         assert_eq!(compactor.compaction.trace_summary_max_bytes, 256 << 20);
         assert_eq!(compactor.compaction.service_graph_max_spans, 4_000_000);
         assert_eq!(compactor.compaction.service_graph_max_bytes, 256 << 20);
+        assert_eq!(
+            compactor.compaction.top_level_operations_max_operations,
+            1_000_000
+        );
+        assert_eq!(
+            compactor.compaction.top_level_operations_max_bytes,
+            64 << 20
+        );
         for bad in [
+            "top_level_operations_max_operations = 0",
+            "top_level_operations_max_bytes = 1",
+            "top_level_operations_max_bytes = 1073741825",
             "trace_summary_max_traces = 0",
             "service_graph_max_spans = 0",
             "trace_summary_max_bytes = 1",

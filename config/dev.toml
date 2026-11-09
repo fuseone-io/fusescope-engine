@@ -69,6 +69,8 @@ trace_summary_max_traces = 4000000
 trace_summary_max_bytes = 268435456
 service_graph_max_spans = 4000000
 service_graph_max_bytes = 268435456
+top_level_operations_max_operations = 1000000
+top_level_operations_max_bytes = 67108864
 compact_logs = true
 # Objects without a catalog row are deleted once seen that way for orphan_ttl_secs.
 orphan_interval_secs = 3600

@@ -217,6 +217,8 @@ fn config(row_group_rows: usize) -> CompactionConfig {
         trace_summary_max_bytes: 256 << 20,
         service_graph_max_spans: 4_000_000,
         service_graph_max_bytes: 256 << 20,
+        top_level_operations_max_operations: 1_000_000,
+        top_level_operations_max_bytes: 256 << 20,
         row_group_rows,
         compact_logs: false,
         text_index: fs_index::TextIndexLimits::DEFAULT,
@@ -389,8 +391,8 @@ async fn a_closed_hour_with_several_l0_files_becomes_one_sorted_l1_file() {
     assert_eq!(done.inputs.len(), 3);
     assert_eq!(
         done.outputs.len(),
-        4,
-        "the L1, attribute_keys, trace_summary and usage_1h files"
+        5,
+        "the L1, attribute_keys, trace_summary, top_level_operations and usage_1h files"
     );
 
     let now = visible(&f).await;
@@ -532,8 +534,9 @@ async fn outputs_close_at_the_target_size() {
     let now = visible(&f).await;
     assert_eq!(
         now.len(),
-        done.outputs.len() - 3,
-        "every L1 output; the others are attribute_keys, trace_summary and usage_1h"
+        done.outputs.len() - 4,
+        "every L1 output; the others are attribute_keys, trace_summary, \
+         top_level_operations and usage_1h"
     );
     assert_eq!(now.iter().map(|x| x.row_count).sum::<i64>(), 18);
     let mut all_rows = Vec::new();
@@ -652,8 +655,8 @@ async fn a_pass_publishes_trace_and_service_graph_contributions_with_the_l1() {
     let done = c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert_eq!(
         done.outputs.len(),
-        5,
-        "L1, the three derived files and usage"
+        6,
+        "L1, the four derived files and usage"
     );
 
     let summaries = trace_summary_files(&f).await;
@@ -793,6 +796,110 @@ async fn two_passes_leave_partial_derived_files_that_queries_aggregate() {
     f.db.finish().await;
 }
 
+/// A trace whose `web` root calls `api` across a remote parent, `api`
+/// calls `db` locally, and `worker` has a parent of unknown remoteness.
+fn entry_request(trace: u8, start: u64) -> ExportTraceServiceRequest {
+    let spans = [
+        ("web", "GET /", 1u8, None, 0u32),
+        ("api", "serve", 2, Some(1u8), 0x300),
+        ("api", "query", 3, Some(2), 0x100),
+        ("worker", "work", 4, Some(2), 0),
+    ];
+    ExportTraceServiceRequest {
+        resource_spans: spans
+            .into_iter()
+            .map(|(service, name, id, parent, flags)| ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", service)],
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![trace; 16],
+                        span_id: vec![id; 8],
+                        parent_span_id: parent.map(|p| vec![p; 8]).unwrap_or_default(),
+                        flags,
+                        name: name.into(),
+                        start_time_unix_nano: start + u64::from(id),
+                        end_time_unix_nano: start + u64::from(id) + 1_000,
+                        ..Span::default()
+                    }],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn a_pass_publishes_top_level_operations_with_the_l1() {
+    let Some(f) = fixture().await else { return };
+    let start = nanos(closed_hour()) + 60_000_000_000;
+    let mut inputs = Vec::new();
+    for trace in 1..=2u8 {
+        let at = start + u64::from(trace) * 1_000_000;
+        inputs.push(
+            write_l0(
+                &f.db.catalog,
+                &f.store,
+                f.tenant,
+                &[entry_request(trace, at)],
+                4,
+            )
+            .await,
+        );
+    }
+    registered_an_hour_ago(&f, &inputs).await;
+    let c = compactor(&f, config(4));
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+
+    let files = top_level_files(&f).await;
+    assert_eq!(files.len(), 1);
+    let traces = visible(&f).await;
+    assert!(files[0].range.start >= traces[0].range.start);
+    assert!(files[0].range.end <= traces[0].range.end);
+    let rows = q_top_level(&f).await;
+    let latest = i64::try_from(start + 2_000_000).unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("api".to_owned(), "serve".to_owned(), latest + 2),
+            ("web".to_owned(), "GET /".to_owned(), latest + 1),
+        ],
+        "a root and a remote parent count; a local or unknown parent does not"
+    );
+    assert_eq!(c.stats().top_level_operations.load(Ordering::Relaxed), 1);
+    f.db.finish().await;
+}
+
+async fn q_top_level(f: &Fixture) -> Vec<(String, String, i64)> {
+    let batches = querier(f)
+        .collect(
+            f.tenant,
+            "select service_name, name, max(last_seen) from top_level_operations \
+             group by service_name, name order by service_name, name",
+        )
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in &batches {
+        let services = batch.column(0).as_string::<i32>();
+        let names = batch.column(1).as_string::<i32>();
+        let seen = batch
+            .column(2)
+            .as_primitive::<arrow::datatypes::TimestampNanosecondType>();
+        for row in 0..batch.num_rows() {
+            out.push((
+                services.value(row).to_owned(),
+                names.value(row).to_owned(),
+                seen.value(row),
+            ));
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn derived_caps_skip_whole_contributions_and_count_them() {
     let Some(f) = fixture().await else { return };
@@ -802,14 +909,22 @@ async fn derived_caps_skip_whole_contributions_and_count_them() {
         CompactionConfig {
             trace_summary_max_traces: 1,
             service_graph_max_spans: 1,
+            top_level_operations_max_operations: 1,
             ..config(4)
         },
     );
     c.compact_once(&fence(&f).await).await.unwrap().unwrap();
     assert_eq!(trace_summary_files(&f).await.len(), 0);
     assert_eq!(service_graph_files(&f).await.len(), 0);
+    assert_eq!(top_level_files(&f).await.len(), 0);
     assert_eq!(c.stats().trace_summary_skipped.load(Ordering::Relaxed), 1);
     assert_eq!(c.stats().service_graph_skipped.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        c.stats()
+            .top_level_operations_skipped
+            .load(Ordering::Relaxed),
+        1
+    );
     f.db.finish().await;
 }
 
@@ -893,9 +1008,17 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     );
     assert_eq!(service_graph_files(&f).await.len(), 0, "and has no row");
     assert_eq!(
+        objects_under(&f, "/traces/derived/top_level_operations/")
+            .await
+            .len(),
+        1,
+        "the top-level operations went up before the swap"
+    );
+    assert_eq!(top_level_files(&f).await.len(), 0, "and have no row");
+    assert_eq!(
         c.stats().orphaned.load(Ordering::Relaxed),
-        5,
-        "the L1 object, the three derived tables and the usage"
+        6,
+        "the L1 object, the four derived tables and the usage"
     );
     assert_eq!(c.stats().failures.load(Ordering::Relaxed), 1);
 
@@ -907,6 +1030,7 @@ async fn a_crash_before_the_swap_leaves_inputs_visible_and_outputs_orphaned() {
     assert_eq!(attribute_keys_files(&f).await.len(), 1);
     assert_eq!(trace_summary_files(&f).await.len(), 1);
     assert_eq!(service_graph_files(&f).await.len(), 1);
+    assert_eq!(top_level_files(&f).await.len(), 1);
     f.db.finish().await;
 }
 
@@ -936,10 +1060,11 @@ async fn a_stale_fence_publishes_nothing() {
     assert_eq!(now.len(), inputs.len());
     assert!(now.iter().all(|x| x.level == Level::L0));
     assert_eq!(c.stats().lease_lost.load(Ordering::Relaxed), 1);
+    assert_eq!(top_level_files(&f).await.len(), 0);
     assert_eq!(
         c.stats().orphaned.load(Ordering::Relaxed),
-        5,
-        "the L1 object, the three derived tables and the usage"
+        6,
+        "the L1 object, the four derived tables and the usage"
     );
 
     // The real holder's fence works.
@@ -1740,6 +1865,13 @@ fn sha256_of(f: &Fixture, path: &str) -> [u8; 32] {
 async fn trace_summary_files(f: &Fixture) -> Vec<FileRecord> {
     f.db.catalog
         .all_visible_files(f.tenant, Signal::TraceSummary)
+        .await
+        .unwrap()
+}
+
+async fn top_level_files(f: &Fixture) -> Vec<FileRecord> {
+    f.db.catalog
+        .all_visible_files(f.tenant, Signal::TopLevelOperations)
         .await
         .unwrap()
 }

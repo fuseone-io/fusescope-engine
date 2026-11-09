@@ -368,6 +368,7 @@ impl Retention {
             Signal::MetricSamples,
             Signal::TraceSummary,
             Signal::ServiceGraph1m,
+            Signal::TopLevelOperations,
             Signal::Usage1h,
         ] {
             result = self
