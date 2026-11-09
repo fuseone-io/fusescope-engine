@@ -723,7 +723,8 @@ querier needs it for "last 5 minutes" dashboards.
   query.
 - Ingesters are discovered through the catalog (heartbeat every 2 s in
   `engine_ingester`). An ingester silent for 10 s is skipped and the querier
-  marks the result as partial in a Flight header.
+  marks the result as partial in the `x-fusescope-partial` Flight header,
+  one value per reason.
 - The scan names its signal; a ticket without one asks for spans, as tickets
   from before logs did. The ingester picks the tenant's buffers of that
   signal and checks the projection, filters and `distinct` column against

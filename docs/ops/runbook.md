@@ -143,7 +143,12 @@ objects are this deployment's.
   `fusescope_jwt_keys_stale`: fix the Secret or ConfigMap. The collectors'
   CA, `tls.ingest_client_ca`, rotates the same way; the collector trusts
   the CA that issued the ingesters' `tls.cert` (`ENGINE_CA_FILE` in
-  `config/gateway-engine.yaml`). A rotated
+  `config/gateway-engine.yaml`). The backend signs under the RFC 7638
+  thumbprint of its key as `kid`, logged by the backend at start and
+  whenever its key file changes ("engine tokens are signed under a new
+  key"): publish the new public key under that `kid` in `auth.jwt_keys`
+  beside the old one before the backend's key changes, and drop the old one
+  once no token signed by it can be live (`jwt.ttl`, 60 s by default). A rotated
   environment Secret (catalog or bucket credentials) needs a rollout; see
   `rolloutTokens` in `docs/ops/helm.md`.
 
@@ -195,7 +200,7 @@ bodies are stored and counted in `fusescope_ingest_log_bodies_truncated_total`.
 | `UNAVAILABLE` | `ingesters did not answer: …` | `metrics.select` needs every live ingester's hot window | the named ingesters; a stopped one leaves the list once its heartbeat is stale |
 
 A result carrying the `x-fusescope-partial` header is complete for what it
-read but missed something, named in the header, such as an ingester whose
+read but missed something, named in the header, one value per reason, such as an ingester whose
 hot window did not answer. An ingester of a version without logs answers a
 `logs` query with span rows; the querier leaves them out and marks the
 `logs` result partial until that ingester is rolled forward, so ingesters

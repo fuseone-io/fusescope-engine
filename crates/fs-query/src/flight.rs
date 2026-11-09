@@ -277,11 +277,11 @@ fn ipc_results(
     ))
 }
 
+/// Names each reason the result is partial in a header value of its own.
 fn announce_partial<T>(response: &mut Response<T>, warnings: &QueryWarnings) {
-    let warnings = warnings.list();
-    if !warnings.is_empty() {
-        if let Ok(value) = warnings.join("; ").parse() {
-            response.metadata_mut().insert(PARTIAL_HEADER, value);
+    for warning in warnings.list() {
+        if let Ok(value) = warning.parse() {
+            response.metadata_mut().append(PARTIAL_HEADER, value);
         }
     }
 }
@@ -490,6 +490,33 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// One header value per reason, so a reason holding "; " stays whole, and none without one.
+    #[test]
+    fn each_partial_reason_is_a_header_value_of_its_own() {
+        let warnings = QueryWarnings::default();
+        let mut quiet = Response::new(());
+        announce_partial(&mut quiet, &warnings);
+        assert!(quiet.metadata().get(PARTIAL_HEADER).is_none());
+
+        warnings.push("ingester-1 did not answer");
+        warnings.push("the hot window of a; b timed out");
+        let mut response = Response::new(());
+        announce_partial(&mut response, &warnings);
+        let values: Vec<&str> = response
+            .metadata()
+            .get_all(PARTIAL_HEADER)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            [
+                "ingester-1 did not answer",
+                "the hot window of a; b timed out"
+            ]
+        );
+    }
 
     #[test]
     fn metric_errors_map_to_their_codes() {
