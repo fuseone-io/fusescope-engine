@@ -14,14 +14,18 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::AsArray;
+use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
-use fs_catalog::{Catalog, NewTenant, TenantId};
+use chrono::TimeZone;
+use fs_catalog::{Catalog, Level, NewFile, NewTenant, Signal, TenantId, TimeRange};
 use fs_ingest::flush;
 use fs_query::{Querier, QueryLimits};
 use fs_schema::limits::Limits;
 use fs_schema::spans::SpanBatchBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
+use object_store::{ObjectStoreExt, PutPayload};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -158,6 +162,69 @@ async fn write_spans(catalog: &Catalog, store: &LocalFileSystem, tenant: TenantI
     catalog.register_file(&prepared.file).await.unwrap();
 }
 
+/// The compacted `top_level_operations` of the same spans: the frontend
+/// root's operation and cart's, reached over a remote parent.
+async fn write_top_level(catalog: &Catalog, store: &LocalFileSystem, tenant: TenantId) {
+    let mut builder = SpanBatchBuilder::new(Limits::default());
+    builder.append_request(&spans()).unwrap();
+    let mut operations = fs_schema::top_level_operations::TopLevelOperations::default();
+    operations
+        .absorb(&builder.finish().unwrap(), 100, usize::MAX)
+        .unwrap();
+    assert_eq!(operations.len(), 2);
+    let (first, last) = operations.range().unwrap();
+    let bytes = fs_schema::top_level_operations::encode(&operations).unwrap();
+    let id = fs_catalog::FileId::new();
+    let path = format!(
+        "t/{}/{}/dt=2025-05-22/hr=21/{}.parquet",
+        tenant.0,
+        Signal::TopLevelOperations.path_name(),
+        id.0
+    );
+    store
+        .put(&Path::from(path.as_str()), PutPayload::from(bytes.clone()))
+        .await
+        .unwrap();
+    catalog
+        .register_file(&NewFile {
+            id,
+            origin: id,
+            tenant_id: tenant,
+            signal: Signal::TopLevelOperations,
+            level: Level::L1,
+            path,
+            size_bytes: i64::try_from(bytes.len()).unwrap(),
+            row_count: 2,
+            range: TimeRange {
+                start: chrono::Utc.timestamp_nanos(first),
+                end: chrono::Utc.timestamp_nanos(last),
+            },
+            services: vec!["cart".into(), "frontend".into()],
+            summary: None,
+            content_sha256: Some(Sha256::digest(&bytes).into()),
+            usage_accounted: true,
+        })
+        .await
+        .unwrap();
+}
+
+/// What a case counts over the spans written: a root and spans with a
+/// remote and a local parent.
+const COUNTS: &[(&str, i64)] = &[
+    ("TestEngineFilterMatrix/isRoot_=_true", 1),
+    ("TestEngineFilterMatrix/isEntryPoint_=_true", 1),
+    (
+        "TestEngineFilterMatrix/parent_span_id_!=_'00f067aa0ba902b7'",
+        3,
+    ),
+    (
+        "TestEngineFilterMatrix/parent_span_id_NOT_IN_['00f067aa0ba902b7',_'00f067aa0ba902b8']",
+        3,
+    ),
+    ("TestEngineFilterMatrix/parent_span_id_NOT_EXISTS", 1),
+    ("TestEngineFilterMatrix/parent_span_id_EXISTS", 2),
+];
+
 #[test]
 fn the_fixture_is_the_generated_copy() {
     fixture();
@@ -193,6 +260,7 @@ async fn every_backend_trace_statement_plans_and_runs() {
     std::fs::create_dir_all(dir.path().join("bucket")).unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path().join("bucket")).unwrap());
     write_spans(&catalog, &store, tenant).await;
+    write_top_level(&catalog, &store, tenant).await;
     let querier = Querier::new(
         catalog.clone(),
         store,
@@ -208,9 +276,26 @@ async fn every_backend_trace_statement_plans_and_runs() {
     let mut rows = 0;
     for case in &fixture.cases {
         match querier.collect(tenant, &case.sql).await {
-            Ok(batches) => rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            Ok(batches) => {
+                rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                if let Some((_, want)) = COUNTS.iter().find(|(name, _)| *name == case.name) {
+                    let got = batches[0].column(0).as_primitive::<Int64Type>().value(0);
+                    if got != *want {
+                        failures.push(format!(
+                            "{}: counts {got}, not {want}\n  {}",
+                            case.name, case.sql
+                        ));
+                    }
+                }
+            }
             Err(e) => failures.push(format!("{}: {e}\n  {}", case.name, case.sql)),
         }
+    }
+    for (name, _) in COUNTS {
+        assert!(
+            fixture.cases.iter().any(|case| case.name == *name),
+            "{name} is not in the fixture"
+        );
     }
 
     catalog.pool().close().await;
