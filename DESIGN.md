@@ -1664,6 +1664,9 @@ surface and is handled as follows:
   migration left for later. Every issue,
   rotation and revocation logs a `fusescope::audit` event with the
   tenant, the token's id, name and scope.
+- Compression: the trace, log and metric services accept gzip and zstd, as
+  collectors send them; `ingest.max_message_bytes` bounds the message once
+  decompressed.
 - Limits: gRPC message size (default 16 MB), attributes per record, key and
   value size, nesting depth, and new attribute keys per tenant per hour.
   Above those, the record is accepted with the excess attributes dropped and

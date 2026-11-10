@@ -49,6 +49,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::Trac
 use prost::Message;
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tokio::task::JoinSet;
+use tonic::codec::CompressionEncoding;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -2059,10 +2060,16 @@ impl Ingester {
         }
 
         let service = TraceServiceServer::new(TraceReceiver::new(self.shared.clone()))
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(self.shared.config.max_message_bytes);
         let logs = LogsServiceServer::new(LogsReceiver::new(self.shared.clone()))
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(self.shared.config.max_message_bytes);
         let metrics = MetricsServiceServer::new(MetricsReceiver::new(self.shared.clone()))
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(self.shared.config.max_message_bytes);
         let mut server_shutdown = shutdown.clone();
         let router = tonic::transport::Server::builder()
