@@ -1,7 +1,7 @@
 {
   "format_version": 1,
-  "backend_commit": "7126cf2556d156197dc42b888a6920ab5a9524a8",
-  "sha256": "bb5688e8008dcff73dcae2ef83ea997d115ccc829b7284c014801297603c0849",
+  "backend_commit": "cf5fb5a55899adf1b732d30a7c0b422b18200432",
+  "sha256": "f028f7382e766fb86da149bbda15f2716680541e4525c47f42d58c3e5a1dcd73",
   "cases": [
     {
       "name": "TestEngineAggregationMatrix/avg(duration_nano)",
@@ -858,6 +858,14 @@
     {
       "name": "TestEngineFilterMatrix/user.id_REGEXP_'^a'",
       "sql": "SELECT count(*) AS __result_0 FROM spans WHERE (regexp_like(coalesce(attributes_string['user.id'], ''), '^a') AND attributes_string['user.id'] IS NOT NULL) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 ORDER BY __result_0 DESC"
+    },
+    {
+      "name": "TestEngineTopLevelOperationsStatement/every_service",
+      "sql": "SELECT name, service_name, max(seen) AS ts FROM (SELECT name, service_name, last_seen AS seen FROM top_level_operations WHERE last_seen >= to_timestamp_nanos(1747947419000000000) UNION ALL SELECT CAST(name AS VARCHAR) AS name, CAST(service_name AS VARCHAR) AS service_name, timestamp AS seen FROM spans WHERE timestamp >= to_timestamp_nanos(1747947419000000000) AND service_name IS NOT NULL AND (parent_span_id IS NULL OR is_remote = 'true')) AS operations GROUP BY name, service_name ORDER BY ts DESC LIMIT 5000"
+    },
+    {
+      "name": "TestEngineTopLevelOperationsStatement/some_services",
+      "sql": "SELECT name, service_name, max(seen) AS ts FROM (SELECT name, service_name, last_seen AS seen FROM top_level_operations WHERE last_seen >= to_timestamp_nanos(1747947419000000000) AND service_name IN ('frontend', 'cart') UNION ALL SELECT CAST(name AS VARCHAR) AS name, CAST(service_name AS VARCHAR) AS service_name, timestamp AS seen FROM spans WHERE timestamp >= to_timestamp_nanos(1747947419000000000) AND service_name IN ('frontend', 'cart') AND (parent_span_id IS NULL OR is_remote = 'true')) AS operations GROUP BY name, service_name ORDER BY ts DESC LIMIT 5000"
     },
     {
       "name": "TestEngineViewStatements/entry_point_operations",
