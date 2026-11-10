@@ -169,6 +169,7 @@ tracked here so the order stays visible.
 | D6 | Engine: the derived span columns `http_url`, `http_host` and `external_http_*` read as ClickHouse's, derived from the attributes at query time or stored | the views return `''` where ClickHouse has a value; D5 blocks the exit on it | a design first; D5 finds no derived-column difference | M | todo |
 | D7 | Engine: a span whose parent is in another service, remoteness unknown, is a top-level operation and an entry point as in ClickHouse | services, calls and entry points differ; D5 blocks the exit on it | a design first, which needs the parent's service across passes and hours; D5 finds no service-boundary difference | L | todo |
 | D8 | Engine and backend: an absent promoted key reads as ClickHouse's, the value (`NULL` against `''`) and the rows a negative filter keeps | a negative filter on an absent key can keep different spans; D5 blocks the exit on it | a design first; D5's absent-key cases find no field or row difference | M | todo |
+| D9 | Backend: the engine dialect's builder resolves its keys from the engine's `metadata.keys` in production, as the parity's engine graph does | production builds engine statements with ClickHouse's keys, so D5 would validate a path production does not run | the engine key store of D5 PR 3a; a latency proof (one Flight call per exact key), the behaviour with recent and hot keys, and a production assembly test with ClickHouse data calls refused; done before D5's 14 qualifying days start | M | todo |
 
 ### Group E · security before staging
 
