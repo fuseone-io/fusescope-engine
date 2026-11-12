@@ -408,6 +408,13 @@ impl Querier {
         })
     }
 
+    /// Bytes reserved in the querier's memory pool now, by queries and by
+    /// the listings of attribute keys still held.
+    #[must_use]
+    pub fn memory_reserved(&self) -> usize {
+        self.runtime.memory_pool.reserved()
+    }
+
     /// The file cache, for the notification follower.
     pub fn cache(&self) -> Arc<FileCache> {
         Arc::clone(&self.cache)
@@ -771,8 +778,8 @@ impl Querier {
         self.stats
             .metadata_lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let listed = self.listed_keys(tenant, query.table, &ctx).await?;
-        let mut frame = ctx.read_batch(listed)?;
+        let listing = self.listed_keys(tenant, query.table, &ctx).await?;
+        let mut frame = ctx.read_batch(listing.batch.clone())?;
         if let Some(prefix) = &query.prefix {
             frame = frame.filter(starts_with(col(key_col::KEY), lit(prefix.as_str())))?;
         }
@@ -784,7 +791,11 @@ impl Querier {
                 col(key_col::TYPE).sort(true, false),
             ])?
             .limit(0, Some(query.limit.min(self.limits.max_rows)))?;
-        Ok((frame.execute_stream().await?, warnings))
+        let stream = frame.execute_stream().await?;
+        Ok((
+            Box::pin(recent_keys::HeldStream::new(stream, &listing)),
+            warnings,
+        ))
     }
 
     /// Plans `sql` for `tenant`, returns the result schema and keeps the
