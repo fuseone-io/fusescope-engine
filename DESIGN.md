@@ -956,15 +956,25 @@ it as it is.
   error: it never answers in part, which would read as absence.
 - **Memory.** The recent rows stream: their keys are counted batch by
   batch, and no batch is kept. The listing's reservation in the querier's
-  memory pool (`metadata.keys`) covers each derived object before it is
-  decoded, the counted keys as they grow (each key's text plus 128 bytes),
-  and the final batch. A listing the pool cannot hold fails
+  memory pool (`metadata.keys`) grows before what it covers does:
+  - before a derived object is fetched, by its size and its keys;
+  - before a batch is counted, by every map entry of it as a new key (its
+    text plus 128 bytes);
+  - before the listing is built, by its rows (each key's text plus 96
+    bytes).
+
+  Once each step is done, the reservation is brought down to what is
+  held. The final batch keeps its charge for as long as anything holds
+  it: the cache while it keeps the listing, and a stream of it until the
+  stream is dropped. A listing the pool cannot hold fails
   `RESOURCE_EXHAUSTED` instead of growing past it.
-- **One fill at a time.** Misses of the same tenant and table share one
-  fill and its outcome, an error as much as a listing
-  (`fusescope_query_recent_keys_fills_total`). The fill is forgotten once
-  it lands, so a failure is not kept. If the request running it goes away,
-  a waiting one runs it.
+- **One fill at a time.** A miss looks, under one lock, for the fill under
+  way, then for the cache, and only then starts a fill. A fill publishes
+  before it is forgotten, so a miss after it lands reads what it published.
+  Misses of the same tenant and table share one fill and its outcome, an
+  error as much as a listing (`fusescope_query_recent_keys_fills_total`).
+  A failure is not kept. If the request running the fill goes away, a
+  waiting one runs it.
 - **Exactness.** The recent rows' keys are counted hour by hour, on what
   the table left of that hour's `max_keys_hour`, as the compactor will
   count them. So on a complete read a key is listed exactly when it is

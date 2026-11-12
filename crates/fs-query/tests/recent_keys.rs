@@ -543,3 +543,52 @@ async fn a_listing_larger_than_the_memory_pool_fails_resources_exhausted() {
     );
     f.db.finish().await;
 }
+
+/// The listing's reservation lives as long as its batch: while a stream of
+/// it is consumed, and in the cache while it is kept there; neither, and
+/// the pool is free again.
+#[tokio::test]
+async fn a_listings_reservation_lives_as_long_as_its_batch() {
+    let Some(f) = fixture(NewTenant::with_defaults("acme")).await else {
+        return;
+    };
+    write_l0(&f, &request(1, H0, 3, &["d9.held"])).await;
+    let query = KeysQuery {
+        table: KeyTable::Spans,
+        prefix: None,
+        limit: 1000,
+    };
+
+    let uncached = querier(&f, limits(Duration::ZERO));
+    let (stream, _) = uncached.metadata_keys(f.tenant, &query).await.unwrap();
+    assert!(
+        uncached.memory_reserved() > 0,
+        "held while its stream is alive"
+    );
+    drop(stream);
+    assert_eq!(uncached.memory_reserved(), 0, "released with the stream");
+
+    let cached = querier(&f, limits(Duration::from_secs(60)));
+    let (stream, _) = cached.metadata_keys(f.tenant, &query).await.unwrap();
+    let _: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert!(
+        cached.memory_reserved() > 0,
+        "held by the cache that keeps it"
+    );
+
+    let too_large = querier(
+        &f,
+        QueryLimits {
+            recent_keys_cache_bytes: 1,
+            ..limits(Duration::from_secs(60))
+        },
+    );
+    let (stream, _) = too_large.metadata_keys(f.tenant, &query).await.unwrap();
+    let _: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(
+        too_large.memory_reserved(),
+        0,
+        "not kept, released once consumed"
+    );
+    f.db.finish().await;
+}

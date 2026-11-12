@@ -42,12 +42,32 @@ const HOUR_NS: i64 = 3_600_000_000_000;
 /// its sightings, as the memory pool is charged for it.
 const KEY_ENTRY_BYTES: usize = 128;
 
+/// What one row of the final listing costs beyond its key's text: its
+/// source, type, count and three timestamps, and the offsets.
+const LISTED_ROW_BYTES: usize = 96;
+
+/// A complete listing and its charge in the memory pool, released when the
+/// last holder lets go: the cache that keeps it, the waiters of its fill or
+/// a stream of it still being read.
+#[derive(Clone)]
+pub(super) struct Listing {
+    pub(super) batch: RecordBatch,
+    held: Arc<MemoryReservation>,
+}
+
 /// The outcome of one fill, shared by every request that missed while it
 /// ran.
-type Filled = Result<RecordBatch, Arc<QueryError>>;
+type Filled = Result<Listing, Arc<QueryError>>;
 
 /// A fill under way, which the misses that join it wait on.
 type Flight = Arc<tokio::sync::OnceCell<Filled>>;
+
+/// What a miss finds, under one lock: a fill to join or start, or the
+/// listing a fill published since the miss.
+pub(super) enum Joined {
+    Cached(Listing),
+    Fill(Flight),
+}
 
 /// Complete listings of attribute keys, one a tenant and table, kept for a
 /// time and bounded by count and bytes, the oldest dropped first.
@@ -63,7 +83,7 @@ pub(super) struct KeysCache {
 
 #[derive(Default)]
 struct Kept {
-    entries: HashMap<(TenantId, KeyTable), (RecordBatch, Instant, usize)>,
+    entries: HashMap<(TenantId, KeyTable), (Listing, Instant, usize)>,
     order: VecDeque<(TenantId, KeyTable)>,
     bytes: usize,
 }
@@ -79,12 +99,23 @@ impl KeysCache {
         }
     }
 
-    /// The fill under way for `tenant` and `table`, or a new one to run.
-    pub(super) fn flight(&self, tenant: TenantId, table: KeyTable) -> Flight {
+    /// Under the lock of the fills: the fill under way for `tenant` and
+    /// `table`, else the listing in the cache, else a new fill. A fill
+    /// publishes before it is forgotten, so a miss that finds no fill finds
+    /// what the last one published.
+    pub(super) fn join(&self, tenant: TenantId, table: KeyTable) -> Joined {
         let Ok(mut inflight) = self.inflight.lock() else {
-            return Arc::new(tokio::sync::OnceCell::new());
+            return Joined::Fill(Arc::new(tokio::sync::OnceCell::new()));
         };
-        Arc::clone(inflight.entry((tenant, table)).or_default())
+        if let Some(flight) = inflight.get(&(tenant, table)) {
+            return Joined::Fill(Arc::clone(flight));
+        }
+        if let Some(listing) = self.get(tenant, table) {
+            return Joined::Cached(listing);
+        }
+        let flight: Flight = Arc::default();
+        inflight.insert((tenant, table), Arc::clone(&flight));
+        Joined::Fill(flight)
     }
 
     /// Forgets `flight` once it landed, unless a later one replaced it.
@@ -99,16 +130,16 @@ impl KeysCache {
         }
     }
 
-    pub(super) fn get(&self, tenant: TenantId, table: KeyTable) -> Option<RecordBatch> {
+    fn get(&self, tenant: TenantId, table: KeyTable) -> Option<Listing> {
         let kept = self.inner.lock().ok()?;
-        let (batch, at, _) = kept.entries.get(&(tenant, table))?;
-        (at.elapsed() < self.ttl).then(|| batch.clone())
+        let (listing, at, _) = kept.entries.get(&(tenant, table))?;
+        (at.elapsed() < self.ttl).then(|| listing.clone())
     }
 
-    /// Keeps `batch`, dropping the oldest listings until it fits; a listing
-    /// larger than the whole cache, or a zero TTL, keeps nothing.
-    pub(super) fn put(&self, tenant: TenantId, table: KeyTable, batch: RecordBatch) {
-        let size = batch.get_array_memory_size();
+    /// Keeps `listing`, dropping the oldest listings until it fits; a
+    /// listing larger than the whole cache, or a zero TTL, keeps nothing.
+    pub(super) fn put(&self, tenant: TenantId, table: KeyTable, listing: Listing) {
+        let size = listing.batch.get_array_memory_size();
         if self.ttl.is_zero() || self.max_entries == 0 || size > self.max_bytes {
             return;
         }
@@ -130,7 +161,7 @@ impl KeysCache {
         }
         kept.bytes += size;
         kept.order.push_back(key);
-        kept.entries.insert(key, (batch, Instant::now(), size));
+        kept.entries.insert(key, (listing, Instant::now(), size));
     }
 }
 
@@ -150,16 +181,16 @@ impl Querier {
         tenant: TenantId,
         table: KeyTable,
         ctx: &SessionContext,
-    ) -> Result<RecordBatch, QueryError> {
-        if let Some(batch) = self.keys_cache.get(tenant, table) {
-            return Ok(batch);
-        }
-        let flight = self.keys_cache.flight(tenant, table);
+    ) -> Result<Listing, QueryError> {
+        let flight = match self.keys_cache.join(tenant, table) {
+            Joined::Cached(listing) => return Ok(listing),
+            Joined::Fill(flight) => flight,
+        };
         let filled = flight
             .get_or_init(|| async {
                 let filled = self.fill_keys(tenant, table, ctx).await;
-                if let Ok(batch) = &filled {
-                    self.keys_cache.put(tenant, table, batch.clone());
+                if let Ok(listing) = &filled {
+                    self.keys_cache.put(tenant, table, listing.clone());
                 }
                 filled.map_err(Arc::new)
             })
@@ -170,13 +201,14 @@ impl Querier {
     }
 
     /// One fill: the snapshot, the derived table and the recent rows,
-    /// counted as they stream, everything held charged to the memory pool.
+    /// counted as they stream. Every growth is charged to the memory pool
+    /// before it happens, and the listing keeps the charge for its batch.
     async fn fill_keys(
         &self,
         tenant: TenantId,
         table: KeyTable,
         ctx: &SessionContext,
-    ) -> Result<RecordBatch, QueryError> {
+    ) -> Result<Listing, QueryError> {
         self.stats.recent_keys_fills.fetch_add(1, Ordering::Relaxed);
         let record = self
             .catalog
@@ -201,15 +233,21 @@ impl Querier {
             .await?;
         while let Some(batch) = recent.next().await {
             let batch = batch.map_err(typed)?;
+            held.try_resize(held_bytes(&stats) + growth_bound(&batch, table))?;
             stats = absorb_by_hour(stats, &batch, max_keys).map_err(|e| match e {
                 Counted::Schema(source) => counting(source),
                 Counted::Query(query) => query,
             })?;
             held.try_resize(held_bytes(&stats))?;
         }
+        held.try_resize(held_bytes(&stats) + listed_bound(&stats))?;
         let batch = stats.to_batch().map_err(counting)?;
-        held.try_resize(held_bytes(&stats) + batch.get_array_memory_size())?;
-        Ok(batch)
+        drop(stats);
+        held.try_resize(batch.get_array_memory_size())?;
+        Ok(Listing {
+            batch,
+            held: Arc::new(held),
+        })
     }
 
     /// The derived table of `files`, one in a steady catalog, decoded and
@@ -224,7 +262,12 @@ impl Querier {
         let mut stats = KeyStats::new(table);
         for file in files {
             let object = usize::try_from(file.size_bytes).unwrap_or(usize::MAX);
-            held.try_resize(held_bytes(&stats).saturating_add(object))?;
+            let keys = usize::try_from(file.row_count).unwrap_or(usize::MAX);
+            held.try_resize(
+                held_bytes(&stats)
+                    .saturating_add(object)
+                    .saturating_add(keys.saturating_mul(KEY_ENTRY_BYTES + LISTED_ROW_BYTES)),
+            )?;
             let bytes = self
                 .store
                 .get(&object_store::path::Path::from(file.path.as_str()))
@@ -268,6 +311,64 @@ impl Querier {
         columns.extend(table.map_columns().iter().map(|(name, _, _)| *name));
         let frame = ctx.read_table(Arc::new(rows))?.select_columns(&columns)?;
         frame.execute_stream().await.map_err(typed)
+    }
+}
+
+/// The most `batch` can add to the counted keys: every map entry of its
+/// rows a new key, its text and an entry.
+fn growth_bound(batch: &RecordBatch, table: KeyTable) -> usize {
+    table
+        .map_columns()
+        .iter()
+        .filter_map(|(name, _, _)| batch.column_by_name(name)?.as_map_opt())
+        .map(|map| {
+            let text = map
+                .keys()
+                .as_string_opt::<i32>()
+                .map_or(0, |keys| keys.value_data().len());
+            text + arrow::array::Array::len(map.entries()) * KEY_ENTRY_BYTES
+        })
+        .sum()
+}
+
+/// What the listing of `stats` will hold once built.
+fn listed_bound(stats: &KeyStats) -> usize {
+    stats
+        .iter()
+        .map(|(_, key, _, _)| key.len() + LISTED_ROW_BYTES)
+        .sum()
+}
+
+/// A stream of a listing's rows that keeps the listing's charge in the
+/// memory pool until it is dropped.
+pub(super) struct HeldStream {
+    inner: SendableRecordBatchStream,
+    _held: Arc<MemoryReservation>,
+}
+
+impl HeldStream {
+    pub(super) fn new(inner: SendableRecordBatchStream, listing: &Listing) -> Self {
+        Self {
+            inner,
+            _held: Arc::clone(&listing.held),
+        }
+    }
+}
+
+impl futures_util::Stream for HeldStream {
+    type Item = datafusion::error::Result<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+}
+
+impl datafusion::execution::RecordBatchStream for HeldStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
     }
 }
 
@@ -375,16 +476,47 @@ mod tests {
         RecordBatch::try_new(schema, vec![column]).unwrap()
     }
 
+    fn listed(rows: u64) -> Listing {
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        Listing {
+            batch: listing(rows),
+            held: Arc::new(MemoryConsumer::new("test").register(&pool)),
+        }
+    }
+
     fn tenant() -> TenantId {
         TenantId(uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn a_miss_joins_the_flight_under_way_or_reads_the_cache_it_published() {
+        let cache = KeysCache::new(Duration::from_secs(60), 4, 1 << 20);
+        let t = tenant();
+        let Joined::Fill(first) = cache.join(t, KeyTable::Spans) else {
+            panic!("an empty cache starts a fill");
+        };
+        let Joined::Fill(second) = cache.join(t, KeyTable::Spans) else {
+            panic!("a fill under way is joined");
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+        cache.put(t, KeyTable::Spans, listed(3));
+        cache.landed(t, KeyTable::Spans, &first);
+        assert!(
+            matches!(cache.join(t, KeyTable::Spans), Joined::Cached(ref l) if l.batch.num_rows() == 3),
+            "a miss after the fill landed reads what it published, and fills nothing"
+        );
     }
 
     #[test]
     fn a_listing_is_kept_for_its_ttl() {
         let cache = KeysCache::new(Duration::from_millis(50), 4, 1 << 20);
         let t = tenant();
-        cache.put(t, KeyTable::Spans, listing(3));
-        assert_eq!(cache.get(t, KeyTable::Spans).map(|b| b.num_rows()), Some(3));
+        cache.put(t, KeyTable::Spans, listed(3));
+        assert_eq!(
+            cache.get(t, KeyTable::Spans).map(|l| l.batch.num_rows()),
+            Some(3)
+        );
         assert!(cache.get(t, KeyTable::Logs).is_none(), "per table");
         std::thread::sleep(Duration::from_millis(60));
         assert!(cache.get(t, KeyTable::Spans).is_none());
@@ -395,9 +527,9 @@ mod tests {
         let size = listing(1000).get_array_memory_size();
         let cache = KeysCache::new(Duration::from_secs(60), 2, 2 * size);
         let (a, b, c) = (tenant(), tenant(), tenant());
-        cache.put(a, KeyTable::Spans, listing(1000));
-        cache.put(b, KeyTable::Spans, listing(1000));
-        cache.put(c, KeyTable::Spans, listing(1000));
+        cache.put(a, KeyTable::Spans, listed(1000));
+        cache.put(b, KeyTable::Spans, listed(1000));
+        cache.put(c, KeyTable::Spans, listed(1000));
         assert!(
             cache.get(a, KeyTable::Spans).is_none(),
             "the oldest is dropped"
@@ -405,13 +537,13 @@ mod tests {
         assert!(cache.get(b, KeyTable::Spans).is_some());
         assert!(cache.get(c, KeyTable::Spans).is_some());
         let tight = KeysCache::new(Duration::from_secs(60), 2, size - 1);
-        tight.put(a, KeyTable::Spans, listing(1000));
+        tight.put(a, KeyTable::Spans, listed(1000));
         assert!(
             tight.get(a, KeyTable::Spans).is_none(),
             "larger than the cache"
         );
         let off = KeysCache::new(Duration::ZERO, 2, 2 * size);
-        off.put(a, KeyTable::Spans, listing(1));
+        off.put(a, KeyTable::Spans, listed(1));
         assert!(
             off.get(a, KeyTable::Spans).is_none(),
             "a zero TTL keeps nothing"
