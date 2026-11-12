@@ -142,6 +142,9 @@ pub struct QueryStats {
     pub trace_lookups: std::sync::atomic::AtomicU64,
     /// `metadata.*` actions served.
     pub metadata_lookups: std::sync::atomic::AtomicU64,
+    /// Fills of the attribute keys listing: each a snapshot, a read of the
+    /// derived table and of the recent rows, shared by concurrent misses.
+    pub recent_keys_fills: std::sync::atomic::AtomicU64,
     /// Rows sent: by Flight executions and by queries collected in process.
     pub rows: std::sync::atomic::AtomicU64,
     /// Hot-window fan-outs performed.
