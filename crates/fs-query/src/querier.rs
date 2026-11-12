@@ -1,5 +1,7 @@
 //! The querier facade: sessions, limits and execution.
 
+mod recent_keys;
+
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -236,6 +238,15 @@ pub struct QueryLimits {
     /// How long a prepared plan waits for its `DoGet` before it is dropped;
     /// clamped to [`MAX_PREPARED_TTL`].
     pub prepared_ttl: Duration,
+    /// How long a complete listing of a tenant's attribute keys, recent
+    /// rows included, answers `metadata.keys` before it is read again: a
+    /// key of recent rows is listed within this. Zero reads every time.
+    pub recent_keys_ttl: Duration,
+    /// Most listings of attribute keys kept, one a tenant and table.
+    pub recent_keys_cache_entries: usize,
+    /// Most bytes the kept listings hold together; a listing larger on its
+    /// own is not kept.
+    pub recent_keys_cache_bytes: usize,
 }
 
 impl Default for QueryLimits {
@@ -256,6 +267,9 @@ impl Default for QueryLimits {
             prepared_plans: 1024,
             prepared_bytes: 64 * 1024 * 1024,
             prepared_ttl: Duration::from_secs(60),
+            recent_keys_ttl: Duration::from_secs(30),
+            recent_keys_cache_entries: 1024,
+            recent_keys_cache_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -294,6 +308,7 @@ pub struct Querier {
     stats: Arc<QueryStats>,
     prepared: Arc<std::sync::Mutex<PreparedPlans>>,
     verified: crate::derived_table::VerifiedPaths,
+    keys_cache: Arc<recent_keys::KeysCache>,
 }
 
 impl Querier {
@@ -376,6 +391,11 @@ impl Querier {
             store,
             runtime,
             store_url,
+            keys_cache: Arc::new(recent_keys::KeysCache::new(
+                limits.recent_keys_ttl,
+                limits.recent_keys_cache_entries,
+                limits.recent_keys_cache_bytes,
+            )),
             limits,
             prepared: Arc::new(std::sync::Mutex::new(PreparedPlans::new(Arc::clone(
                 &stats,
@@ -730,12 +750,15 @@ impl Querier {
         Ok((frame.execute_stream().await?, warnings))
     }
 
-    /// The rows of the tenant's `query.table`, `attribute_keys` or
-    /// `log_attribute_keys`, whose key starts with `query.prefix`, most
-    /// frequent first, `query.limit` at most.
+    /// The tenant's attribute keys of `query.table`, those of the
+    /// `attribute_keys` or `log_attribute_keys` table together with those
+    /// of the rows it does not hold yet, whose key starts with
+    /// `query.prefix`, most frequent first, `query.limit` at most. A key of
+    /// recent rows is listed within `recent_keys_ttl`.
     ///
     /// # Errors
-    /// Unknown tenant, planning or execution failure.
+    /// Unknown tenant, planning or execution failure, recent rows over the
+    /// tenant's byte budget, or an ingester that does not answer.
     pub async fn metadata_keys(
         &self,
         tenant: TenantId,
@@ -745,7 +768,8 @@ impl Querier {
         self.stats
             .metadata_lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut frame = ctx.table(query.table.name()).await?;
+        let listed = self.listed_keys(tenant, query.table, &ctx).await?;
+        let mut frame = ctx.read_batch(listed)?;
         if let Some(prefix) = &query.prefix {
             frame = frame.filter(starts_with(col(key_col::KEY), lit(prefix.as_str())))?;
         }

@@ -725,6 +725,17 @@ pub struct QuerySection {
     /// Seconds a prepared plan waits for its `DoGet` before it is dropped.
     #[serde(default = "default_prepared_ttl")]
     pub prepared_ttl_secs: u64,
+    /// Seconds a complete listing of attribute keys, recent rows included,
+    /// answers `metadata.keys` before it is read again, at most 600; a key
+    /// of recent rows is listed within it. Zero reads every time.
+    #[serde(default = "default_recent_keys_ttl")]
+    pub recent_keys_ttl_secs: u64,
+    /// Most listings of attribute keys kept, one a tenant and table.
+    #[serde(default = "default_recent_keys_cache_entries")]
+    pub recent_keys_cache_entries: usize,
+    /// Most bytes the kept listings hold together.
+    #[serde(default = "default_recent_keys_cache_bytes")]
+    pub recent_keys_cache_bytes: usize,
 }
 
 impl Default for QuerySection {
@@ -744,6 +755,9 @@ impl Default for QuerySection {
             prepared_plans: default_prepared_plans(),
             prepared_bytes: default_prepared_bytes(),
             prepared_ttl_secs: default_prepared_ttl(),
+            recent_keys_ttl_secs: default_recent_keys_ttl(),
+            recent_keys_cache_entries: default_recent_keys_cache_entries(),
+            recent_keys_cache_bytes: default_recent_keys_cache_bytes(),
         }
     }
 }
@@ -765,6 +779,9 @@ impl QuerySection {
             prepared_plans: self.prepared_plans,
             prepared_bytes: self.prepared_bytes,
             prepared_ttl: std::time::Duration::from_secs(self.prepared_ttl_secs),
+            recent_keys_ttl: std::time::Duration::from_secs(self.recent_keys_ttl_secs),
+            recent_keys_cache_entries: self.recent_keys_cache_entries,
+            recent_keys_cache_bytes: self.recent_keys_cache_bytes,
             ..fs_query::QueryLimits::default()
         }
     }
@@ -804,6 +821,18 @@ fn default_prepared_bytes() -> usize {
 
 fn default_prepared_ttl() -> u64 {
     fs_query::QueryLimits::default().prepared_ttl.as_secs()
+}
+
+fn default_recent_keys_ttl() -> u64 {
+    fs_query::QueryLimits::default().recent_keys_ttl.as_secs()
+}
+
+fn default_recent_keys_cache_entries() -> usize {
+    fs_query::QueryLimits::default().recent_keys_cache_entries
+}
+
+fn default_recent_keys_cache_bytes() -> usize {
+    fs_query::QueryLimits::default().recent_keys_cache_bytes
 }
 
 fn default_query_memory() -> usize {
@@ -1728,6 +1757,9 @@ impl Config {
         if self.query.prepared_ttl_secs > fs_query::querier::MAX_PREPARED_TTL.as_secs() {
             return invalid("query.prepared_ttl_secs is at most 86400");
         }
+        if self.query.recent_keys_ttl_secs > 600 {
+            return invalid("query.recent_keys_ttl_secs is at most 600");
+        }
         Ok(())
     }
 
@@ -2009,6 +2041,40 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("wal_queue")
+        );
+    }
+
+    #[test]
+    fn recent_keys_limits_are_read_and_bounded() {
+        let secrets = Secrets {
+            catalog_url: Some("postgres://x".into()),
+            ..Secrets::default()
+        };
+        let err = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\nrecent_keys_ttl_secs = 601\n",
+        )
+        .unwrap()
+        .validate(&secrets)
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("recent_keys_ttl_secs"), "{err}");
+        let limits = Config::parse(
+            "[bucket]\nkind = \"local\"\npath = \"/x\"\n[query]\nrecent_keys_ttl_secs = 0\nrecent_keys_cache_entries = 3\nrecent_keys_cache_bytes = 4\n",
+        )
+        .unwrap()
+        .query
+        .to_limits();
+        assert_eq!(
+            limits.recent_keys_ttl,
+            std::time::Duration::ZERO,
+            "zero reads every time"
+        );
+        assert_eq!(limits.recent_keys_cache_entries, 3);
+        assert_eq!(limits.recent_keys_cache_bytes, 4);
+        let defaults = QuerySection::default().to_limits();
+        assert_eq!(
+            defaults.recent_keys_ttl,
+            fs_query::QueryLimits::default().recent_keys_ttl
         );
     }
 

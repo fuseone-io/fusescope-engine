@@ -119,7 +119,7 @@ impl KeyTable {
     }
 
     /// The map columns of the rows and what their keys are.
-    fn map_columns(self) -> [(&'static str, KeySource, KeyType); 5] {
+    pub fn map_columns(self) -> [(&'static str, KeySource, KeyType); 5] {
         let row = self.row_source();
         [
             (col::RESOURCES_STRING, KeySource::Resource, KeyType::String),

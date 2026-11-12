@@ -56,6 +56,9 @@ pub struct SignalTable {
     hot_required: bool,
     /// What the hot window's answers are charged to before they are held.
     hot_charge: Option<crate::hot::Charge>,
+    /// The files to read, fixed by the caller's snapshot, in place of the
+    /// cache's visible files.
+    files: Option<Arc<Vec<fs_catalog::FileRecord>>>,
 }
 
 /// The files a scan opens and what the text index made of them.
@@ -122,7 +125,17 @@ impl SignalTable {
             source_order: false,
             hot_required: false,
             hot_charge: None,
+            files: None,
         }
+    }
+
+    /// Reads `files` alone, a listing the caller took from one catalog
+    /// snapshot, instead of the cache's visible files; pruning and the hot
+    /// window's exclusions still apply to them.
+    #[must_use]
+    pub fn over_files(mut self, files: Arc<Vec<fs_catalog::FileRecord>>) -> Self {
+        self.files = Some(files);
+        self
     }
 
     /// Shows the samples' source order, for a reader that deduplicates
@@ -217,7 +230,10 @@ impl SignalTable {
         excluded: &std::collections::HashSet<fs_catalog::FileId>,
     ) -> Result<Planned, QueryError> {
         let pruning = self.pruning(filters);
-        let all = self.cache.files(self.tenant, self.catalog_signal()).await?;
+        let all = match &self.files {
+            Some(files) => Arc::clone(files),
+            None => self.cache.files(self.tenant, self.catalog_signal()).await?,
+        };
         let candidates: Vec<&fs_catalog::FileRecord> = all
             .iter()
             .filter(|f| {
