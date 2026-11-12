@@ -240,8 +240,11 @@ async fn fixture() -> Option<Fixture> {
     )
     .await;
 
+    // Every listing of keys read again: the tests change the tables between
+    // listings, and the cache is tested on its own (tests/recent_keys.rs).
     let limits = QueryLimits {
         timeout: Duration::from_secs(30),
+        recent_keys_ttl: Duration::ZERO,
         ..QueryLimits::default()
     };
     let querier = Querier::new(
@@ -2023,8 +2026,9 @@ async fn metadata_operations_action_lists_the_operations_of_a_service() {
     f.db.finish().await;
 }
 
-/// `metadata.keys` reads the tenant's `attribute_keys` table, most
-/// frequent first, narrowed by a prefix; SQL reads the same table; a tenant
+/// `metadata.keys` reads the tenant's `attribute_keys` table with the L0
+/// rows it does not hold yet, most frequent first, narrowed by a prefix;
+/// SQL reads the table alone; a tenant
 /// without one gets an empty answer, and so do logs without theirs; a
 /// signal without a table is refused.
 #[tokio::test]
@@ -2095,7 +2099,9 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
     );
     assert_eq!(strings(&all, "source"), ["span", "resource"]);
     assert_eq!(strings(&all, "type"), ["string", "string"]);
-    assert_eq!(counts(&all, "count"), [3, 3]);
+    // 3 spans in the table, and the 22 of the fixture's L0 files, which no
+    // compaction holds yet; the other tenant's 100 are not counted.
+    assert_eq!(counts(&all, "count"), [25, 25]);
     let http = action(
         &mut client,
         METADATA_KEYS,
@@ -2133,9 +2139,9 @@ async fn metadata_keys_action_reads_the_attribute_keys_table() {
         .await
         .unwrap();
     assert_eq!(
-        theirs.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        0,
-        "no table of their own, nothing of ours"
+        counts(&theirs, "count"),
+        [100, 100],
+        "no table of their own: the 100 spans of their own L0 file, nothing of ours"
     );
 
     // A v1 file, which lacks admitted_hour, reads through the v2 table
@@ -2411,9 +2417,9 @@ async fn metadata_keys_lists_log_keys_from_their_own_table() {
         .await
         .unwrap();
     assert_eq!(
-        traces.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        0,
-        "log keys are not span keys"
+        strings(&traces, "key"),
+        ["http.request.method", "service.name"],
+        "the span keys of the fixture's L0 files; log keys are not span keys"
     );
     let by_sql = f
         .querier

@@ -935,8 +935,41 @@ the table says is left for its hour. Within a pass
 keys are admitted in merge order and never allocated for beyond the
 budget (`fusescope_compaction_derived_keys_dropped_total`); which keys an
 hour admits depends on how its files were split into passes, the total
-does not. Keys of rows not yet compacted are not listed: the table lags
-ingestion by the hour close delay. The format carries its signal and
+does not. The table itself lags ingestion by the hour close delay: it
+holds the keys of compacted rows only, and SQL over `attribute_keys` reads
+it as it is.
+
+`metadata.keys` lists every row's keys:
+- **Coverage.** The rows the table does not hold yet are the visible L0
+  files of the signal and the hot window. The catalog lists those L0 files
+  and the visible table in one repeatable-read snapshot
+  (`Catalog::keys_snapshot`). A compaction swaps its L0 inputs out and the
+  table it rebuilt in within one transaction, so the two never overlap nor
+  leave a gap, a late L0 of an old hour included. The L0 files and the hot
+  window are read as the `spans` or `logs` table reads them: the hot
+  window first, leaving out the files it still serves. A compacted file's
+  rows are never in the hot window, because the hour close delay exceeds
+  the persisted retention plus a query timeout plus the file cache TTL.
+- **Budget and failure.** The read is charged to the tenant's byte
+  budget. A read over it fails `RESOURCE_EXHAUSTED`, and an ingester that
+  does not answer fails `UNAVAILABLE`. A listing is complete or it is an
+  error: it never answers in part, which would read as absence.
+- **Exactness.** The recent rows' keys are counted hour by hour, on what
+  the table left of that hour's `max_keys_hour`, as the compactor will
+  count them. So on a complete read a key is listed exactly when it is
+  admitted, and its count is every row read that carries it. When an
+  hour's budget binds, the recent keys are admitted in read order; that
+  may name other keys than the compactor later admits, though never more
+  of them.
+- **Cache.** A complete listing, one a tenant and table, answers again
+  for `query.recent_keys_ttl_secs` (30 s, at most 600, zero reads every
+  time). The cache keeps `query.recent_keys_cache_entries` listings (1024)
+  in `query.recent_keys_cache_bytes` (32 MiB), the oldest dropped first and
+  a listing larger than the whole cache not kept. The prefix and the limit
+  are applied after it. A key of recent rows is therefore listed within one
+  TTL, not at once.
+
+The format carries its signal and
 version in the schema metadata and each version has one exact physical
 layout, every column required (v2 the seven columns, `admitted_hour`
 always the start of an hour; v1 the six, read with the hour of
