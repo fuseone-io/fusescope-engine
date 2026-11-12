@@ -20,7 +20,7 @@ mod types;
 mod usage;
 mod watch;
 
-pub use catalog::{ACQUIRE_TIMEOUT, Catalog};
+pub use catalog::{ACQUIRE_TIMEOUT, Catalog, KeysSnapshot};
 pub use compaction::CompactionInputs;
 pub use lease::{COMPACTOR_LEASE, Lease, LeaseFence};
 pub use metric_sets::{MetricInputs, MetricPass, MetricSet};
