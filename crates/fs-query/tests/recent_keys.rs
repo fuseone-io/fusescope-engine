@@ -453,3 +453,93 @@ async fn the_keys_of_rows_only_the_hot_window_holds_are_listed_once() {
     task.await.unwrap().unwrap();
     f.db.finish().await;
 }
+
+fn fills(q: &Querier) -> u64 {
+    q.stats()
+        .recent_keys_fills
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Concurrent misses share one fill: one snapshot, one read, one answer.
+#[tokio::test]
+async fn concurrent_misses_share_one_fill() {
+    let Some(f) = fixture(NewTenant::with_defaults("acme")).await else {
+        return;
+    };
+    write_l0(&f, &request(1, H0, 3, &["d9.shared"])).await;
+    let q = querier(&f, limits(Duration::from_secs(60)));
+    let answers = futures_util::future::join_all((0..8).map(|_| keys(&q, f.tenant))).await;
+    for answer in answers {
+        assert_eq!(answer.unwrap().get("d9.shared"), Some(&3));
+    }
+    assert_eq!(fills(&q), 1, "eight misses, one fill");
+    f.db.finish().await;
+}
+
+/// Concurrent misses share one failure too, and a failure is not kept: the
+/// next miss fills again.
+#[tokio::test]
+async fn concurrent_misses_share_one_failure_that_is_not_kept() {
+    let Some(f) = fixture(NewTenant::with_defaults("acme")).await else {
+        return;
+    };
+    write_l0(&f, &request(1, H0, 3, &["d9.shared"])).await;
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = silent.local_addr().unwrap().to_string();
+    drop(silent);
+    f.db.catalog
+        .heartbeat("ingester-gone", &address)
+        .await
+        .unwrap();
+    let q = querier(&f, limits(Duration::from_secs(60)));
+    let answers = futures_util::future::join_all((0..6).map(|_| keys(&q, f.tenant))).await;
+    for answer in answers {
+        let err = answer.unwrap_err();
+        assert!(matches!(err, QueryError::HotUnavailable(_)), "{err}");
+    }
+    assert_eq!(fills(&q), 1, "six misses, one fill");
+    assert!(keys(&q, f.tenant).await.is_err());
+    assert_eq!(fills(&q), 2, "the failure was not kept");
+    f.db.finish().await;
+}
+
+/// The derived table and the counted keys are held under the querier's
+/// memory pool: a table too large for it fails the listing as resources
+/// exhausted instead of growing past it.
+#[tokio::test]
+async fn a_listing_larger_than_the_memory_pool_fails_resources_exhausted() {
+    let Some(f) = fixture(NewTenant::with_defaults("acme")).await else {
+        return;
+    };
+    let names: Vec<String> = (0..400).map(|i| format!("d9.key.{i:04}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let many = request(1, H0, 50, &refs);
+    write_derived(&f, &[(&many, H0)]).await;
+    let q = querier(
+        &f,
+        QueryLimits {
+            memory_bytes: 16 * 1024,
+            ..limits(Duration::ZERO)
+        },
+    );
+    let err = keys(&q, f.tenant).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            QueryError::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
+        ),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("metadata.keys"),
+        "refused by the listing's own reservation, before any operator: {err}"
+    );
+    let roomy = querier(&f, limits(Duration::ZERO));
+    let listed = keys(&roomy, f.tenant).await.unwrap();
+    assert!(
+        listed.len() > 200 && listed.contains_key("service.name"),
+        "the same table fits the default pool: {} keys",
+        listed.len()
+    );
+    f.db.finish().await;
+}

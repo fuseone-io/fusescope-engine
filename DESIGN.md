@@ -954,6 +954,17 @@ it as it is.
   budget. A read over it fails `RESOURCE_EXHAUSTED`, and an ingester that
   does not answer fails `UNAVAILABLE`. A listing is complete or it is an
   error: it never answers in part, which would read as absence.
+- **Memory.** The recent rows stream: their keys are counted batch by
+  batch, and no batch is kept. The listing's reservation in the querier's
+  memory pool (`metadata.keys`) covers each derived object before it is
+  decoded, the counted keys as they grow (each key's text plus 128 bytes),
+  and the final batch. A listing the pool cannot hold fails
+  `RESOURCE_EXHAUSTED` instead of growing past it.
+- **One fill at a time.** Misses of the same tenant and table share one
+  fill and its outcome, an error as much as a listing
+  (`fusescope_query_recent_keys_fills_total`). The fill is forgotten once
+  it lands, so a failure is not kept. If the request running it goes away,
+  a waiting one runs it.
 - **Exactness.** The recent rows' keys are counted hour by hour, on what
   the table left of that hour's `max_keys_hour`, as the compactor will
   count them. So on a complete read a key is listed exactly when it is

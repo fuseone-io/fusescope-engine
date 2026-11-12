@@ -540,6 +540,7 @@ impl Metrics {
                 "metadata.* and metrics.label_* actions served",
                 q.metadata_lookups.load(Ordering::Relaxed),
             );
+            render_key_listings(out, q);
             render_metric_queries(out, q);
             counter(
                 out,
@@ -617,6 +618,15 @@ fn render_usage(out: &mut String, c: &fs_compactor::CompactorStats) {
         "fusescope_usage_peak_bytes",
         "Most bytes of usage counts one pass held at once since start",
         c.usage_peak_bytes.load(Ordering::Relaxed),
+    );
+}
+
+fn render_key_listings(out: &mut String, q: &fs_query::QueryStats) {
+    counter(
+        out,
+        "fusescope_query_recent_keys_fills_total",
+        "Fills of the metadata.keys listing, each shared by the misses it served",
+        q.recent_keys_fills.load(Ordering::Relaxed),
     );
 }
 
@@ -1392,6 +1402,7 @@ mod tests {
         query.plannings.fetch_add(2, Ordering::Relaxed);
         query.trace_lookups.fetch_add(3, Ordering::Relaxed);
         query.metadata_lookups.fetch_add(4, Ordering::Relaxed);
+        query.recent_keys_fills.fetch_add(16, Ordering::Relaxed);
         query.metric_selects.fetch_add(11, Ordering::Relaxed);
         query.metric_ambiguous.fetch_add(12, Ordering::Relaxed);
         query.metric_index_fetches.fetch_add(13, Ordering::Relaxed);
@@ -1411,6 +1422,10 @@ mod tests {
         );
         assert!(
             page.contains("fusescope_query_metadata_lookups_total 4\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_query_recent_keys_fills_total 16\n"),
             "{page}"
         );
         for line in [
