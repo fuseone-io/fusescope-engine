@@ -2770,3 +2770,65 @@ async fn a_closed_day_without_l0_files_is_ready_for_l2() {
     );
     db.finish().await;
 }
+
+/// The keys snapshot reads, in one transaction, the row files the derived
+/// keys table does not hold yet, every visible L0 of the signal, and the
+/// visible keys table: never an L1, a file a compaction quarantined, or
+/// another tenant's.
+#[tokio::test]
+async fn a_keys_snapshot_holds_the_l0_files_and_the_keys_table_of_one_state() {
+    let Some(db) = TestDb::new().await else {
+        return;
+    };
+    let c = &db.catalog;
+    let t = c
+        .create_tenant(&NewTenant::with_defaults("keys"))
+        .await
+        .unwrap()
+        .id;
+    let other = c
+        .create_tenant(&NewTenant::with_defaults("keys-other"))
+        .await
+        .unwrap()
+        .id;
+    let open = c
+        .register_file(&file(t, Signal::Traces, 5, 5, &["api"]))
+        .await
+        .unwrap();
+    let late = c
+        .register_file(&file(t, Signal::Traces, 1, 1, &["api"]))
+        .await
+        .unwrap();
+    let compacted = c
+        .register_file(&file(t, Signal::Traces, 2, 2, &["api"]))
+        .await
+        .unwrap();
+    let mut l1 = file(t, Signal::Traces, 2, 2, &["api"]);
+    l1.level = Level::L1;
+    let mut keys = file(t, Signal::AttributeKeys, 2, 2, &[]);
+    keys.level = Level::L1;
+    c.swap_files(t, Signal::Traces, &[compacted.id], &[l1.clone()])
+        .await
+        .unwrap();
+    let keys = c.register_file(&keys).await.unwrap();
+    c.register_file(&file(other, Signal::Traces, 5, 5, &["api"]))
+        .await
+        .unwrap();
+    c.register_file(&file(t, Signal::Logs, 5, 5, &["api"]))
+        .await
+        .unwrap();
+
+    let snapshot = c
+        .keys_snapshot(t, Signal::Traces, Signal::AttributeKeys)
+        .await
+        .unwrap();
+    let mut l0: Vec<_> = snapshot.l0.iter().map(|f| f.id).collect();
+    l0.sort_by_key(|id| id.0);
+    let mut want = vec![open.id, late.id];
+    want.sort_by_key(|id| id.0);
+    assert_eq!(l0, want, "every visible L0, a late one of an old hour too");
+    assert_eq!(
+        snapshot.keys.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [keys.id]
+    );
+}

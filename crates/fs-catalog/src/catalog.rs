@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::CatalogError;
 use crate::token::{TenantToken, TokenScope, generate_token, hash_token};
 use crate::types::{
-    Compaction, FileId, FileRecord, FileRow, FileSetId, FileState, Ingester, NewFile, NewTenant,
-    PurgedFile, Signal, Tenant, TenantId, TimeRange,
+    Compaction, FileId, FileRecord, FileRow, FileSetId, FileState, Ingester, Level, NewFile,
+    NewTenant, PurgedFile, Signal, Tenant, TenantId, TimeRange,
 };
 use crate::watch::Watcher;
 
@@ -255,6 +255,52 @@ impl Catalog {
         .await?;
         tx.commit().await?;
         rows.into_iter().map(FileRecord::try_from).collect()
+    }
+
+    /// The row files of `rows` the derived table of `keys` does not hold
+    /// yet, every visible L0 of `tenant`, and that visible derived table,
+    /// read in one snapshot: a compaction swaps its L0 inputs out and the
+    /// table it rebuilt in together, so the two never overlap nor leave a
+    /// gap between them.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn keys_snapshot(
+        &self,
+        tenant: TenantId,
+        rows: Signal,
+        keys: Signal,
+    ) -> Result<KeysSnapshot, CatalogError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read, read only")
+            .execute(&mut *tx)
+            .await?;
+        let listed = sqlx::query_as::<_, FileRow>(
+            "select id, origin, tenant_id, signal, level, path, size_bytes, row_count, ts_min, ts_max,
+                    services, summary, content_sha256, state, created_at, quarantined_at, usage_accounted
+             from engine_file
+             where tenant_id = $1 and state = $2
+               and ((signal = $3 and level = $4) or signal = $5)
+             order by ts_min, id",
+        )
+        .bind(tenant)
+        .bind(FileState::Visible.code())
+        .bind(rows.code())
+        .bind(Level::L0.code())
+        .bind(keys.code())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut snapshot = KeysSnapshot::default();
+        for row in listed {
+            let file = FileRecord::try_from(row)?;
+            if file.signal == keys {
+                snapshot.keys.push(file);
+            } else {
+                snapshot.l0.push(file);
+            }
+        }
+        Ok(snapshot)
     }
 
     /// Latest `ts_max` among visible files of a tenant and signal: how far the
@@ -702,4 +748,13 @@ fn verify_same_content(file: &NewFile, existing: &FileRow) -> Result<(), Catalog
         }
     }
     Ok(())
+}
+
+/// What [`Catalog::keys_snapshot`] reads in one snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct KeysSnapshot {
+    /// The visible L0 files of the row signal, oldest first.
+    pub l0: Vec<FileRecord>,
+    /// The visible files of the derived keys table.
+    pub keys: Vec<FileRecord>,
 }
