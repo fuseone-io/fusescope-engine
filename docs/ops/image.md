@@ -59,6 +59,21 @@ checks it is CycloneDX 1.5 JSON whose root is the binary, with a non-empty
 graph naming the engine's runtime crates. It lists crates only: the
 distroless base's Debian packages are recorded by the base image itself.
 
+## Build cache
+
+The build stage uses cargo-chef: a `planner` stage reduces the workspace to
+a recipe of its manifests, a `cook` stage compiles the dependencies from
+that recipe alone, and only then is the source copied. The dependency layer
+changes with `Cargo.lock` and the manifests, not with the code, so the
+GitHub Actions layer cache (`type=gha`) reuses it across runs. The `PROFILE`
+build argument picks the Cargo profile: `release` (fat LTO, one codegen
+unit) by default and for every published image; the CI `image` job of a
+pull request and of `main` builds `ci`, the same profile with thin LTO and
+parallel codegen, to check the image in minutes. Caches are scoped by
+profile: `ci` for the CI job, and `release`, which `main` keeps warm with a
+`cook`-only build (`release-cache`), since a tag reads the cache of `main`
+and its own alone.
+
 ## Releases
 
 A tag `v<version>`, equal to the workspace version, publishes the image

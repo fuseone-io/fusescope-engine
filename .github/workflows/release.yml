@@ -38,8 +38,8 @@ jobs:
           context: .
           load: true
           tags: fusescope-engine:release
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
       - run: scripts/image-check.sh fusescope-engine:release
         env:
           SBOM_OUT: sbom.cdx.json

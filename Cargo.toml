@@ -91,6 +91,13 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+# The CI image job's build: release semantics, thin LTO and parallel
+# codegen, so a pull request's image builds in minutes; tags use `release`.
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [profile.bench]
 inherits = "release"
 debug = true
