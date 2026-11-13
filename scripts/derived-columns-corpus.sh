@@ -54,7 +54,8 @@ for _ in $(seq 60); do
 done
 sleep 5
 echo '---rows'
-query "SELECT span_id, kind, http_url, http_host, external_http_method, external_http_url, http_method
+query "SELECT span_id, kind, http_url, http_host, external_http_method, external_http_url, http_method,
+              response_status_code, db_name, db_operation
        FROM signoz_traces.distributed_signoz_index_v3 WHERE startsWith(trace_id, 'd6c0$RUN') FORMAT JSONEachRow"
 echo '---versions'
 printf '{"collector":"%s","clickhouse":"%s","table":"signoz_traces.distributed_signoz_index_v3","run":"%s"}\n' \

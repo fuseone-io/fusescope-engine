@@ -1,0 +1,7487 @@
+{
+ "versions": {
+  "collector": "ghcr.io/fuseone-io/fusescope-collector:0.6.1@sha256:bca9dd696fb69558dff92eb52fc7f3400f79b38ea645501acb7afc3394e53baf",
+  "clickhouse": "25.12.5.44",
+  "table": "signoz_traces.distributed_signoz_index_v3",
+  "run": "6fa5aaaf"
+ },
+ "request": {
+  "resourceSpans": [
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "d6-corpus-6fa5aaaf"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {
+       "name": "d6-corpus"
+      },
+      "spans": [
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000001",
+        "spanId": "d600000000000001",
+        "name": "db_name:server_db.name_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803453717221",
+        "endTimeUnixNano": "1794595803454217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000002",
+        "spanId": "d600000000000002",
+        "name": "db_name:server_db.name_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803454717221",
+        "endTimeUnixNano": "1794595803455217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000003",
+        "spanId": "d600000000000003",
+        "name": "db_name:server_db.name_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803455717221",
+        "endTimeUnixNano": "1794595803456217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000004",
+        "spanId": "d600000000000004",
+        "name": "db_name:server_db.namespace_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803456717221",
+        "endTimeUnixNano": "1794595803457217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000005",
+        "spanId": "d600000000000005",
+        "name": "db_name:server_db.namespace_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803457717221",
+        "endTimeUnixNano": "1794595803458217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000006",
+        "spanId": "d600000000000006",
+        "name": "db_name:server_db.namespace_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803458717221",
+        "endTimeUnixNano": "1794595803459217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000007",
+        "spanId": "d600000000000007",
+        "name": "db_name:server_db.name_then_db.namespace",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803459717221",
+        "endTimeUnixNano": "1794595803460217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         },
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000008",
+        "spanId": "d600000000000008",
+        "name": "db_name:server_db.name_then_db.namespace_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803460717221",
+        "endTimeUnixNano": "1794595803461217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         },
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000009",
+        "spanId": "d600000000000009",
+        "name": "db_name:server_db.name_int_then_db.namespace_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803461717221",
+        "endTimeUnixNano": "1794595803462217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "db.namespace",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000000a",
+        "spanId": "d60000000000000a",
+        "name": "db_name:server_db.namespace_then_db.name",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803462717221",
+        "endTimeUnixNano": "1794595803463217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         },
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000000b",
+        "spanId": "d60000000000000b",
+        "name": "db_name:server_db.namespace_then_db.name_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803463717221",
+        "endTimeUnixNano": "1794595803464217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         },
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000000c",
+        "spanId": "d60000000000000c",
+        "name": "db_name:server_db.namespace_int_then_db.name_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803464717221",
+        "endTimeUnixNano": "1794595803465217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "db.name",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000000d",
+        "spanId": "d60000000000000d",
+        "name": "db_name:server_none",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803465717221",
+        "endTimeUnixNano": "1794595803466217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000000e",
+        "spanId": "d60000000000000e",
+        "name": "db_name:client_db.name_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803466717221",
+        "endTimeUnixNano": "1794595803467217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000000f",
+        "spanId": "d60000000000000f",
+        "name": "db_name:client_db.name_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803467717221",
+        "endTimeUnixNano": "1794595803468217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000010",
+        "spanId": "d600000000000010",
+        "name": "db_name:client_db.name_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803468717221",
+        "endTimeUnixNano": "1794595803469217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000011",
+        "spanId": "d600000000000011",
+        "name": "db_name:client_db.namespace_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803469717221",
+        "endTimeUnixNano": "1794595803470217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000012",
+        "spanId": "d600000000000012",
+        "name": "db_name:client_db.namespace_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803470717221",
+        "endTimeUnixNano": "1794595803471217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000013",
+        "spanId": "d600000000000013",
+        "name": "db_name:client_db.namespace_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803471717221",
+        "endTimeUnixNano": "1794595803472217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000014",
+        "spanId": "d600000000000014",
+        "name": "db_name:client_db.name_then_db.namespace",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803472717221",
+        "endTimeUnixNano": "1794595803473217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         },
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000015",
+        "spanId": "d600000000000015",
+        "name": "db_name:client_db.name_then_db.namespace_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803473717221",
+        "endTimeUnixNano": "1794595803474217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         },
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000016",
+        "spanId": "d600000000000016",
+        "name": "db_name:client_db.name_int_then_db.namespace_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803474717221",
+        "endTimeUnixNano": "1794595803475217221",
+        "attributes": [
+         {
+          "key": "db.name",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "db.namespace",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000017",
+        "spanId": "d600000000000017",
+        "name": "db_name:client_db.namespace_then_db.name",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803475717221",
+        "endTimeUnixNano": "1794595803476217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         },
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": "db_name-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000018",
+        "spanId": "d600000000000018",
+        "name": "db_name:client_db.namespace_then_db.name_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803476717221",
+        "endTimeUnixNano": "1794595803477217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "stringValue": "db_name-1"
+          }
+         },
+         {
+          "key": "db.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000019",
+        "spanId": "d600000000000019",
+        "name": "db_name:client_db.namespace_int_then_db.name_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803477717221",
+        "endTimeUnixNano": "1794595803478217221",
+        "attributes": [
+         {
+          "key": "db.namespace",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "db.name",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000001a",
+        "spanId": "d60000000000001a",
+        "name": "db_name:client_none",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803478717221",
+        "endTimeUnixNano": "1794595803479217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000001b",
+        "spanId": "d60000000000001b",
+        "name": "db_operation:server_db.operation_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803479717221",
+        "endTimeUnixNano": "1794595803480217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000001c",
+        "spanId": "d60000000000001c",
+        "name": "db_operation:server_db.operation_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803480717221",
+        "endTimeUnixNano": "1794595803481217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000001d",
+        "spanId": "d60000000000001d",
+        "name": "db_operation:server_db.operation_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803481717221",
+        "endTimeUnixNano": "1794595803482217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000001e",
+        "spanId": "d60000000000001e",
+        "name": "db_operation:server_db.operation.name_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803482717221",
+        "endTimeUnixNano": "1794595803483217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000001f",
+        "spanId": "d60000000000001f",
+        "name": "db_operation:server_db.operation.name_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803483717221",
+        "endTimeUnixNano": "1794595803484217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000020",
+        "spanId": "d600000000000020",
+        "name": "db_operation:server_db.operation.name_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803484717221",
+        "endTimeUnixNano": "1794595803485217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000021",
+        "spanId": "d600000000000021",
+        "name": "db_operation:server_db.operation_then_db.operation.name",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803485717221",
+        "endTimeUnixNano": "1794595803486217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         },
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000022",
+        "spanId": "d600000000000022",
+        "name": "db_operation:server_db.operation_then_db.operation.name_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803486717221",
+        "endTimeUnixNano": "1794595803487217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         },
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000023",
+        "spanId": "d600000000000023",
+        "name": "db_operation:server_db.operation_int_then_db.operation.name_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803487717221",
+        "endTimeUnixNano": "1794595803488217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "db.operation.name",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000024",
+        "spanId": "d600000000000024",
+        "name": "db_operation:server_db.operation.name_then_db.operation",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803488717221",
+        "endTimeUnixNano": "1794595803489217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         },
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000025",
+        "spanId": "d600000000000025",
+        "name": "db_operation:server_db.operation.name_then_db.operation_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803489717221",
+        "endTimeUnixNano": "1794595803490217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         },
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000026",
+        "spanId": "d600000000000026",
+        "name": "db_operation:server_db.operation.name_int_then_db.operation_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803490717221",
+        "endTimeUnixNano": "1794595803491217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "db.operation",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000027",
+        "spanId": "d600000000000027",
+        "name": "db_operation:server_none",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803491717221",
+        "endTimeUnixNano": "1794595803492217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000028",
+        "spanId": "d600000000000028",
+        "name": "db_operation:client_db.operation_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803492717221",
+        "endTimeUnixNano": "1794595803493217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000029",
+        "spanId": "d600000000000029",
+        "name": "db_operation:client_db.operation_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803493717221",
+        "endTimeUnixNano": "1794595803494217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000002a",
+        "spanId": "d60000000000002a",
+        "name": "db_operation:client_db.operation_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803494717221",
+        "endTimeUnixNano": "1794595803495217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000002b",
+        "spanId": "d60000000000002b",
+        "name": "db_operation:client_db.operation.name_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803495717221",
+        "endTimeUnixNano": "1794595803496217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000002c",
+        "spanId": "d60000000000002c",
+        "name": "db_operation:client_db.operation.name_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803496717221",
+        "endTimeUnixNano": "1794595803497217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000002d",
+        "spanId": "d60000000000002d",
+        "name": "db_operation:client_db.operation.name_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803497717221",
+        "endTimeUnixNano": "1794595803498217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000002e",
+        "spanId": "d60000000000002e",
+        "name": "db_operation:client_db.operation_then_db.operation.name",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803498717221",
+        "endTimeUnixNano": "1794595803499217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         },
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000002f",
+        "spanId": "d60000000000002f",
+        "name": "db_operation:client_db.operation_then_db.operation.name_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803499717221",
+        "endTimeUnixNano": "1794595803500217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         },
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000030",
+        "spanId": "d600000000000030",
+        "name": "db_operation:client_db.operation_int_then_db.operation.name_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803500717221",
+        "endTimeUnixNano": "1794595803501217221",
+        "attributes": [
+         {
+          "key": "db.operation",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "db.operation.name",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000031",
+        "spanId": "d600000000000031",
+        "name": "db_operation:client_db.operation.name_then_db.operation",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803501717221",
+        "endTimeUnixNano": "1794595803502217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         },
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": "db_operation-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000032",
+        "spanId": "d600000000000032",
+        "name": "db_operation:client_db.operation.name_then_db.operation_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803502717221",
+        "endTimeUnixNano": "1794595803503217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "stringValue": "db_operation-1"
+          }
+         },
+         {
+          "key": "db.operation",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000033",
+        "spanId": "d600000000000033",
+        "name": "db_operation:client_db.operation.name_int_then_db.operation_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803503717221",
+        "endTimeUnixNano": "1794595803504217221",
+        "attributes": [
+         {
+          "key": "db.operation.name",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "db.operation",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000034",
+        "spanId": "d600000000000034",
+        "name": "db_operation:client_none",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803504717221",
+        "endTimeUnixNano": "1794595803505217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000035",
+        "spanId": "d600000000000035",
+        "name": "http_method:server_http.method_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803505717221",
+        "endTimeUnixNano": "1794595803506217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000036",
+        "spanId": "d600000000000036",
+        "name": "http_method:server_http.method_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803506717221",
+        "endTimeUnixNano": "1794595803507217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000037",
+        "spanId": "d600000000000037",
+        "name": "http_method:server_http.method_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803507717221",
+        "endTimeUnixNano": "1794595803508217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000038",
+        "spanId": "d600000000000038",
+        "name": "http_method:server_http.request.method_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803508717221",
+        "endTimeUnixNano": "1794595803509217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000039",
+        "spanId": "d600000000000039",
+        "name": "http_method:server_http.request.method_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803509717221",
+        "endTimeUnixNano": "1794595803510217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000003a",
+        "spanId": "d60000000000003a",
+        "name": "http_method:server_http.request.method_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803510717221",
+        "endTimeUnixNano": "1794595803511217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000003b",
+        "spanId": "d60000000000003b",
+        "name": "http_method:server_http.method_then_http.request.method",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803511717221",
+        "endTimeUnixNano": "1794595803512217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         },
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000003c",
+        "spanId": "d60000000000003c",
+        "name": "http_method:server_http.method_then_http.request.method_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803512717221",
+        "endTimeUnixNano": "1794595803513217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         },
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000003d",
+        "spanId": "d60000000000003d",
+        "name": "http_method:server_http.method_int_then_http.request.method_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803513717221",
+        "endTimeUnixNano": "1794595803514217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "http.request.method",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000003e",
+        "spanId": "d60000000000003e",
+        "name": "http_method:server_http.request.method_then_http.method",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803514717221",
+        "endTimeUnixNano": "1794595803515217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         },
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000003f",
+        "spanId": "d60000000000003f",
+        "name": "http_method:server_http.request.method_then_http.method_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803515717221",
+        "endTimeUnixNano": "1794595803516217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         },
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000040",
+        "spanId": "d600000000000040",
+        "name": "http_method:server_http.request.method_int_then_http.method_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803516717221",
+        "endTimeUnixNano": "1794595803517217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "http.method",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000041",
+        "spanId": "d600000000000041",
+        "name": "http_method:server_none",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803517717221",
+        "endTimeUnixNano": "1794595803518217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000042",
+        "spanId": "d600000000000042",
+        "name": "http_method:client_http.method_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803518717221",
+        "endTimeUnixNano": "1794595803519217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000043",
+        "spanId": "d600000000000043",
+        "name": "http_method:client_http.method_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803519717221",
+        "endTimeUnixNano": "1794595803520217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000044",
+        "spanId": "d600000000000044",
+        "name": "http_method:client_http.method_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803520717221",
+        "endTimeUnixNano": "1794595803521217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000045",
+        "spanId": "d600000000000045",
+        "name": "http_method:client_http.request.method_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803521717221",
+        "endTimeUnixNano": "1794595803522217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000046",
+        "spanId": "d600000000000046",
+        "name": "http_method:client_http.request.method_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803522717221",
+        "endTimeUnixNano": "1794595803523217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000047",
+        "spanId": "d600000000000047",
+        "name": "http_method:client_http.request.method_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803523717221",
+        "endTimeUnixNano": "1794595803524217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000048",
+        "spanId": "d600000000000048",
+        "name": "http_method:client_http.method_then_http.request.method",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803524717221",
+        "endTimeUnixNano": "1794595803525217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         },
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000049",
+        "spanId": "d600000000000049",
+        "name": "http_method:client_http.method_then_http.request.method_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803525717221",
+        "endTimeUnixNano": "1794595803526217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         },
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000004a",
+        "spanId": "d60000000000004a",
+        "name": "http_method:client_http.method_int_then_http.request.method_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803526717221",
+        "endTimeUnixNano": "1794595803527217221",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "http.request.method",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000004b",
+        "spanId": "d60000000000004b",
+        "name": "http_method:client_http.request.method_then_http.method",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803527717221",
+        "endTimeUnixNano": "1794595803528217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         },
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "http_method-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000004c",
+        "spanId": "d60000000000004c",
+        "name": "http_method:client_http.request.method_then_http.method_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803528717221",
+        "endTimeUnixNano": "1794595803529217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "stringValue": "http_method-1"
+          }
+         },
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000004d",
+        "spanId": "d60000000000004d",
+        "name": "http_method:client_http.request.method_int_then_http.method_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803529717221",
+        "endTimeUnixNano": "1794595803530217221",
+        "attributes": [
+         {
+          "key": "http.request.method",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "http.method",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000004e",
+        "spanId": "d60000000000004e",
+        "name": "http_method:client_none",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803530717221",
+        "endTimeUnixNano": "1794595803531217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000004f",
+        "spanId": "d60000000000004f",
+        "name": "response_status_code:server_http.status_code_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803531717221",
+        "endTimeUnixNano": "1794595803532217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000050",
+        "spanId": "d600000000000050",
+        "name": "response_status_code:server_http.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803532717221",
+        "endTimeUnixNano": "1794595803533217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000051",
+        "spanId": "d600000000000051",
+        "name": "response_status_code:server_http.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803533717221",
+        "endTimeUnixNano": "1794595803534217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000052",
+        "spanId": "d600000000000052",
+        "name": "response_status_code:server_http.response.status_code_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803534717221",
+        "endTimeUnixNano": "1794595803535217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000053",
+        "spanId": "d600000000000053",
+        "name": "response_status_code:server_http.response.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803535717221",
+        "endTimeUnixNano": "1794595803536217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000054",
+        "spanId": "d600000000000054",
+        "name": "response_status_code:server_http.response.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803536717221",
+        "endTimeUnixNano": "1794595803537217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000055",
+        "spanId": "d600000000000055",
+        "name": "response_status_code:server_rpc.grpc.status_code_only",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803537717221",
+        "endTimeUnixNano": "1794595803538217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000056",
+        "spanId": "d600000000000056",
+        "name": "response_status_code:server_rpc.grpc.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803538717221",
+        "endTimeUnixNano": "1794595803539217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000057",
+        "spanId": "d600000000000057",
+        "name": "response_status_code:server_rpc.grpc.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803539717221",
+        "endTimeUnixNano": "1794595803540217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000058",
+        "spanId": "d600000000000058",
+        "name": "response_status_code:server_http.status_code_then_http.response.status_code",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803540717221",
+        "endTimeUnixNano": "1794595803541217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000059",
+        "spanId": "d600000000000059",
+        "name": "response_status_code:server_http.status_code_then_http.response.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803541717221",
+        "endTimeUnixNano": "1794595803542217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000005a",
+        "spanId": "d60000000000005a",
+        "name": "response_status_code:server_http.status_code_int_then_http.response.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803542717221",
+        "endTimeUnixNano": "1794595803543217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000005b",
+        "spanId": "d60000000000005b",
+        "name": "response_status_code:server_http.status_code_then_rpc.grpc.status_code",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803543717221",
+        "endTimeUnixNano": "1794595803544217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000005c",
+        "spanId": "d60000000000005c",
+        "name": "response_status_code:server_http.status_code_then_rpc.grpc.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803544717221",
+        "endTimeUnixNano": "1794595803545217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000005d",
+        "spanId": "d60000000000005d",
+        "name": "response_status_code:server_http.status_code_int_then_rpc.grpc.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803545717221",
+        "endTimeUnixNano": "1794595803546217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000005e",
+        "spanId": "d60000000000005e",
+        "name": "response_status_code:server_http.response.status_code_then_http.status_code",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803546717221",
+        "endTimeUnixNano": "1794595803547217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000005f",
+        "spanId": "d60000000000005f",
+        "name": "response_status_code:server_http.response.status_code_then_http.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803547717221",
+        "endTimeUnixNano": "1794595803548217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000060",
+        "spanId": "d600000000000060",
+        "name": "response_status_code:server_http.response.status_code_int_then_http.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803548717221",
+        "endTimeUnixNano": "1794595803549217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000061",
+        "spanId": "d600000000000061",
+        "name": "response_status_code:server_http.response.status_code_then_rpc.grpc.status_code",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803549717221",
+        "endTimeUnixNano": "1794595803550217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000062",
+        "spanId": "d600000000000062",
+        "name": "response_status_code:server_http.response.status_code_then_rpc.grpc.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803550717221",
+        "endTimeUnixNano": "1794595803551217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000063",
+        "spanId": "d600000000000063",
+        "name": "response_status_code:server_http.response.status_code_int_then_rpc.grpc.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803551717221",
+        "endTimeUnixNano": "1794595803552217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000064",
+        "spanId": "d600000000000064",
+        "name": "response_status_code:server_rpc.grpc.status_code_then_http.status_code",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803552717221",
+        "endTimeUnixNano": "1794595803553217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000065",
+        "spanId": "d600000000000065",
+        "name": "response_status_code:server_rpc.grpc.status_code_then_http.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803553717221",
+        "endTimeUnixNano": "1794595803554217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000066",
+        "spanId": "d600000000000066",
+        "name": "response_status_code:server_rpc.grpc.status_code_int_then_http.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803554717221",
+        "endTimeUnixNano": "1794595803555217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000067",
+        "spanId": "d600000000000067",
+        "name": "response_status_code:server_rpc.grpc.status_code_then_http.response.status_code",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803555717221",
+        "endTimeUnixNano": "1794595803556217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000068",
+        "spanId": "d600000000000068",
+        "name": "response_status_code:server_rpc.grpc.status_code_then_http.response.status_code_empty",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803556717221",
+        "endTimeUnixNano": "1794595803557217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000069",
+        "spanId": "d600000000000069",
+        "name": "response_status_code:server_rpc.grpc.status_code_int_then_http.response.status_code_int",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803557717221",
+        "endTimeUnixNano": "1794595803558217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000006a",
+        "spanId": "d60000000000006a",
+        "name": "response_status_code:server_none",
+        "kind": 2,
+        "startTimeUnixNano": "1794595803558717221",
+        "endTimeUnixNano": "1794595803559217221",
+        "attributes": [],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000006b",
+        "spanId": "d60000000000006b",
+        "name": "response_status_code:client_http.status_code_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803559717221",
+        "endTimeUnixNano": "1794595803560217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000006c",
+        "spanId": "d60000000000006c",
+        "name": "response_status_code:client_http.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803560717221",
+        "endTimeUnixNano": "1794595803561217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000006d",
+        "spanId": "d60000000000006d",
+        "name": "response_status_code:client_http.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803561717221",
+        "endTimeUnixNano": "1794595803562217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000006e",
+        "spanId": "d60000000000006e",
+        "name": "response_status_code:client_http.response.status_code_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803562717221",
+        "endTimeUnixNano": "1794595803563217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000006f",
+        "spanId": "d60000000000006f",
+        "name": "response_status_code:client_http.response.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803563717221",
+        "endTimeUnixNano": "1794595803564217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000070",
+        "spanId": "d600000000000070",
+        "name": "response_status_code:client_http.response.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803564717221",
+        "endTimeUnixNano": "1794595803565217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000071",
+        "spanId": "d600000000000071",
+        "name": "response_status_code:client_rpc.grpc.status_code_only",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803565717221",
+        "endTimeUnixNano": "1794595803566217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000072",
+        "spanId": "d600000000000072",
+        "name": "response_status_code:client_rpc.grpc.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803566717221",
+        "endTimeUnixNano": "1794595803567217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000073",
+        "spanId": "d600000000000073",
+        "name": "response_status_code:client_rpc.grpc.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803567717221",
+        "endTimeUnixNano": "1794595803568217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000074",
+        "spanId": "d600000000000074",
+        "name": "response_status_code:client_http.status_code_then_http.response.status_code",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803568717221",
+        "endTimeUnixNano": "1794595803569217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000075",
+        "spanId": "d600000000000075",
+        "name": "response_status_code:client_http.status_code_then_http.response.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803569717221",
+        "endTimeUnixNano": "1794595803570217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000076",
+        "spanId": "d600000000000076",
+        "name": "response_status_code:client_http.status_code_int_then_http.response.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803570717221",
+        "endTimeUnixNano": "1794595803571217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000077",
+        "spanId": "d600000000000077",
+        "name": "response_status_code:client_http.status_code_then_rpc.grpc.status_code",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803571717221",
+        "endTimeUnixNano": "1794595803572217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000078",
+        "spanId": "d600000000000078",
+        "name": "response_status_code:client_http.status_code_then_rpc.grpc.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803572717221",
+        "endTimeUnixNano": "1794595803573217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000079",
+        "spanId": "d600000000000079",
+        "name": "response_status_code:client_http.status_code_int_then_rpc.grpc.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803573717221",
+        "endTimeUnixNano": "1794595803574217221",
+        "attributes": [
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000007a",
+        "spanId": "d60000000000007a",
+        "name": "response_status_code:client_http.response.status_code_then_http.status_code",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803574717221",
+        "endTimeUnixNano": "1794595803575217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000007b",
+        "spanId": "d60000000000007b",
+        "name": "response_status_code:client_http.response.status_code_then_http.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803575717221",
+        "endTimeUnixNano": "1794595803576217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000007c",
+        "spanId": "d60000000000007c",
+        "name": "response_status_code:client_http.response.status_code_int_then_http.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803576717221",
+        "endTimeUnixNano": "1794595803577217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000007d",
+        "spanId": "d60000000000007d",
+        "name": "response_status_code:client_http.response.status_code_then_rpc.grpc.status_code",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803577717221",
+        "endTimeUnixNano": "1794595803578217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000007e",
+        "spanId": "d60000000000007e",
+        "name": "response_status_code:client_http.response.status_code_then_rpc.grpc.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803578717221",
+        "endTimeUnixNano": "1794595803579217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf0000000000000000007f",
+        "spanId": "d60000000000007f",
+        "name": "response_status_code:client_http.response.status_code_int_then_rpc.grpc.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803579717221",
+        "endTimeUnixNano": "1794595803580217221",
+        "attributes": [
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         },
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000080",
+        "spanId": "d600000000000080",
+        "name": "response_status_code:client_rpc.grpc.status_code_then_http.status_code",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803580717221",
+        "endTimeUnixNano": "1794595803581217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": "response_status_code-0"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000081",
+        "spanId": "d600000000000081",
+        "name": "response_status_code:client_rpc.grpc.status_code_then_http.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803581717221",
+        "endTimeUnixNano": "1794595803582217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000082",
+        "spanId": "d600000000000082",
+        "name": "response_status_code:client_rpc.grpc.status_code_int_then_http.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803582717221",
+        "endTimeUnixNano": "1794595803583217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000083",
+        "spanId": "d600000000000083",
+        "name": "response_status_code:client_rpc.grpc.status_code_then_http.response.status_code",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803583717221",
+        "endTimeUnixNano": "1794595803584217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": "response_status_code-1"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000084",
+        "spanId": "d600000000000084",
+        "name": "response_status_code:client_rpc.grpc.status_code_then_http.response.status_code_empty",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803584717221",
+        "endTimeUnixNano": "1794595803585217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "stringValue": "response_status_code-2"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "stringValue": ""
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000085",
+        "spanId": "d600000000000085",
+        "name": "response_status_code:client_rpc.grpc.status_code_int_then_http.response.status_code_int",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803585717221",
+        "endTimeUnixNano": "1794595803586217221",
+        "attributes": [
+         {
+          "key": "rpc.grpc.status_code",
+          "value": {
+           "intValue": "202"
+          }
+         },
+         {
+          "key": "http.response.status_code",
+          "value": {
+           "intValue": "201"
+          }
+         }
+        ],
+        "status": {}
+       },
+       {
+        "traceId": "d6c06fa5aaaf00000000000000000086",
+        "spanId": "d600000000000086",
+        "name": "response_status_code:client_none",
+        "kind": 3,
+        "startTimeUnixNano": "1794595803586717221",
+        "endTimeUnixNano": "1794595803587217221",
+        "attributes": [],
+        "status": {}
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "cases": [
+  {
+   "case": "db_name:server_db.name_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-0",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "200",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.namespace_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-1",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.namespace_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.namespace_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "201",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.name_then_db.namespace",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     },
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-1",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.name_then_db.namespace_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     },
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.name_int_then_db.namespace_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "db.namespace",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "201",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.namespace_then_db.name",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     },
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-0",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.namespace_then_db.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     },
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_db.namespace_int_then_db.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "db.name",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "200",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:server_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.name_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-0",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "200",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.namespace_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-1",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.namespace_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.namespace_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "201",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.name_then_db.namespace",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     },
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-1",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.name_then_db.namespace_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     },
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.name_int_then_db.namespace_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.name",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "db.namespace",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "201",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.namespace_then_db.name",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     },
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": "db_name-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "db_name-0",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.namespace_then_db.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "stringValue": "db_name-1"
+      }
+     },
+     {
+      "key": "db.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_db.namespace_int_then_db.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.namespace",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "db.name",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "200",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_name:client_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-0"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "200"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation.name_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-1"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "201"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation_then_db.operation.name",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     },
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-1"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation_then_db.operation.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     },
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation_int_then_db.operation.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "db.operation.name",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "201"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation.name_then_db.operation",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     },
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-0"
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation.name_then_db.operation_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     },
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:server_db.operation.name_int_then_db.operation_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "db.operation",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "200"
+   }
+  },
+  {
+   "case": "db_operation:server_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-0"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "200"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation.name_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-1"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "201"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation_then_db.operation.name",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     },
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-1"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation_then_db.operation.name_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     },
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation_int_then_db.operation.name_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "db.operation.name",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "201"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation.name_then_db.operation",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     },
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": "db_operation-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "db_operation-0"
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation.name_then_db.operation_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "stringValue": "db_operation-1"
+      }
+     },
+     {
+      "key": "db.operation",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "db_operation:client_db.operation.name_int_then_db.operation_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "db.operation.name",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "db.operation",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": "200"
+   }
+  },
+  {
+   "case": "db_operation:client_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.method_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "http_method-0",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "200",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.request.method_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "http_method-1",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.request.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.request.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "201",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.method_then_http.request.method",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     },
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "http_method-1",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.method_then_http.request.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     },
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.method_int_then_http.request.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "http.request.method",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "201",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.request.method_then_http.method",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     },
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "http_method-0",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.request.method_then_http.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     },
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_http.request.method_int_then_http.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "http.method",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "200",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:server_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.method_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "http_method-0",
+    "external_http_url": "",
+    "http_method": "http_method-0",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "200",
+    "external_http_url": "",
+    "http_method": "200",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.request.method_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "http_method-1",
+    "external_http_url": "",
+    "http_method": "http_method-1",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.request.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.request.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "201",
+    "external_http_url": "",
+    "http_method": "201",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.method_then_http.request.method",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     },
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "http_method-1",
+    "external_http_url": "",
+    "http_method": "http_method-1",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.method_then_http.request.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     },
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.method_int_then_http.request.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.method",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "http.request.method",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "201",
+    "external_http_url": "",
+    "http_method": "201",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.request.method_then_http.method",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     },
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": "http_method-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "http_method-0",
+    "external_http_url": "",
+    "http_method": "http_method-0",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.request.method_then_http.method_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "stringValue": "http_method-1"
+      }
+     },
+     {
+      "key": "http.method",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_http.request.method_int_then_http.method_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.request.method",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "http.method",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "200",
+    "external_http_url": "",
+    "http_method": "200",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "http_method:client_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_then_http.response.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_then_http.response.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_int_then_http.response.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_then_rpc.grpc.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_then_rpc.grpc.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.status_code_int_then_rpc.grpc.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_then_http.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_then_http.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_int_then_http.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_then_rpc.grpc.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_then_rpc.grpc.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_http.response.status_code_int_then_rpc.grpc.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_then_http.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_then_http.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_int_then_http.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_then_http.response.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_then_http.response.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_rpc.grpc.status_code_int_then_http.response.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:server_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 2,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 2,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_only",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_then_http.response.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_then_http.response.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_int_then_http.response.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_then_rpc.grpc.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_then_rpc.grpc.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.status_code_int_then_rpc.grpc.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_then_http.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_then_http.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_int_then_http.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_then_rpc.grpc.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_then_rpc.grpc.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_http.response.status_code_int_then_rpc.grpc.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     },
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_then_http.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": "response_status_code-0"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-0",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_then_http.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_int_then_http.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     },
+     {
+      "key": "http.status_code",
+      "value": {
+       "intValue": "200"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "200",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_then_http.response.status_code",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": "response_status_code-1"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "response_status_code-1",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_then_http.response.status_code_empty",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "stringValue": "response_status_code-2"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "stringValue": ""
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_rpc.grpc.status_code_int_then_http.response.status_code_int",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": [
+     {
+      "key": "rpc.grpc.status_code",
+      "value": {
+       "intValue": "202"
+      }
+     },
+     {
+      "key": "http.response.status_code",
+      "value": {
+       "intValue": "201"
+      }
+     }
+    ]
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "201",
+    "db_name": "",
+    "db_operation": ""
+   }
+  },
+  {
+   "case": "response_status_code:client_none",
+   "resource": [
+    {
+     "key": "service.name",
+     "value": {
+      "stringValue": "d6-corpus-6fa5aaaf"
+     }
+    }
+   ],
+   "span": {
+    "kind": 3,
+    "attributes": []
+   },
+   "observed": {
+    "kind": 3,
+    "http_url": "",
+    "http_host": "",
+    "external_http_method": "",
+    "external_http_url": "",
+    "http_method": "",
+    "response_status_code": "",
+    "db_name": "",
+    "db_operation": ""
+   }
+  }
+ ]
+}
