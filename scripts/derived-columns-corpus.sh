@@ -3,7 +3,7 @@
 # a throwaway collector on the target's Docker network takes the corpus over OTLP/HTTP
 # and writes it with its ClickHouse exporter; the rows it wrote become the fixture.
 #
-#   CORPUS_SSH="ssh -l root -i KEY HOST" scripts/derived-columns-corpus.sh OUT.json
+#   CORPUS_SSH="ssh -l root -i KEY HOST" [CORPUS=host-keys] scripts/derived-columns-corpus.sh OUT.json
 set -euo pipefail
 
 : "${CORPUS_SSH:?the ssh command that reaches the host of the pipeline}"
@@ -16,7 +16,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 run=$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')
-python3 "$here/derived-columns-corpus.py" request "$run" "$(date +%s%N)" > "$work/request.json"
+python3 "$here/derived-columns-corpus.py" request "$run" "$(date +%s%N)" "${CORPUS:-derived}" > "$work/request.json"
 
 dir=$($CORPUS_SSH 'mktemp -d /tmp/d6-corpus.XXXXXX')
 $CORPUS_SSH "cat > $dir/request.json" < "$work/request.json"

@@ -26,6 +26,12 @@ const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/derived_columns_observed.json"
 );
+/// `client.address` and `http.request.header.host`, the keys semconv names
+/// in place of the deprecated `http.host`.
+const HOST_KEYS_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/derived_columns_host_keys_observed.json"
+);
 
 /// Cases whose answer depends on the order of a string and a non-string
 /// attribute, which v1 keeps in separate maps; the columns they differ in.
@@ -48,6 +54,17 @@ fn any_value(json: Option<&Json>) -> Option<AnyValue> {
         Some(Value::DoubleValue(d.as_f64().unwrap()))
     } else if let Some(b) = object.get("boolValue") {
         Some(Value::BoolValue(b.as_bool().unwrap()))
+    } else if let Some(array) = object.get("arrayValue") {
+        let values = array.get("values").map_or_else(Vec::new, |v| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| any_value(Some(v)))
+                .collect()
+        });
+        Some(Value::ArrayValue(
+            opentelemetry_proto::tonic::common::v1::ArrayValue { values },
+        ))
     } else {
         assert!(object.is_empty(), "unexpected value {object:?}");
         None
@@ -138,9 +155,10 @@ fn the_corpus_records_its_pipeline_and_observes_every_case() {
     }
 }
 
-#[test]
-fn every_observed_case_reads_as_the_clickhouse_pipeline_wrote_it() {
-    let fixture: Json = serde_json::from_str(&std::fs::read_to_string(FIXTURE).unwrap()).unwrap();
+/// The cases of `path` the engine reads otherwise than observed, beyond
+/// [`UNORDERED_ACROSS_TYPES`], and how many of those it differs in.
+fn differences(path: &str) -> (Vec<String>, usize) {
+    let fixture: Json = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let mut differing = Vec::new();
     let mut unordered = 0;
     for case in fixture["cases"].as_array().unwrap() {
@@ -173,11 +191,41 @@ fn every_observed_case_reads_as_the_clickhouse_pipeline_wrote_it() {
             ));
         }
     }
+    (differing, unordered)
+}
+
+#[test]
+fn every_observed_case_reads_as_the_clickhouse_pipeline_wrote_it() {
+    let (differing, unordered) = differences(FIXTURE);
     assert!(differing.is_empty(), "{}", differing.join("\n"));
     assert!(
         unordered > 0,
         "the unordered cases still differ, or the list is stale"
     );
+}
+
+#[test]
+fn client_address_and_the_host_header_read_as_observed() {
+    let fixture: Json =
+        serde_json::from_str(&std::fs::read_to_string(HOST_KEYS_FIXTURE).unwrap()).unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert!(cases.iter().all(|c| c["observed"].is_object()));
+    for kind in [
+        "unspecified",
+        "internal",
+        "server",
+        "client",
+        "producer",
+        "consumer",
+    ] {
+        for key in ["client_address", "header_host"] {
+            let name = format!("kind_{kind}_{key}");
+            assert!(cases.iter().any(|c| c["case"] == name.as_str()), "{name}");
+        }
+    }
+    let (differing, unordered) = differences(HOST_KEYS_FIXTURE);
+    assert!(differing.is_empty(), "{}", differing.join("\n"));
+    assert_eq!(unordered, 0);
 }
 
 #[test]
