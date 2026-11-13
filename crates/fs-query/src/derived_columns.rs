@@ -9,9 +9,9 @@
 //! to the memory pool before they are made, and the charge travels with
 //! their buffers, released when the last of them is dropped.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Column, Result as DfResult};
@@ -211,11 +211,8 @@ fn derive(
     let derivation = derived::derive(batch, &split.wanted)
         .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
     reservation.try_grow(derivation.bytes())?;
-    let prepaid = Prepaid(Mutex::new(reservation.take()));
     let made = derivation.into_arrays();
-    for array in &made {
-        array.claim(&prepaid);
-    }
+    crate::claim::claim(&made, reservation.take());
     let columns = split
         .shown
         .iter()
@@ -235,55 +232,4 @@ fn derive(
         columns,
         &options,
     )?)
-}
-
-/// The arrow side of a charge already granted: each buffer that claims takes
-/// its share of it, and a buffer past it grows it, which exact sizing rules out.
-#[derive(Debug)]
-struct Prepaid(Mutex<MemoryReservation>);
-
-#[derive(Debug)]
-struct Held(MemoryReservation);
-
-impl arrow_buffer::MemoryReservation for Held {
-    fn size(&self) -> usize {
-        self.0.size()
-    }
-
-    fn resize(&mut self, new_size: usize) {
-        self.0.resize(new_size);
-    }
-}
-
-impl arrow_buffer::MemoryPool for Prepaid {
-    fn reserve(&self, size: usize) -> Box<dyn arrow_buffer::MemoryReservation> {
-        let mut prepaid = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let held = if prepaid.size() >= size {
-            prepaid.split(size)
-        } else {
-            let held = prepaid.take();
-            held.grow(size - held.size());
-            held
-        };
-        Box::new(Held(held))
-    }
-
-    fn available(&self) -> isize {
-        let prepaid = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        isize::try_from(prepaid.size()).unwrap_or(isize::MAX)
-    }
-
-    fn used(&self) -> usize {
-        0
-    }
-
-    fn capacity(&self) -> usize {
-        self.available().unsigned_abs()
-    }
 }

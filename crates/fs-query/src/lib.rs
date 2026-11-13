@@ -10,6 +10,7 @@
 pub mod actions;
 mod audit;
 pub mod auth;
+mod claim;
 pub mod derived_columns;
 pub mod derived_table;
 pub mod error_info;

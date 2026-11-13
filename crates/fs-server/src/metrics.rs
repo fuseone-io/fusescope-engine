@@ -628,6 +628,12 @@ fn render_key_listings(out: &mut String, q: &fs_query::QueryStats) {
         "Fills of the metadata.keys listing, each shared by the misses it served",
         q.recent_keys_fills.load(Ordering::Relaxed),
     );
+    counter(
+        out,
+        "fusescope_query_recent_top_level_fills_total",
+        "Fills of the top_level_operations listing, each shared by the misses it served",
+        q.recent_top_level_fills.load(Ordering::Relaxed),
+    );
 }
 
 fn render_metric_queries(out: &mut String, q: &fs_query::QueryStats) {
@@ -1403,6 +1409,9 @@ mod tests {
         query.trace_lookups.fetch_add(3, Ordering::Relaxed);
         query.metadata_lookups.fetch_add(4, Ordering::Relaxed);
         query.recent_keys_fills.fetch_add(16, Ordering::Relaxed);
+        query
+            .recent_top_level_fills
+            .fetch_add(17, Ordering::Relaxed);
         query.metric_selects.fetch_add(11, Ordering::Relaxed);
         query.metric_ambiguous.fetch_add(12, Ordering::Relaxed);
         query.metric_index_fetches.fetch_add(13, Ordering::Relaxed);
@@ -1426,6 +1435,10 @@ mod tests {
         );
         assert!(
             page.contains("fusescope_query_recent_keys_fills_total 16\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("fusescope_query_recent_top_level_fills_total 17\n"),
             "{page}"
         );
         for line in [
