@@ -1,6 +1,7 @@
 //! The querier facade: sessions, limits and execution.
 
 mod recent_keys;
+mod recent_top_level;
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Weak};
@@ -145,6 +146,9 @@ pub struct QueryStats {
     /// Fills of the attribute keys listing: each a snapshot, a read of the
     /// derived table and of the recent rows, shared by concurrent misses.
     pub recent_keys_fills: std::sync::atomic::AtomicU64,
+    /// Fills of the `top_level_operations` listing: each a snapshot, a read
+    /// of the compacted contributions and of the recent spans.
+    pub recent_top_level_fills: std::sync::atomic::AtomicU64,
     /// Rows sent: by Flight executions and by queries collected in process.
     pub rows: std::sync::atomic::AtomicU64,
     /// Hot-window fan-outs performed.
@@ -513,7 +517,37 @@ impl Querier {
             self.limits.batch_size,
             Arc::clone(&self.verified),
         )?;
+        self.register_top_level(&ctx, tenant)?;
         Ok((ctx, warnings, budget))
+    }
+
+    /// Replaces the session's compacted `top_level_operations` with the
+    /// listing of every span, resolved when a query reads it.
+    fn register_top_level(&self, ctx: &SessionContext, tenant: TenantId) -> Result<(), QueryError> {
+        let source = Arc::new(recent_top_level::TopLevelSource {
+            catalog: self.catalog.clone(),
+            cache: Arc::clone(&self.cache),
+            hot: Arc::clone(&self.hot),
+            store: Arc::clone(&self.store),
+            store_url: self.store_url.clone(),
+            pool: Arc::clone(&self.runtime.memory_pool),
+            listings: Arc::clone(&self.keys_cache),
+            stats: Arc::clone(&self.stats),
+        });
+        let schema = ctx
+            .catalog(crate::session::CATALOG)
+            .and_then(|catalog| catalog.schema(crate::session::SCHEMA))
+            .ok_or_else(|| {
+                QueryError::DataFusion(datafusion::error::DataFusionError::Internal(
+                    "no session schema".into(),
+                ))
+            })?;
+        schema.deregister_table(fs_schema::top_level_operations::TABLE)?;
+        schema.register_table(
+            fs_schema::top_level_operations::TABLE.into(),
+            Arc::new(recent_top_level::TopLevelTable::new(tenant, source)),
+        )?;
+        Ok(())
     }
 
     /// The series of `query`'s selector for `tenant` with their samples,
