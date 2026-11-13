@@ -1217,7 +1217,7 @@ fn default_top_level_operations_max_operations() -> usize {
 }
 
 fn default_top_level_operations_max_bytes() -> usize {
-    64 * 1024 * 1024
+    256 * 1024 * 1024
 }
 
 fn default_purge_interval() -> u64 {
@@ -2645,7 +2645,7 @@ mod tests {
         );
         assert_eq!(
             compactor.compaction.top_level_operations_max_bytes,
-            64 << 20
+            256 << 20
         );
         for bad in [
             "top_level_operations_max_operations = 0",

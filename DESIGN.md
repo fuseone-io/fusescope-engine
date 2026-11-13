@@ -828,7 +828,7 @@ Derived tables replacing the ClickHouse materialized views:
 |---|---|---|
 | trace_summary | signoz_traces.trace_summary | trace_id, start, end, num_spans, services, has_error |
 | service_graph_1m | dependency_graph_minutes | (src, dst, dst_kind, minute): count, error_count, quantiles via t-digest |
-| top_level_operations | top_level_operations | (service_name, name): last_seen; a root span or one with a remote parent |
+| top_level_operations | top_level_operations | (service_name, name): last_seen; a root span, or one whose parent in the same pass belongs to another service |
 | duration_sort | durationSort | top-k per service and operation, per hour |
 | usage_1h | usage | bytes and rows per tenant, signal, service, hour |
 | attribute_keys | tag_attributes, span_attributes_keys | key, type, count, first and last seen |
@@ -849,11 +849,37 @@ several partial files and the query combines them: trace summaries use
 `[0, 1]`; an integer literal is accepted only for the exact endpoints `0`
 and `1`, so percentiles such as p99 are written as `0.99`, not `99`.
 
-An operation is top-level when its span has no parent or a parent
-flagged remote (`is_remote = "true"`), read from the span alone: a parent
-in another hour or pass changes nothing, and an unknown remoteness counts
-as not remote. The Go `isEntryPoint` reads this table for compacted data
-and the same flag on `spans` for the hot window, excluding roots there.
+An operation is top-level when its span, of a named service, has no
+parent, or a parent found in the same pass by `(trace_id, parent_span_id)`
+that belongs to another service, an unnamed one included. Kind and
+`is_remote` play no part, and a parent outside the pass (another hour,
+another pass of the hour, or never sent) makes no boundary. This is the
+rule observed of the ClickHouse pipeline, where "the same pass" is the
+collector's export batch (`MAPPING.md`, "Compactor-derived trace data"):
+the engine therefore lists children whose parent crossed services in
+another batch, which ClickHouse misses, and never the reverse. The pass
+indexes every span's service until it ends, so a child read before its
+parent is resolved at the end; that index is charged to
+`compactor.top_level_operations_max_bytes`, not to the service graph's
+caps, so a graph skipped over its caps leaves this contribution whole.
+Files written before this rule hold roots and spans whose parent was
+flagged remote (`is_remote = "true"`) and are read as written: the
+change is a semantic cut, not a format version.
+
+A query reads `top_level_operations` complete: the compacted
+contributions with the visible L0 files and the hot window they do not
+hold yet, listed in one catalog snapshot, the hot window required and the
+files it still serves left out, as `metadata.keys` reads recent keys.
+The recent spans are resolved hour by hour with the compactor's own code,
+an hour's spans together as its pass will take them, then united with
+the contributions by `max(last_seen)`; every filter applies after that,
+so a parent before the queried window or of another service still
+counts. The listing fails whole over the tenant's byte budget, the memory
+pool or a silent ingester, holds its charge in its buffers, and complete
+listings are kept for `query.recent_keys_ttl_secs` in the same cache as
+the keys. An hour the compactor splits into several passes may lose a
+boundary split between them that the listing saw. The Go `isEntryPoint`
+and the services' top-level operations read only this table.
 Its catalog range is the span starts it counted, so it expires with them.
 
 The summary file's catalog range is the minimum and maximum **span start**
@@ -881,8 +907,8 @@ DataFusion's t-digest centroids, count, min, max and sum. A pass whose trace
 map crosses `compactor.trace_summary_max_traces` or
 `compactor.trace_summary_max_bytes`, or whose span map crosses
 `compactor.service_graph_max_spans` or `compactor.service_graph_max_bytes`,
-or whose operation map crosses `compactor.top_level_operations_max_operations`
-(1 000 000) or `compactor.top_level_operations_max_bytes` (64 MiB, at most
+or whose operation map and parent index cross `compactor.top_level_operations_max_operations`
+(1 000 000) or `compactor.top_level_operations_max_bytes` (256 MiB, at most
 1 GiB), skips that whole contribution and increments the corresponding
 `_skipped_total`; it never publishes a partial derived file. The first skip
 for a tenant, hour and derived signal is also warned with the limit, cap,

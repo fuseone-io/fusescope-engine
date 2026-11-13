@@ -866,10 +866,124 @@ async fn a_pass_publishes_top_level_operations_with_the_l1() {
         [
             ("api".to_owned(), "serve".to_owned(), latest + 2),
             ("web".to_owned(), "GET /".to_owned(), latest + 1),
+            ("worker".to_owned(), "work".to_owned(), latest + 4),
         ],
-        "a root and a remote parent count; a local or unknown parent does not"
+        "a root and children of another service count, whatever their flags; a child of its own service does not"
     );
     assert_eq!(c.stats().top_level_operations.load(Ordering::Relaxed), 1);
+    f.db.finish().await;
+}
+
+/// One span of `service` in trace 1.
+fn lone_span(
+    service: &str,
+    name: &str,
+    id: u8,
+    parent: Option<u8>,
+    start: u64,
+) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", service)],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![id; 8],
+                    parent_span_id: parent.map(|p| vec![p; 8]).unwrap_or_default(),
+                    name: name.into(),
+                    start_time_unix_nano: start + u64::from(id),
+                    end_time_unix_nano: start + u64::from(id) + 1_000,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    }
+}
+
+#[tokio::test]
+async fn a_child_met_before_its_parent_in_another_file_of_the_pass_counts() {
+    let Some(f) = fixture().await else { return };
+    let start = nanos(closed_hour()) + 60_000_000_000;
+    let inputs = vec![
+        write_l0(
+            &f.db.catalog,
+            &f.store,
+            f.tenant,
+            &[lone_span("alpha", "consume", 2, Some(1), start)],
+            4,
+        )
+        .await,
+        write_l0(
+            &f.db.catalog,
+            &f.store,
+            f.tenant,
+            &[lone_span("zeta", "produce", 1, None, start)],
+            4,
+        )
+        .await,
+    ];
+    registered_an_hour_ago(&f, &inputs).await;
+    let c = compactor(&f, config(4));
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    let names: Vec<(String, String)> = q_top_level(&f)
+        .await
+        .into_iter()
+        .map(|(s, n, _)| (s, n))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("alpha".to_owned(), "consume".to_owned()),
+            ("zeta".to_owned(), "produce".to_owned())
+        ],
+        "alpha's rows come first in the pass, before its parent's"
+    );
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn a_service_graph_past_its_cap_leaves_top_level_operations_whole() {
+    let Some(f) = fixture().await else { return };
+    let start = nanos(closed_hour()) + 60_000_000_000;
+    let inputs = vec![
+        write_l0(
+            &f.db.catalog,
+            &f.store,
+            f.tenant,
+            &[entry_request(1, start)],
+            4,
+        )
+        .await,
+    ];
+    registered_an_hour_ago(&f, &inputs).await;
+    let c = compactor(
+        &f,
+        CompactionConfig {
+            service_graph_max_spans: 1,
+            ..config(4)
+        },
+    );
+    c.compact_once(&fence(&f).await).await.unwrap().unwrap();
+    assert_eq!(service_graph_files(&f).await.len(), 0);
+    assert_eq!(c.stats().service_graph_skipped.load(Ordering::Relaxed), 1);
+    let names: Vec<(String, String)> = q_top_level(&f)
+        .await
+        .into_iter()
+        .map(|(s, n, _)| (s, n))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("api".to_owned(), "serve".to_owned()),
+            ("web".to_owned(), "GET /".to_owned()),
+            ("worker".to_owned(), "work".to_owned()),
+        ]
+    );
     f.db.finish().await;
 }
 

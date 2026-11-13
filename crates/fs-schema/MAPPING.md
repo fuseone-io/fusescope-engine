@@ -138,8 +138,16 @@ attributes above; they do not derive from an exporter implementation.
 | graph count/error_count | one call, and one error when the measured child or inferred client/producer has error status | OTLP status; product service-map contract |
 | graph digest | latency of that same measured span, in nanoseconds | OTLP span start and end |
 
-| top_level_operations row | one per `(service_name, name)` of a span with no parent, or whose parent is remote (`is_remote = "true"`); a span without a service, with a local parent (`"false"`) or whose remoteness is unknown (`""`) does not count | OTLP empty `parent_span_id` means root; `SpanFlags` bits 0x100 and 0x200 for the parent context's `is_remote` |
+| top_level_operations row | one per `(service_name, name)` of a span of a named service with no parent, or whose parent, found in the same pass by `(trace_id, parent_span_id)`, has another service, an unnamed one included; kind and `is_remote` play no part; a parent of its own service, outside the pass or never sent makes no boundary | OTLP empty `parent_span_id` means root; observed: `tests/fixtures/top_level_operations_observed.json`, one case a batch (`cross_child_*`, `local_child*`, `missing_parent_*`, `parent_no_service`, `cross_child_no_service`, `root_*_flag`); files before this rule were written with `is_remote = "true"` in place of the parent's service and are read as written |
 | top_level_operations.last_seen | greatest span `timestamp` of the pair in the pass | OTLP span start |
+
+ClickHouse resolves the parent within one collector export batch, by span
+id alone: a parent in another batch makes no boundary there, and spans of
+other traces with the same span id in one batch can (the corpus reuses
+span ids, so its canonical record spaces each case past the batch flush).
+The pass resolves within itself by trace and span id, so it lists the
+boundaries ClickHouse missed across batches (`*_export` cases) and none
+it did not see.
 
 Top-level membership needs only the span itself: no parent lookup, so a
 parent that is absent, in another hour or in another pass changes nothing,

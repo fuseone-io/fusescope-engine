@@ -1,11 +1,19 @@
 //! Per-compaction-pass top-level operations.
 //!
 //! Format v1 has one row per `(service_name, name)` seen in the pass on a
-//! span that has no parent or whose parent is remote (`is_remote = "true"`),
-//! with `last_seen`, the latest such span start. Files are partial
+//! span of a named service that has no parent, or whose parent, found in
+//! the same pass by `(trace_id, parent_span_id)`, belongs to another
+//! service, an unnamed one included; kind and `is_remote` play no part.
+//! `last_seen` is the latest such span start. Files are partial
 //! contributions: queries combine every visible file with `max(last_seen)`.
+//! Files written before the parent rule hold roots and spans whose parent
+//! was remote, and are read as written.
+//!
+//! A pass keeps every span's service until [`TopLevelOperations::finish`],
+//! so a child met before its parent is resolved at the end; that index is
+//! charged to the contribution's own byte cap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
@@ -27,9 +35,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const SIGNAL: &str = "top_level_operations";
 /// Name in a query session.
 pub const TABLE: &str = "top_level_operations";
-/// `is_remote` of a span whose parent context is known to be remote.
-pub const REMOTE_PARENT: &str = "true";
 const BTREE_ENTRY_OVERHEAD: usize = 4 * size_of::<usize>();
+/// One indexed span, with hash table slack for growth.
+const INDEX_ENTRY_BYTES: usize = 2 * (size_of::<(SpanKey, Arc<str>)>() + 1);
+/// One child waiting for its parent, with vector slack for growth.
+const PENDING_ENTRY_BYTES: usize = 2 * size_of::<Pending>();
+/// One interned name besides its UTF-8 bytes: the `Arc` header and a set slot.
+const INTERNED_NAME_BYTES: usize = 2 * size_of::<usize>() + 2 * size_of::<Arc<str>>();
 const OPERATION_OUTPUT_FIXED_BYTES: usize = 2 * size_of::<i32>() + size_of::<i64>();
 
 /// One operation's map entry, B-tree node slack and fixed Arrow output
@@ -57,12 +69,34 @@ pub struct TopLevelOperations {
     range: Option<(i64, i64)>,
     estimated_bytes: usize,
     exceeded: Option<LimitExceeded>,
+    /// The service of every span of the pass, `""` for an unnamed one.
+    parents: HashMap<SpanKey, Arc<str>>,
+    pending: Vec<Pending>,
+    names: HashSet<Arc<str>>,
+    max_operations: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SpanKey {
+    trace: [u8; 16],
+    span: [u8; 8],
+}
+
+/// A child of a named service whose parent the pass had not met yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pending {
+    parent: SpanKey,
+    service: Arc<str>,
+    name: Arc<str>,
+    start: i64,
 }
 
 impl TopLevelOperations {
-    /// Adds the top-level spans of a batch while distinct operations and
-    /// conservatively charged resident bytes stay within their caps. A span
-    /// without a service never counts. Once a cap is crossed, it stays empty.
+    /// Adds a batch of the pass: its roots and the children whose parent
+    /// is already known count now, the others wait for
+    /// [`TopLevelOperations::finish`]. A span without a service never
+    /// counts. Once a cap is crossed, it stays empty.
     ///
     /// # Errors
     /// A required span column is missing or has another physical type.
@@ -75,8 +109,26 @@ impl TopLevelOperations {
         if self.exceeded.is_some() {
             return Ok(());
         }
+        self.max_operations = if self.max_operations == 0 {
+            max_operations
+        } else {
+            self.max_operations.min(max_operations)
+        };
+        self.max_bytes = if self.max_bytes == 0 {
+            max_bytes
+        } else {
+            self.max_bytes.min(max_bytes)
+        };
         let schema = batch.schema();
-        let parents = batch.column(schema.index_of(col::PARENT_SPAN_ID)?);
+        let id = |name: &'static str| {
+            batch
+                .column(schema.index_of(name)?)
+                .as_fixed_size_binary_opt()
+                .ok_or(SchemaError::Layout(name))
+        };
+        let traces = id(col::TRACE_ID)?;
+        let spans = id(col::SPAN_ID)?;
+        let parents = id(col::PARENT_SPAN_ID)?;
         let timestamps = batch
             .column(schema.index_of(col::TIMESTAMP)?)
             .as_primitive_opt::<TimestampNanosecondType>()
@@ -87,67 +139,202 @@ impl TopLevelOperations {
                 &DataType::Utf8,
             )?)
         };
-        let remotes = text(col::IS_REMOTE)?;
-        let remotes = remotes.as_string::<i32>();
         let services = text(col::SERVICE_NAME)?;
         let services = services.as_string::<i32>();
         let names = text(col::NAME)?;
         let names = names.as_string::<i32>();
         for row in 0..batch.num_rows() {
-            let top_level = parents.is_null(row)
-                || (!remotes.is_null(row) && remotes.value(row) == REMOTE_PARENT);
-            if !top_level || services.is_null(row) || services.value(row).is_empty() {
+            let trace: [u8; 16] = traces
+                .value(row)
+                .try_into()
+                .map_err(|_| SchemaError::Layout("trace_id"))?;
+            let span: [u8; 8] = spans
+                .value(row)
+                .try_into()
+                .map_err(|_| SchemaError::Layout("span_id"))?;
+            let service = if services.is_null(row) {
+                ""
+            } else {
+                services.value(row)
+            };
+            if !self.index(SpanKey { trace, span }, service) {
+                return Ok(());
+            }
+            if service.is_empty() {
                 continue;
             }
-            let service = services.value(row);
             let name = if names.is_null(row) {
                 ""
             } else {
                 names.value(row)
             };
             let start = timestamps.value(row);
-            if !self.add(service, name, start, max_operations, max_bytes) {
+            let counted = if parents.is_null(row) {
+                self.add(service, name, start)
+            } else {
+                let parent = SpanKey {
+                    trace,
+                    span: parents
+                        .value(row)
+                        .try_into()
+                        .map_err(|_| SchemaError::Layout("parent_span_id"))?,
+                };
+                match self.parents.get(&parent) {
+                    Some(known) if known.as_ref() != service => self.add(service, name, start),
+                    Some(_) => true,
+                    None => self.wait(parent, service, name, start),
+                }
+            };
+            if !counted {
                 return Ok(());
             }
         }
         Ok(())
     }
 
-    fn add(
-        &mut self,
-        service: &str,
-        name: &str,
-        start: i64,
-        max_operations: usize,
-        max_bytes: usize,
-    ) -> bool {
-        let key = (Arc::<str>::from(service), Arc::<str>::from(name));
+    /// The most absorbing `batch` can add to the estimate: each row an
+    /// indexed span, a waiting child and a new operation, its service and
+    /// name interned anew.
+    ///
+    /// # Errors
+    /// A required span column is missing or has another physical type.
+    pub fn growth_bound(batch: &RecordBatch) -> Result<usize, SchemaError> {
+        let schema = batch.schema();
+        let text = |name: &str| -> Result<usize, SchemaError> {
+            let column =
+                arrow::compute::cast(batch.column(schema.index_of(name)?), &DataType::Utf8)?;
+            Ok(column.as_string::<i32>().value_data().len())
+        };
+        let per_row = INDEX_ENTRY_BYTES
+            + PENDING_ENTRY_BYTES
+            + OPERATION_ENTRY_BYTES
+            + 2 * INTERNED_NAME_BYTES;
+        let text = text(col::SERVICE_NAME)?.saturating_add(text(col::NAME)?);
+        Ok(batch
+            .num_rows()
+            .saturating_mul(per_row)
+            .saturating_add(text.saturating_mul(2)))
+    }
+
+    /// Resolves the children that met their parent after them, then
+    /// releases the pass's index, leaving only the operations charged.
+    pub fn finish(&mut self) {
+        for child in std::mem::take(&mut self.pending) {
+            if self.exceeded.is_some() {
+                break;
+            }
+            if self
+                .parents
+                .get(&child.parent)
+                .is_some_and(|known| *known != child.service)
+            {
+                self.add(&child.service, &child.name, child.start);
+            }
+        }
+        self.parents = HashMap::new();
+        self.names = HashSet::new();
+        self.estimated_bytes = self.rows_bytes();
+    }
+
+    /// Records `key`'s service, charged before it is kept.
+    fn index(&mut self, key: SpanKey, service: &str) -> bool {
+        if self.parents.contains_key(&key) {
+            return true;
+        }
+        let mut charge = INDEX_ENTRY_BYTES;
+        if !self.names.contains(service) {
+            charge = charge
+                .saturating_add(service.len())
+                .saturating_add(INTERNED_NAME_BYTES);
+        }
+        if !self.charge(charge) {
+            return false;
+        }
+        let service = self.intern(service);
+        self.parents.insert(key, service);
+        true
+    }
+
+    /// Keeps a child for [`TopLevelOperations::finish`], charged before it is kept.
+    fn wait(&mut self, parent: SpanKey, service: &str, name: &str, start: i64) -> bool {
+        let mut charge = PENDING_ENTRY_BYTES;
+        if !self.names.contains(name) {
+            charge = charge
+                .saturating_add(name.len())
+                .saturating_add(INTERNED_NAME_BYTES);
+        }
+        if !self.charge(charge) {
+            return false;
+        }
+        let pending = Pending {
+            parent,
+            service: self.intern(service),
+            name: self.intern(name),
+            start,
+        };
+        self.pending.push(pending);
+        true
+    }
+
+    fn intern(&mut self, name: &str) -> Arc<str> {
+        if let Some(known) = self.names.get(name) {
+            return Arc::clone(known);
+        }
+        let interned: Arc<str> = Arc::from(name);
+        self.names.insert(Arc::clone(&interned));
+        interned
+    }
+
+    /// Adds `bytes` to the estimate, or skips the contribution past its cap.
+    fn charge(&mut self, bytes: usize) -> bool {
+        let next_bytes = self.estimated_bytes.saturating_add(bytes);
+        if next_bytes > self.max_bytes {
+            self.skip(LimitExceeded {
+                limit: "top_level_operations_max_bytes",
+                cap: self.max_bytes,
+                observed: next_bytes,
+                estimated_bytes: next_bytes,
+            });
+            return false;
+        }
+        self.estimated_bytes = next_bytes;
+        true
+    }
+
+    fn rows_bytes(&self) -> usize {
+        self.rows.keys().fold(0, |bytes, (service, name)| {
+            bytes
+                .saturating_add(OPERATION_ENTRY_BYTES)
+                .saturating_add(service.len())
+                .saturating_add(name.len())
+        })
+    }
+
+    fn add(&mut self, service: &str, name: &str, start: i64) -> bool {
+        let key = (self.intern(service), self.intern(name));
         if let Some(last_seen) = self.rows.get_mut(&key) {
             *last_seen = (*last_seen).max(start);
         } else {
-            let charge = OPERATION_ENTRY_BYTES
-                .saturating_add(service.len())
-                .saturating_add(name.len());
-            let next_bytes = self.estimated_bytes.saturating_add(charge);
-            if self.rows.len() >= max_operations {
+            if self.rows.len() >= self.max_operations {
+                let next_bytes = self
+                    .estimated_bytes
+                    .saturating_add(OPERATION_ENTRY_BYTES)
+                    .saturating_add(service.len())
+                    .saturating_add(name.len());
                 self.skip(LimitExceeded {
                     limit: "top_level_operations_max_operations",
-                    cap: max_operations,
+                    cap: self.max_operations,
                     observed: self.rows.len().saturating_add(1),
                     estimated_bytes: next_bytes,
                 });
                 return false;
             }
-            if next_bytes > max_bytes {
-                self.skip(LimitExceeded {
-                    limit: "top_level_operations_max_bytes",
-                    cap: max_bytes,
-                    observed: next_bytes,
-                    estimated_bytes: next_bytes,
-                });
+            let charge = OPERATION_ENTRY_BYTES
+                .saturating_add(service.len())
+                .saturating_add(name.len());
+            if !self.charge(charge) {
                 return false;
             }
-            self.estimated_bytes = next_bytes;
             self.rows.insert(key, start);
         }
         self.widen(start);
@@ -216,18 +403,16 @@ impl TopLevelOperations {
             self.widen(low);
             self.widen(high);
         }
-        self.estimated_bytes = self.rows.keys().fold(0, |bytes, (service, name)| {
-            bytes
-                .saturating_add(OPERATION_ENTRY_BYTES)
-                .saturating_add(service.len())
-                .saturating_add(name.len())
-        });
+        self.estimated_bytes = self.rows_bytes();
     }
 
     fn skip(&mut self, exceeded: LimitExceeded) {
         self.rows.clear();
         self.range = None;
         self.estimated_bytes = 0;
+        self.parents = HashMap::new();
+        self.pending = Vec::new();
+        self.names = HashSet::new();
         self.exceeded = Some(exceeded);
     }
 
@@ -272,12 +457,7 @@ impl TopLevelOperations {
                 .or_insert(last_seen);
             out.widen(last_seen);
         }
-        out.estimated_bytes = out.rows.keys().fold(0, |bytes, (service, name)| {
-            bytes
-                .saturating_add(OPERATION_ENTRY_BYTES)
-                .saturating_add(service.len())
-                .saturating_add(name.len())
-        });
+        out.estimated_bytes = out.rows_bytes();
         Ok(out)
     }
 }
