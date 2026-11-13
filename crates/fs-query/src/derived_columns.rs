@@ -234,7 +234,9 @@ fn derive(
     let derivation = derived::derive(batch, &split.wanted)
         .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
     reservation.try_grow(derivation.bytes())?;
-    let made = derivation.into_arrays();
+    let made = derivation
+        .into_arrays()
+        .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
     crate::claim::claim(&made, reservation.take());
     let columns = split
         .shown

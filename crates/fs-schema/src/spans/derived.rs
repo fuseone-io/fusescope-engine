@@ -12,11 +12,12 @@
 //! without either.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray, MapArray, StringArray};
+use arrow::array::{ArrayRef, AsArray, DictionaryArray, Int32Array, MapArray, StringArray};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field, Float64Type, Int8Type};
+use arrow::datatypes::{DataType, Field, Float64Type, Int8Type, Int32Type};
 use arrow::record_batch::RecordBatch;
 
 use super::col;
@@ -121,10 +122,16 @@ impl Derived {
         Self::ALL.into_iter().find(|d| d.name() == name)
     }
 
-    /// The column's field: text, `''` where nothing derives it; nullable for
-    /// a column that replaces a nullable promoted one, though never null.
+    /// The column's field: text, `''` where nothing derives it; for a
+    /// column that replaces a promoted one, that column's dictionary type
+    /// and nullability, though never null.
     pub fn field(self) -> Field {
-        Field::new(self.name(), DataType::Utf8, self.replaces())
+        if self.replaces() {
+            let dictionary =
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+            return Field::new(self.name(), dictionary, true);
+        }
+        Field::new(self.name(), DataType::Utf8, false)
     }
 }
 
@@ -132,8 +139,63 @@ impl Derived {
 /// they are stored text, with the bytes their arrays will take.
 #[derive(Debug)]
 pub struct Derivation<'a> {
-    columns: Vec<Vec<Cow<'a, str>>>,
+    columns: Vec<Column<'a>>,
     bytes: usize,
+}
+
+/// One derived column's values: text, or for a column that replaces a
+/// dictionary-encoded one, its keys into its distinct values.
+#[derive(Debug)]
+enum Column<'a> {
+    Text(Vec<Cow<'a, str>>),
+    Dictionary {
+        keys: Vec<i32>,
+        values: Vec<Cow<'a, str>>,
+    },
+}
+
+impl<'a> Column<'a> {
+    fn of(column: Derived, values: Vec<Cow<'a, str>>) -> Result<Self, SchemaError> {
+        if !column.replaces() {
+            return Ok(Self::Text(values));
+        }
+        let mut distinct: HashMap<Cow<'a, str>, i32> = HashMap::new();
+        let mut keys = Vec::with_capacity(values.len());
+        let mut unique = Vec::new();
+        for value in values {
+            let next = i32::try_from(unique.len())
+                .map_err(|_| SchemaError::Layout("derived dictionary keys"))?;
+            let key = *distinct.entry(value.clone()).or_insert_with(|| {
+                unique.push(value);
+                next
+            });
+            keys.push(key);
+        }
+        Ok(Self::Dictionary {
+            keys,
+            values: unique,
+        })
+    }
+
+    /// The bytes the column's arrays allocate, exactly.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Text(values) => array_bytes(values),
+            Self::Dictionary { keys, values } => {
+                keys.len() * std::mem::size_of::<i32>() + array_bytes(values)
+            }
+        }
+    }
+
+    fn into_array(self) -> Result<ArrayRef, SchemaError> {
+        Ok(match self {
+            Self::Text(values) => string_array(&values),
+            Self::Dictionary { keys, values } => Arc::new(DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                string_array(&values),
+            )?),
+        })
+    }
 }
 
 impl Derivation<'_> {
@@ -143,8 +205,11 @@ impl Derivation<'_> {
     }
 
     /// The derived arrays, in the order they were asked for.
-    pub fn into_arrays(self) -> Vec<ArrayRef> {
-        self.columns.iter().map(|c| string_array(c)).collect()
+    ///
+    /// # Errors
+    /// Arrow refuses a dictionary, which the derivation's keys rule out.
+    pub fn into_arrays(self) -> Result<Vec<ArrayRef>, SchemaError> {
+        self.columns.into_iter().map(Column::into_array).collect()
     }
 }
 
@@ -203,7 +268,12 @@ pub fn derive<'a>(
             out.push(derived.value(*column));
         }
     }
-    let bytes = columns.iter().map(|values| array_bytes(values)).sum();
+    let columns = columns
+        .into_iter()
+        .zip(wanted)
+        .map(|(values, column)| Column::of(*column, values))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bytes = columns.iter().map(Column::bytes).sum();
     Ok(Derivation { columns, bytes })
 }
 
@@ -425,13 +495,9 @@ mod tests {
         let mut builder = SpanBatchBuilder::new(Limits::default());
         builder.append_request(&request).unwrap();
         let batch = builder.finish().unwrap();
-        let arrays = derive(&batch, &[column]).unwrap().into_arrays();
-        arrays
-            .first()
-            .unwrap()
-            .as_string::<i32>()
-            .value(0)
-            .to_owned()
+        let arrays = derive(&batch, &[column]).unwrap().into_arrays().unwrap();
+        let text = arrow::compute::cast(arrays.first().unwrap(), &DataType::Utf8).unwrap();
+        text.as_string::<i32>().value(0).to_owned()
     }
 
     fn text(v: &str) -> Value {

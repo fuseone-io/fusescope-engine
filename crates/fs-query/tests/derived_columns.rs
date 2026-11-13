@@ -623,7 +623,7 @@ async fn a_span_column_only_in_a_filter_stays_out_of_the_file_scan() {
 }
 
 #[tokio::test]
-async fn a_span_column_keeps_its_place_and_nullable_text_in_select_star() {
+async fn a_span_column_keeps_its_place_and_type_in_select_star() {
     let Some(f) = fixture().await else { return };
     write_l0(&f, &conflicting(1, T0)).await;
     let q = querier(&f, QueryLimits::default());
@@ -644,11 +644,17 @@ async fn a_span_column_keeps_its_place_and_nullable_text_in_select_star() {
         );
         assert_eq!(
             schema.field(at).data_type(),
-            &arrow::datatypes::DataType::Utf8
+            stored.field(stored.index_of(name).unwrap()).data_type(),
+            "{name}: the promoted column's dictionary type"
         );
         assert!(schema.field(at).is_nullable());
     }
     let method = batches[0].column_by_name("http_method").unwrap();
+    assert!(matches!(
+        method.data_type(),
+        arrow::datatypes::DataType::Dictionary(_, _)
+    ));
+    let method = arrow::compute::cast(method, &arrow::datatypes::DataType::Utf8).unwrap();
     assert_eq!(method.as_string::<i32>().value(0), "POST");
     f.db.finish().await;
 }

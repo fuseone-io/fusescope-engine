@@ -127,10 +127,11 @@ fn engine_reads(case: &Json) -> BTreeMap<&'static str, String> {
     let derivation = derived::derive(&batch, &Derived::ALL).unwrap();
     Derived::ALL
         .iter()
-        .zip(derivation.into_arrays())
+        .zip(derivation.into_arrays().unwrap())
         .map(|(column, array)| {
             assert_eq!(array.len(), 1);
-            (column.name(), array.as_string::<i32>().value(0).to_owned())
+            let text = arrow::compute::cast(&array, &arrow::datatypes::DataType::Utf8).unwrap();
+            (column.name(), text.as_string::<i32>().value(0).to_owned())
         })
         .collect()
 }
@@ -263,7 +264,7 @@ fn the_span_columns_read_as_the_clickhouse_pipeline_derived_them() {
 }
 
 #[test]
-fn the_replaced_span_columns_keep_their_names_and_nullable_text() {
+fn the_replaced_span_columns_keep_the_names_and_types_they_replace() {
     let names: Vec<&str> = Derived::REPLACED.iter().map(|d| d.name()).collect();
     assert_eq!(
         names,
@@ -274,9 +275,23 @@ fn the_replaced_span_columns_keep_their_names_and_nullable_text() {
             "db_operation"
         ]
     );
+    let dictionary = arrow::datatypes::DataType::Dictionary(
+        Box::new(arrow::datatypes::DataType::Int32),
+        Box::new(arrow::datatypes::DataType::Utf8),
+    );
+    let stored = fs_schema::spans::span_schema_v1();
     for d in Derived::REPLACED {
         let field = d.field();
-        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
+        assert_eq!(
+            field.data_type(),
+            &dictionary,
+            "{} as the promoted column it replaces",
+            d.name()
+        );
+        assert_eq!(
+            field.data_type(),
+            stored.field_with_name(d.name()).unwrap().data_type()
+        );
         assert!(
             field.is_nullable(),
             "{} as the promoted column it replaces",
@@ -327,6 +342,7 @@ fn the_derivation_counts_the_bytes_it_will_make_before_making_them() {
     let counted = derivation.bytes();
     let made: usize = derivation
         .into_arrays()
+        .unwrap()
         .iter()
         .map(arrow::array::Array::get_buffer_memory_size)
         .sum();
