@@ -43,8 +43,9 @@ jobs:
           context: .
           load: true
           tags: fusescope-engine:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: PROFILE=ci
+          cache-from: type=gha,scope=ci
+          cache-to: type=gha,mode=max,scope=ci
       - run: scripts/image-check.sh fusescope-engine:ci
         env:
           SBOM_OUT: sbom.cdx.json
@@ -70,6 +71,21 @@ jobs:
           path: fusescope-charts
       - run: scripts/fusescope-engine-chart-check.sh --image fusescope-engine:ci
         working-directory: fusescope-charts
+  # Tags read the cache of main alone: main keeps the release profile's
+  # dependency layer warm so a release compiles only the workspace.
+  release-cache:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: cook
+          build-args: PROFILE=release
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
   deny:
     runs-on: ubuntu-latest
     steps:
