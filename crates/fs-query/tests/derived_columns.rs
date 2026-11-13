@@ -406,7 +406,13 @@ async fn rows_only_the_hot_window_holds_answer_the_derived_columns() {
     client.export(export).await.unwrap();
 
     let q = querier(&f, QueryLimits::default());
-    let projected = format!("select name, {DERIVED} from spans order by name");
+    let projected = format!("select name, {DERIVED} from spans where name <> 'op-9' order by name");
+    let mut methods = tonic::Request::new(conflicting(8, now - 1_000_000_000));
+    methods.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from(format!("Bearer {ingest_token}")).unwrap(),
+    );
+    client.export(methods).await.unwrap();
     let batches = q.collect(f.tenant, &projected).await.unwrap();
     assert_eq!(
         rows(&batches),
@@ -416,11 +422,27 @@ async fn rows_only_the_hot_window_holds_answer_the_derived_columns() {
     let filtered = q
         .collect(
             f.tenant,
-            "select name from spans where external_http_method = 'POST'",
+            "select name from spans where external_http_method = 'POST' and name <> 'op-9'",
         )
         .await
         .unwrap();
     assert_eq!(rows(&filtered), vec![vec!["op-1".to_owned()]]);
+    let hot = q
+        .collect(
+            f.tenant,
+            &format!(
+                "select {SPAN_COLUMNS} from spans where http_method = 'POST' and name = 'op-9'"
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&hot),
+        [["POST", "200", "legacy-db", "SELECT"]
+            .map(str::to_owned)
+            .to_vec()],
+        "span columns of hot rows"
+    );
     ingester.flush_all().await;
     let batches = q.collect(f.tenant, &projected).await.unwrap();
     assert_eq!(
@@ -503,5 +525,130 @@ async fn deriving_past_the_memory_pool_fails_as_resources_exhausted() {
         "{err}"
     );
     assert_eq!(q.memory_reserved(), 0);
+    f.db.finish().await;
+}
+
+fn typed(key: &str, value: Value) -> KeyValue {
+    KeyValue {
+        key: key.into(),
+        value: Some(AnyValue { value: Some(value) }),
+        ..KeyValue::default()
+    }
+}
+
+/// A client span whose span-column keys conflict: the legacy names first,
+/// then the stable ones, and a gRPC status.
+fn conflicting(trace: u8, start: u64) -> ExportTraceServiceRequest {
+    requests_of(vec![span(
+        trace,
+        9,
+        start,
+        3,
+        vec![
+            kv("http.method", "GET"),
+            kv("http.request.method", "POST"),
+            typed("http.status_code", Value::IntValue(404)),
+            typed("http.response.status_code", Value::IntValue(200)),
+            typed("rpc.grpc.status_code", Value::IntValue(2)),
+            kv("db.namespace", "stable-db"),
+            kv("db.name", "legacy-db"),
+            kv("db.operation", "SELECT"),
+        ],
+    )])
+}
+
+const SPAN_COLUMNS: &str = "http_method, response_status_code, db_name, db_operation";
+
+#[tokio::test]
+async fn the_span_columns_derive_beside_the_exact_keys_they_replace() {
+    let Some(f) = fixture().await else { return };
+    write_l0(&f, &conflicting(1, T0)).await;
+    let q = querier(&f, QueryLimits::default());
+    let sql = format!(
+        "select {SPAN_COLUMNS}, attributes_string['http.method'], attributes_string['db.namespace'], external_http_method from spans"
+    );
+    let batches = q.collect(f.tenant, &sql).await.unwrap();
+    assert_eq!(
+        rows(&batches),
+        [[
+            "POST",
+            "200",
+            "legacy-db",
+            "SELECT",
+            "GET",
+            "stable-db",
+            "POST"
+        ]
+        .map(str::to_owned)
+        .to_vec()],
+        "the column takes the last of its keys, no gRPC status; each key reads only itself"
+    );
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn a_span_column_only_in_a_filter_stays_out_of_the_file_scan() {
+    let Some(f) = fixture().await else { return };
+    write_l0(&f, &conflicting(1, T0)).await;
+    let q = querier(&f, QueryLimits::default());
+    let sql = "select name from spans where db_name = 'legacy-db'";
+    assert_eq!(
+        rows(&q.collect(f.tenant, sql).await.unwrap()),
+        vec![vec!["op-9".to_owned()]]
+    );
+    let none = q
+        .collect(
+            f.tenant,
+            "select name from spans where db_name = 'stable-db'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&none).len(),
+        0,
+        "the promoted value, stable first, is not read"
+    );
+    let plan = rows(
+        &q.collect(f.tenant, &format!("explain {sql}"))
+            .await
+            .unwrap(),
+    );
+    let physical = &plan.iter().find(|r| r[0] == "physical_plan").unwrap()[1];
+    let scan = physical
+        .lines()
+        .find(|l| l.contains("DataSourceExec"))
+        .unwrap();
+    assert!(!scan.contains("db_name"), "pushed down: {scan}");
+    f.db.finish().await;
+}
+
+#[tokio::test]
+async fn a_span_column_keeps_its_place_and_nullable_text_in_select_star() {
+    let Some(f) = fixture().await else { return };
+    write_l0(&f, &conflicting(1, T0)).await;
+    let q = querier(&f, QueryLimits::default());
+    let batches = q.collect(f.tenant, "select * from spans").await.unwrap();
+    let schema = batches[0].schema();
+    let stored = fs_schema::spans::span_schema_v1();
+    for name in [
+        "http_method",
+        "response_status_code",
+        "db_name",
+        "db_operation",
+    ] {
+        let at = schema.index_of(name).unwrap();
+        assert_eq!(
+            at,
+            stored.index_of(name).unwrap(),
+            "{name} where the promoted column was"
+        );
+        assert_eq!(
+            schema.field(at).data_type(),
+            &arrow::datatypes::DataType::Utf8
+        );
+        assert!(schema.field(at).is_nullable());
+    }
+    let method = batches[0].column_by_name("http_method").unwrap();
+    assert_eq!(method.as_string::<i32>().value(0), "POST");
     f.db.finish().await;
 }

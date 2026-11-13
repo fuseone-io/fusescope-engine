@@ -1,7 +1,10 @@
 //! The spans table's derived columns over its stored ones.
 //!
 //! The table shows `http_url`, `http_host`, `external_http_method` and
-//! `external_http_url` after the stored columns. A scan that needs one
+//! `external_http_url` after the stored columns, and derives
+//! `http_method`, `response_status_code`, `db_name` and `db_operation` in
+//! place of the promoted columns of those names, which it no longer reads.
+//! A scan that needs one
 //! reads [`derived::INPUTS`] in their place, from the files and the hot
 //! window alike, and [`DeriveExec`] computes the columns above the union.
 //! Filters on them are never pushed to a scan: the table declares them
@@ -32,9 +35,21 @@ pub const CONSUMER: &str = "derived span columns";
 
 /// `stored` followed by the derived columns.
 pub fn table_schema(stored: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<_> = stored.fields().iter().cloned().collect();
-    fields.extend(Derived::ALL.iter().map(|d| Arc::new(d.field())));
+    let mut fields: Vec<_> = stored
+        .fields()
+        .iter()
+        .map(|field| match replacing(field.name()) {
+            Some(derived) => Arc::new(derived.field()),
+            None => Arc::clone(field),
+        })
+        .collect();
+    fields.extend(Derived::APPENDED.iter().map(|d| Arc::new(d.field())));
     Arc::new(Schema::new_with_metadata(fields, stored.metadata().clone()))
+}
+
+/// The derived column that takes the place of the stored column `name`.
+fn replacing(name: &str) -> Option<Derived> {
+    Derived::of(name).filter(|d| d.replaces())
 }
 
 /// True when `filter` reads a derived column.
@@ -69,9 +84,11 @@ impl Split {
     /// An index past the table's columns.
     pub fn of(stored: &SchemaRef, projection: Option<&Vec<usize>>) -> DfResult<Option<Self>> {
         let width = stored.fields().len();
-        let all: Vec<usize> = (0..width + Derived::ALL.len()).collect();
+        let all: Vec<usize> = (0..width + Derived::APPENDED.len()).collect();
         let projection = projection.unwrap_or(&all);
-        if projection.iter().all(|i| *i < width) {
+        let shows_derived =
+            |index: &usize| *index >= width || replacing(stored.field(*index).name()).is_some();
+        if !projection.iter().any(shows_derived) {
             return Ok(None);
         }
         let mut split = Self {
@@ -80,14 +97,20 @@ impl Split {
             wanted: Vec::new(),
         };
         for &index in projection {
-            let shown = match index.checked_sub(width) {
-                Some(d) => {
-                    let Some(column) = Derived::ALL.get(d) else {
+            let derived = match index.checked_sub(width) {
+                Some(d) => match Derived::APPENDED.get(d) {
+                    Some(column) => Some(*column),
+                    None => {
                         return datafusion::common::internal_err!(
                             "column {index} past the spans table"
                         );
-                    };
-                    split.wanted.push(*column);
+                    }
+                },
+                None => replacing(stored.field(index).name()),
+            };
+            let shown = match derived {
+                Some(column) => {
+                    split.wanted.push(column);
                     Shown::Derived(split.wanted.len() - 1)
                 }
                 None => Shown::Stored(split.read(index)),

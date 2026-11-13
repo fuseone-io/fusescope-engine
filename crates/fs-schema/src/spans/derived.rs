@@ -1,11 +1,15 @@
 //! Span columns derived from the stored kind and attributes when they are
-//! read, never stored: `http_url`, `http_host`, `external_http_method` and
-//! `external_http_url`. The rules and their observed sources are in
-//! `MAPPING.md`, section "Derived span columns".
+//! read: `http_url`, `http_host`, `external_http_method` and
+//! `external_http_url`, never stored, and `http_method`,
+//! `response_status_code`, `db_name` and `db_operation`, which replace the
+//! promoted columns of those names. The rules and their observed sources
+//! are in `MAPPING.md`, section "Derived span columns".
 //!
 //! Each map is folded in its stored order, which is the OTLP order within
-//! one value type; the order between types is not stored, so string values
-//! decide wherever a key also appears with another type.
+//! one value type, so the last key wins within a type. The order between
+//! types is not stored: where a column's keys hold values of different
+//! types, a string decides, a number only without a string, a bool only
+//! without either.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -29,7 +33,17 @@ pub const INPUTS: [&str; 4] = [
 const CLIENT: i8 = 3;
 const URL_KEYS: [&str; 2] = ["url.full", "http.url"];
 const HOST_KEYS: [&str; 3] = ["server.address", "net.peer.name", "http.host"];
-const METHOD_KEYS: [&str; 2] = ["http.request.method", "http.method"];
+/// The span columns derived from several keys, the last of them winning,
+/// with those keys.
+const KEYED: [(Derived, &[&str]); 4] = [
+    (Derived::HttpMethod, &["http.method", "http.request.method"]),
+    (
+        Derived::ResponseStatusCode,
+        &["http.status_code", "http.response.status_code"],
+    ),
+    (Derived::DbName, &["db.name", "db.namespace"]),
+    (Derived::DbOperation, &["db.operation", "db.operation.name"]),
+];
 
 /// One derived span column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,15 +57,44 @@ pub enum Derived {
     ExternalHttpMethod,
     /// The host of a client span's URL.
     ExternalHttpUrl,
+    /// The last HTTP method attribute.
+    HttpMethod,
+    /// The last HTTP status code attribute; a gRPC status is not one.
+    ResponseStatusCode,
+    /// The last database name attribute.
+    DbName,
+    /// The last database operation attribute.
+    DbOperation,
 }
 
 impl Derived {
-    /// Every derived column, in the order the table shows them.
-    pub const ALL: [Self; 4] = [
+    /// The columns the table shows after the stored ones, in that order.
+    pub const APPENDED: [Self; 4] = [
         Self::HttpUrl,
         Self::HttpHost,
         Self::ExternalHttpMethod,
         Self::ExternalHttpUrl,
+    ];
+
+    /// The columns that take the place of the promoted columns of their
+    /// names.
+    pub const REPLACED: [Self; 4] = [
+        Self::HttpMethod,
+        Self::ResponseStatusCode,
+        Self::DbName,
+        Self::DbOperation,
+    ];
+
+    /// Every derived column.
+    pub const ALL: [Self; 8] = [
+        Self::HttpUrl,
+        Self::HttpHost,
+        Self::ExternalHttpMethod,
+        Self::ExternalHttpUrl,
+        Self::HttpMethod,
+        Self::ResponseStatusCode,
+        Self::DbName,
+        Self::DbOperation,
     ];
 
     /// The column name, the backend's.
@@ -61,7 +104,16 @@ impl Derived {
             Self::HttpHost => "http_host",
             Self::ExternalHttpMethod => "external_http_method",
             Self::ExternalHttpUrl => "external_http_url",
+            Self::HttpMethod => "http_method",
+            Self::ResponseStatusCode => "response_status_code",
+            Self::DbName => "db_name",
+            Self::DbOperation => "db_operation",
         }
+    }
+
+    /// True for a column that takes the place of a stored one.
+    pub fn replaces(self) -> bool {
+        Self::REPLACED.contains(&self)
     }
 
     /// The derived column called `name`.
@@ -69,9 +121,10 @@ impl Derived {
         Self::ALL.into_iter().find(|d| d.name() == name)
     }
 
-    /// The column's field: text, `''` where nothing derives it.
+    /// The column's field: text, `''` where nothing derives it; nullable for
+    /// a column that replaces a nullable promoted one, though never null.
     pub fn field(self) -> Field {
-        Field::new(self.name(), DataType::Utf8, false)
+        Field::new(self.name(), DataType::Utf8, self.replaces())
     }
 }
 
@@ -130,14 +183,20 @@ pub fn derive<'a>(
     for row in 0..batch.num_rows() {
         let mut span =
             fold_strings(entries(strings, row).map(|(k, i)| (k, string_values.value(i))));
-        if span.method.is_none() {
-            span.method = last_typed(
-                entries(numbers, row).map(|(k, i)| (k, number_text(number_values.value(i)))),
-            )
-            .or_else(|| {
-                last_typed(entries(bools, row).map(|(k, i)| (k, bool_values.value(i).to_string())))
-            })
-            .map(Cow::Owned);
+        for ((_, keys), slot) in KEYED.iter().zip(span.keyed.iter_mut()) {
+            if slot.is_none() {
+                *slot = last_typed(
+                    keys,
+                    entries(numbers, row).map(|(k, i)| (k, number_text(number_values.value(i)))),
+                )
+                .or_else(|| {
+                    last_typed(
+                        keys,
+                        entries(bools, row).map(|(k, i)| (k, bool_values.value(i).to_string())),
+                    )
+                })
+                .map(Cow::Owned);
+            }
         }
         let derived = span.finish(kind.value(row) == CLIENT);
         for (out, column) in columns.iter_mut().zip(wanted) {
@@ -200,13 +259,14 @@ struct Fold<'a> {
     url: &'a str,
     first_url: &'a str,
     host: &'a str,
-    method: Option<Cow<'a, str>>,
+    /// The values of the [`KEYED`] columns, in that order.
+    keyed: [Option<Cow<'a, str>>; 4],
 }
 
 struct Span<'a> {
     url: &'a str,
     host: &'a str,
-    method: Cow<'a, str>,
+    keyed: [Cow<'a, str>; 4],
     client: bool,
 }
 
@@ -220,7 +280,7 @@ impl<'a> Fold<'a> {
         Span {
             url: self.url,
             host,
-            method: self.method.unwrap_or_default(),
+            keyed: self.keyed.map(Option::unwrap_or_default),
             client,
         }
     }
@@ -231,10 +291,20 @@ impl<'a> Span<'a> {
         match column {
             Derived::HttpUrl => Cow::Borrowed(self.url),
             Derived::HttpHost => Cow::Borrowed(self.host),
-            Derived::ExternalHttpMethod if self.client => self.method.clone(),
+            Derived::ExternalHttpMethod if self.client => self.keyed(Derived::HttpMethod),
             Derived::ExternalHttpUrl if self.client => Cow::Borrowed(url_host(self.url)),
             Derived::ExternalHttpMethod | Derived::ExternalHttpUrl => Cow::Borrowed(""),
+            keyed => self.keyed(keyed),
         }
+    }
+
+    fn keyed(&self, column: Derived) -> Cow<'a, str> {
+        KEYED
+            .iter()
+            .position(|(c, _)| *c == column)
+            .and_then(|at| self.keyed.get(at))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -248,16 +318,21 @@ fn fold_strings<'a>(entries: impl Iterator<Item = (&'a str, &'a str)>) -> Fold<'
             }
         } else if HOST_KEYS.contains(&key) {
             fold.host = value;
-        } else if METHOD_KEYS.contains(&key) {
-            fold.method = Some(Cow::Borrowed(value));
+        } else if let Some(at) = KEYED.iter().position(|(_, keys)| keys.contains(&key)) {
+            if let Some(slot) = fold.keyed.get_mut(at) {
+                *slot = Some(Cow::Borrowed(value));
+            }
         }
     }
     fold
 }
 
-fn last_typed<'a>(entries: impl Iterator<Item = (&'a str, String)>) -> Option<String> {
+fn last_typed<'a>(
+    keys: &[&str],
+    entries: impl Iterator<Item = (&'a str, String)>,
+) -> Option<String> {
     entries
-        .filter(|(key, _)| METHOD_KEYS.contains(key))
+        .filter(|(key, _)| keys.contains(key))
         .last()
         .map(|(_, value)| value)
 }
@@ -312,6 +387,133 @@ fn string_array(values: &[Cow<'_, str>]) -> ArrayRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits::Limits;
+    use crate::spans::SpanBatchBuilder;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    fn attribute(key: &str, value: Value) -> KeyValue {
+        KeyValue {
+            key: key.into(),
+            value: Some(AnyValue { value: Some(value) }),
+            ..KeyValue::default()
+        }
+    }
+
+    /// `column` of one span of `kind` with `attributes`, in their order.
+    fn read(column: Derived, kind: i32, attributes: Vec<KeyValue>) -> String {
+        let span = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![1; 8],
+            kind,
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            attributes,
+            ..Span::default()
+        };
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        };
+        let mut builder = SpanBatchBuilder::new(Limits::default());
+        builder.append_request(&request).unwrap();
+        let batch = builder.finish().unwrap();
+        let arrays = derive(&batch, &[column]).unwrap().into_arrays();
+        arrays
+            .first()
+            .unwrap()
+            .as_string::<i32>()
+            .value(0)
+            .to_owned()
+    }
+
+    fn text(v: &str) -> Value {
+        Value::StringValue(v.into())
+    }
+
+    #[test]
+    fn across_types_a_string_decides_whatever_the_order() {
+        let later_number = vec![
+            attribute("http.method", text("GET")),
+            attribute("http.request.method", Value::IntValue(5)),
+        ];
+        assert_eq!(read(Derived::HttpMethod, 2, later_number), "GET");
+        let earlier_number = vec![
+            attribute("http.method", Value::IntValue(5)),
+            attribute("http.request.method", text("POST")),
+        ];
+        assert_eq!(read(Derived::HttpMethod, 2, earlier_number), "POST");
+        let empty_string = vec![
+            attribute("db.name", Value::IntValue(7)),
+            attribute("db.namespace", text("")),
+        ];
+        assert_eq!(
+            read(Derived::DbName, 2, empty_string),
+            "",
+            "an empty string is a string"
+        );
+    }
+
+    #[test]
+    fn without_a_string_a_number_decides_then_a_bool() {
+        let numbers = vec![
+            attribute("http.status_code", Value::IntValue(404)),
+            attribute("http.response.status_code", Value::IntValue(200)),
+        ];
+        assert_eq!(
+            read(Derived::ResponseStatusCode, 2, numbers),
+            "200",
+            "one type: the last wins"
+        );
+        let mixed = vec![
+            attribute("db.operation", Value::BoolValue(true)),
+            attribute("db.operation.name", Value::DoubleValue(1.5)),
+        ];
+        assert_eq!(read(Derived::DbOperation, 2, mixed), "1.5");
+        assert_eq!(
+            read(
+                Derived::DbOperation,
+                2,
+                vec![attribute("db.operation", Value::BoolValue(true))]
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn a_grpc_status_feeds_no_response_status_code() {
+        assert_eq!(
+            read(
+                Derived::ResponseStatusCode,
+                3,
+                vec![attribute("rpc.grpc.status_code", Value::IntValue(2))]
+            ),
+            ""
+        );
+        let after = vec![
+            attribute("http.status_code", Value::IntValue(500)),
+            attribute("rpc.grpc.status_code", Value::IntValue(2)),
+        ];
+        assert_eq!(read(Derived::ResponseStatusCode, 3, after), "500");
+    }
+
+    #[test]
+    fn a_client_spans_external_method_is_its_http_method() {
+        let both = vec![
+            attribute("http.request.method", text("PATCH")),
+            attribute("http.method", text("DELETE")),
+        ];
+        assert_eq!(read(Derived::HttpMethod, 3, both.clone()), "DELETE");
+        assert_eq!(read(Derived::ExternalHttpMethod, 3, both.clone()), "DELETE");
+        assert_eq!(read(Derived::ExternalHttpMethod, 2, both), "");
+    }
 
     #[test]
     fn a_url_host_keeps_case_and_drops_user_info_port_and_brackets() {

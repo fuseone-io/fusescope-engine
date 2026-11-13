@@ -83,6 +83,13 @@ Numeric sources (status codes) render as integers without a fraction. All
 promoted columns are dictionary-encoded strings in schema v1; typed promotions
 are a compactor concern.
 
+The query layer no longer reads `http_method`, `response_status_code`,
+`db_name` and `db_operation` as stored: the spans table derives those
+columns when read ("Derived span columns"), because the folding above, the
+stable key first and a gRPC status included, is not how ClickHouse derives
+them. Every key also stays in its attribute map, which an attribute filter
+reads exactly: a key is never answered from another key's promoted column.
+
 ## Derived span columns
 
 `http_url`, `http_host`, `external_http_method` and `external_http_url` are
@@ -104,6 +111,10 @@ case names below are its cases.
 | http_host, client | a CLIENT span whose host attributes leave it empty takes the host of its first non-empty `url.full` or `http.url` value | `client_url_full_only`, `client_url_full_and_http_url_conflict`, `client_url_full_empty_then_http_url`, `client_url_full_then_server_address_empty` |
 | external_http_method | CLIENT only: the value of the last `http.request.method` or `http.method` attribute, any type rendered as text (integral numbers without a fraction, booleans `true`/`false`), case kept; `""` overrides; `""` for every other kind | `client_method_*`, `kind_*_full` |
 | external_http_url | CLIENT only: the host of the final `http_url`; `""` for every other kind | `client_url_full_*`, `kind_*_full` |
+| http_method | the value of the last `http.method` or `http.request.method` attribute, any kind; `""` overrides | `span_columns_observed.json`: `http_method:*` |
+| response_status_code | the value of the last `http.status_code` or `http.response.status_code` attribute, any kind; `""` overrides; `rpc.grpc.status_code` is not an input, alone or with the others | `response_status_code:*`, `*rpc.grpc.status_code*` |
+| db_name | the value of the last `db.name` or `db.namespace` attribute; `""` overrides | `db_name:*` |
+| db_operation | the value of the last `db.operation` or `db.operation.name` attribute; `""` overrides | `db_operation:*` |
 | a URL's host | without user info, port or IPv6 brackets, case kept; `""` when the URL has no `//` authority (no scheme, a relative path, `https://`); the whole URL when it does not parse (a scheme not starting with a letter, a port that is not a number) | `*_url_full_userinfo_upper`, `*_url_full_ipv6`, `*_url_full_ip`, `*_url_full_no_scheme`, `*_url_full_relative`, `*_url_full_scheme_only`, `*_url_full_bad_port`, `*_url_full_bad_scheme`, `*_url_full_empty_port` |
 
 Not inputs, observed: `net.host.name`, `peer.service`, resource attributes
@@ -120,8 +131,12 @@ maps, so the order between a string and a non-string value is lost. Where
 the pipeline let a later non-string value of an input key override an
 earlier string one, the engine keeps the string
 (`*_server_address_then_net_peer_name_int`, `*_url_full_then_http_url_int`,
-`*_method_stable_then_legacy_int`); for the method, string values decide
-and a number or bool counts only when no string method is present.
+`*_method_stable_then_legacy_int`). For `http_method`,
+`response_status_code`, `db_name` and `db_operation` the engine's rule
+where a column's keys hold values of different types is fixed: a string
+value decides, the last string in order; without one, the last number;
+without either, the last bool. "The last wins" holds as stated only among
+values of one type, whose order v1 keeps.
 
 ## Compactor-derived trace data
 
