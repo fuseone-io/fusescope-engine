@@ -3,7 +3,7 @@
 derived span columns, and the fixture pairing each span with the row the
 ClickHouse pipeline wrote for it.
 
-  derived-columns-corpus.py request RUN_HEX START_UNIX_NANO [derived|host-keys] > request.json
+  derived-columns-corpus.py request RUN_HEX START_UNIX_NANO [derived|host-keys|span-columns] > request.json
   derived-columns-corpus.py fixture request.json rows.json versions.json > fixture.json
 """
 
@@ -18,7 +18,17 @@ KINDS = {
     "PRODUCER": 4,
     "CONSUMER": 5,
 }
-COLUMNS = ["kind", "http_url", "http_host", "external_http_method", "external_http_url", "http_method"]
+COLUMNS = [
+    "kind",
+    "http_url",
+    "http_host",
+    "external_http_method",
+    "external_http_url",
+    "http_method",
+    "response_status_code",
+    "db_name",
+    "db_operation",
+]
 
 
 def s(v):
@@ -189,6 +199,37 @@ def attributes(attrs):
     return out
 
 
+# The span columns ClickHouse derives from more than one key: each column's keys alone, together in
+# both orders, empty, and typed otherwise.
+SPAN_COLUMN_KEYS = {
+    "db_name": ["db.name", "db.namespace"],
+    "db_operation": ["db.operation", "db.operation.name"],
+    "http_method": ["http.method", "http.request.method"],
+    "response_status_code": ["http.status_code", "http.response.status_code", "rpc.grpc.status_code"],
+}
+
+
+def span_column_cases():
+    out = []
+    for column, keys in SPAN_COLUMN_KEYS.items():
+        variations = {}
+        for n, key in enumerate(keys):
+            variations[f"{key}_only"] = {key: s(f"{column}-{n}")}
+            variations[f"{key}_empty"] = {key: s("")}
+            variations[f"{key}_int"] = {key: i(200 + n)}
+        for a in range(len(keys)):
+            for b in range(len(keys)):
+                if a != b:
+                    variations[f"{keys[a]}_then_{keys[b]}"] = {keys[a]: s(f"{column}-{a}"), keys[b]: s(f"{column}-{b}")}
+                    variations[f"{keys[a]}_then_{keys[b]}_empty"] = {keys[a]: s(f"{column}-{a}"), keys[b]: s("")}
+                    variations[f"{keys[a]}_int_then_{keys[b]}_int"] = {keys[a]: i(200 + a), keys[b]: i(200 + b)}
+        variations["none"] = {}
+        for kind in ("SERVER", "CLIENT"):
+            for name, attrs in variations.items():
+                out.append((f"{column}:{kind.lower()}_{name}", kind, attrs, {}))
+    return out
+
+
 def host_key_cases():
     out = []
     for kind in KINDS:
@@ -217,7 +258,7 @@ def ids(run, n):
     return f"d6c0{run:08x}{0:012x}{n:08x}", f"d6{n:014x}"
 
 
-CORPORA = {"derived": cases, "host-keys": host_key_cases}
+CORPORA = {"derived": cases, "host-keys": host_key_cases, "span-columns": span_column_cases}
 
 
 def request(run, start, corpus="derived"):
