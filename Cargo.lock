@@ -1749,6 +1749,7 @@ name = "fs-query"
 version = "0.0.4"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "arrow-flight",
  "async-trait",
  "base64 0.22.1",
