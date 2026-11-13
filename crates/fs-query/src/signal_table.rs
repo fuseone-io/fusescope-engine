@@ -279,9 +279,25 @@ impl SignalTable {
         Ok(Planned { files, bytes, text })
     }
 
-    /// The schema the table shows: its signal's, for metrics its table's,
-    /// without the samples' source order unless it was asked for.
+    /// The schema the table shows: the stored one, for spans followed by
+    /// the derived columns.
     fn table_schema(&self) -> arrow::datatypes::SchemaRef {
+        if self.derives() {
+            crate::derived_columns::table_schema(&self.stored_schema())
+        } else {
+            self.stored_schema()
+        }
+    }
+
+    /// True for the spans table, which shows the derived span columns.
+    fn derives(&self) -> bool {
+        self.signal == RowSignal::Traces && self.table.is_none()
+    }
+
+    /// The schema of the table's files and hot rows: its signal's, for
+    /// metrics its table's, without the samples' source order unless it was
+    /// asked for.
+    fn stored_schema(&self) -> arrow::datatypes::SchemaRef {
         match self.table {
             Some(MetricTable::Series) => fs_schema::metrics::series_schema_v1(),
             Some(MetricTable::Samples) if self.source_order => {
@@ -349,7 +365,16 @@ impl TableProvider for SignalTable {
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         // Pruning is a hint; DataFusion keeps evaluating every filter.
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if self.derives() && crate::derived_columns::reads_derived(f) {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -359,8 +384,41 @@ impl TableProvider for SignalTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let stored = self.stored_schema();
+        let split = if self.derives() {
+            crate::derived_columns::Split::of(&stored, projection)?
+        } else {
+            None
+        };
+        let Some(split) = split else {
+            return self.scan_stored(state, projection, filters, limit).await;
+        };
+        let table = self.table_schema();
+        let shown = match projection {
+            Some(indices) => Arc::new(table.project(indices)?),
+            None => table,
+        };
+        let input = self
+            .scan_stored(state, Some(&split.stored.clone()), filters, limit)
+            .await?;
+        Ok(Arc::new(crate::derived_columns::DeriveExec::new(
+            input, split, shown,
+        )))
+    }
+}
+
+impl SignalTable {
+    /// The scan of the stored columns `projection` names, indices into
+    /// [`SignalTable::stored_schema`].
+    async fn scan_stored(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let started = std::time::Instant::now();
-        let schema = self.table_schema();
+        let schema = self.stored_schema();
         let external = |e: QueryError| datafusion::error::DataFusionError::External(Box::new(e));
 
         // Hot window first: ingesters report which recently flushed files they
@@ -450,7 +508,7 @@ impl SignalTable {
         planned: Planned,
         started: std::time::Instant,
     ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-        let schema = self.table_schema();
+        let schema = self.stored_schema();
         let text = planned
             .text
             .zip(self.text_index.as_ref().map(|(_, stats)| Arc::clone(stats)));

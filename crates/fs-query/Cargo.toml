@@ -10,7 +10,8 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-arrow = { workspace = true }
+arrow = { workspace = true, features = ["pool"] }
+arrow-buffer = { workspace = true }
 arrow-flight = { workspace = true }
 datafusion = { workspace = true }
 datafusion-datasource = { workspace = true }
