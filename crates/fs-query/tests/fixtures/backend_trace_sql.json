@@ -1,7 +1,7 @@
 {
   "format_version": 1,
-  "backend_commit": "5ca8337c8e03799c5bb4adf07f022cd83965c631",
-  "sha256": "e9c88c9cd42cc82d76c366374f590ec444ff617398d8677ce70b2706fc9d890d",
+  "backend_commit": "b4ada03d6003ad985729aa4457ec803218ccdb17",
+  "sha256": "a1a439e3d0b0697b4aabdd71a93957466b852e95099483f5c136af12e07d647d",
   "cases": [
     {
       "name": "TestEngineAggregationMatrix/avg(duration_nano)",
@@ -325,7 +325,7 @@
     },
     {
       "name": "TestEngineFilterMatrix/isEntryPoint_=_true",
-      "sql": "SELECT count(*) AS __result_0 FROM spans WHERE (parent_span_id IS NOT NULL AND (is_remote = 'true' OR EXISTS (SELECT 1 FROM top_level_operations t WHERE t.service_name = spans.service_name AND t.name = spans.name AND t.last_seen >= to_timestamp_nanos(1747947419000000000)))) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 ORDER BY __result_0 DESC"
+      "sql": "SELECT count(*) AS __result_0 FROM spans WHERE (parent_span_id IS NOT NULL AND EXISTS (SELECT 1 FROM top_level_operations t WHERE t.service_name = spans.service_name AND t.name = spans.name AND t.last_seen >= to_timestamp_nanos(1747947419000000000))) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 ORDER BY __result_0 DESC"
     },
     {
       "name": "TestEngineFilterMatrix/isRoot_=_true",
@@ -897,15 +897,15 @@
     },
     {
       "name": "TestEngineTopLevelOperationsStatement/every_service",
-      "sql": "SELECT name, service_name, max(seen) AS ts FROM (SELECT name, service_name, last_seen AS seen FROM top_level_operations WHERE last_seen >= to_timestamp_nanos(1747947419000000000) UNION ALL SELECT CAST(name AS VARCHAR) AS name, CAST(service_name AS VARCHAR) AS service_name, timestamp AS seen FROM spans WHERE timestamp >= to_timestamp_nanos(1747947419000000000) AND service_name IS NOT NULL AND (parent_span_id IS NULL OR is_remote = 'true')) AS operations GROUP BY name, service_name ORDER BY ts DESC LIMIT 5000"
+      "sql": "SELECT name, service_name, max(last_seen) AS ts FROM top_level_operations WHERE last_seen >= to_timestamp_nanos(1747947419000000000) GROUP BY name, service_name ORDER BY ts DESC LIMIT 5000"
     },
     {
       "name": "TestEngineTopLevelOperationsStatement/some_services",
-      "sql": "SELECT name, service_name, max(seen) AS ts FROM (SELECT name, service_name, last_seen AS seen FROM top_level_operations WHERE last_seen >= to_timestamp_nanos(1747947419000000000) AND service_name IN ('frontend', 'cart') UNION ALL SELECT CAST(name AS VARCHAR) AS name, CAST(service_name AS VARCHAR) AS service_name, timestamp AS seen FROM spans WHERE timestamp >= to_timestamp_nanos(1747947419000000000) AND service_name IN ('frontend', 'cart') AND (parent_span_id IS NULL OR is_remote = 'true')) AS operations GROUP BY name, service_name ORDER BY ts DESC LIMIT 5000"
+      "sql": "SELECT name, service_name, max(last_seen) AS ts FROM top_level_operations WHERE last_seen >= to_timestamp_nanos(1747947419000000000) AND service_name IN ('frontend', 'cart') GROUP BY name, service_name ORDER BY ts DESC LIMIT 5000"
     },
     {
       "name": "TestEngineViewStatements/entry_point_operations",
-      "sql": "SELECT CAST(name AS VARCHAR) AS \"__GROUP_BY_KEY_0_name\", approx_percentile_cont(0.99) WITHIN GROUP (ORDER BY TRY_CAST(duration_nano AS DOUBLE)) AS __result_0, (count(*) / 36029) AS __result_1 FROM spans WHERE ((service_name = 'frontend') AND (parent_span_id IS NOT NULL AND (is_remote = 'true' OR EXISTS (SELECT 1 FROM top_level_operations t WHERE t.service_name = spans.service_name AND t.name = spans.name AND t.last_seen >= to_timestamp_nanos(1747947419000000000))))) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 GROUP BY \"__GROUP_BY_KEY_0_name\" ORDER BY __result_0 DESC LIMIT 50"
+      "sql": "SELECT CAST(name AS VARCHAR) AS \"__GROUP_BY_KEY_0_name\", approx_percentile_cont(0.99) WITHIN GROUP (ORDER BY TRY_CAST(duration_nano AS DOUBLE)) AS __result_0, (count(*) / 36029) AS __result_1 FROM spans WHERE ((service_name = 'frontend') AND (parent_span_id IS NOT NULL AND EXISTS (SELECT 1 FROM top_level_operations t WHERE t.service_name = spans.service_name AND t.name = spans.name AND t.last_seen >= to_timestamp_nanos(1747947419000000000)))) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 GROUP BY \"__GROUP_BY_KEY_0_name\" ORDER BY __result_0 DESC LIMIT 50"
     },
     {
       "name": "TestEngineViewStatements/latency_per_service",
@@ -913,7 +913,7 @@
     },
     {
       "name": "TestEngineViewStatements/services",
-      "sql": "SELECT CAST(service_name AS VARCHAR) AS \"__GROUP_BY_KEY_0_service.name\", approx_percentile_cont(0.99) WITHIN GROUP (ORDER BY TRY_CAST(duration_nano AS DOUBLE)) AS __result_0, avg(TRY_CAST(duration_nano AS DOUBLE)) AS __result_1, count(*) AS __result_2, count(*) FILTER (WHERE TRY_CAST(status_code AS DOUBLE) = 2) AS __result_3, count(*) FILTER (WHERE (TRY_CAST(coalesce(response_status_code, '') AS DOUBLE) >= 400 AND TRY_CAST(coalesce(response_status_code, '') AS DOUBLE) < 500)) AS __result_4 FROM spans WHERE ((deployment_environment = 'prod') AND ((parent_span_id IS NULL OR (parent_span_id IS NOT NULL AND (is_remote = 'true' OR EXISTS (SELECT 1 FROM top_level_operations t WHERE t.service_name = spans.service_name AND t.name = spans.name AND t.last_seen >= to_timestamp_nanos(1747947419000000000))))))) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 GROUP BY \"__GROUP_BY_KEY_0_service.name\" ORDER BY __result_0 DESC"
+      "sql": "SELECT CAST(service_name AS VARCHAR) AS \"__GROUP_BY_KEY_0_service.name\", approx_percentile_cont(0.99) WITHIN GROUP (ORDER BY TRY_CAST(duration_nano AS DOUBLE)) AS __result_0, avg(TRY_CAST(duration_nano AS DOUBLE)) AS __result_1, count(*) AS __result_2, count(*) FILTER (WHERE TRY_CAST(status_code AS DOUBLE) = 2) AS __result_3, count(*) FILTER (WHERE (TRY_CAST(coalesce(response_status_code, '') AS DOUBLE) >= 400 AND TRY_CAST(coalesce(response_status_code, '') AS DOUBLE) < 500)) AS __result_4 FROM spans WHERE ((deployment_environment = 'prod') AND ((parent_span_id IS NULL OR (parent_span_id IS NOT NULL AND EXISTS (SELECT 1 FROM top_level_operations t WHERE t.service_name = spans.service_name AND t.name = spans.name AND t.last_seen >= to_timestamp_nanos(1747947419000000000)))))) AND timestamp >= to_timestamp_nanos(1747947419000000000) AND timestamp < to_timestamp_nanos(1747983448000000000) AND ts_bucket_start >= 1747945619 AND ts_bucket_start <= 1747983448 GROUP BY \"__GROUP_BY_KEY_0_service.name\" ORDER BY __result_0 DESC"
     },
     {
       "name": "TestEngineViewStatements/span_list",
