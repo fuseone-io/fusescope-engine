@@ -83,9 +83,41 @@ Numeric sources (status codes) render as integers without a fraction. All
 promoted columns are dictionary-encoded strings in schema v1; typed promotions
 are a compactor concern.
 
-Deferred: `http_url`, `http_host`, `external_http_url`, `external_http_method`
-used by the external-calls views. They are derived from `url.full`,
-`server.address` and span kind and belong to a later schema version.
+## Derived span columns
+
+`http_url`, `http_host`, `external_http_method` and `external_http_url` are
+computed from the stored `kind` and attribute maps when a query reads them;
+schema v1 stores none of them, so every v1 file and the hot window answer
+them. Filters on them run above the scan and never prune files.
+
+Sources: the OTLP protocol (`SpanKind`, `AnyValue`), the semconv HTTP, URL
+and server attribute names, and controlled observation of the ClickHouse
+pipeline: `tests/fixtures/derived_columns_observed.json`, recorded with
+`scripts/derived-columns-corpus.sh`, holds each OTLP span exactly as sent
+and the row written for it, with the collector and ClickHouse versions. The
+case names below are its cases.
+
+| Column | Rule | Observed in |
+|---|---|---|
+| http_url | the value of the last `url.full` or `http.url` attribute, in attribute order, any kind; `""` overrides an earlier value; a URL is never assembled from `url.scheme`, `server.address`, `url.path`, `url.query` or `http.target` | `*_url_full_and_http_url_conflict`, `*_http_url_and_url_full_conflict`, `*_url_full_then_http_url_empty`, `*_url_parts_*` |
+| http_host | the value of the last `server.address`, `net.peer.name` or `http.host` attribute, any kind, kept as written (a `host:port` value keeps its port; `server.port` and `net.peer.port` are not appended); `""` overrides | `*_server_address_vs_*`, `*_net_peer_name_vs_*`, `*_http_host_vs_*`, `*_with_port`, `*_and_port`, `*_then_net_peer_name_empty` |
+| http_host, client | a CLIENT span whose host attributes leave it empty takes the host of its first non-empty `url.full` or `http.url` value | `client_url_full_only`, `client_url_full_and_http_url_conflict`, `client_url_full_empty_then_http_url`, `client_url_full_then_server_address_empty` |
+| external_http_method | CLIENT only: the value of the last `http.request.method` or `http.method` attribute, any type rendered as text (integral numbers without a fraction, booleans `true`/`false`), case kept; `""` overrides; `""` for every other kind | `client_method_*`, `kind_*_full` |
+| external_http_url | CLIENT only: the host of the final `http_url`; `""` for every other kind | `client_url_full_*`, `kind_*_full` |
+| a URL's host | without user info, port or IPv6 brackets, case kept; `""` when the URL has no `//` authority (no scheme, a relative path, `https://`); the whole URL when it does not parse (a scheme not starting with a letter, a port that is not a number) | `*_url_full_userinfo_upper`, `*_url_full_ipv6`, `*_url_full_ip`, `*_url_full_no_scheme`, `*_url_full_relative`, `*_url_full_scheme_only`, `*_url_full_bad_port`, `*_url_full_bad_scheme`, `*_url_full_empty_port` |
+
+Not inputs, observed: `net.host.name`, `peer.service`, resource attributes
+(`host.name`, `server.address`), the span kinds other than CLIENT for the
+URL host fallback. An empty or missing `AnyValue` is no attribute; a
+non-string URL or host value derives `""`.
+
+Known divergence: v1 keeps string, number and bool attributes in separate
+maps, so the order between a string and a non-string value is lost. Where
+the pipeline let a later non-string value of an input key override an
+earlier string one, the engine keeps the string
+(`*_server_address_then_net_peer_name_int`, `*_url_full_then_http_url_int`,
+`*_method_stable_then_legacy_int`); for the method, string values decide
+and a number or bool counts only when no string method is present.
 
 ## Compactor-derived trace data
 

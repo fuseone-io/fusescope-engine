@@ -415,13 +415,7 @@ fn promoted_from_typed(typed: &TypedAttributes, key: &str) -> Option<String> {
     if let Some(s) = typed.string(key) {
         return Some(s.to_owned());
     }
-    let n = typed.number(key)?;
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        // Integral and within the exactly representable range; the cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        return Some((n as i64).to_string());
-    }
-    Some(n.to_string())
+    typed.number(key).map(super::derived::number_text)
 }
 
 fn kind_name(kind: SpanKind) -> &'static str {
