@@ -163,7 +163,8 @@ async fn write_spans(catalog: &Catalog, store: &LocalFileSystem, tenant: TenantI
 }
 
 /// The compacted `top_level_operations` of the same spans: the frontend
-/// root's operation and cart's, reached over a remote parent.
+/// root's operation, and cart's and worker's, each a child of another
+/// service.
 async fn write_top_level(catalog: &Catalog, store: &LocalFileSystem, tenant: TenantId) {
     let mut builder = SpanBatchBuilder::new(Limits::default());
     builder.append_request(&spans()).unwrap();
@@ -171,7 +172,8 @@ async fn write_top_level(catalog: &Catalog, store: &LocalFileSystem, tenant: Ten
     operations
         .absorb(&builder.finish().unwrap(), 100, usize::MAX)
         .unwrap();
-    assert_eq!(operations.len(), 2);
+    operations.finish();
+    assert_eq!(operations.len(), 3);
     let (first, last) = operations.range().unwrap();
     let bytes = fs_schema::top_level_operations::encode(&operations).unwrap();
     let id = fs_catalog::FileId::new();
@@ -209,10 +211,11 @@ async fn write_top_level(catalog: &Catalog, store: &LocalFileSystem, tenant: Ten
 }
 
 /// What a case counts over the spans written: a root and spans with a
-/// remote and a local parent.
+/// remote and a local parent, each of a service other than its parent's,
+/// so both are entry points.
 const COUNTS: &[(&str, i64)] = &[
     ("TestEngineFilterMatrix/isRoot_=_true", 1),
-    ("TestEngineFilterMatrix/isEntryPoint_=_true", 1),
+    ("TestEngineFilterMatrix/isEntryPoint_=_true", 2),
     (
         "TestEngineFilterMatrix/parent_span_id_!=_'00f067aa0ba902b7'",
         3,

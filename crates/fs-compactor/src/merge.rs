@@ -219,9 +219,12 @@ impl Merger {
         std::mem::take(&mut self.summaries)
     }
 
-    /// The pass's top-level operations, including which cap skipped them.
+    /// The pass's top-level operations, its children resolved against
+    /// every span of the pass, including which cap skipped them.
     pub fn take_top_level_operations(&mut self) -> TopLevelOperations {
-        std::mem::take(&mut self.top_level)
+        let mut operations = std::mem::take(&mut self.top_level);
+        operations.finish();
+        operations
     }
 
     /// The pass's service graph builder, including which cap skipped it.
