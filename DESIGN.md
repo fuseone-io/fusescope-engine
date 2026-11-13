@@ -857,7 +857,7 @@ another pass of the hour, or never sent) makes no boundary. This is the
 rule observed of the ClickHouse pipeline, where "the same pass" is the
 collector's export batch (`MAPPING.md`, "Compactor-derived trace data"):
 the engine therefore lists children whose parent crossed services in
-another batch, which ClickHouse misses, and never the reverse. The pass
+another batch, which ClickHouse misses. The pass
 indexes every span's service until it ends, so a child read before its
 parent is resolved at the end; that index is charged to
 `compactor.top_level_operations_max_bytes`, not to the service graph's
