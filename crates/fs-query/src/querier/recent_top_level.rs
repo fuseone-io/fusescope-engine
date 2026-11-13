@@ -191,7 +191,7 @@ impl TopLevelSource {
             operations.finish();
             total.merge(operations);
         }
-        held.try_resize(total.estimated_bytes())?;
+        held.try_resize(total.estimated_bytes().saturating_add(total.batch_bytes()))?;
         let batch = total.to_batch().map_err(resolving)?;
         drop(total);
         held.try_resize(batch.get_array_memory_size())?;

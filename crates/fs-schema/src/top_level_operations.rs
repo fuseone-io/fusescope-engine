@@ -40,13 +40,17 @@ const BTREE_ENTRY_OVERHEAD: usize = 4 * size_of::<usize>();
 const INDEX_ENTRY_BYTES: usize = 2 * (size_of::<(SpanKey, Arc<str>)>() + 1);
 /// One child waiting for its parent, with vector slack for growth.
 const PENDING_ENTRY_BYTES: usize = 2 * size_of::<Pending>();
+/// The counts in front of an `Arc<str>`'s bytes.
+const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 /// One interned name besides its UTF-8 bytes: the `Arc` header and a set slot.
-const INTERNED_NAME_BYTES: usize = 2 * size_of::<usize>() + 2 * size_of::<Arc<str>>();
+const INTERNED_NAME_BYTES: usize = ARC_HEADER_BYTES + 2 * size_of::<Arc<str>>();
 const OPERATION_OUTPUT_FIXED_BYTES: usize = 2 * size_of::<i32>() + size_of::<i64>();
 
-/// One operation's map entry, B-tree node slack and fixed Arrow output
-/// storage, before the UTF-8 bytes of its service and name.
+/// One operation's map entry, the headers of its two names, B-tree node
+/// slack and fixed Arrow output storage, before the UTF-8 bytes of its
+/// service and name, which its names keep alive once the pass ends.
 pub const OPERATION_ENTRY_BYTES: usize = size_of::<(Arc<str>, Arc<str>)>()
+    + 2 * ARC_HEADER_BYTES
     + size_of::<i64>()
     + BTREE_ENTRY_OVERHEAD
     + OPERATION_OUTPUT_FIXED_BYTES;
@@ -303,40 +307,53 @@ impl TopLevelOperations {
 
     fn rows_bytes(&self) -> usize {
         self.rows.keys().fold(0, |bytes, (service, name)| {
-            bytes
-                .saturating_add(OPERATION_ENTRY_BYTES)
-                .saturating_add(service.len())
-                .saturating_add(name.len())
+            bytes.saturating_add(operation_bytes(service, name))
         })
     }
 
+    /// Counts a top-level span: a new operation, and any name it interns
+    /// anew, is charged before anything is allocated for it.
     fn add(&mut self, service: &str, name: &str, start: i64) -> bool {
-        let key = (self.intern(service), self.intern(name));
-        if let Some(last_seen) = self.rows.get_mut(&key) {
-            *last_seen = (*last_seen).max(start);
-        } else {
-            if self.rows.len() >= self.max_operations {
-                let next_bytes = self
-                    .estimated_bytes
-                    .saturating_add(OPERATION_ENTRY_BYTES)
-                    .saturating_add(service.len())
-                    .saturating_add(name.len());
-                self.skip(LimitExceeded {
-                    limit: "top_level_operations_max_operations",
-                    cap: self.max_operations,
-                    observed: self.rows.len().saturating_add(1),
-                    estimated_bytes: next_bytes,
-                });
-                return false;
+        if let (Some(known_service), Some(known_name)) =
+            (self.names.get(service), self.names.get(name))
+        {
+            let key = (Arc::clone(known_service), Arc::clone(known_name));
+            if let Some(last_seen) = self.rows.get_mut(&key) {
+                *last_seen = (*last_seen).max(start);
+                self.widen(start);
+                return true;
             }
-            let charge = OPERATION_ENTRY_BYTES
-                .saturating_add(service.len())
-                .saturating_add(name.len());
-            if !self.charge(charge) {
-                return false;
-            }
-            self.rows.insert(key, start);
         }
+        if self.rows.len() >= self.max_operations {
+            let next_bytes = self
+                .estimated_bytes
+                .saturating_add(operation_bytes(service, name));
+            self.skip(LimitExceeded {
+                limit: "top_level_operations_max_operations",
+                cap: self.max_operations,
+                observed: self.rows.len().saturating_add(1),
+                estimated_bytes: next_bytes,
+            });
+            return false;
+        }
+        let interned = [service, name]
+            .into_iter()
+            .collect::<HashSet<&str>>()
+            .into_iter()
+            .filter(|text| !self.names.contains(*text))
+            .fold(0usize, |bytes, text| {
+                bytes
+                    .saturating_add(text.len())
+                    .saturating_add(INTERNED_NAME_BYTES)
+            });
+        if !self.charge(operation_bytes(service, name).saturating_add(interned)) {
+            return false;
+        }
+        let key = (self.intern(service), self.intern(name));
+        self.rows
+            .entry(key)
+            .and_modify(|known| *known = (*known).max(start))
+            .or_insert(start);
         self.widen(start);
         true
     }
@@ -416,19 +433,42 @@ impl TopLevelOperations {
         self.exceeded = Some(exceeded);
     }
 
+    /// The bytes [`TopLevelOperations::to_batch`] allocates beside the
+    /// rows, which stay alive while it copies them: their text, offsets
+    /// and timestamps, exactly.
+    pub fn batch_bytes(&self) -> usize {
+        let text = self.rows.keys().fold(0usize, |bytes, (service, name)| {
+            bytes
+                .saturating_add(service.len())
+                .saturating_add(name.len())
+        });
+        let offsets = 2 * (self.rows.len() + 1) * size_of::<i32>();
+        text.saturating_add(offsets)
+            .saturating_add(self.rows.len() * size_of::<i64>())
+    }
+
     /// Encodes the rows as one Arrow batch.
     ///
     /// # Errors
     /// Arrow refuses an inconsistent array.
     pub fn to_batch(&self) -> Result<RecordBatch, SchemaError> {
-        let services: StringArray = self.iter().map(|(service, _, _)| Some(service)).collect();
-        let names: StringArray = self.iter().map(|(_, name, _)| Some(name)).collect();
-        let seen: Vec<i64> = self.iter().map(|(_, _, last_seen)| last_seen).collect();
+        let services = exact_strings(
+            self.iter().map(|(service, _, _)| service),
+            self.rows.len(),
+            self.iter().map(|(service, _, _)| service.len()).sum(),
+        );
+        let names = exact_strings(
+            self.iter().map(|(_, name, _)| name),
+            self.rows.len(),
+            self.iter().map(|(_, name, _)| name.len()).sum(),
+        );
+        let mut seen = Vec::with_capacity(self.rows.len());
+        seen.extend(self.iter().map(|(_, _, last_seen)| last_seen));
         Ok(RecordBatch::try_new(
             schema(),
             vec![
-                Arc::new(services),
-                Arc::new(names),
+                Arc::new(services?),
+                Arc::new(names?),
                 Arc::new(TimestampNanosecondArray::from(seen).with_timezone("UTC")),
             ],
         )?)
@@ -460,6 +500,36 @@ impl TopLevelOperations {
         out.estimated_bytes = out.rows_bytes();
         Ok(out)
     }
+}
+
+/// One operation as charged once kept: its entry, headers and text.
+fn operation_bytes(service: &str, name: &str) -> usize {
+    OPERATION_ENTRY_BYTES
+        .saturating_add(service.len())
+        .saturating_add(name.len())
+}
+
+/// `values` as a string array whose buffers hold exactly their bytes.
+fn exact_strings<'a>(
+    values: impl Iterator<Item = &'a str>,
+    rows: usize,
+    bytes: usize,
+) -> Result<StringArray, SchemaError> {
+    let mut data = Vec::with_capacity(bytes);
+    let mut offsets = Vec::with_capacity(rows + 1);
+    offsets.push(0i32);
+    for value in values {
+        data.extend_from_slice(value.as_bytes());
+        offsets.push(
+            i32::try_from(data.len())
+                .map_err(|_| SchemaError::Layout("top-level operations text"))?,
+        );
+    }
+    Ok(StringArray::try_new(
+        arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+        arrow::buffer::Buffer::from_vec(data),
+        None,
+    )?)
 }
 
 /// Exact physical layout of format v1.

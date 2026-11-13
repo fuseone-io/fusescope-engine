@@ -145,9 +145,10 @@ ClickHouse resolves the parent within one collector export batch, by span
 id alone: a parent in another batch makes no boundary there, and spans of
 other traces with the same span id in one batch can (the corpus reuses
 span ids, so its canonical record spaces each case past the batch flush).
-The pass resolves within itself by trace and span id, so it lists the
-boundaries ClickHouse missed across batches (`*_export` cases) and none
-it did not see.
+The pass resolves within itself by trace and span id, so it also lists
+the boundaries ClickHouse missed across batches (`*_export` cases); a
+boundary split across passes it misses, as ClickHouse does across
+batches, and ClickHouse may then list it alone.
 
 Top-level membership needs only the span itself: no parent lookup, so a
 parent that is absent, in another hour or in another pass changes nothing,

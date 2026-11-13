@@ -336,3 +336,49 @@ fn the_growth_bound_covers_what_a_batch_adds() {
         operations.estimated_bytes()
     );
 }
+
+#[test]
+fn an_operation_and_its_new_names_are_charged_before_they_are_kept() {
+    let root = batch(vec![resource(
+        Some("api"),
+        vec![span("GET /", 1, None, 0, 10)],
+    )]);
+    let indexed = INDEX_ENTRY_BYTES + "api".len() + INTERNED_NAME_BYTES;
+    let added =
+        OPERATION_ENTRY_BYTES + "api".len() + "GET /".len() + "GET /".len() + INTERNED_NAME_BYTES;
+
+    let mut refused = TopLevelOperations::default();
+    refused.absorb(&root, usize::MAX, indexed).unwrap();
+    assert_eq!(
+        refused.limit_exceeded(),
+        Some(LimitExceeded {
+            limit: "top_level_operations_max_bytes",
+            cap: indexed,
+            observed: indexed + added,
+            estimated_bytes: indexed + added,
+        }),
+        "the index fits; the operation, its new name included, does not"
+    );
+
+    let mut kept = TopLevelOperations::default();
+    kept.absorb(&root, usize::MAX, indexed + added).unwrap();
+    assert!(!kept.skipped());
+    assert_eq!(kept.estimated_bytes(), indexed + added);
+}
+
+#[test]
+fn the_batch_bound_covers_the_arrow_output_beside_the_rows() {
+    let operations = pass(&[sample()], usize::MAX, usize::MAX);
+    let made: usize = operations
+        .to_batch()
+        .unwrap()
+        .columns()
+        .iter()
+        .map(arrow::array::Array::get_buffer_memory_size)
+        .sum();
+    assert!(
+        operations.batch_bytes() >= made,
+        "{} under {made}",
+        operations.batch_bytes()
+    );
+}
