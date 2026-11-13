@@ -150,10 +150,6 @@ the boundaries ClickHouse missed across batches (`*_export` cases); a
 boundary split across passes it misses, as ClickHouse does across
 batches, and ClickHouse may then list it alone.
 
-Top-level membership needs only the span itself: no parent lookup, so a
-parent that is absent, in another hour or in another pass changes nothing,
-and nothing is inferred when the flags do not say.
-
 A direct edge takes precedence over inference. The parent map is keyed by
 both trace and span id, because span ids are only unique within a trace.
 Pairs split across compaction passes or UTC hours do not form an edge.

@@ -261,7 +261,8 @@ pub enum Signal {
     LogAttributeKeys,
     /// Derived: the labels, values and types of metric series.
     MetricMetadata,
-    /// Derived: operations seen on a root span or one with a remote parent.
+    /// Derived: operations seen on a root span or one whose parent, in the
+    /// same pass, belongs to another service.
     TopLevelOperations,
 }
 
