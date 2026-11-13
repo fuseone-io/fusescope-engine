@@ -108,7 +108,11 @@ case names below are its cases.
 
 Not inputs, observed: `net.host.name`, `peer.service`, resource attributes
 (`host.name`, `server.address`), the span kinds other than CLIENT for the
-URL host fallback. An empty or missing `AnyValue` is no attribute; a
+URL host fallback. Nor are `client.address` and `http.request.header.host`,
+which semconv names in place of the deprecated `http.host`: in every kind,
+as a `string[]` or a string, alone, empty or before or after a host key,
+they derive nothing and override nothing
+(`tests/fixtures/derived_columns_host_keys_observed.json`). An empty or missing `AnyValue` is no attribute; a
 non-string URL or host value derives `""`.
 
 Known divergence: v1 keeps string, number and bool attributes in separate

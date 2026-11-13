@@ -3,7 +3,7 @@
 derived span columns, and the fixture pairing each span with the row the
 ClickHouse pipeline wrote for it.
 
-  derived-columns-corpus.py request RUN_HEX START_UNIX_NANO > request.json
+  derived-columns-corpus.py request RUN_HEX START_UNIX_NANO [derived|host-keys] > request.json
   derived-columns-corpus.py fixture request.json rows.json versions.json > fixture.json
 """
 
@@ -142,6 +142,43 @@ RESOURCE_CASES = {
 }
 
 
+def arr(*values):
+    return {"arrayValue": {"values": [s(v) for v in values]}}
+
+
+# The keys semconv names in place of the deprecated http.host: client.address, the client as the
+# server sees it, and http.request.header.host, an opt-in string[] header attribute.
+HOST_KEY_VARIATIONS = {
+    "client_address_only": {"client.address": s("ca.d6.test")},
+    "client_address_ip": {"client.address": s("10.0.0.7")},
+    "client_address_empty": {"client.address": s("")},
+    "client_address_and_port": {"client.address": s("cap.d6.test"), "client.port": i(51000)},
+    "header_host_array": {"http.request.header.host": arr("hh.d6.test")},
+    "header_host_array_with_port": {"http.request.header.host": arr("hhp.d6.test:8080")},
+    "header_host_array_two": {"http.request.header.host": arr("hh1.d6.test", "hh2.d6.test")},
+    "header_host_array_empty": {"http.request.header.host": {"arrayValue": {}}},
+    "header_host_array_empty_string": {"http.request.header.host": arr("")},
+    "header_host_string": {"http.request.header.host": s("hs.d6.test")},
+    "server_address_then_client_address": {"server.address": s("sa1.d6.test"), "client.address": s("ca1.d6.test")},
+    "client_address_then_server_address": {"client.address": s("ca2.d6.test"), "server.address": s("sa2.d6.test")},
+    "client_address_then_server_address_empty": {"client.address": s("ca3.d6.test"), "server.address": s("")},
+    "client_address_vs_net_peer_name": {"client.address": s("ca4.d6.test"), "net.peer.name": s("npn4.d6.test")},
+    "net_peer_name_vs_client_address": {"net.peer.name": s("npn5.d6.test"), "client.address": s("ca5.d6.test")},
+    "client_address_vs_http_host": {"client.address": s("ca6.d6.test"), "http.host": s("hh6.d6.test")},
+    "http_host_vs_client_address": {"http.host": s("hh7.d6.test"), "client.address": s("ca7.d6.test")},
+    "server_address_then_header_host": {"server.address": s("sa8.d6.test"), "http.request.header.host": arr("hh8.d6.test")},
+    "header_host_then_server_address": {"http.request.header.host": arr("hh9.d6.test"), "server.address": s("sa9.d6.test")},
+    "header_host_then_server_address_empty": {"http.request.header.host": arr("hh10.d6.test"), "server.address": s("")},
+    "client_address_vs_header_host": {"client.address": s("ca11.d6.test"), "http.request.header.host": arr("hh11.d6.test")},
+    "header_host_vs_client_address": {"http.request.header.host": arr("hh12.d6.test"), "client.address": s("ca12.d6.test")},
+    "header_host_string_then_server_address": {"http.request.header.host": s("hs13.d6.test"), "server.address": s("sa13.d6.test")},
+    "client_address_and_url_full": {"client.address": s("ca14.d6.test"), "url.full": s("https://uf14.d6.test/x")},
+    "url_full_and_client_address": {"url.full": s("https://uf15.d6.test/x"), "client.address": s("ca15.d6.test")},
+    "header_host_and_url_full": {"http.request.header.host": arr("hh16.d6.test"), "url.full": s("https://uf16.d6.test/x")},
+    "client_address_empty_and_url_full": {"client.address": s(""), "url.full": s("https://uf17.d6.test/x")},
+}
+
+
 def attributes(attrs):
     out = []
     for key, value in attrs.items():
@@ -149,6 +186,17 @@ def attributes(attrs):
             out.append({"key": key})
         else:
             out.append({"key": key, "value": value})
+    return out
+
+
+def host_key_cases():
+    out = []
+    for kind in KINDS:
+        out.append((f"kind_{kind.lower()}_client_address", kind, {"client.address": s("k.d6.test")}, {}))
+        out.append((f"kind_{kind.lower()}_header_host", kind, {"http.request.header.host": arr("kh.d6.test")}, {}))
+    for kind in ("SERVER", "CLIENT"):
+        for name, attrs in HOST_KEY_VARIATIONS.items():
+            out.append((f"{kind.lower()}_{name}", kind, attrs, {}))
     return out
 
 
@@ -169,9 +217,12 @@ def ids(run, n):
     return f"d6c0{run:08x}{0:012x}{n:08x}", f"d6{n:014x}"
 
 
-def request(run, start):
+CORPORA = {"derived": cases, "host-keys": host_key_cases}
+
+
+def request(run, start, corpus="derived"):
     by_resource = {}
-    for n, (name, kind, attrs, resource) in enumerate(cases(), start=1):
+    for n, (name, kind, attrs, resource) in enumerate(CORPORA[corpus](), start=1):
         trace_id, span_id = ids(run, n)
         res = {"service.name": s(f"d6-corpus-{run:08x}"), **resource}
         key = json.dumps(res, sort_keys=True)
@@ -220,7 +271,7 @@ def fixture(request_path, rows_path, versions_path):
 
 def main():
     if sys.argv[1] == "request":
-        json.dump(request(int(sys.argv[2], 16), int(sys.argv[3])), sys.stdout, indent=1)
+        json.dump(request(int(sys.argv[2], 16), int(sys.argv[3]), *sys.argv[4:5]), sys.stdout, indent=1)
     elif sys.argv[1] == "fixture":
         json.dump(fixture(*sys.argv[2:5]), sys.stdout, indent=1, ensure_ascii=False)
     else:
