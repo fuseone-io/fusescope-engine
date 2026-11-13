@@ -28,6 +28,11 @@ const FIXTURE: &str = concat!(
 );
 /// `client.address` and `http.request.header.host`, the keys semconv names
 /// in place of the deprecated `http.host`.
+/// The span columns ClickHouse derives from several keys.
+const SPAN_COLUMNS_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/span_columns_observed.json"
+);
 const HOST_KEYS_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/derived_columns_host_keys_observed.json"
@@ -41,7 +46,10 @@ const UNORDERED_ACROSS_TYPES: &[(&str, &[&str])] = &[
         "url_full_then_http_url_int",
         &["http_url", "external_http_url"],
     ),
-    ("method_stable_then_legacy_int", &["external_http_method"]),
+    (
+        "method_stable_then_legacy_int",
+        &["external_http_method", "http_method"],
+    ),
 ];
 
 fn any_value(json: Option<&Json>) -> Option<AnyValue> {
@@ -111,7 +119,7 @@ fn span_request(case: &Json) -> ExportTraceServiceRequest {
     }
 }
 
-/// The four derived columns of `case`'s span, as the engine reads them.
+/// Every derived column of `case`'s span, as the engine reads them.
 fn engine_reads(case: &Json) -> BTreeMap<&'static str, String> {
     let mut builder = SpanBatchBuilder::new(Limits::default());
     builder.append_request(&span_request(case)).unwrap();
@@ -167,7 +175,9 @@ fn differences(path: &str) -> (Vec<String>, usize) {
         let differs: Vec<&str> = read
             .iter()
             .filter(|(column, value)| {
-                case["observed"][**column].as_str().unwrap() != value.as_str()
+                case["observed"]
+                    .get(**column)
+                    .is_some_and(|observed| observed.as_str().unwrap() != value.as_str())
             })
             .map(|(column, _)| *column)
             .collect();
@@ -229,8 +239,56 @@ fn client_address_and_the_host_header_read_as_observed() {
 }
 
 #[test]
+fn the_span_columns_read_as_the_clickhouse_pipeline_derived_them() {
+    let fixture: Json =
+        serde_json::from_str(&std::fs::read_to_string(SPAN_COLUMNS_FIXTURE).unwrap()).unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert!(cases.len() >= 130 && cases.iter().all(|c| c["observed"].is_object()));
+    for column in [
+        "http_method",
+        "response_status_code",
+        "db_name",
+        "db_operation",
+    ] {
+        assert!(
+            cases
+                .iter()
+                .any(|c| c["case"].as_str().unwrap().starts_with(column)),
+            "{column}"
+        );
+    }
+    let (differing, unordered) = differences(SPAN_COLUMNS_FIXTURE);
+    assert!(differing.is_empty(), "{}", differing.join("\n"));
+    assert_eq!(unordered, 0, "every pair of this corpus is of one type");
+}
+
+#[test]
+fn the_replaced_span_columns_keep_their_names_and_nullable_text() {
+    let names: Vec<&str> = Derived::REPLACED.iter().map(|d| d.name()).collect();
+    assert_eq!(
+        names,
+        [
+            "http_method",
+            "response_status_code",
+            "db_name",
+            "db_operation"
+        ]
+    );
+    for d in Derived::REPLACED {
+        let field = d.field();
+        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
+        assert!(
+            field.is_nullable(),
+            "{} as the promoted column it replaces",
+            d.name()
+        );
+        assert!(d.replaces());
+    }
+}
+
+#[test]
 fn the_derived_columns_are_named_after_the_backend_and_never_null() {
-    let names: Vec<&str> = Derived::ALL.iter().map(|d| d.name()).collect();
+    let names: Vec<&str> = Derived::APPENDED.iter().map(|d| d.name()).collect();
     assert_eq!(
         names,
         [
@@ -240,10 +298,11 @@ fn the_derived_columns_are_named_after_the_backend_and_never_null() {
             "external_http_url"
         ]
     );
-    for d in Derived::ALL {
+    for d in Derived::APPENDED {
         let field = d.field();
         assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
         assert!(!field.is_nullable());
+        assert!(!d.replaces());
     }
     assert_eq!(
         derived::INPUTS,

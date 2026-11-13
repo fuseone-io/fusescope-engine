@@ -439,6 +439,7 @@ which `fusescope-collector-server` replaces (ADR 0010).
 | links | List(Struct{trace_id, span_id, trace_state, attributes}) | |
 | service_name, http_route, ... | Dictionary(Utf8), nullable | promoted columns with flat snake_case names, registry in `fs-schema` (`PROMOTED`); the Go storage layer maps logical attribute to physical column, as it does today for `attribute_string_http$$route` |
 | http_url, http_host, external_http_method, external_http_url | Utf8, not stored | derived when read from `kind` and the attribute maps (`fs-schema` `spans::derived`, rules in `MAPPING.md`); the table shows them after the stored columns, their filters run above the scan, their arrays are charged to the memory pool for as long as they live |
+| http_method, response_status_code, db_name, db_operation | Utf8, nullable, derived | stored promoted, but the table derives them when read, the same way, in place of the stored columns, which it no longer reads: ClickHouse takes the last of their keys and no gRPC status; same names and types over Flight |
 
 Promoted from day one because the Go backend and the UI depend on them:
 `service.name` (resource), `http.route`, `http.request.method` and legacy
