@@ -1,6 +1,7 @@
 //! Span schema and the OTLP spans to Arrow converter.
 
 mod builder;
+pub mod derived;
 mod schema;
 
 pub use builder::SpanBatchBuilder;
