@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "fs-auth"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "fs-bench"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1658,11 +1658,11 @@ dependencies = [
 
 [[package]]
 name = "fs-cache"
-version = "0.0.6"
+version = "0.0.7"
 
 [[package]]
 name = "fs-catalog"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "fs-compactor"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "fs-index"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "roaring",
  "thiserror",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "fs-ingest"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "fs-query"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "fs-schema"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "fs-server"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "fs-wal"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "crc32c",
  "serde",
