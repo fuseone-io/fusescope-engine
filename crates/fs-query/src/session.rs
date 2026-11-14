@@ -122,6 +122,7 @@ pub fn tenant_session(
     catalog.register_schema(SCHEMA, schema)?;
     ctx.register_catalog(CATALOG, catalog);
     ctx.register_udaf(crate::tdigest::quantile_tdigest());
+    ctx.register_udaf(crate::quantile_compat::quantile_compat());
     ctx.register_udf(crate::has_token::udf());
     Ok(ctx)
 }

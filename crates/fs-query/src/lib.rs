@@ -22,6 +22,7 @@ pub mod hot;
 pub mod metric_index;
 pub mod metric_select;
 pub mod prune;
+mod quantile_compat;
 pub mod querier;
 pub mod session;
 mod sidecar_cache;

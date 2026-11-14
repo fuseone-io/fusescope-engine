@@ -15,6 +15,7 @@ arrow-buffer = { workspace = true }
 arrow-flight = { workspace = true }
 datafusion = { workspace = true }
 datafusion-datasource = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 object_store = { workspace = true }

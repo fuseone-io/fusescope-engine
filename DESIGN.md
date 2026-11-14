@@ -1431,10 +1431,12 @@ of the same ticket, or on another querier than the one that prepared it.
 `fusescope_query_prepared_plans` and `fusescope_query_prepared_bytes` show
 what waits. Dialect: DataFusion, close to PostgreSQL. Functions registered
 by the engine: `has_token(body, 'token')` (section 5) and
-`quantile_tdigest(digest, 0.99)` over service-graph digests. The Go dialect
-uses the built-in functions for the rest: `attributes_string['k']` for a map
-key, `date_bin` for time buckets, `approx_percentile_cont ... WITHIN GROUP`
-for quantiles of raw values, `encode`/`decode(..., 'hex')` for ids. Every
+`quantile_tdigest(digest, 0.99)` over service-graph digests, and
+`quantile_compat(value, 0.99)` for quantiles of raw values, exact up to
+10,010 values per group and a t-digest above ([ADR 0011](docs/adr/0011-quantile-compat.md)).
+The Go dialect uses the built-in functions for the rest:
+`attributes_string['k']` for a map key, `date_bin` for time buckets,
+`encode`/`decode(..., 'hex')` for ids. Every
 statement the Go trace builders render is planned and run by
 `crates/fs-query/tests/backend_sql.rs` from a copy written by
 `scripts/backend-sql-fixture.py`, which records the backend commit, the
