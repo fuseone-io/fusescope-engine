@@ -798,7 +798,9 @@ impl Querier {
     /// `attribute_keys` or `log_attribute_keys` table together with those
     /// of the rows it does not hold yet, whose key starts with
     /// `query.prefix`, most frequent first, `query.limit` at most. A key of
-    /// recent rows is listed within `recent_keys_ttl`.
+    /// recent rows is listed within `recent_keys_ttl`. When `max_rows`, below
+    /// `query.limit`, leaves out keys the prefix matches, the answer carries
+    /// a warning: the client cannot tell that cut from a complete listing.
     ///
     /// # Errors
     /// Unknown tenant, planning or execution failure, recent rows over the
@@ -817,6 +819,10 @@ impl Querier {
         if let Some(prefix) = &query.prefix {
             frame = frame.filter(starts_with(col(key_col::KEY), lit(prefix.as_str())))?;
         }
+        let cap = self.limits.max_rows;
+        if query.limit > cap && frame.clone().limit(0, Some(cap + 1))?.count().await? > cap {
+            warnings.push(format!("max_rows {cap} left keys out of the listing"));
+        }
         let frame = frame
             .sort(vec![
                 col(key_col::COUNT).sort(false, false),
@@ -824,7 +830,7 @@ impl Querier {
                 col(key_col::SOURCE).sort(true, false),
                 col(key_col::TYPE).sort(true, false),
             ])?
-            .limit(0, Some(query.limit.min(self.limits.max_rows)))?;
+            .limit(0, Some(query.limit.min(cap)))?;
         let stream = frame.execute_stream().await?;
         Ok((
             Box::pin(recent_keys::HeldStream::new(stream, &listing)),
