@@ -5,11 +5,12 @@
 
 ## Context
 
-The parity judges each engine quantile against ClickHouse's exact
-distribution of the group. While one value is coarser than its rank
+The parity judges each engine quantile against the exact distribution of
+the group, read from ClickHouse. While one value is coarser than its rank
 tolerance, `0.1·q·(1 − q) ≤ 1/n`, the value must lie between the two order
-statistics around rank `q·(n − 1)`, where ClickHouse's `quantile`
-interpolates. Above that it may be off by `0.1·q·(1 − q)` in rank.
+statistics around rank `q·(n − 1)`. Above that it may be off by
+`0.1·q·(1 − q)` in rank. ClickHouse's own `quantile` interpolates at that
+rank over every value up to 8,192 values and samples a reservoir past them.
 
 DataFusion's `approx_percentile_cont` estimates at rank `q·n`. In the order
 statistic regime this half-value shift puts about half of the groups outside
@@ -23,13 +24,14 @@ ClickHouse answers can exhaust the memory pool.
 The engine registers `quantile_compat(value, q)`, a compatibility function,
 not a reimplementation of ClickHouse's `quantile`:
 
-- Up to 10,010 values a group keeps them all and answers the linear
-  interpolation at `q·(n − 1)`. 10,010 is the largest `n` the parity judges
-  by order statistics for the backend's highest quantile, p999:
-  `0.1·0.999·0.001 ≤ 1/10 010` and `> 1/10 011`.
-- Past 10,010 the values fold into a t-digest of 1000 centroids, which stays
-  within the rank tolerance. ClickHouse samples a reservoir there; the two
-  algorithms differ and only the parity's rule is shared.
+- Up to 10,010 values a group is in the parity's exact regime: it keeps them
+  all and answers the linear interpolation at rank `q·(n − 1)`. 10,010 is the
+  largest `n` the parity judges by order statistics for the backend's highest
+  quantile, p999: `0.1·0.999·0.001 ≤ 1/10 010` and `> 1/10 011`.
+- The algorithm diverges from ClickHouse's from 8,193 values: ClickHouse
+  samples there, the function stays exact up to 10,010 and then folds the
+  values into a t-digest of 1000 centroids, which stays within the rank
+  tolerance. Only the parity's rule is shared.
 - Partial states carry either the values or the digest; merging exact with
   exact, exact with digest and digest with digest gives the same answer
   whatever the split across partitions, exactly while the group is at most
