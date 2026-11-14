@@ -178,8 +178,10 @@ async fn the_backend_p99_lies_on_the_order_statistics() {
     f.db.finish().await;
 }
 
-/// One group's accumulator grows to about 80 KB before it turns into a
-/// digest; an aggregate without groups cannot spill it.
+/// Every partition's accumulator outgrows a 16 KiB pool, however the 20 011
+/// values split across partitions: the reservation is checked per batch, so a
+/// larger pool lets a partial past 10 010 values turn into a digest between
+/// two checks. An aggregate without groups cannot spill.
 #[tokio::test]
 async fn an_accumulator_past_the_memory_pool_fails_as_resources_exhausted() {
     let Some(f) = fixture().await else { return };
@@ -190,7 +192,7 @@ async fn an_accumulator_past_the_memory_pool_fails_as_resources_exhausted() {
     let q = querier(
         &f,
         QueryLimits {
-            memory_bytes: 64 * 1024,
+            memory_bytes: 16 * 1024,
             ..QueryLimits::default()
         },
     );
