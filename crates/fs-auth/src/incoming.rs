@@ -12,6 +12,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::server::Router;
 use tracing::{debug, warn};
 
@@ -84,6 +85,7 @@ impl ServerTls {
                     continue;
                 }
             };
+            nodelay(&tcp);
             let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                 self.stats
                     .handshakes_refused
@@ -115,6 +117,22 @@ impl ServerTls {
     }
 }
 
+/// Connections from `listener` in plain text.
+pub fn plain_incoming(
+    listener: TcpListener,
+) -> impl Stream<Item = std::io::Result<TcpStream>> + Send + 'static {
+    TcpListenerStream::new(listener).map(|accepted| accepted.inspect(nodelay))
+}
+
+/// Turns Nagle off on an accepted connection, as tonic's own listener does: a
+/// response written in small frames would otherwise wait for the client's
+/// delayed ACK. A socket that refuses still serves, only slower.
+fn nodelay(tcp: &TcpStream) {
+    if let Err(e) = tcp.set_nodelay(true) {
+        warn!(error = %e, "TCP_NODELAY refused");
+    }
+}
+
 /// Serves `router` on `listener` until `signal`: over mTLS with `tls`, in
 /// plain text without it.
 ///
@@ -134,7 +152,7 @@ pub async fn serve(
         }
         None => {
             router
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), signal)
+                .serve_with_incoming_shutdown(plain_incoming(listener), signal)
                 .await
         }
     }
