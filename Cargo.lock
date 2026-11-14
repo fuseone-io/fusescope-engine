@@ -1757,6 +1757,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-datasource",
+ "datafusion-functions-aggregate-common",
  "fs-auth",
  "fs-catalog",
  "fs-index",
