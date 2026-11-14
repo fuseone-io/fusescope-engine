@@ -1,8 +1,9 @@
 //! `quantile_compat(value, q)`: a quantile compatible with ClickHouse's
-//! `quantile` under the parity's rules (ADR 0011), not an identical one.
+//! `quantile` under the parity's rules (ADR 0011), not its algorithm.
 //!
-//! Up to [`EXACT_LIMIT`] values a group keeps them all and answers the linear
-//! interpolation at rank `q·(n − 1)`, as ClickHouse does. Past it the values
+//! Up to [`EXACT_LIMIT`] values a group is in the parity's exact regime: it
+//! keeps them all and answers the linear interpolation at rank `q·(n − 1)`.
+//! ClickHouse already samples past 8,192 values. Past the limit the values
 //! fold into a t-digest of [`DIGEST_CENTROIDS`] centroids, whose estimate
 //! stays within the parity's rank tolerance. NULL and NaN values are skipped;
 //! a group without values is NULL.

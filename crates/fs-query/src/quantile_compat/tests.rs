@@ -57,9 +57,9 @@ impl Rng {
     }
 }
 
-/// ClickHouse's `quantile` over every value: rank `q·(n − 1)`, linear
+/// The parity's exact quantile: rank `q·(n − 1)` over every value, linear
 /// interpolation.
-fn clickhouse(values: &[f64], q: f64) -> f64 {
+fn parity_exact_quantile(values: &[f64], q: f64) -> f64 {
     let mut s = values.to_vec();
     s.sort_by(f64::total_cmp);
     let h = q * (s.len() - 1) as f64;
@@ -138,7 +138,7 @@ fn deal(values: &[f64], k: usize) -> Vec<Vec<f64>> {
 }
 
 #[test]
-fn up_to_the_limit_it_answers_clickhouse_interpolation() {
+fn up_to_the_limit_it_answers_the_parity_exact_interpolation() {
     let mut rng = Rng(1);
     for n in [1, 2, 3, 37, 211, 1_013, 9_973, 10_010] {
         let values = rng.values(n, 0);
@@ -147,7 +147,7 @@ fn up_to_the_limit_it_answers_clickhouse_interpolation() {
             update(&mut accumulator, &values, q);
             assert!(is_exact(&accumulator), "n={n}");
             let got = value(&mut accumulator).unwrap();
-            let want = clickhouse(&values, q);
+            let want = parity_exact_quantile(&values, q);
             assert!(
                 (got - want).abs() <= want.abs() * 1e-12,
                 "n={n} q={q}: {got} vs {want}"
@@ -196,7 +196,7 @@ fn every_split_of_a_group_up_to_the_limit_answers_the_same() {
     let mut rng = Rng(3);
     let values = rng.values(EXACT_LIMIT, 1);
     for q in [0.5, 0.95, 0.99, 0.999] {
-        let want = clickhouse(&values, q);
+        let want = parity_exact_quantile(&values, q);
         let (a, b) = values.split_at(7_919);
         let (b, c) = b.split_at(1);
         for partitions in [vec![&values[..]], vec![a, b, c], vec![c, &[], b, a]] {
