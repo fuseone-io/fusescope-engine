@@ -592,3 +592,56 @@ async fn a_listings_reservation_lives_as_long_as_its_batch() {
     );
     f.db.finish().await;
 }
+
+/// The rows of a listing of at most `limit` keys, and its warnings.
+async fn listing(querier: &Querier, tenant: TenantId, limit: usize) -> (usize, Vec<String>) {
+    let query = KeysQuery {
+        table: KeyTable::Spans,
+        prefix: None,
+        limit,
+    };
+    let (stream, warnings) = querier.metadata_keys(tenant, &query).await.unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    let rows = batches.iter().map(RecordBatch::num_rows).sum();
+    (rows, warnings.list())
+}
+
+fn max_rows(max_rows: usize) -> QueryLimits {
+    QueryLimits {
+        max_rows,
+        ..QueryLimits::default()
+    }
+}
+
+/// A listing `max_rows` cuts short says so, so a client never reads a key
+/// it omitted as absent; one it cuts nothing from, or that the client's own
+/// limit ends, does not.
+#[tokio::test]
+async fn a_key_listing_max_rows_cuts_short_is_partial() {
+    let Some(f) = fixture(NewTenant::with_defaults("acme")).await else {
+        return;
+    };
+    // service.name, a.one and a.two.
+    write_l0(&f, &request(1, H0, 2, &["a.one", "a.two"])).await;
+
+    let (rows, warnings) = listing(&querier(&f, max_rows(2)), f.tenant, 1001).await;
+    assert_eq!(rows, 2);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+    for limit in [3, 5] {
+        let (rows, warnings) = listing(&querier(&f, max_rows(limit)), f.tenant, 1001).await;
+        assert_eq!(rows, 3, "max_rows {limit}");
+        assert_eq!(warnings.len(), 0, "max_rows {limit}: {warnings:?}");
+    }
+
+    let (rows, warnings) = listing(&querier(&f, QueryLimits::default()), f.tenant, 2).await;
+    assert_eq!(
+        rows, 2,
+        "the client's limit, which it detects by asking one more"
+    );
+    assert_eq!(warnings.len(), 0, "{warnings:?}");
+    let (rows, warnings) = listing(&querier(&f, max_rows(2)), f.tenant, 1).await;
+    assert_eq!(rows, 1, "the client's limit, below max_rows");
+    assert_eq!(warnings.len(), 0, "{warnings:?}");
+    f.db.finish().await;
+}

@@ -1500,7 +1500,9 @@ the table is also `attribute_keys` in SQL. `"signal": "logs"` answers the
 rows of `log_attribute_keys`, also a SQL table, and any other signal is
 `INVALID_ARGUMENT`. A listing answers at most
 `limit` rows, 1000 when absent, never more than `query.max_rows`
-(`fusescope_query_metadata_lookups_total`). An unknown action is
+(`fusescope_query_metadata_lookups_total`). A `metadata.keys` listing that
+`max_rows` cuts below `limit` while more keys match carries a partial
+warning, since its client cannot tell that cut from a complete listing. An unknown action is
 `UNIMPLEMENTED`, a malformed body or a field the action does not know
 `INVALID_ARGUMENT`.
 
