@@ -790,3 +790,27 @@ async fn silent_and_excess_connections_are_dropped_within_the_limits() {
         "the permit came back"
     );
 }
+
+/// Connections reach the server with Nagle off: gRPC writes a response in
+/// small frames, and a held frame waits for the client's delayed ACK.
+#[tokio::test]
+async fn tls_connections_are_accepted_with_nodelay() {
+    let tls = Tls::load(fixtures(), limits()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut incoming = tls.public_server().incoming(listener);
+    let client = tokio::spawn(async move { connect(addr, "localhost", "ca-a.pem", BACKEND).await });
+    let server = incoming.next().await.unwrap().unwrap();
+    assert!(server.get_ref().0.nodelay().unwrap());
+    client.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn plain_connections_are_accepted_with_nodelay() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut incoming = fs_auth::plain_incoming(listener);
+    let _client = TcpStream::connect(addr).await.unwrap();
+    let server = incoming.next().await.unwrap().unwrap();
+    assert!(server.nodelay().unwrap());
+}

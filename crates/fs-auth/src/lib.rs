@@ -27,7 +27,7 @@ mod reload;
 mod validity;
 
 pub use client::{ClientTls, endpoint, error_chain};
-pub use incoming::{ServerTls, serve};
+pub use incoming::{ServerTls, plain_incoming, serve};
 pub use jwks::JwksStats;
 pub use jwt::{
     Claims, JwtError, JwtRules, JwtVerifier, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES, TENANT_CLAIM,
