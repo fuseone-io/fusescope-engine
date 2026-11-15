@@ -183,6 +183,14 @@ Pairs split across compaction passes or UTC hours do not form an edge.
 Dropped counts reported by the producer (`dropped_attributes_count`,
 `dropped_events_count`, `dropped_links_count`) are not stored in v1.
 
+`isError` is not stored; the backend's legacy reader derives it as
+`name == "exception"`, compared exactly. ClickHouse stores `isError: true` on
+those events and no `isError` key on the others, whatever the span's status,
+kind or attributes. Sources: the OTel exception event name (trace
+specification, exceptions) and `tests/fixtures/span_events_observed.json`,
+recorded with `scripts/span-events-corpus.sh`: each case as sent and the
+events stored for it, for two collector versions.
+
 ## Logs
 
 Logs follow the attribute, resource, scope, fingerprint and limit rules above;
